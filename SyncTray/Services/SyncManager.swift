@@ -10,19 +10,28 @@ final class SyncManager: ObservableObject {
     @Published private(set) var recentChanges: [FileChange] = []
     @Published private(set) var isManualSyncRunning = false
 
-    private var logWatcher: LogWatcher?
+    /// State per profile (keyed by profile ID)
+    @Published private(set) var profileStates: [UUID: SyncState] = [:]
+
+    let profileStore: ProfileStore
+
+    private var logWatchers: [UUID: LogWatcher] = [:]
     private let logParser = LogParser()
     private let notificationService = NotificationService.shared
+    private let setupService = SyncSetupService.shared
 
     private var workspaceObserver: NSObjectProtocol?
     private var currentSyncChanges: [FileChange] = []
+    private var cancellables = Set<AnyCancellable>()
 
     private let maxRecentChanges = 20
 
-    init() {
+    init(profileStore: ProfileStore? = nil) {
+        self.profileStore = profileStore ?? ProfileStore()
         setupWorkspaceObserver()
+        setupProfileObserver()
         checkInitialState()
-        startWatching()
+        startWatchingAllProfiles()
     }
 
     deinit {
@@ -34,61 +43,83 @@ final class SyncManager: ObservableObject {
     // MARK: - Public Methods
 
     func refreshSettings() {
-        startWatching()
+        startWatchingAllProfiles()
         checkInitialState()
     }
 
-    func triggerManualSync() {
+    /// Trigger manual sync for all enabled profiles, or a specific profile
+    func triggerManualSync(for profile: SyncProfile? = nil) {
         guard !isManualSyncRunning else { return }
 
-        let scriptPath = SyncTraySettings.syncScriptPath
-        guard !scriptPath.isEmpty && FileManager.default.fileExists(atPath: scriptPath) else {
-            currentState = .error("Sync script not configured")
-            return
+        let profilesToSync: [SyncProfile]
+        if let profile = profile {
+            profilesToSync = [profile]
+        } else {
+            profilesToSync = profileStore.enabledProfiles
         }
 
-        let drivePath = SyncTraySettings.drivePathToMonitor
-        if !drivePath.isEmpty && !FileManager.default.fileExists(atPath: drivePath) {
-            currentState = .driveNotMounted
-            notificationService.notifyDriveNotMounted()
+        guard !profilesToSync.isEmpty else {
+            currentState = .notConfigured
             return
         }
 
         isManualSyncRunning = true
 
         Task {
-            await runSyncScript()
+            for profile in profilesToSync {
+                await runSyncScript(for: profile)
+            }
             await MainActor.run {
                 isManualSyncRunning = false
             }
         }
     }
 
-    func openLogFile() {
-        let logPath = SyncTraySettings.logFilePath
+    func openLogFile(for profile: SyncProfile? = nil) {
+        let logPath: String
+        if let profile = profile {
+            logPath = profile.logPath
+        } else if let firstEnabled = profileStore.enabledProfiles.first {
+            logPath = firstEnabled.logPath
+        } else {
+            return
+        }
+
         if FileManager.default.fileExists(atPath: logPath) {
             NSWorkspace.shared.open(URL(fileURLWithPath: logPath))
         }
     }
 
-    func openSyncDirectory() {
-        let syncPath = SyncTraySettings.syncDirectoryPath
+    func openSyncDirectory(for profile: SyncProfile? = nil) {
+        let syncPath: String
+        if let profile = profile {
+            syncPath = profile.localSyncPath
+        } else if let firstEnabled = profileStore.enabledProfiles.first {
+            syncPath = firstEnabled.localSyncPath
+        } else {
+            return
+        }
+
         if !syncPath.isEmpty && FileManager.default.fileExists(atPath: syncPath) {
             NSWorkspace.shared.open(URL(fileURLWithPath: syncPath))
         }
     }
 
     func openFileInFinder(_ change: FileChange) {
-        let syncDir = SyncTraySettings.syncDirectoryPath
-        guard !syncDir.isEmpty else { return }
+        // Try to find the file in any of the enabled profiles
+        for profile in profileStore.enabledProfiles {
+            let fullPath = (profile.localSyncPath as NSString).appendingPathComponent(change.path)
+            let url = URL(fileURLWithPath: fullPath)
 
-        let fullPath = (syncDir as NSString).appendingPathComponent(change.path)
-        let url = URL(fileURLWithPath: fullPath)
+            if FileManager.default.fileExists(atPath: fullPath) {
+                NSWorkspace.shared.activateFileViewerSelecting([url])
+                return
+            }
+        }
 
-        if FileManager.default.fileExists(atPath: fullPath) {
-            NSWorkspace.shared.activateFileViewerSelecting([url])
-        } else {
-            // File might have been deleted, open parent directory
+        // File might have been deleted, try the first profile's path
+        if let profile = profileStore.enabledProfiles.first {
+            let fullPath = (profile.localSyncPath as NSString).appendingPathComponent(change.path)
             let parentDir = (fullPath as NSString).deletingLastPathComponent
             if FileManager.default.fileExists(atPath: parentDir) {
                 NSWorkspace.shared.open(URL(fileURLWithPath: parentDir))
@@ -123,29 +154,136 @@ final class SyncManager: ObservableObject {
         return false
     }
 
+    // MARK: - Profile Management
+
+    /// Enable/disable scheduled sync for a profile
+    func setProfileEnabled(_ profile: SyncProfile, enabled: Bool) {
+        var updatedProfile = profile
+        updatedProfile.isEnabled = enabled
+        profileStore.update(updatedProfile)
+
+        if enabled {
+            do {
+                try setupService.install(profile: updatedProfile)
+                startWatching(profile: updatedProfile)
+            } catch {
+                print("Failed to install profile: \(error)")
+            }
+        } else {
+            do {
+                try setupService.uninstall(profile: updatedProfile)
+                stopWatching(profileId: profile.id)
+            } catch {
+                print("Failed to uninstall profile: \(error)")
+            }
+        }
+
+        updateAggregateState()
+    }
+
+    /// Get state for a specific profile
+    func state(for profileId: UUID) -> SyncState {
+        profileStates[profileId] ?? .idle
+    }
+
     // MARK: - Private Methods
 
-    private func startWatching() {
-        logWatcher?.stopWatching()
-        logWatcher = LogWatcher(logPath: SyncTraySettings.logFilePath)
-        logWatcher?.delegate = self
-        logWatcher?.startWatching()
+    private func setupProfileObserver() {
+        profileStore.$profiles
+            .sink { [weak self] _ in
+                self?.startWatchingAllProfiles()
+                self?.updateAggregateState()
+            }
+            .store(in: &cancellables)
+    }
+
+    private func startWatchingAllProfiles() {
+        // Stop all existing watchers
+        for (id, watcher) in logWatchers {
+            watcher.stopWatching()
+            logWatchers.removeValue(forKey: id)
+        }
+
+        // Start watchers for all enabled profiles
+        for profile in profileStore.enabledProfiles {
+            startWatching(profile: profile)
+        }
+    }
+
+    private func startWatching(profile: SyncProfile) {
+        let watcher = LogWatcher(logPath: profile.logPath)
+        watcher.delegate = self
+        watcher.startWatching()
+        logWatchers[profile.id] = watcher
+        profileStates[profile.id] = .idle
+    }
+
+    private func stopWatching(profileId: UUID) {
+        logWatchers[profileId]?.stopWatching()
+        logWatchers.removeValue(forKey: profileId)
+        profileStates.removeValue(forKey: profileId)
     }
 
     private func checkInitialState() {
-        let logPath = SyncTraySettings.logFilePath
-        if logPath.isEmpty {
+        if profileStore.profiles.isEmpty {
             currentState = .notConfigured
             return
         }
 
-        let drivePath = SyncTraySettings.drivePathToMonitor
-        if !drivePath.isEmpty && !FileManager.default.fileExists(atPath: drivePath) {
-            currentState = .driveNotMounted
+        // Check each enabled profile
+        for profile in profileStore.enabledProfiles {
+            if !profile.drivePathToMonitor.isEmpty &&
+               !FileManager.default.fileExists(atPath: profile.drivePathToMonitor) {
+                profileStates[profile.id] = .driveNotMounted
+            } else {
+                profileStates[profile.id] = .idle
+            }
+        }
+
+        updateAggregateState()
+    }
+
+    /// Update the aggregate state (worst state wins)
+    private func updateAggregateState() {
+        if profileStore.profiles.isEmpty {
+            currentState = .notConfigured
             return
         }
 
-        currentState = .idle
+        if profileStore.enabledProfiles.isEmpty {
+            currentState = .idle
+            return
+        }
+
+        // Priority: error > syncing > driveNotMounted > idle
+        var hasError = false
+        var hasSyncing = false
+        var hasDriveNotMounted = false
+        var errorMessage: String?
+
+        for state in profileStates.values {
+            switch state {
+            case .error(let msg):
+                hasError = true
+                errorMessage = msg
+            case .syncing:
+                hasSyncing = true
+            case .driveNotMounted:
+                hasDriveNotMounted = true
+            default:
+                break
+            }
+        }
+
+        if hasError {
+            currentState = .error(errorMessage ?? "Unknown error")
+        } else if hasSyncing {
+            currentState = .syncing
+        } else if hasDriveNotMounted {
+            currentState = .driveNotMounted
+        } else {
+            currentState = .idle
+        }
     }
 
     private func setupWorkspaceObserver() {
@@ -171,66 +309,103 @@ final class SyncManager: ObservableObject {
     }
 
     private func handleVolumeMount(_ notification: Notification) {
-        let drivePath = SyncTraySettings.drivePathToMonitor
-        guard !drivePath.isEmpty else { return }
-
-        guard let volumePath = (notification.userInfo?[NSWorkspace.volumeURLUserInfoKey] as? URL)?.path,
-              drivePath.hasPrefix(volumePath) || volumePath == drivePath else {
+        guard let volumePath = (notification.userInfo?[NSWorkspace.volumeURLUserInfoKey] as? URL)?.path else {
             return
         }
 
-        notificationService.resetDriveNotMountedState()
-        if currentState == .driveNotMounted {
-            currentState = .idle
+        for profile in profileStore.enabledProfiles {
+            let drivePath = profile.drivePathToMonitor
+            guard !drivePath.isEmpty else { continue }
+
+            if drivePath.hasPrefix(volumePath) || volumePath == drivePath {
+                notificationService.resetDriveNotMountedState()
+                if profileStates[profile.id] == .driveNotMounted {
+                    profileStates[profile.id] = .idle
+                }
+            }
         }
+
+        updateAggregateState()
     }
 
     private func handleVolumeUnmount(_ notification: Notification) {
-        let drivePath = SyncTraySettings.drivePathToMonitor
-        guard !drivePath.isEmpty else { return }
-
-        guard let volumePath = (notification.userInfo?[NSWorkspace.volumeURLUserInfoKey] as? URL)?.path,
-              drivePath.hasPrefix(volumePath) || volumePath == drivePath else {
+        guard let volumePath = (notification.userInfo?[NSWorkspace.volumeURLUserInfoKey] as? URL)?.path else {
             return
         }
 
-        currentState = .driveNotMounted
-        notificationService.notifyDriveNotMounted()
+        for profile in profileStore.enabledProfiles {
+            let drivePath = profile.drivePathToMonitor
+            guard !drivePath.isEmpty else { continue }
+
+            if drivePath.hasPrefix(volumePath) || volumePath == drivePath {
+                profileStates[profile.id] = .driveNotMounted
+                notificationService.notifyDriveNotMounted()
+            }
+        }
+
+        updateAggregateState()
     }
 
-    private func runSyncScript() async {
+    private func runSyncScript(for profile: SyncProfile) async {
+        // Check if drive is mounted
+        if !profile.drivePathToMonitor.isEmpty &&
+           !FileManager.default.fileExists(atPath: profile.drivePathToMonitor) {
+            await MainActor.run {
+                profileStates[profile.id] = .driveNotMounted
+                notificationService.notifyDriveNotMounted()
+                updateAggregateState()
+            }
+            return
+        }
+
+        guard FileManager.default.fileExists(atPath: SyncProfile.sharedScriptPath) else {
+            await MainActor.run {
+                profileStates[profile.id] = .error("Script not found")
+                updateAggregateState()
+            }
+            return
+        }
+
+        guard FileManager.default.fileExists(atPath: profile.configPath) else {
+            await MainActor.run {
+                profileStates[profile.id] = .error("Config not found")
+                updateAggregateState()
+            }
+            return
+        }
+
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/bin/bash")
-        process.arguments = [SyncTraySettings.syncScriptPath]
+        process.arguments = [SyncProfile.sharedScriptPath, profile.configPath]
 
         do {
             try process.run()
             process.waitUntilExit()
         } catch {
-            print("Failed to run sync script: \(error)")
+            print("Failed to run sync script for \(profile.name): \(error)")
         }
     }
 
-    private func processLogEvent(_ event: ParsedLogEvent) {
+    private func processLogEvent(_ event: ParsedLogEvent, profileId: UUID) {
         switch event.type {
         case .syncStarted:
-            currentState = .syncing
+            profileStates[profileId] = .syncing
             currentSyncChanges.removeAll()
             notificationService.notifySyncStarted()
 
         case .syncCompleted:
-            currentState = .idle
+            profileStates[profileId] = .idle
             lastSyncTime = event.timestamp
             notificationService.notifySyncCompleted(changesCount: currentSyncChanges.count)
             currentSyncChanges.removeAll()
 
         case .syncFailed(let exitCode):
-            currentState = .error("Exit code \(exitCode)")
+            profileStates[profileId] = .error("Exit code \(exitCode)")
             notificationService.notifySyncError("Sync failed with exit code \(exitCode)")
             currentSyncChanges.removeAll()
 
         case .driveNotMounted:
-            currentState = .driveNotMounted
+            profileStates[profileId] = .driveNotMounted
             notificationService.notifyDriveNotMounted()
 
         case .syncAlreadyRunning:
@@ -247,6 +422,8 @@ final class SyncManager: ObservableObject {
         case .unknown:
             break
         }
+
+        updateAggregateState()
     }
 
     private func addRecentChange(_ change: FileChange) {
@@ -255,6 +432,16 @@ final class SyncManager: ObservableObject {
             recentChanges = Array(recentChanges.prefix(maxRecentChanges))
         }
     }
+
+    /// Find which profile a log watcher belongs to
+    private func profileId(for watcher: LogWatcher) -> UUID? {
+        for (id, w) in logWatchers {
+            if w === watcher {
+                return id
+            }
+        }
+        return nil
+    }
 }
 
 // MARK: - LogWatcherDelegate
@@ -262,9 +449,11 @@ final class SyncManager: ObservableObject {
 extension SyncManager: LogWatcherDelegate {
     nonisolated func logWatcher(_ watcher: LogWatcher, didReceiveNewLines lines: [String]) {
         Task { @MainActor in
+            guard let profileId = profileId(for: watcher) else { return }
+
             for line in lines {
                 if let event = logParser.parse(line: line) {
-                    processLogEvent(event)
+                    processLogEvent(event, profileId: profileId)
                 }
             }
         }

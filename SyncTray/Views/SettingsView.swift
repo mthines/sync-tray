@@ -5,16 +5,62 @@ struct SettingsView: View {
     @EnvironmentObject var syncManager: SyncManager
     @Environment(\.dismiss) private var dismiss
 
-    // Sync Configuration
-    @State private var rcloneRemote: String = SyncTraySettings.rcloneRemote
-    @State private var localSyncPath: String = SyncTraySettings.localSyncPath
-    @State private var isExternalDrive: Bool = !SyncTraySettings.drivePathToMonitor.isEmpty
-    @State private var syncIntervalMinutes: Int = SyncTraySettings.syncIntervalMinutes
-    @State private var additionalRcloneFlags: String = SyncTraySettings.additionalRcloneFlags
+    @State private var selectedProfileId: UUID?
 
-    // Manual Configuration (advanced)
-    @State private var logFilePath: String = SyncTraySettings.logFilePath
-    @State private var syncScriptPath: String = SyncTraySettings.syncScriptPath
+    var body: some View {
+        NavigationSplitView {
+            ProfileListView(
+                profileStore: syncManager.profileStore,
+                selection: $selectedProfileId
+            )
+            .navigationSplitViewColumnWidth(min: 180, ideal: 200, max: 250)
+        } detail: {
+            if let profileId = selectedProfileId,
+               let profile = syncManager.profileStore.profile(for: profileId) {
+                ProfileDetailView(
+                    profile: profile,
+                    profileStore: syncManager.profileStore,
+                    syncManager: syncManager
+                )
+            } else {
+                VStack(spacing: 16) {
+                    Image(systemName: "arrow.triangle.2.circlepath")
+                        .font(.system(size: 48))
+                        .foregroundColor(.secondary)
+                    Text("No Profile Selected")
+                        .font(.title2)
+                    Text("Select a profile from the sidebar or create a new one.")
+                        .font(.body)
+                        .foregroundColor(.secondary)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
+        }
+        .frame(width: 700, height: 650)
+        .onAppear {
+            // Select first profile if none selected
+            if selectedProfileId == nil {
+                selectedProfileId = syncManager.profileStore.profiles.first?.id
+            }
+        }
+    }
+}
+
+// MARK: - Profile Detail View
+
+struct ProfileDetailView: View {
+    let profile: SyncProfile
+    @ObservedObject var profileStore: ProfileStore
+    @ObservedObject var syncManager: SyncManager
+
+    // Editable fields (local state)
+    @State private var name: String = ""
+    @State private var rcloneRemote: String = ""
+    @State private var remotePath: String = ""
+    @State private var localSyncPath: String = ""
+    @State private var isExternalDrive: Bool = false
+    @State private var syncIntervalMinutes: Int = 15
+    @State private var additionalRcloneFlags: String = ""
 
     // UI State
     @State private var showAdvanced: Bool = false
@@ -32,7 +78,6 @@ struct SettingsView: View {
 
     // MARK: - Computed Properties
 
-    /// Computed drive path based on local sync path (extracts /Volumes/DriveName)
     private var computedDrivePath: String {
         guard isExternalDrive, localSyncPath.hasPrefix("/Volumes/") else { return "" }
         let components = localSyncPath.split(separator: "/")
@@ -43,21 +88,21 @@ struct SettingsView: View {
     }
 
     private var hasChanges: Bool {
-        rcloneRemote != SyncTraySettings.rcloneRemote ||
-        localSyncPath != SyncTraySettings.localSyncPath ||
-        computedDrivePath != SyncTraySettings.drivePathToMonitor ||
-        syncIntervalMinutes != SyncTraySettings.syncIntervalMinutes ||
-        additionalRcloneFlags != SyncTraySettings.additionalRcloneFlags ||
-        logFilePath != SyncTraySettings.logFilePath ||
-        syncScriptPath != SyncTraySettings.syncScriptPath
+        name != profile.name ||
+        rcloneRemote != profile.rcloneRemote ||
+        remotePath != profile.remotePath ||
+        localSyncPath != profile.localSyncPath ||
+        computedDrivePath != profile.drivePathToMonitor ||
+        syncIntervalMinutes != profile.syncIntervalMinutes ||
+        additionalRcloneFlags != profile.additionalRcloneFlags
     }
 
     private var canInstall: Bool {
-        !rcloneRemote.isEmpty && !localSyncPath.isEmpty && !isRemoteFolderEmpty
+        !rcloneRemote.isEmpty && !localSyncPath.isEmpty && !remotePath.isEmpty
     }
 
     private var isInstalled: Bool {
-        setupService.isInstalled()
+        setupService.isInstalled(profile: profile)
     }
 
     // MARK: - Body
@@ -65,25 +110,30 @@ struct SettingsView: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 20) {
-                // Section 1: Sync Configuration
+                // Profile Name
+                profileNameSection
+
+                Divider().padding(.vertical, 8)
+
+                // Sync Configuration
                 sectionHeader("Sync Configuration", icon: "arrow.triangle.2.circlepath")
                 syncConfigurationSection
 
                 Divider().padding(.vertical, 8)
 
-                // Section 2: Schedule
+                // Schedule
                 sectionHeader("Schedule", icon: "clock")
                 scheduleSection
 
                 Divider().padding(.vertical, 8)
 
-                // Section 3: Scheduled Sync Management
+                // Scheduled Sync Management
                 sectionHeader("Automatic Sync", icon: "calendar.badge.clock")
                 scheduledSyncSection
 
                 Divider().padding(.vertical, 8)
 
-                // Section 4: Advanced / Manual Configuration
+                // Advanced Options
                 advancedSection
 
                 // Action Buttons
@@ -92,20 +142,22 @@ struct SettingsView: View {
             }
             .padding(20)
         }
-        .frame(width: 550, height: 650)
         .onAppear {
-            loadSettings()
+            loadProfileValues()
             loadRcloneRemotes()
+        }
+        .onChange(of: profile.id) { _ in
+            loadProfileValues()
         }
         .alert("Uninstall Scheduled Sync?", isPresented: $showingUninstallConfirm) {
             Button("Cancel", role: .cancel) {}
             Button("Uninstall", role: .destructive) { uninstallSync() }
         } message: {
-            Text("This will remove the sync script and stop automatic syncing.")
+            Text("This will remove the sync script and stop automatic syncing for \"\(profile.name)\".")
         }
     }
 
-    // MARK: - Section Header
+    // MARK: - Sections
 
     @ViewBuilder
     private func sectionHeader(_ title: String, icon: String) -> some View {
@@ -114,18 +166,15 @@ struct SettingsView: View {
             .foregroundColor(.primary)
     }
 
-    /// Extract the folder name from the remote path
-    private var remoteFolderPath: String {
-        rcloneRemote.components(separatedBy: ":").dropFirst().joined(separator: ":")
+    private var profileNameSection: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text("Profile Name")
+                .font(.subheadline.weight(.medium))
+            TextField("e.g., Work, Personal, Photos", text: $name)
+                .textFieldStyle(.roundedBorder)
+                .frame(maxWidth: 300)
+        }
     }
-
-    /// Check if remote has a folder path specified
-    private var isRemoteFolderEmpty: Bool {
-        let remote = rcloneRemote.components(separatedBy: ":").first ?? ""
-        return !remote.isEmpty && remoteFolderPath.isEmpty
-    }
-
-    // MARK: - Sync Configuration Section
 
     private var syncConfigurationSection: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -144,13 +193,7 @@ struct SettingsView: View {
                             .scaleEffect(0.7)
                             .frame(width: 150)
                     } else if !availableRemotes.isEmpty {
-                        Picker("", selection: Binding(
-                            get: { rcloneRemote.components(separatedBy: ":").first ?? "" },
-                            set: { newRemote in
-                                let folder = rcloneRemote.components(separatedBy: ":").dropFirst().joined(separator: ":")
-                                rcloneRemote = folder.isEmpty ? "\(newRemote):" : "\(newRemote):\(folder)"
-                            }
-                        )) {
+                        Picker("", selection: $rcloneRemote) {
                             Text("Select...").tag("")
                             ForEach(availableRemotes, id: \.self) { remote in
                                 Text(remote).tag(remote)
@@ -167,13 +210,7 @@ struct SettingsView: View {
                                 .scaleEffect(0.7)
                                 .frame(maxWidth: .infinity, alignment: .leading)
                         } else if !availableFolders.isEmpty {
-                            Picker("", selection: Binding(
-                                get: { remoteFolderPath },
-                                set: { newFolder in
-                                    let remote = rcloneRemote.components(separatedBy: ":").first ?? ""
-                                    rcloneRemote = "\(remote):\(newFolder)"
-                                }
-                            )) {
+                            Picker("", selection: $remotePath) {
                                 Text("Select folder...").tag("")
                                 ForEach(availableFolders, id: \.self) { folder in
                                     Text(folder).tag(folder)
@@ -181,14 +218,8 @@ struct SettingsView: View {
                             }
                             .frame(maxWidth: .infinity)
                         } else {
-                            TextField("Folder on remote", text: Binding(
-                                get: { remoteFolderPath },
-                                set: { newFolder in
-                                    let remote = rcloneRemote.components(separatedBy: ":").first ?? ""
-                                    rcloneRemote = remote.isEmpty ? newFolder : "\(remote):\(newFolder)"
-                                }
-                            ))
-                            .textFieldStyle(.roundedBorder)
+                            TextField("Folder on remote", text: $remotePath)
+                                .textFieldStyle(.roundedBorder)
                         }
 
                         // Refresh folders button
@@ -201,9 +232,16 @@ struct SettingsView: View {
                             }
                         }
                         .help("Load folders from remote")
-                        .disabled(rcloneRemote.components(separatedBy: ":").first?.isEmpty ?? true)
+                        .disabled(rcloneRemote.isEmpty)
                     } else {
-                        TextField("remote:folder", text: $rcloneRemote)
+                        TextField("remote", text: $rcloneRemote)
+                            .textFieldStyle(.roundedBorder)
+                            .frame(width: 150)
+
+                        Text(":")
+                            .foregroundColor(.secondary)
+
+                        TextField("folder", text: $remotePath)
                             .textFieldStyle(.roundedBorder)
                     }
 
@@ -213,14 +251,13 @@ struct SettingsView: View {
                     .help("Refresh remotes list")
                 }
 
-                // Warning if folder path is empty
-                if isRemoteFolderEmpty && availableFolders.isEmpty {
+                // Folder hint
+                if remotePath.isEmpty && !rcloneRemote.isEmpty && availableFolders.isEmpty {
                     Label("Click the folder icon to browse, or type the folder name", systemImage: "info.circle")
                         .font(.caption)
                         .foregroundColor(.secondary)
                 }
 
-                // Folder validation error
                 if let error = foldersError {
                     Label(error, systemImage: "exclamationmark.triangle")
                         .font(.caption)
@@ -236,8 +273,6 @@ struct SettingsView: View {
                         .font(.caption)
                         .foregroundColor(.secondary)
                 }
-
-                validationMessage(for: rcloneRemoteValidation)
             }
 
             // Local Sync Path
@@ -256,9 +291,8 @@ struct SettingsView: View {
                         }
                     }
                 }
-                validationMessage(for: localSyncPathValidation)
 
-                // External drive toggle - only show if path is on /Volumes/
+                // External drive toggle
                 if localSyncPath.hasPrefix("/Volumes/") {
                     Toggle(isOn: $isExternalDrive) {
                         VStack(alignment: .leading, spacing: 2) {
@@ -278,8 +312,6 @@ struct SettingsView: View {
         .background(Color(nsColor: .controlBackgroundColor))
         .cornerRadius(8)
     }
-
-    // MARK: - Schedule Section
 
     private var scheduleSection: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -310,8 +342,6 @@ struct SettingsView: View {
         .cornerRadius(8)
     }
 
-    // MARK: - Scheduled Sync Section
-
     private var scheduledSyncSection: some View {
         VStack(alignment: .leading, spacing: 12) {
             // Status
@@ -332,13 +362,16 @@ struct SettingsView: View {
                     Text("Generated files:")
                         .font(.caption.weight(.medium))
                         .foregroundColor(.secondary)
-                    Text("• Script: ~/.local/bin/synctray-sync.sh")
+                    Text("• Script: \(SyncProfile.sharedScriptPath.replacingOccurrences(of: NSHomeDirectory(), with: "~"))")
                         .font(.caption)
                         .foregroundColor(.secondary)
-                    Text("• Schedule: ~/Library/LaunchAgents/com.synctray.sync.plist")
+                    Text("• Config: \(profile.configPath.replacingOccurrences(of: NSHomeDirectory(), with: "~"))")
                         .font(.caption)
                         .foregroundColor(.secondary)
-                    Text("• Log: ~/.local/log/synctray-sync.log")
+                    Text("• Schedule: \(profile.plistPath.replacingOccurrences(of: NSHomeDirectory(), with: "~"))")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                    Text("• Log: \(profile.logPath.replacingOccurrences(of: NSHomeDirectory(), with: "~"))")
                         .font(.caption)
                         .foregroundColor(.secondary)
                 }
@@ -363,10 +396,7 @@ struct SettingsView: View {
                     }
                     .disabled(!canInstall || isInstalling)
                 } else {
-                    Button(action: {
-                        print("Install button pressed - canInstall: \(canInstall), rcloneRemote: '\(rcloneRemote)', localSyncPath: '\(localSyncPath)'")
-                        installSync()
-                    }) {
+                    Button(action: installSync) {
                         if isInstalling {
                             ProgressView()
                                 .scaleEffect(0.7)
@@ -386,9 +416,10 @@ struct SettingsView: View {
             // Show why install is disabled
             if !canInstall && !isInstalled {
                 VStack(alignment: .leading, spacing: 2) {
-                    if rcloneRemote.components(separatedBy: ":").first?.isEmpty ?? true {
+                    if rcloneRemote.isEmpty {
                         Label("Select an rclone remote", systemImage: "exclamationmark.circle")
-                    } else if isRemoteFolderEmpty {
+                    }
+                    if remotePath.isEmpty {
                         Label("Enter the folder path on the remote", systemImage: "exclamationmark.circle")
                     }
                     if localSyncPath.isEmpty {
@@ -403,8 +434,6 @@ struct SettingsView: View {
         .background(Color(nsColor: .controlBackgroundColor))
         .cornerRadius(8)
     }
-
-    // MARK: - Advanced Section
 
     private var advancedSection: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -430,46 +459,6 @@ struct SettingsView: View {
                         TextField("--dry-run --verbose", text: $additionalRcloneFlags)
                             .textFieldStyle(.roundedBorder)
                     }
-
-                    Divider()
-
-                    Text("Manual Configuration")
-                        .font(.subheadline.weight(.medium))
-                    Text("Override auto-generated paths (for existing setups)")
-                        .font(.caption)
-                        .foregroundColor(.secondary)
-
-                    // Log File Path
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text("Log File Path")
-                            .font(.caption.weight(.medium))
-                        HStack {
-                            TextField("~/.local/log/rclone-sync.log", text: $logFilePath)
-                                .textFieldStyle(.roundedBorder)
-                            Button("Browse...") {
-                                browseForFile(title: "Select Log File", extensions: ["log", "txt"]) { path in
-                                    logFilePath = path
-                                }
-                            }
-                        }
-                        validationMessage(for: logFileValidation)
-                    }
-
-                    // Sync Script Path
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text("Sync Script Path")
-                            .font(.caption.weight(.medium))
-                        HStack {
-                            TextField("~/.local/bin/rclone-sync.sh", text: $syncScriptPath)
-                                .textFieldStyle(.roundedBorder)
-                            Button("Browse...") {
-                                browseForFile(title: "Select Sync Script", extensions: ["sh"]) { path in
-                                    syncScriptPath = path
-                                }
-                            }
-                        }
-                        validationMessage(for: syncScriptValidation)
-                    }
                 }
                 .padding(.leading, 8)
             }
@@ -478,8 +467,6 @@ struct SettingsView: View {
         .background(Color(nsColor: .controlBackgroundColor))
         .cornerRadius(8)
     }
-
-    // MARK: - Action Buttons
 
     private var actionButtons: some View {
         HStack {
@@ -490,12 +477,13 @@ struct SettingsView: View {
             }
             Spacer()
 
-            Button("Cancel") {
-                dismiss()
+            Button("Revert") {
+                loadProfileValues()
             }
+            .disabled(!hasChanges)
 
             Button("Save") {
-                saveSettings()
+                saveProfile()
             }
             .keyboardShortcut(.defaultAction)
             .disabled(!hasChanges)
@@ -503,96 +491,34 @@ struct SettingsView: View {
         }
     }
 
-    // MARK: - Validation
-
-    private enum ValidationStatus {
-        case valid, warning(String), error(String), none
-
-        var message: String? {
-            switch self {
-            case .warning(let msg), .error(let msg): return msg
-            default: return nil
-            }
-        }
-
-        var color: Color {
-            switch self {
-            case .valid: return .green
-            case .warning: return .orange
-            case .error: return .red
-            case .none: return .clear
-            }
-        }
-
-        var isError: Bool {
-            if case .error = self { return true }
-            return false
-        }
-    }
-
-    private var rcloneRemoteValidation: ValidationStatus {
-        if rcloneRemote.isEmpty { return .none }
-        if !rcloneRemote.contains(":") {
-            return .warning("Should be in format 'remote:path' (e.g., mydrive:Backup)")
-        }
-        return .valid
-    }
-
-    private var localSyncPathValidation: ValidationStatus {
-        if localSyncPath.isEmpty { return .none }
-        let expanded = (localSyncPath as NSString).expandingTildeInPath
-        var isDir: ObjCBool = false
-        if FileManager.default.fileExists(atPath: expanded, isDirectory: &isDir) {
-            return isDir.boolValue ? .valid : .error("Path is not a directory")
-        }
-        if expanded.hasPrefix("/Volumes/") {
-            return .warning("Directory not found - drive may not be mounted")
-        }
-        return .error("Directory does not exist")
-    }
-
-    private var logFileValidation: ValidationStatus {
-        if logFilePath.isEmpty { return .error("Log file path is required") }
-        let expanded = (logFilePath as NSString).expandingTildeInPath
-        if FileManager.default.fileExists(atPath: expanded) { return .valid }
-        let parent = (expanded as NSString).deletingLastPathComponent
-        if FileManager.default.fileExists(atPath: parent) {
-            return .warning("Log file will be created when sync runs")
-        }
-        return .error("Parent directory does not exist")
-    }
-
-    private var syncScriptValidation: ValidationStatus {
-        if syncScriptPath.isEmpty { return .warning("No sync script - 'Sync Now' disabled") }
-        let expanded = (syncScriptPath as NSString).expandingTildeInPath
-        if !FileManager.default.fileExists(atPath: expanded) {
-            return .error("Script not found")
-        }
-        if !FileManager.default.isExecutableFile(atPath: expanded) {
-            return .error("Script not executable (chmod +x)")
-        }
-        return .valid
-    }
-
-    @ViewBuilder
-    private func validationMessage(for status: ValidationStatus) -> some View {
-        if let message = status.message {
-            Label(message, systemImage: status.isError ? "xmark.circle" : "info.circle")
-                .font(.caption)
-                .foregroundColor(status.color)
-        }
-    }
-
     // MARK: - Actions
 
-    private func loadSettings() {
-        rcloneRemote = SyncTraySettings.rcloneRemote
-        localSyncPath = SyncTraySettings.localSyncPath
-        isExternalDrive = !SyncTraySettings.drivePathToMonitor.isEmpty
-        syncIntervalMinutes = SyncTraySettings.syncIntervalMinutes
-        additionalRcloneFlags = SyncTraySettings.additionalRcloneFlags
-        logFilePath = SyncTraySettings.logFilePath
-        syncScriptPath = SyncTraySettings.syncScriptPath
+    private func loadProfileValues() {
+        name = profile.name
+        rcloneRemote = profile.rcloneRemote
+        remotePath = profile.remotePath
+        localSyncPath = profile.localSyncPath
+        isExternalDrive = !profile.drivePathToMonitor.isEmpty
+        syncIntervalMinutes = profile.syncIntervalMinutes
+        additionalRcloneFlags = profile.additionalRcloneFlags
+    }
+
+    private func saveProfile() {
+        var updatedProfile = profile
+        updatedProfile.name = name
+        updatedProfile.rcloneRemote = rcloneRemote
+        updatedProfile.remotePath = remotePath
+        updatedProfile.localSyncPath = localSyncPath
+        updatedProfile.drivePathToMonitor = computedDrivePath
+        updatedProfile.syncIntervalMinutes = syncIntervalMinutes
+        updatedProfile.additionalRcloneFlags = additionalRcloneFlags
+
+        profileStore.update(updatedProfile)
+
+        // If installed, reinstall to apply changes
+        if isInstalled {
+            reinstallSync()
+        }
     }
 
     private func loadRcloneRemotes() {
@@ -603,7 +529,6 @@ struct SettingsView: View {
             let process = Process()
             let pipe = Pipe()
 
-            // Try common rclone paths
             let rclonePaths = ["/opt/homebrew/bin/rclone", "/usr/local/bin/rclone", "/usr/bin/rclone"]
             var rclonePath: String?
 
@@ -657,8 +582,7 @@ struct SettingsView: View {
     }
 
     private func loadRemoteFolders() {
-        let remoteName = rcloneRemote.components(separatedBy: ":").first ?? ""
-        guard !remoteName.isEmpty else { return }
+        guard !rcloneRemote.isEmpty else { return }
 
         isLoadingFolders = true
         foldersError = nil
@@ -687,7 +611,7 @@ struct SettingsView: View {
             }
 
             process.executableURL = URL(fileURLWithPath: path)
-            process.arguments = ["lsd", "\(remoteName):"]
+            process.arguments = ["lsd", "\(rcloneRemote):"]
             process.standardOutput = pipe
             process.standardError = pipe
 
@@ -698,13 +622,11 @@ struct SettingsView: View {
                 let data = pipe.fileHandleForReading.readDataToEndOfFile()
                 let output = String(data: data, encoding: .utf8) ?? ""
 
-                // Parse lsd output - format: "          -1 2024-01-01 00:00:00        -1 FolderName"
                 let folders = output
                     .components(separatedBy: .newlines)
                     .compactMap { line -> String? in
                         let trimmed = line.trimmingCharacters(in: .whitespaces)
                         guard !trimmed.isEmpty else { return nil }
-                        // The folder name is the last component after the date/time
                         let components = trimmed.components(separatedBy: .whitespaces).filter { !$0.isEmpty }
                         return components.last
                     }
@@ -725,54 +647,33 @@ struct SettingsView: View {
         }
     }
 
-    private func saveSettings() {
-        SyncTraySettings.rcloneRemote = rcloneRemote
-        SyncTraySettings.localSyncPath = localSyncPath
-        SyncTraySettings.drivePathToMonitor = computedDrivePath
-        SyncTraySettings.syncIntervalMinutes = syncIntervalMinutes
-        SyncTraySettings.additionalRcloneFlags = additionalRcloneFlags
-        SyncTraySettings.logFilePath = logFilePath
-        SyncTraySettings.syncScriptPath = syncScriptPath
-        SyncTraySettings.syncDirectoryPath = localSyncPath
-        SyncTraySettings.hasCompletedSetup = true
-
-        syncManager.refreshSettings()
-    }
-
     private func installSync() {
-        print("installSync called")
         isInstalling = true
         installError = nil
 
-        // Save sync configuration (but not script/log paths - those will be set by install)
-        SyncTraySettings.rcloneRemote = rcloneRemote
-        SyncTraySettings.localSyncPath = localSyncPath
-        SyncTraySettings.drivePathToMonitor = computedDrivePath
-        SyncTraySettings.syncIntervalMinutes = syncIntervalMinutes
-        SyncTraySettings.additionalRcloneFlags = additionalRcloneFlags
-        SyncTraySettings.syncDirectoryPath = localSyncPath
+        // Save profile first
+        saveProfile()
 
-        print("Settings saved, starting install...")
-        print("  rcloneRemote: \(SyncTraySettings.rcloneRemote)")
-        print("  localSyncPath: \(SyncTraySettings.localSyncPath)")
-        print("  drivePathToMonitor: \(SyncTraySettings.drivePathToMonitor)")
+        // Get updated profile
+        guard let currentProfile = profileStore.profile(for: profile.id) else {
+            isInstalling = false
+            installError = "Profile not found"
+            return
+        }
 
         DispatchQueue.global(qos: .userInitiated).async {
             do {
-                try setupService.install()
-                print("Install succeeded!")
-                print("  syncScriptPath: \(SyncTraySettings.syncScriptPath)")
-                print("  logFilePath: \(SyncTraySettings.logFilePath)")
+                try setupService.install(profile: currentProfile)
+
                 DispatchQueue.main.async {
                     isInstalling = false
-                    // Update UI state with generated paths
-                    logFilePath = SyncTraySettings.logFilePath
-                    syncScriptPath = SyncTraySettings.syncScriptPath
-                    // Refresh manager
+                    // Update profile to mark as enabled
+                    var enabledProfile = currentProfile
+                    enabledProfile.isEnabled = true
+                    profileStore.update(enabledProfile)
                     syncManager.refreshSettings()
                 }
             } catch {
-                print("Install failed: \(error)")
                 DispatchQueue.main.async {
                     isInstalling = false
                     installError = error.localizedDescription
@@ -782,8 +683,15 @@ struct SettingsView: View {
     }
 
     private func uninstallSync() {
+        guard let currentProfile = profileStore.profile(for: profile.id) else { return }
+
         do {
-            try setupService.uninstall()
+            try setupService.uninstall(profile: currentProfile)
+
+            // Update profile to mark as disabled
+            var disabledProfile = currentProfile
+            disabledProfile.isEnabled = false
+            profileStore.update(disabledProfile)
             syncManager.refreshSettings()
         } catch {
             installError = error.localizedDescription
@@ -791,8 +699,10 @@ struct SettingsView: View {
     }
 
     private func reinstallSync() {
+        guard let currentProfile = profileStore.profile(for: profile.id) else { return }
+
         do {
-            try setupService.uninstall()
+            try setupService.uninstall(profile: currentProfile)
         } catch {
             // Ignore uninstall errors
         }
@@ -800,19 +710,6 @@ struct SettingsView: View {
     }
 
     // MARK: - File Dialogs
-
-    private func browseForFile(title: String, extensions: [String], completion: @escaping (String) -> Void) {
-        let panel = NSOpenPanel()
-        panel.title = title
-        panel.canChooseFiles = true
-        panel.canChooseDirectories = false
-        panel.allowsMultipleSelection = false
-        panel.allowedContentTypes = extensions.compactMap { UTType(filenameExtension: $0) }
-
-        if panel.runModal() == .OK, let url = panel.url {
-            completion(url.path)
-        }
-    }
 
     private func browseForFolder(title: String, completion: @escaping (String) -> Void) {
         let panel = NSOpenPanel()

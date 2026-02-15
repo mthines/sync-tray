@@ -10,6 +10,16 @@ struct MenuBarView: View {
                 .padding(.top, 12)
                 .padding(.bottom, 8)
 
+            // Profile status section (if multiple profiles)
+            if syncManager.profileStore.enabledProfiles.count > 1 {
+                Divider()
+                    .padding(.horizontal, 8)
+
+                profileStatusSection
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 8)
+            }
+
             Divider()
                 .padding(.horizontal, 8)
 
@@ -24,6 +34,49 @@ struct MenuBarView: View {
                 .padding(.vertical, 8)
         }
         .frame(width: 320)
+    }
+
+    private var profileStatusSection: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text("Profiles")
+                .font(.caption)
+                .foregroundColor(.secondary)
+
+            ForEach(syncManager.profileStore.enabledProfiles) { profile in
+                HStack(spacing: 8) {
+                    Circle()
+                        .fill(statusColor(for: profile))
+                        .frame(width: 6, height: 6)
+
+                    Text(profile.name)
+                        .font(.system(size: 12))
+                        .lineLimit(1)
+
+                    Spacer()
+
+                    if syncManager.state(for: profile.id) == .syncing {
+                        ProgressView()
+                            .scaleEffect(0.5)
+                            .frame(width: 12, height: 12)
+                    }
+                }
+            }
+        }
+    }
+
+    private func statusColor(for profile: SyncProfile) -> Color {
+        switch syncManager.state(for: profile.id) {
+        case .idle:
+            return .green
+        case .syncing:
+            return .blue
+        case .error:
+            return .red
+        case .driveNotMounted:
+            return .orange
+        case .notConfigured:
+            return .yellow
+        }
     }
 
     private var actionButtons: some View {
@@ -49,8 +102,9 @@ struct MenuBarView: View {
             .cornerRadius(6)
             .disabled(syncManager.isManualSyncRunning || syncManager.currentState == .driveNotMounted || syncManager.currentState == .notConfigured)
 
-            // Open Sync Directory button
-            if !SyncTraySettings.syncDirectoryPath.isEmpty {
+            // Open Sync Directory button (shows first enabled profile's directory)
+            if let firstProfile = syncManager.profileStore.enabledProfiles.first,
+               !firstProfile.localSyncPath.isEmpty {
                 Button(action: { syncManager.openSyncDirectory() }) {
                     HStack {
                         Image(systemName: "folder")

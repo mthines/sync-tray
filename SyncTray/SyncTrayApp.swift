@@ -3,8 +3,17 @@ import UserNotifications
 
 @main
 struct SyncTrayApp: App {
-    @StateObject private var syncManager = SyncManager()
+    @StateObject private var syncManager: SyncManager
+
     @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
+
+    init() {
+        // Perform migration if needed
+        Self.performMigrationIfNeeded()
+
+        // Create the sync manager
+        _syncManager = StateObject(wrappedValue: SyncManager())
+    }
 
     var body: some Scene {
         MenuBarExtra {
@@ -19,6 +28,38 @@ struct SyncTrayApp: App {
             SettingsView()
                 .environmentObject(syncManager)
         }
+    }
+
+    /// Migrate from single-profile to multi-profile if needed
+    private static func performMigrationIfNeeded() {
+        guard SyncTraySettings.needsMultiProfileMigration else { return }
+
+        // Create a temporary profile store to perform migration
+        let profileStore = ProfileStore()
+
+        // Create a profile from legacy settings
+        if let profile = SyncTraySettings.createProfileFromLegacySettings() {
+            profileStore.add(profile)
+
+            // Try to uninstall legacy launchd agent
+            let setupService = SyncSetupService.shared
+            if setupService.isLegacyInstalled() {
+                try? setupService.uninstallLegacy()
+            }
+
+            // Install the new profile
+            do {
+                try setupService.install(profile: profile)
+            } catch {
+                print("Failed to install migrated profile: \(error)")
+            }
+        }
+
+        // Mark migration as complete
+        SyncTraySettings.markMigrationComplete()
+
+        // Optionally clear legacy settings
+        // SyncTraySettings.clearLegacySettings()
     }
 }
 

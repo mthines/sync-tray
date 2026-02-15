@@ -21,6 +21,9 @@
 		A1111111000000000000000F /* SettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000000000000000000000F /* SettingsView.swift */; };
 		A11111110000000000000010 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000010 /* Assets.xcassets */; };
 		A11111110000000000000011 /* SyncSetupService.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000011 /* SyncSetupService.swift */; };
+		A11111110000000000000012 /* SyncProfile.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000012 /* SyncProfile.swift */; };
+		A11111110000000000000013 /* ProfileStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000013 /* ProfileStore.swift */; };
+		A11111110000000000000014 /* ProfileListView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000014 /* ProfileListView.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -41,6 +44,9 @@
 		A1000000000000000000000F /* SettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsView.swift; sourceTree = "<group>"; };
 		A10000000000000000000010 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		A10000000000000000000011 /* SyncSetupService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SyncSetupService.swift; sourceTree = "<group>"; };
+		A10000000000000000000012 /* SyncProfile.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SyncProfile.swift; sourceTree = "<group>"; };
+		A10000000000000000000013 /* ProfileStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProfileStore.swift; sourceTree = "<group>"; };
+		A10000000000000000000014 /* ProfileListView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProfileListView.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -82,6 +88,7 @@
 				A1000000000000000000000E /* Settings.swift */,
 				A10000000000000000000002 /* SyncState.swift */,
 				A10000000000000000000003 /* RcloneLogEntry.swift */,
+				A10000000000000000000012 /* SyncProfile.swift */,
 			);
 			path = Models;
 			sourceTree = "<group>";
@@ -94,6 +101,7 @@
 				A10000000000000000000006 /* NotificationService.swift */,
 				A10000000000000000000007 /* SyncManager.swift */,
 				A10000000000000000000011 /* SyncSetupService.swift */,
+				A10000000000000000000013 /* ProfileStore.swift */,
 			);
 			path = Services;
 			sourceTree = "<group>";
@@ -105,6 +113,7 @@
 				A10000000000000000000009 /* StatusHeaderView.swift */,
 				A1000000000000000000000A /* RecentChangesView.swift */,
 				A1000000000000000000000F /* SettingsView.swift */,
+				A10000000000000000000014 /* ProfileListView.swift */,
 			);
 			path = Views;
 			sourceTree = "<group>";
@@ -190,15 +199,18 @@
 				A1111111000000000000000E /* Settings.swift in Sources */,
 				A11111110000000000000002 /* SyncState.swift in Sources */,
 				A11111110000000000000003 /* RcloneLogEntry.swift in Sources */,
+				A11111110000000000000012 /* SyncProfile.swift in Sources */,
 				A11111110000000000000004 /* LogWatcher.swift in Sources */,
 				A11111110000000000000005 /* LogParser.swift in Sources */,
 				A11111110000000000000006 /* NotificationService.swift in Sources */,
 				A11111110000000000000007 /* SyncManager.swift in Sources */,
+				A11111110000000000000013 /* ProfileStore.swift in Sources */,
+				A11111110000000000000011 /* SyncSetupService.swift in Sources */,
 				A11111110000000000000008 /* MenuBarView.swift in Sources */,
 				A11111110000000000000009 /* StatusHeaderView.swift in Sources */,
 				A1111111000000000000000A /* RecentChangesView.swift in Sources */,
 				A1111111000000000000000F /* SettingsView.swift in Sources */,
-				A11111110000000000000011 /* SyncSetupService.swift in Sources */,
+				A11111110000000000000014 /* ProfileListView.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
