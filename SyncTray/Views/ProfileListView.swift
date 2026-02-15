@@ -5,29 +5,62 @@ struct ProfileListView: View {
     @EnvironmentObject var syncManager: SyncManager
     @Binding var selection: UUID?
 
+    @State private var showingDeleteConfirmation = false
+
     var body: some View {
-        List(selection: $selection) {
-            ForEach(profileStore.profiles) { profile in
-                ProfileRow(
-                    profile: profile,
-                    state: syncManager.state(for: profile.id),
-                    isInstalled: SyncSetupService.shared.isInstalled(profile: profile)
-                )
-                .tag(profile.id)
-                .contextMenu {
-                    Button("Delete", role: .destructive) {
-                        deleteProfile(profile)
+        VStack(spacing: 0) {
+            // Profile list
+            List(selection: $selection) {
+                ForEach(profileStore.profiles) { profile in
+                    ProfileRow(
+                        profile: profile,
+                        state: syncManager.state(for: profile.id),
+                        isInstalled: SyncSetupService.shared.isInstalled(profile: profile)
+                    )
+                    .tag(profile.id)
+                    .contextMenu {
+                        Button("Delete", role: .destructive) {
+                            deleteProfile(profile)
+                        }
                     }
                 }
+                .onDelete(perform: deleteProfiles)
             }
-            .onDelete(perform: deleteProfiles)
-        }
-        .listStyle(.sidebar)
-        .toolbar {
-            ToolbarItem(placement: .primaryAction) {
+            .listStyle(.sidebar)
+
+            Divider()
+
+            // Action buttons bar at bottom
+            HStack(spacing: 12) {
                 Button(action: addProfile) {
-                    Label("Add Profile", systemImage: "plus")
+                    Image(systemName: "plus")
+                        .foregroundColor(.primary)
                 }
+                .buttonStyle(.borderless)
+                .help("Add Profile")
+
+                Button(action: { showingDeleteConfirmation = true }) {
+                    Image(systemName: "trash")
+                        .foregroundColor(selection == nil ? .secondary : .primary)
+                }
+                .buttonStyle(.borderless)
+                .disabled(selection == nil)
+                .help("Delete Profile")
+
+                Spacer()
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+        }
+        .alert("Delete Profile?", isPresented: $showingDeleteConfirmation) {
+            Button("Cancel", role: .cancel) {}
+            Button("Delete", role: .destructive) { deleteSelectedProfile() }
+        } message: {
+            if let selectedId = selection,
+               let profile = profileStore.profile(for: selectedId) {
+                Text("Are you sure you want to delete \"\(profile.name.isEmpty ? "Untitled Profile" : profile.name)\"? This will also uninstall its scheduled sync.")
+            } else {
+                Text("Are you sure you want to delete this profile?")
             }
         }
     }
@@ -37,9 +70,15 @@ struct ProfileListView: View {
         selection = profile.id
     }
 
+    private func deleteSelectedProfile() {
+        guard let selectedId = selection,
+              let profile = profileStore.profile(for: selectedId) else { return }
+        deleteProfile(profile)
+    }
+
     private func deleteProfile(_ profile: SyncProfile) {
-        // Uninstall if enabled
-        if profile.isEnabled {
+        // Uninstall if installed
+        if SyncSetupService.shared.isInstalled(profile: profile) {
             try? SyncSetupService.shared.uninstall(profile: profile)
         }
         profileStore.delete(id: profile.id)

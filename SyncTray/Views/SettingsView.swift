@@ -14,6 +14,11 @@ struct SettingsView: View {
                 selection: $selectedProfileId
             )
             .navigationSplitViewColumnWidth(min: 180, ideal: 200, max: 250)
+            .toolbar {
+                ToolbarItem(placement: .automatic) {
+                    Spacer()
+                }
+            }
         } detail: {
             if let profileId = selectedProfileId,
                let profile = syncManager.profileStore.profile(for: profileId) {
@@ -38,9 +43,18 @@ struct SettingsView: View {
         }
         .frame(width: 700, height: 650)
         .onAppear {
-            // Select first profile if none selected
-            if selectedProfileId == nil {
+            // Check if there's a pending profile selection from notification tap
+            if let pendingId = AppDelegate.pendingProfileSelection {
+                selectedProfileId = pendingId
+                AppDelegate.pendingProfileSelection = nil
+            } else if selectedProfileId == nil {
+                // Select first profile if none selected
                 selectedProfileId = syncManager.profileStore.profiles.first?.id
+            }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .selectProfile)) { notification in
+            if let profileId = notification.userInfo?["profileId"] as? UUID {
+                selectedProfileId = profileId
             }
         }
     }
@@ -69,6 +83,9 @@ struct ProfileDetailView: View {
     @State private var showingUninstallConfirm: Bool = false
     @State private var availableRemotes: [String] = []
     @State private var isLoadingRemotes: Bool = false
+    @State private var isRunningResync: Bool = false
+    @State private var resyncOutput: String = ""
+    @State private var showResyncOutput: Bool = false
     @State private var remotesError: String?
     @State private var availableFolders: [String] = []
     @State private var isLoadingFolders: Bool = false
@@ -347,13 +364,86 @@ struct ProfileDetailView: View {
             // Status
             HStack {
                 if isInstalled {
-                    Label("Installed", systemImage: "checkmark.circle.fill")
-                        .foregroundColor(.green)
+                    let state = syncManager.state(for: profile.id)
+                    switch state {
+                    case .error:
+                        Label("Error", systemImage: "exclamationmark.circle.fill")
+                            .foregroundColor(.red)
+                    case .syncing:
+                        Label("Syncing", systemImage: "arrow.triangle.2.circlepath")
+                            .foregroundColor(.blue)
+                    default:
+                        Label("Installed", systemImage: "checkmark.circle.fill")
+                            .foregroundColor(.green)
+                    }
                 } else {
                     Label("Not Installed", systemImage: "circle.dashed")
                         .foregroundColor(.secondary)
                 }
                 Spacer()
+            }
+
+            // Last sync error from rclone
+            if isInstalled, let lastError = syncManager.lastError(for: profile.id) {
+                VStack(alignment: .leading, spacing: 8) {
+                    Label("Last sync error:", systemImage: "exclamationmark.triangle.fill")
+                        .font(.caption.weight(.medium))
+                        .foregroundColor(.red)
+                    Text(lastError)
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                        .textSelection(.enabled)
+                        .padding(8)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(Color.red.opacity(0.1))
+                        .cornerRadius(4)
+
+                    // Action buttons for common errors
+                    if lastError.contains("cannot find prior") || lastError.contains("--resync") || lastError.contains("retryable without --resync") {
+                        HStack(spacing: 8) {
+                            Button(action: runResync) {
+                                if isRunningResync {
+                                    ProgressView()
+                                        .scaleEffect(0.7)
+                                        .frame(width: 14, height: 14)
+                                    Text("Running resync...")
+                                } else {
+                                    Label("Run Initial Sync (--resync)", systemImage: "arrow.triangle.2.circlepath")
+                                }
+                            }
+                            .buttonStyle(.borderedProminent)
+                            .disabled(isRunningResync)
+                            .help("This will establish the initial baseline for bidirectional sync")
+                        }
+                    }
+
+                    // Show resync output if available
+                    if showResyncOutput && !resyncOutput.isEmpty {
+                        VStack(alignment: .leading, spacing: 4) {
+                            HStack {
+                                Text("Resync output:")
+                                    .font(.caption.weight(.medium))
+                                Spacer()
+                                Button(action: { showResyncOutput = false }) {
+                                    Image(systemName: "xmark.circle.fill")
+                                        .foregroundColor(.secondary)
+                                }
+                                .buttonStyle(.plain)
+                            }
+                            ScrollView {
+                                Text(resyncOutput)
+                                    .font(.system(size: 10, design: .monospaced))
+                                    .foregroundColor(.secondary)
+                                    .textSelection(.enabled)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                            }
+                            .frame(maxHeight: 150)
+                            .padding(8)
+                            .background(Color(nsColor: .textBackgroundColor))
+                            .cornerRadius(4)
+                        }
+                    }
+                }
             }
 
             // Info about generated files
@@ -362,18 +452,10 @@ struct ProfileDetailView: View {
                     Text("Generated files:")
                         .font(.caption.weight(.medium))
                         .foregroundColor(.secondary)
-                    Text("• Script: \(SyncProfile.sharedScriptPath.replacingOccurrences(of: NSHomeDirectory(), with: "~"))")
-                        .font(.caption)
-                        .foregroundColor(.secondary)
-                    Text("• Config: \(profile.configPath.replacingOccurrences(of: NSHomeDirectory(), with: "~"))")
-                        .font(.caption)
-                        .foregroundColor(.secondary)
-                    Text("• Schedule: \(profile.plistPath.replacingOccurrences(of: NSHomeDirectory(), with: "~"))")
-                        .font(.caption)
-                        .foregroundColor(.secondary)
-                    Text("• Log: \(profile.logPath.replacingOccurrences(of: NSHomeDirectory(), with: "~"))")
-                        .font(.caption)
-                        .foregroundColor(.secondary)
+                    filePathLink(label: "Script", path: SyncProfile.sharedScriptPath)
+                    filePathLink(label: "Config", path: profile.configPath)
+                    filePathLink(label: "Schedule", path: profile.plistPath)
+                    filePathLink(label: "Log", path: profile.logPath)
                 }
             }
 
@@ -709,6 +791,116 @@ struct ProfileDetailView: View {
         installSync()
     }
 
+    private func runResync() {
+        isRunningResync = true
+        resyncOutput = ""
+        showResyncOutput = true
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            let process = Process()
+            let pipe = Pipe()
+            let errorPipe = Pipe()
+
+            // Find rclone
+            let rclonePaths = ["/opt/homebrew/bin/rclone", "/usr/local/bin/rclone", "/usr/bin/rclone"]
+            var rclonePath: String?
+
+            for path in rclonePaths {
+                if FileManager.default.fileExists(atPath: path) {
+                    rclonePath = path
+                    break
+                }
+            }
+
+            guard let path = rclonePath else {
+                DispatchQueue.main.async {
+                    isRunningResync = false
+                    resyncOutput = "Error: rclone not found. Install with: brew install rclone"
+                }
+                return
+            }
+
+            // Build the resync command
+            let remotePath = "\(rcloneRemote):\(self.remotePath)"
+            var arguments = ["bisync", remotePath, localSyncPath, "--resync", "--verbose"]
+
+            // Add any additional flags from profile
+            if !additionalRcloneFlags.isEmpty {
+                let extraFlags = additionalRcloneFlags.components(separatedBy: .whitespaces).filter { !$0.isEmpty }
+                arguments.append(contentsOf: extraFlags)
+            }
+
+            process.executableURL = URL(fileURLWithPath: path)
+            process.arguments = arguments
+            process.standardOutput = pipe
+            process.standardError = errorPipe
+
+            DispatchQueue.main.async {
+                resyncOutput = "Running: rclone \(arguments.joined(separator: " "))\n\n"
+            }
+
+            do {
+                try process.run()
+
+                // Read output in real-time
+                let outputHandle = pipe.fileHandleForReading
+                let errorHandle = errorPipe.fileHandleForReading
+
+                outputHandle.readabilityHandler = { handle in
+                    let data = handle.availableData
+                    if let str = String(data: data, encoding: .utf8), !str.isEmpty {
+                        DispatchQueue.main.async {
+                            resyncOutput += str
+                        }
+                    }
+                }
+
+                errorHandle.readabilityHandler = { handle in
+                    let data = handle.availableData
+                    if let str = String(data: data, encoding: .utf8), !str.isEmpty {
+                        DispatchQueue.main.async {
+                            resyncOutput += str
+                        }
+                    }
+                }
+
+                process.waitUntilExit()
+
+                outputHandle.readabilityHandler = nil
+                errorHandle.readabilityHandler = nil
+
+                // Read any remaining data
+                let remainingOutput = outputHandle.readDataToEndOfFile()
+                let remainingError = errorHandle.readDataToEndOfFile()
+
+                DispatchQueue.main.async {
+                    if let str = String(data: remainingOutput, encoding: .utf8), !str.isEmpty {
+                        resyncOutput += str
+                    }
+                    if let str = String(data: remainingError, encoding: .utf8), !str.isEmpty {
+                        resyncOutput += str
+                    }
+
+                    let exitCode = process.terminationStatus
+                    if exitCode == 0 {
+                        resyncOutput += "\n✓ Resync completed successfully!"
+                        // Clear the error state
+                        syncManager.refreshSettings()
+                    } else {
+                        resyncOutput += "\n✗ Resync failed with exit code \(exitCode)"
+                    }
+
+                    isRunningResync = false
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    resyncOutput += "Error running rclone: \(error.localizedDescription)"
+                    isRunningResync = false
+                }
+            }
+        }
+    }
+
     // MARK: - File Dialogs
 
     private func browseForFolder(title: String, completion: @escaping (String) -> Void) {
@@ -720,6 +912,26 @@ struct ProfileDetailView: View {
 
         if panel.runModal() == .OK, let url = panel.url {
             completion(url.path)
+        }
+    }
+
+    @ViewBuilder
+    private func filePathLink(label: String, path: String) -> some View {
+        let displayPath = path.replacingOccurrences(of: NSHomeDirectory(), with: "~")
+        HStack(spacing: 4) {
+            Text("• \(label):")
+                .font(.caption)
+                .foregroundColor(.secondary)
+            Button(action: {
+                NSWorkspace.shared.open(URL(fileURLWithPath: path))
+            }) {
+                Text(displayPath)
+                    .font(.caption)
+                    .foregroundColor(.accentColor)
+                    .underline()
+            }
+            .buttonStyle(.plain)
+            .help("Click to open in default app")
         }
     }
 }

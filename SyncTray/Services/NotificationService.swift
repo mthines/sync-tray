@@ -106,12 +106,14 @@ final class NotificationService {
         )
     }
 
-    func notifySyncError(_ message: String) {
+    func notifySyncError(_ message: String, profileId: UUID? = nil, profileName: String? = nil) {
+        let title = profileName != nil ? "SyncTray: \(profileName!)" : "SyncTray Error"
         sendNotification(
-            title: "SyncTray Error",
+            title: title,
             body: message,
             sound: .defaultCritical,
-            isCritical: true
+            isCritical: true,
+            profileId: profileId
         )
     }
 
@@ -135,7 +137,8 @@ final class NotificationService {
         body: String,
         sound: UNNotificationSound?,
         isCritical: Bool = false,
-        directoryPath: String? = nil
+        directoryPath: String? = nil,
+        profileId: UUID? = nil
     ) {
         let content = UNMutableNotificationContent()
         content.title = title
@@ -155,6 +158,11 @@ final class NotificationService {
             content.userInfo["directoryPath"] = path
         } else if !currentSyncDirectoryPath.isEmpty {
             content.userInfo["directoryPath"] = currentSyncDirectoryPath
+        }
+
+        // Add profile ID to open specific profile in Settings
+        if let profileId = profileId {
+            content.userInfo["profileId"] = profileId.uuidString
         }
 
         let request = UNNotificationRequest(
