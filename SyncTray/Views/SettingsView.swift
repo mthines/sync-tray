@@ -37,6 +37,7 @@ struct SettingsView: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
         }
+        .toolbar(.hidden)
         .frame(width: 700, height: 650)
         .onAppear {
             // Check if there's a pending profile selection from notification tap

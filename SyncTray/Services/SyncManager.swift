@@ -477,8 +477,16 @@ final class SyncManager: ObservableObject {
         process.arguments = [SyncProfile.sharedScriptPath, profile.configPath]
 
         do {
-            try process.run()
-            process.waitUntilExit()
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                process.terminationHandler = { _ in
+                    continuation.resume()
+                }
+                do {
+                    try process.run()
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
         } catch {
             print("Failed to run sync script for \(profile.name): \(error)")
         }
