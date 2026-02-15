@@ -12,8 +12,8 @@ final class LogWatcher {
 
     weak var delegate: LogWatcherDelegate?
 
-    init(logPath: String? = nil) {
-        self.logPath = logPath ?? SyncTraySettings.logFilePath
+    init(logPath: String) {
+        self.logPath = logPath
     }
 
     func updateLogPath(_ path: String) {

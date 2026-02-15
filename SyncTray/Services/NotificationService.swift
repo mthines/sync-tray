@@ -13,6 +13,9 @@ final class NotificationService {
     private let categoryIdentifier = "SYNC_NOTIFICATION"
     private let openDirectoryActionIdentifier = "OPEN_DIRECTORY"
 
+    /// Current sync directory path, set by SyncManager when processing changes
+    var currentSyncDirectoryPath: String = ""
+
     private init() {
         setupNotificationCategories()
     }
@@ -85,7 +88,7 @@ final class NotificationService {
         // Get directory from first change for "Open Directory" action
         let directoryPath: String?
         if let firstChange = changes.first {
-            let syncDir = SyncTraySettings.syncDirectoryPath
+            let syncDir = currentSyncDirectoryPath
             if !syncDir.isEmpty {
                 directoryPath = (syncDir as NSString).appendingPathComponent(firstChange.directory)
             } else {
@@ -150,8 +153,8 @@ final class NotificationService {
         // Add directory path for "Open Directory" action
         if let path = directoryPath {
             content.userInfo["directoryPath"] = path
-        } else if !SyncTraySettings.syncDirectoryPath.isEmpty {
-            content.userInfo["directoryPath"] = SyncTraySettings.syncDirectoryPath
+        } else if !currentSyncDirectoryPath.isEmpty {
+            content.userInfo["directoryPath"] = currentSyncDirectoryPath
         }
 
         let request = UNNotificationRequest(

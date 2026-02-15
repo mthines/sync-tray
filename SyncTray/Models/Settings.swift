@@ -1,138 +1,93 @@
 import Foundation
 
+/// Global app settings (not profile-specific)
 struct SyncTraySettings {
     private static let defaults = UserDefaults.standard
 
     private enum Keys {
-        // Sync Configuration
+        // Legacy keys for migration
         static let rcloneRemote = "rcloneRemote"
         static let localSyncPath = "localSyncPath"
         static let drivePathToMonitor = "drivePathToMonitor"
         static let syncIntervalMinutes = "syncIntervalMinutes"
         static let additionalRcloneFlags = "additionalRcloneFlags"
-
-        // Generated Paths (read-only, derived)
         static let logFilePath = "logFilePath"
         static let syncScriptPath = "syncScriptPath"
-
-        // Legacy (kept for compatibility)
         static let syncDirectoryPath = "syncDirectoryPath"
         static let hasCompletedSetup = "hasCompletedSetup"
         static let isScheduledSyncInstalled = "isScheduledSyncInstalled"
+
+        // Migration flag
+        static let hasCompletedMultiProfileMigration = "hasCompletedMultiProfileMigration"
     }
 
-    // MARK: - Sync Configuration
+    // MARK: - Migration Support
 
-    /// Rclone remote path (e.g., "synology-kaiju:Kaiju")
-    static var rcloneRemote: String {
-        get { defaults.string(forKey: Keys.rcloneRemote) ?? "" }
-        set { defaults.set(newValue, forKey: Keys.rcloneRemote) }
+    /// Check if we need to migrate from single-profile to multi-profile
+    static var needsMultiProfileMigration: Bool {
+        !defaults.bool(forKey: Keys.hasCompletedMultiProfileMigration) &&
+        !legacyRcloneRemote.isEmpty
     }
 
-    /// Local directory to sync (e.g., "/Volumes/SeagateHD/Kaiju")
-    static var localSyncPath: String {
-        get { defaults.string(forKey: Keys.localSyncPath) ?? "" }
-        set { defaults.set(newValue, forKey: Keys.localSyncPath) }
+    static func markMigrationComplete() {
+        defaults.set(true, forKey: Keys.hasCompletedMultiProfileMigration)
     }
 
-    /// Drive path to monitor for mount/unmount (e.g., "/Volumes/SeagateHD")
-    static var drivePathToMonitor: String {
-        get { defaults.string(forKey: Keys.drivePathToMonitor) ?? "" }
-        set { defaults.set(newValue, forKey: Keys.drivePathToMonitor) }
+    // MARK: - Legacy Settings (for reading during migration)
+
+    static var legacyRcloneRemote: String {
+        defaults.string(forKey: Keys.rcloneRemote) ?? ""
     }
 
-    /// Sync interval in minutes (default: 15)
-    static var syncIntervalMinutes: Int {
-        get {
-            let value = defaults.integer(forKey: Keys.syncIntervalMinutes)
-            return value > 0 ? value : 15
-        }
-        set { defaults.set(newValue, forKey: Keys.syncIntervalMinutes) }
+    static var legacyLocalSyncPath: String {
+        defaults.string(forKey: Keys.localSyncPath) ?? ""
     }
 
-    /// Additional rclone flags (optional)
-    static var additionalRcloneFlags: String {
-        get { defaults.string(forKey: Keys.additionalRcloneFlags) ?? "" }
-        set { defaults.set(newValue, forKey: Keys.additionalRcloneFlags) }
+    static var legacyDrivePathToMonitor: String {
+        defaults.string(forKey: Keys.drivePathToMonitor) ?? ""
     }
 
-    // MARK: - Generated File Paths
-
-    static var generatedScriptPath: String {
-        "\(NSHomeDirectory())/.local/bin/synctray-sync.sh"
+    static var legacySyncIntervalMinutes: Int {
+        let value = defaults.integer(forKey: Keys.syncIntervalMinutes)
+        return value > 0 ? value : 15
     }
 
-    static var generatedLogPath: String {
-        "\(NSHomeDirectory())/.local/log/synctray-sync.log"
+    static var legacyAdditionalRcloneFlags: String {
+        defaults.string(forKey: Keys.additionalRcloneFlags) ?? ""
     }
 
-    static var generatedPlistPath: String {
-        "\(NSHomeDirectory())/Library/LaunchAgents/com.synctray.sync.plist"
+    /// Create a SyncProfile from legacy settings
+    static func createProfileFromLegacySettings() -> SyncProfile? {
+        guard !legacyRcloneRemote.isEmpty else { return nil }
+
+        // Parse rclone remote into remote and path
+        let parts = legacyRcloneRemote.components(separatedBy: ":")
+        let remote = parts.first ?? ""
+        let remotePath = parts.dropFirst().joined(separator: ":")
+
+        return SyncProfile(
+            name: "Default",
+            rcloneRemote: remote,
+            remotePath: remotePath,
+            localSyncPath: legacyLocalSyncPath,
+            drivePathToMonitor: legacyDrivePathToMonitor,
+            syncIntervalMinutes: legacySyncIntervalMinutes,
+            additionalRcloneFlags: legacyAdditionalRcloneFlags,
+            isEnabled: true
+        )
     }
 
-    // MARK: - Legacy Settings (for manual configuration)
-
-    static var logFilePath: String {
-        get { defaults.string(forKey: Keys.logFilePath) ?? defaultLogFilePath }
-        set { defaults.set(newValue, forKey: Keys.logFilePath) }
-    }
-
-    static var defaultLogFilePath: String {
-        "\(NSHomeDirectory())/.local/log/rclone-sync.log"
-    }
-
-    static var syncScriptPath: String {
-        get { defaults.string(forKey: Keys.syncScriptPath) ?? defaultSyncScriptPath }
-        set { defaults.set(newValue, forKey: Keys.syncScriptPath) }
-    }
-
-    static var defaultSyncScriptPath: String {
-        "\(NSHomeDirectory())/.local/bin/rclone-sync.sh"
-    }
-
-    /// Sync directory path (alias for localSyncPath for compatibility)
-    static var syncDirectoryPath: String {
-        get { defaults.string(forKey: Keys.syncDirectoryPath) ?? localSyncPath }
-        set { defaults.set(newValue, forKey: Keys.syncDirectoryPath) }
-    }
-
-    // MARK: - Status
-
-    static var hasCompletedSetup: Bool {
-        get { defaults.bool(forKey: Keys.hasCompletedSetup) }
-        set { defaults.set(newValue, forKey: Keys.hasCompletedSetup) }
-    }
-
-    static var isScheduledSyncInstalled: Bool {
-        get { defaults.bool(forKey: Keys.isScheduledSyncInstalled) }
-        set { defaults.set(newValue, forKey: Keys.isScheduledSyncInstalled) }
-    }
-
-    // MARK: - Validation
-
-    static var isConfigured: Bool {
-        !logFilePath.isEmpty && FileManager.default.fileExists(atPath: logFilePath)
-    }
-
-    static var canGenerateSync: Bool {
-        !rcloneRemote.isEmpty && !localSyncPath.isEmpty
-    }
-
-    static func validatePaths() -> [String] {
-        var errors: [String] = []
-
-        if logFilePath.isEmpty {
-            errors.append("Log file path is not set")
-        }
-
-        if !syncScriptPath.isEmpty && !FileManager.default.fileExists(atPath: syncScriptPath) {
-            errors.append("Sync script not found at: \(syncScriptPath)")
-        }
-
-        if !syncDirectoryPath.isEmpty && !FileManager.default.fileExists(atPath: syncDirectoryPath) {
-            errors.append("Sync directory not found at: \(syncDirectoryPath)")
-        }
-
-        return errors
+    /// Clear legacy settings after migration
+    static func clearLegacySettings() {
+        defaults.removeObject(forKey: Keys.rcloneRemote)
+        defaults.removeObject(forKey: Keys.localSyncPath)
+        defaults.removeObject(forKey: Keys.drivePathToMonitor)
+        defaults.removeObject(forKey: Keys.syncIntervalMinutes)
+        defaults.removeObject(forKey: Keys.additionalRcloneFlags)
+        defaults.removeObject(forKey: Keys.logFilePath)
+        defaults.removeObject(forKey: Keys.syncScriptPath)
+        defaults.removeObject(forKey: Keys.syncDirectoryPath)
+        defaults.removeObject(forKey: Keys.hasCompletedSetup)
+        defaults.removeObject(forKey: Keys.isScheduledSyncInstalled)
     }
 }

@@ -6,123 +6,161 @@ final class SyncSetupService {
 
     private init() {}
 
-    // MARK: - Public Methods
+    // MARK: - Public Methods (Profile-based)
 
-    /// Check if the scheduled sync is currently installed and loaded
-    func isInstalled() -> Bool {
-        let plistPath = SyncTraySettings.generatedPlistPath
-        let scriptPath = SyncTraySettings.generatedScriptPath
-
-        return FileManager.default.fileExists(atPath: plistPath) &&
-               FileManager.default.fileExists(atPath: scriptPath)
+    /// Check if a profile's scheduled sync is currently installed
+    func isInstalled(profile: SyncProfile) -> Bool {
+        let fm = FileManager.default
+        return fm.fileExists(atPath: profile.plistPath) &&
+               fm.fileExists(atPath: profile.configPath) &&
+               fm.fileExists(atPath: SyncProfile.sharedScriptPath)
     }
 
-    /// Check if the launchd agent is currently loaded
-    func isLoaded() -> Bool {
-        let result = runCommand("/bin/launchctl", arguments: ["list", "com.synctray.sync"])
+    /// Check if a profile's launchd agent is currently loaded
+    func isLoaded(profile: SyncProfile) -> Bool {
+        let result = runCommand("/bin/launchctl", arguments: ["list", profile.launchdLabel])
         return result.exitCode == 0
     }
 
-    /// Generate and install the sync script and launchd plist
-    func install() throws {
+    /// Generate and install the sync script and launchd plist for a profile
+    func install(profile: SyncProfile) throws {
         // Validate required settings
-        guard !SyncTraySettings.rcloneRemote.isEmpty else {
+        guard !profile.rcloneRemote.isEmpty else {
             throw SetupError.missingRcloneRemote
         }
-        guard !SyncTraySettings.localSyncPath.isEmpty else {
+        guard !profile.localSyncPath.isEmpty else {
             throw SetupError.missingLocalPath
+        }
+        guard !profile.remotePath.isEmpty else {
+            throw SetupError.missingRemotePath
         }
 
         // Create directories if needed
-        try createDirectories()
+        try createDirectories(for: profile)
 
-        // Generate and write script
+        // Generate and write the shared script (only if it doesn't exist or needs update)
         let script = generateSyncScript()
-        try script.write(toFile: SyncTraySettings.generatedScriptPath, atomically: true, encoding: .utf8)
+        try script.write(toFile: SyncProfile.sharedScriptPath, atomically: true, encoding: .utf8)
 
         // Make script executable
         try FileManager.default.setAttributes(
             [.posixPermissions: 0o755],
-            ofItemAtPath: SyncTraySettings.generatedScriptPath
+            ofItemAtPath: SyncProfile.sharedScriptPath
         )
 
-        // Generate and write plist
-        let plist = generateLaunchdPlist()
-        try plist.write(toFile: SyncTraySettings.generatedPlistPath, atomically: true, encoding: .utf8)
+        // Generate and write profile config JSON
+        let config = generateProfileConfig(for: profile)
+        try config.write(toFile: profile.configPath, atomically: true, encoding: .utf8)
 
-        // Update settings to use generated paths
-        SyncTraySettings.syncScriptPath = SyncTraySettings.generatedScriptPath
-        SyncTraySettings.logFilePath = SyncTraySettings.generatedLogPath
-        SyncTraySettings.syncDirectoryPath = SyncTraySettings.localSyncPath
-        SyncTraySettings.isScheduledSyncInstalled = true
-        SyncTraySettings.hasCompletedSetup = true
+        // Generate and write plist
+        let plist = generateLaunchdPlist(for: profile)
+        try plist.write(toFile: profile.plistPath, atomically: true, encoding: .utf8)
 
         // Load the launchd agent
-        _ = runCommand("/bin/launchctl", arguments: ["load", SyncTraySettings.generatedPlistPath])
+        _ = runCommand("/bin/launchctl", arguments: ["load", profile.plistPath])
     }
 
-    /// Uninstall the sync script and launchd plist
-    func uninstall() throws {
+    /// Uninstall the sync configuration for a profile
+    func uninstall(profile: SyncProfile) throws {
         // Unload the launchd agent first
-        _ = runCommand("/bin/launchctl", arguments: ["unload", SyncTraySettings.generatedPlistPath])
+        _ = runCommand("/bin/launchctl", arguments: ["unload", profile.plistPath])
 
-        // Remove files
+        // Remove profile-specific files
         let fm = FileManager.default
 
-        if fm.fileExists(atPath: SyncTraySettings.generatedPlistPath) {
-            try fm.removeItem(atPath: SyncTraySettings.generatedPlistPath)
+        if fm.fileExists(atPath: profile.plistPath) {
+            try fm.removeItem(atPath: profile.plistPath)
         }
 
-        if fm.fileExists(atPath: SyncTraySettings.generatedScriptPath) {
-            try fm.removeItem(atPath: SyncTraySettings.generatedScriptPath)
+        if fm.fileExists(atPath: profile.configPath) {
+            try fm.removeItem(atPath: profile.configPath)
         }
 
-        SyncTraySettings.isScheduledSyncInstalled = false
+        // Note: We don't remove the shared script as other profiles may use it
+        // Note: We don't remove log files to preserve history
     }
 
-    /// Reload the launchd agent (useful after settings change)
-    func reload() {
-        _ = runCommand("/bin/launchctl", arguments: ["unload", SyncTraySettings.generatedPlistPath])
-        _ = runCommand("/bin/launchctl", arguments: ["load", SyncTraySettings.generatedPlistPath])
+    /// Reload the launchd agent for a profile
+    func reload(profile: SyncProfile) {
+        _ = runCommand("/bin/launchctl", arguments: ["unload", profile.plistPath])
+        _ = runCommand("/bin/launchctl", arguments: ["load", profile.plistPath])
+    }
+
+    /// Update just the profile config (without reinstalling the script)
+    func updateConfig(for profile: SyncProfile) throws {
+        let config = generateProfileConfig(for: profile)
+        try config.write(toFile: profile.configPath, atomically: true, encoding: .utf8)
+    }
+
+    // MARK: - Legacy Methods (for backward compatibility during migration)
+
+    /// Check if the legacy single-profile scheduled sync is installed
+    func isLegacyInstalled() -> Bool {
+        let plistPath = "\(NSHomeDirectory())/Library/LaunchAgents/com.synctray.sync.plist"
+        let scriptPath = "\(NSHomeDirectory())/.local/bin/synctray-sync.sh"
+
+        // Check if it's the old-style script (without config file support)
+        if FileManager.default.fileExists(atPath: scriptPath),
+           let content = try? String(contentsOfFile: scriptPath, encoding: .utf8) {
+            // Old scripts have hardcoded REMOTE= values, new ones read from config
+            return content.contains("REMOTE=\"") && !content.contains("CONFIG_FILE=")
+        }
+
+        return FileManager.default.fileExists(atPath: plistPath)
+    }
+
+    /// Uninstall legacy single-profile configuration
+    func uninstallLegacy() throws {
+        let plistPath = "\(NSHomeDirectory())/Library/LaunchAgents/com.synctray.sync.plist"
+
+        _ = runCommand("/bin/launchctl", arguments: ["unload", plistPath])
+
+        let fm = FileManager.default
+        if fm.fileExists(atPath: plistPath) {
+            try fm.removeItem(atPath: plistPath)
+        }
+        // Don't remove the script path since we'll reuse it
     }
 
     // MARK: - Script Generation
 
+    /// Generate the shared sync script that reads config from JSON
     private func generateSyncScript() -> String {
-        let remote = SyncTraySettings.rcloneRemote
-        let localPath = SyncTraySettings.localSyncPath
-        let logFile = SyncTraySettings.generatedLogPath
-        let drivePath = SyncTraySettings.drivePathToMonitor
-        let additionalFlags = SyncTraySettings.additionalRcloneFlags
-
-        var script = """
+        return """
         #!/bin/bash
-        # SyncTray Generated Sync Script
-        # Generated: \(ISO8601DateFormatter().string(from: Date()))
+        # SyncTray Sync Script
+        # This script reads profile configuration from a JSON file
         # DO NOT EDIT - This file is managed by SyncTray
 
-        REMOTE="\(remote)"
-        LOCAL_PATH="\(localPath)"
-        LOG_FILE="\(logFile)"
-        LOCK_FILE="/tmp/synctray-sync.lock"
+        CONFIG_FILE="$1"
 
-        """
+        if [[ -z "$CONFIG_FILE" || ! -f "$CONFIG_FILE" ]]; then
+            echo "Error: Config file not specified or not found: $CONFIG_FILE"
+            exit 1
+        fi
 
-        // Add drive check if configured
-        if !drivePath.isEmpty {
-            script += """
-
-            # Check if drive is mounted
-            DRIVE="\(drivePath)"
-            if [[ ! -d "$DRIVE" ]]; then
-                echo "$(date '+%Y-%m-%d %H:%M:%S') - Drive not mounted, skipping sync" >> "$LOG_FILE"
-                exit 0
-            fi
-
-            """
+        # Parse JSON config using Python (available on all macOS)
+        parse_json() {
+            python3 -c "import json,sys; d=json.load(open('$CONFIG_FILE')); print(d.get('$1', '$2'))"
         }
 
-        script += """
+        REMOTE=$(parse_json "remote" "")
+        LOCAL_PATH=$(parse_json "localPath" "")
+        LOG_FILE=$(parse_json "logPath" "")
+        LOCK_FILE=$(parse_json "lockFile" "")
+        DRIVE_PATH=$(parse_json "drivePath" "")
+        ADDITIONAL_FLAGS=$(parse_json "additionalFlags" "")
+
+        if [[ -z "$REMOTE" || -z "$LOCAL_PATH" ]]; then
+            echo "Error: Invalid config - missing remote or localPath"
+            exit 1
+        fi
+
+        # Check if drive is mounted (if configured)
+        if [[ -n "$DRIVE_PATH" && ! -d "$DRIVE_PATH" ]]; then
+            echo "$(date '+%Y-%m-%d %H:%M:%S') - Drive not mounted, skipping sync" >> "$LOG_FILE"
+            exit 0
+        fi
 
         # Check if another sync is already running
         if [[ -f "$LOCK_FILE" ]]; then
@@ -142,25 +180,15 @@ final class SyncSetupService {
 
         echo "$(date '+%Y-%m-%d %H:%M:%S') - Starting bisync" >> "$LOG_FILE"
 
+        # Build rclone command
+        RCLONE_CMD="/opt/homebrew/bin/rclone bisync \\"$REMOTE\\" \\"$LOCAL_PATH\\" --verbose --use-json-log --check-access --resilient --recover --conflict-resolve newer --conflict-loser num --conflict-suffix sync-conflict-{DateOnly}-"
+
+        if [[ -n "$ADDITIONAL_FLAGS" ]]; then
+            RCLONE_CMD="$RCLONE_CMD $ADDITIONAL_FLAGS"
+        fi
+
         # Run bisync
-        /opt/homebrew/bin/rclone bisync "$REMOTE" "$LOCAL_PATH" \\
-            --verbose \\
-            --use-json-log \\
-            --check-access \\
-            --resilient \\
-            --recover \\
-            --conflict-resolve newer \\
-            --conflict-loser num \\
-            --conflict-suffix sync-conflict-{DateOnly}- \\
-        """
-
-        // Add additional flags if provided
-        if !additionalFlags.isEmpty {
-            script += "    \(additionalFlags) \\\n"
-        }
-
-        script += """
-            2>&1 | tee -a "$LOG_FILE"
+        eval "$RCLONE_CMD" 2>&1 | tee -a "$LOG_FILE"
 
         EXIT_CODE=${PIPESTATUS[0]}
 
@@ -172,14 +200,35 @@ final class SyncSetupService {
 
         echo "" >> "$LOG_FILE"
         """
-
-        return script
     }
 
-    private func generateLaunchdPlist() -> String {
-        let intervalSeconds = SyncTraySettings.syncIntervalMinutes * 60
-        let scriptPath = SyncTraySettings.generatedScriptPath
-        let logPath = (SyncTraySettings.generatedLogPath as NSString).deletingLastPathComponent + "/synctray-launchd.log"
+    /// Generate profile-specific JSON config
+    private func generateProfileConfig(for profile: SyncProfile) -> String {
+        let config: [String: Any] = [
+            "profileId": profile.id.uuidString,
+            "name": profile.name,
+            "remote": profile.fullRemotePath,
+            "localPath": profile.localSyncPath,
+            "logPath": profile.logPath,
+            "lockFile": profile.lockFilePath,
+            "drivePath": profile.drivePathToMonitor,
+            "additionalFlags": profile.additionalRcloneFlags,
+            "syncIntervalMinutes": profile.syncIntervalMinutes
+        ]
+
+        if let data = try? JSONSerialization.data(withJSONObject: config, options: [.prettyPrinted, .sortedKeys]),
+           let json = String(data: data, encoding: .utf8) {
+            return json
+        }
+        return "{}"
+    }
+
+    private func generateLaunchdPlist(for profile: SyncProfile) -> String {
+        let intervalSeconds = profile.syncIntervalMinutes * 60
+        let scriptPath = SyncProfile.sharedScriptPath
+        let configPath = profile.configPath
+        let logDir = (profile.logPath as NSString).deletingLastPathComponent
+        let launchdLogPath = logDir + "/synctray-launchd-\(profile.shortId).log"
 
         return """
         <?xml version="1.0" encoding="UTF-8"?>
@@ -187,11 +236,12 @@ final class SyncSetupService {
         <plist version="1.0">
         <dict>
             <key>Label</key>
-            <string>com.synctray.sync</string>
+            <string>\(profile.launchdLabel)</string>
 
             <key>ProgramArguments</key>
             <array>
                 <string>\(scriptPath)</string>
+                <string>\(configPath)</string>
             </array>
 
             <key>StartInterval</key>
@@ -201,10 +251,10 @@ final class SyncSetupService {
             <true/>
 
             <key>StandardOutPath</key>
-            <string>\(logPath)</string>
+            <string>\(launchdLogPath)</string>
 
             <key>StandardErrorPath</key>
-            <string>\(logPath)</string>
+            <string>\(launchdLogPath)</string>
 
             <key>EnvironmentVariables</key>
             <dict>
@@ -218,23 +268,28 @@ final class SyncSetupService {
 
     // MARK: - Helpers
 
-    private func createDirectories() throws {
+    private func createDirectories(for profile: SyncProfile) throws {
         let fm = FileManager.default
 
         // Create ~/.local/bin if needed
-        let binDir = (SyncTraySettings.generatedScriptPath as NSString).deletingLastPathComponent
+        let binDir = (SyncProfile.sharedScriptPath as NSString).deletingLastPathComponent
         if !fm.fileExists(atPath: binDir) {
             try fm.createDirectory(atPath: binDir, withIntermediateDirectories: true)
         }
 
         // Create ~/.local/log if needed
-        let logDir = (SyncTraySettings.generatedLogPath as NSString).deletingLastPathComponent
+        let logDir = (profile.logPath as NSString).deletingLastPathComponent
         if !fm.fileExists(atPath: logDir) {
             try fm.createDirectory(atPath: logDir, withIntermediateDirectories: true)
         }
 
+        // Create ~/.config/synctray/profiles if needed
+        if !fm.fileExists(atPath: SyncProfile.configDirectory) {
+            try fm.createDirectory(atPath: SyncProfile.configDirectory, withIntermediateDirectories: true)
+        }
+
         // LaunchAgents directory should already exist, but just in case
-        let agentsDir = (SyncTraySettings.generatedPlistPath as NSString).deletingLastPathComponent
+        let agentsDir = (profile.plistPath as NSString).deletingLastPathComponent
         if !fm.fileExists(atPath: agentsDir) {
             try fm.createDirectory(atPath: agentsDir, withIntermediateDirectories: true)
         }
@@ -267,6 +322,7 @@ final class SyncSetupService {
     enum SetupError: LocalizedError {
         case missingRcloneRemote
         case missingLocalPath
+        case missingRemotePath
         case scriptGenerationFailed
         case plistGenerationFailed
 
@@ -276,6 +332,8 @@ final class SyncSetupService {
                 return "Rclone remote is required"
             case .missingLocalPath:
                 return "Local sync path is required"
+            case .missingRemotePath:
+                return "Remote folder path is required"
             case .scriptGenerationFailed:
                 return "Failed to generate sync script"
             case .plistGenerationFailed:
