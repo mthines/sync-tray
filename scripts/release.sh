@@ -274,7 +274,7 @@ main() {
     git commit -m "chore(release): bump version to ${new_version}" || true
 
     # Create git tag
-    git tag -a "$new_version" -m "Release ${new_version}"
+    git tag -s "$new_version" -m "Release ${new_version}"
     log_success "Created git tag: $new_version"
 
     # Build release
