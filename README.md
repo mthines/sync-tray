@@ -45,11 +45,20 @@ Think of it as a lightweight sync client that works with any rclone remote you'v
 - Click notifications to open the sync directory
 - Error notifications with actionable details
 
+<p align="center">
+  <img src="/docs/assets/notification.png" alt="SyncTray Logo" width="732" height="1120">
+</p>
+
 ### Multi-Profile Support
 - Create unlimited sync profiles (Work, Personal, Archive, etc.)
 - Each profile syncs on its own schedule
 - Independent enable/disable per profile
 - Per-profile status indicators in the menu
+
+<p align="center">
+  <img src="/docs/assets/settings.png" alt="SyncTray Logo" width="1624" height="1588">
+</p>
+
 
 ### Recent Changes
 - View last 20 synced files in the menu dropdown
