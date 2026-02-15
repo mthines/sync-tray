@@ -27,6 +27,7 @@ struct SettingsView: View {
                     profileStore: syncManager.profileStore,
                     syncManager: syncManager
                 )
+                .id(profile.id)
             } else {
                 VStack(spacing: 16) {
                     Image(systemName: "arrow.triangle.2.circlepath")
