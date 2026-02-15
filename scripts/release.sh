@@ -24,10 +24,10 @@ XCODEPROJ="$PROJECT_DIR/SyncTray.xcodeproj"
 # Helper Functions
 # =============================================================================
 
-log_info() { echo -e "${BLUE}ℹ${NC} $1"; }
-log_success() { echo -e "${GREEN}✓${NC} $1"; }
-log_warning() { echo -e "${YELLOW}⚠${NC} $1"; }
-log_error() { echo -e "${RED}✗${NC} $1"; exit 1; }
+log_info() { echo -e "${BLUE}ℹ${NC} $1" >&2; }
+log_success() { echo -e "${GREEN}✓${NC} $1" >&2; }
+log_warning() { echo -e "${YELLOW}⚠${NC} $1" >&2; }
+log_error() { echo -e "${RED}✗${NC} $1" >&2; exit 1; }
 
 # Get the latest git tag (version)
 get_latest_tag() {
