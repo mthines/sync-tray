@@ -9,6 +9,9 @@ struct ProfileListView: View {
 
     var body: some View {
         VStack(spacing: 0) {
+            Spacer()
+                .frame(height: 16)
+
             // Profile list
             List(selection: $selection) {
                 ForEach(profileStore.profiles) { profile in

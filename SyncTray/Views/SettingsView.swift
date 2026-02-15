@@ -14,11 +14,6 @@ struct SettingsView: View {
                 selection: $selectedProfileId
             )
             .navigationSplitViewColumnWidth(min: 180, ideal: 200, max: 250)
-            .toolbar {
-                ToolbarItem(placement: .automatic) {
-                    Spacer()
-                }
-            }
         } detail: {
             if let profileId = selectedProfileId,
                let profile = syncManager.profileStore.profile(for: profileId) {
@@ -168,28 +163,42 @@ struct ProfileDetailView: View {
     var body: some View {
         VStack(spacing: 0) {
             ScrollView {
-                VStack(alignment: .leading, spacing: 20) {
+                VStack(alignment: .leading, spacing: 16) {
                     // Profile Name
                     profileNameSection
 
-                    Divider().padding(.vertical, 8)
+                    Divider().padding(.vertical, 4)
 
                     // Sync Configuration
                     sectionHeader("Sync Configuration", icon: "arrow.triangle.2.circlepath")
                     syncConfigurationSection
 
-                    Divider().padding(.vertical, 8)
+                    Divider().padding(.vertical, 4)
 
                     // Scheduled Sync Management
                     sectionHeader("Automatic Sync", icon: "calendar.badge.clock")
                     scheduledSyncSection
 
-                    Divider().padding(.vertical, 8)
+                    Divider().padding(.vertical, 4)
 
                     // Advanced Options
-                    advancedSection
+                    Button(action: { withAnimation { showAdvanced.toggle() } }) {
+                        HStack {
+                            sectionHeader("Advanced Options", icon: "gearshape.2")
+                            Spacer()
+                            Image(systemName: showAdvanced ? "chevron.up" : "chevron.down")
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    .buttonStyle(.plain)
+
+                    if showAdvanced {
+                        advancedSectionContent
+                    }
                 }
-                .padding(20)
+                .padding(.horizontal, 20)
+                .padding(.bottom, 20)
+                .padding(.top, 12)
             }
 
             // Fixed footer with Save/Revert buttons
@@ -235,16 +244,15 @@ struct ProfileDetailView: View {
 
     private var syncConfigurationSection: some View {
         VStack(alignment: .leading, spacing: 12) {
-            // Rclone Remote
+            // Remote Name
             VStack(alignment: .leading, spacing: 4) {
-                Text("Rclone Remote")
+                Text("Remote Name")
                     .font(.subheadline.weight(.medium))
-                Text("Select a remote and enter the folder path to sync")
+                Text("The rclone remote to sync with")
                     .font(.caption)
-                    .foregroundColor(.secondary)
+                    .foregroundStyle(.secondary)
 
                 HStack {
-                    // Remote picker
                     if isLoadingRemotes {
                         ProgressView()
                             .scaleEffect(0.7)
@@ -256,100 +264,100 @@ struct ProfileDetailView: View {
                                 Text(remote).tag(remote)
                             }
                         }
-                        .frame(width: 150)
-
-                        Text(":")
-                            .foregroundColor(.secondary)
-
-                        // Folder picker or text field
-                        if isLoadingFolders {
-                            ProgressView()
-                                .scaleEffect(0.7)
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                        } else if !availableFolders.isEmpty && !useTextInputForFolder {
-                            Picker("", selection: $remotePath) {
-                                Text("Select folder...").tag("")
-                                ForEach(availableFolders, id: \.self) { folder in
-                                    Text(folder).tag(folder)
-                                }
-                            }
-                            .frame(maxWidth: .infinity)
-                        } else {
-                            TextField("folder/subfolder", text: $remotePath)
-                                .textFieldStyle(.roundedBorder)
-                        }
-
-                        // Toggle between picker and text input
-                        if !availableFolders.isEmpty {
-                            Button(action: { useTextInputForFolder.toggle() }) {
-                                Image(systemName: useTextInputForFolder ? "list.bullet" : "pencil")
-                            }
-                            .help(useTextInputForFolder ? "Switch to folder picker" : "Switch to text input for nested paths")
-                        }
-
-                        // Refresh folders button
-                        Button(action: {
-                            useTextInputForFolder = false
-                            loadRemoteFolders()
-                        }) {
-                            if isLoadingFolders {
-                                ProgressView()
-                                    .scaleEffect(0.6)
-                            } else {
-                                Image(systemName: "folder.badge.questionmark")
-                            }
-                        }
-                        .help("Load folders from remote")
-                        .disabled(rcloneRemote.isEmpty)
+                        .labelsHidden()
                     } else {
-                        TextField("remote", text: $rcloneRemote)
+                        TextField("e.g., synology", text: $rcloneRemote)
                             .textFieldStyle(.roundedBorder)
-                            .frame(width: 150)
-
-                        Text(":")
-                            .foregroundColor(.secondary)
-
-                        TextField("folder", text: $remotePath)
-                            .textFieldStyle(.roundedBorder)
+                            .frame(maxWidth: 200)
                     }
 
                     Button(action: loadRcloneRemotes) {
                         Image(systemName: "arrow.clockwise")
                     }
                     .help("Refresh remotes list")
-                }
-
-                // Folder hint
-                if remotePath.isEmpty && !rcloneRemote.isEmpty && availableFolders.isEmpty {
-                    Label("Click the folder icon to browse, or type the folder name", systemImage: "info.circle")
-                        .font(.caption)
-                        .foregroundColor(.secondary)
-                }
-
-                if let error = foldersError {
-                    Label(error, systemImage: "exclamationmark.triangle")
-                        .font(.caption)
-                        .foregroundColor(.orange)
+                    Spacer()
                 }
 
                 if let error = remotesError {
                     Label(error, systemImage: "exclamationmark.triangle")
                         .font(.caption)
-                        .foregroundColor(.orange)
+                        .foregroundStyle(.orange)
                 } else if availableRemotes.isEmpty && !isLoadingRemotes {
                     Text("Run `rclone listremotes` in Terminal to see configured remotes")
                         .font(.caption)
-                        .foregroundColor(.secondary)
+                        .foregroundStyle(.secondary)
                 }
             }
 
-            // Local Sync Path
+            // Remote Folder
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Remote Folder")
+                    .font(.subheadline.weight(.medium))
+                Text("The folder path on the remote to sync")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
+                HStack {
+                    if isLoadingFolders {
+                        ProgressView()
+                            .scaleEffect(0.7)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    } else if !availableFolders.isEmpty && !useTextInputForFolder {
+                        Picker("", selection: $remotePath) {
+                            Text("Select folder...").tag("")
+                            ForEach(availableFolders, id: \.self) { folder in
+                                Text(folder).tag(folder)
+                            }
+                        }
+                        .labelsHidden()
+                    } else {
+                        TextField("e.g., home/Documents", text: $remotePath)
+                            .textFieldStyle(.roundedBorder)
+                    }
+
+                    if !availableFolders.isEmpty {
+                        Button(action: { useTextInputForFolder.toggle() }) {
+                            Image(systemName: useTextInputForFolder ? "list.bullet" : "pencil")
+                        }
+                        .help(useTextInputForFolder ? "Switch to folder picker" : "Switch to text input")
+                    }
+
+                    Button(action: {
+                        useTextInputForFolder = false
+                        loadRemoteFolders()
+                    }) {
+                        if isLoadingFolders {
+                            ProgressView()
+                                .scaleEffect(0.6)
+                        } else {
+                            Image(systemName: "folder.badge.questionmark")
+                        }
+                    }
+                    .help("Load folders from remote")
+                    .disabled(rcloneRemote.isEmpty)
+                    Spacer()
+                }
+
+                if remotePath.isEmpty && !rcloneRemote.isEmpty && availableFolders.isEmpty {
+                    Label("Click the folder icon to browse, or type the folder name", systemImage: "info.circle")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
+                if let error = foldersError {
+                    Label(error, systemImage: "exclamationmark.triangle")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                }
+            }
+
+            // Local Folder
             VStack(alignment: .leading, spacing: 4) {
                 Text("Local Folder")
                     .font(.subheadline.weight(.medium))
                 Text("The folder on your Mac that will be synced with the remote")
                     .font(.caption)
-                    .foregroundColor(.secondary)
+                    .foregroundStyle(.secondary)
                 HStack {
                     TextField("/Volumes/MyDrive/MyFolder", text: $localSyncPath)
                         .textFieldStyle(.roundedBorder)
@@ -368,7 +376,7 @@ struct ProfileDetailView: View {
                                 .font(.subheadline)
                             Text("Skip sync when drive is disconnected")
                                 .font(.caption)
-                                .foregroundColor(.secondary)
+                                .foregroundStyle(.secondary)
                         }
                     }
                     .toggleStyle(.switch)
@@ -381,27 +389,26 @@ struct ProfileDetailView: View {
                 VStack(alignment: .leading, spacing: 8) {
                     HStack(spacing: 8) {
                         Image(systemName: "exclamationmark.triangle.fill")
-                            .foregroundColor(.orange)
+                            .foregroundStyle(.orange)
                         VStack(alignment: .leading, spacing: 2) {
                             Text("Initial sync required")
                                 .font(.subheadline.weight(.medium))
                             Text("These paths haven't been synced before. Saving will run an initial sync to establish the baseline.")
                                 .font(.caption)
-                                .foregroundColor(.secondary)
+                                .foregroundStyle(.secondary)
                         }
                     }
 
-                    // Additional warning if local directory has content
                     if localDirectoryHasContent {
                         HStack(spacing: 8) {
                             Image(systemName: "arrow.up.circle.fill")
-                                .foregroundColor(.blue)
+                                .foregroundStyle(.blue)
                             VStack(alignment: .leading, spacing: 2) {
                                 Text("Local folder contains \(localDirectoryItemCount) item\(localDirectoryItemCount == 1 ? "" : "s")")
                                     .font(.subheadline.weight(.medium))
                                 Text("These files will be uploaded to the remote during initial sync.")
                                     .font(.caption)
-                                    .foregroundColor(.secondary)
+                                    .foregroundStyle(.secondary)
                             }
                         }
                     }
@@ -409,12 +416,15 @@ struct ProfileDetailView: View {
                 .padding()
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .background(Color.orange.opacity(0.1))
-                .cornerRadius(6)
+                .clipShape(.rect(cornerRadius: 6))
             }
         }
-        .padding()
-        .background(Color(nsColor: .controlBackgroundColor))
-        .cornerRadius(8)
+        .padding(12)
+        .background(Color.black.opacity(0.15), in: .rect(cornerRadius: 8))
+        .overlay(
+            RoundedRectangle(cornerRadius: 8)
+                .strokeBorder(Color.white.opacity(0.06), lineWidth: 1)
+        )
     }
 
     private var scheduleSection: some View {
@@ -601,67 +611,58 @@ struct ProfileDetailView: View {
                     }
                 }
                 .font(.caption)
-                .foregroundColor(.orange)
+                .foregroundStyle(.orange)
             }
         }
-        .padding()
-        .background(Color(nsColor: .controlBackgroundColor))
-        .cornerRadius(8)
+        .padding(12)
+        .background(Color.black.opacity(0.15), in: .rect(cornerRadius: 8))
+        .overlay(
+            RoundedRectangle(cornerRadius: 8)
+                .strokeBorder(Color.white.opacity(0.06), lineWidth: 1)
+        )
     }
 
-    private var advancedSection: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Button(action: { withAnimation { showAdvanced.toggle() } }) {
-                HStack {
-                    Label("Advanced Options", systemImage: "gearshape.2")
-                        .font(.headline)
-                    Spacer()
-                    Image(systemName: showAdvanced ? "chevron.up" : "chevron.down")
+    private var advancedSectionContent: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            // Sync Interval
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Sync Interval")
+                    .font(.subheadline.weight(.medium))
+                Text("How often to run the sync")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
+                Picker("", selection: $syncIntervalMinutes) {
+                    Text("5 minutes").tag(5)
+                    Text("10 minutes").tag(10)
+                    Text("15 minutes").tag(15)
+                    Text("30 minutes").tag(30)
+                    Text("1 hour").tag(60)
+                    Text("2 hours").tag(120)
                 }
+                .pickerStyle(.menu)
+                .frame(width: 150, alignment: .leading)
             }
-            .buttonStyle(.plain)
 
-            if showAdvanced {
-                VStack(alignment: .leading, spacing: 16) {
-                    // Sync Interval
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text("Sync Interval")
-                            .font(.subheadline.weight(.medium))
-                        Text("How often to run the sync")
-                            .font(.caption)
-                            .foregroundColor(.secondary)
+            Divider()
 
-                        Picker("", selection: $syncIntervalMinutes) {
-                            Text("5 minutes").tag(5)
-                            Text("10 minutes").tag(10)
-                            Text("15 minutes").tag(15)
-                            Text("30 minutes").tag(30)
-                            Text("1 hour").tag(60)
-                            Text("2 hours").tag(120)
-                        }
-                        .pickerStyle(.menu)
-                        .frame(width: 150)
-                    }
-
-                    Divider()
-
-                    // Additional rclone flags
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text("Additional rclone Flags")
-                            .font(.subheadline.weight(.medium))
-                        Text("Extra flags to pass to rclone bisync command")
-                            .font(.caption)
-                            .foregroundColor(.secondary)
-                        TextField("--dry-run --verbose", text: $additionalRcloneFlags)
-                            .textFieldStyle(.roundedBorder)
-                    }
-                }
-                .padding(.leading, 8)
+            // Additional rclone flags
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Additional rclone Flags")
+                    .font(.subheadline.weight(.medium))
+                Text("Extra flags to pass to rclone bisync command")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                TextField("--dry-run --verbose", text: $additionalRcloneFlags)
+                    .textFieldStyle(.roundedBorder)
             }
         }
-        .padding()
-        .background(Color(nsColor: .controlBackgroundColor))
-        .cornerRadius(8)
+        .padding(12)
+        .background(Color.black.opacity(0.15), in: .rect(cornerRadius: 8))
+        .overlay(
+            RoundedRectangle(cornerRadius: 8)
+                .strokeBorder(Color.white.opacity(0.06), lineWidth: 1)
+        )
     }
 
     private var actionButtons: some View {
