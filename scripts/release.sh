@@ -202,18 +202,32 @@ create_github_release() {
     if ! command -v gh &> /dev/null; then
         log_warning "GitHub CLI (gh) not installed. Skipping GitHub release."
         log_info "Install with: brew install gh"
-        log_info "Then run: gh release create $version \"$zip_path\" --title \"$PROJECT_NAME $version\" --notes-file -"
         return
     fi
 
-    log_info "Creating GitHub release..."
+    # Verify zip exists
+    if [ ! -f "$zip_path" ]; then
+        log_error "Zip file not found: $zip_path"
+    fi
 
-    echo "$changelog" | gh release create "$version" \
+    log_info "Creating GitHub release..."
+    log_info "Uploading: $zip_path"
+
+    # Write changelog to temp file (more reliable than piping)
+    local notes_file=$(mktemp)
+    echo "$changelog" > "$notes_file"
+
+    if gh release create "$version" \
         "$zip_path" \
         --title "${PROJECT_NAME} ${version}" \
-        --notes-file -
+        --notes-file "$notes_file" \
+        --verify-tag; then
+        log_success "GitHub release created: $version"
+    else
+        log_error "Failed to create GitHub release"
+    fi
 
-    log_success "GitHub release created: $version"
+    rm -f "$notes_file"
 }
 
 # =============================================================================
@@ -257,9 +271,9 @@ main() {
     fi
 
     # Confirm with user
-    read -p "Release ${new_version}? (y/N) " -n 1 -r
+    read -p "Release ${new_version}? (Y/n) " -n 1 -r
     echo ""
-    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+    if [[ $REPLY =~ ^[Nn]$ ]]; then
         log_warning "Aborted."
         exit 0
     fi
@@ -294,9 +308,9 @@ main() {
     echo ""
 
     # Push to remote
-    read -p "Push to remote and create GitHub release? (y/N) " -n 1 -r
+    read -p "Push to remote and create GitHub release? (Y/n) " -n 1 -r
     echo ""
-    if [[ $REPLY =~ ^[Yy]$ ]]; then
+    if [[ ! $REPLY =~ ^[Nn]$ ]]; then
         git push origin main
         git push origin "$new_version"
         log_success "Pushed to remote"
