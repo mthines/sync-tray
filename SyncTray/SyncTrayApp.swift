@@ -78,6 +78,22 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
     static var pendingProfileSelection: UUID?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // Check if another instance is already running
+        let runningApps = NSWorkspace.shared.runningApplications
+        let myBundleId = Bundle.main.bundleIdentifier
+        let myPID = ProcessInfo.processInfo.processIdentifier
+
+        let otherInstances = runningApps.filter { app in
+            app.bundleIdentifier == myBundleId && app.processIdentifier != myPID
+        }
+
+        if !otherInstances.isEmpty {
+            // Another instance is running, activate it and quit this one
+            otherInstances.first?.activate()
+            NSApp.terminate(nil)
+            return
+        }
+
         UNUserNotificationCenter.current().delegate = self
         requestNotificationPermissions()
     }
@@ -102,14 +118,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
             // Store the profile ID and open Settings
             AppDelegate.pendingProfileSelection = profileId
 
-            // Post notification to select the profile
-            NotificationCenter.default.post(
-                name: .selectProfile,
-                object: nil,
-                userInfo: ["profileId": profileId]
-            )
-
-            // Open Settings window
+            // Open Settings window first, then post notification to select profile
+            // (posting after ensures SettingsView is ready to receive it)
             DispatchQueue.main.async {
                 if #available(macOS 14.0, *) {
                     NSApp.activate()
@@ -117,6 +127,15 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
                     NSApp.activate(ignoringOtherApps: true)
                 }
                 NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil)
+
+                // Post notification after a short delay to ensure Settings window is ready
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                    NotificationCenter.default.post(
+                        name: .selectProfile,
+                        object: nil,
+                        userInfo: ["profileId": profileId]
+                    )
+                }
             }
         } else if response.actionIdentifier == "OPEN_DIRECTORY" || response.actionIdentifier == UNNotificationDefaultActionIdentifier {
             // Open directory action

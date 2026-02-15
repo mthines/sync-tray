@@ -6,6 +6,20 @@ final class SyncSetupService {
 
     private init() {}
 
+    // MARK: - Constants
+
+    /// The check file name used by rclone bisync --check-access
+    /// This file must exist in both local and remote paths for sync to work
+    /// Note: rclone's --check-filename expects a filename, not a path
+    static let checkFileName = ".synctray-check"
+
+    // MARK: - Rclone Path Helper
+
+    private func findRclonePath() -> String? {
+        let paths = ["/opt/homebrew/bin/rclone", "/usr/local/bin/rclone", "/usr/bin/rclone"]
+        return paths.first { FileManager.default.fileExists(atPath: $0) }
+    }
+
     // MARK: - Public Methods (Profile-based)
 
     /// Check if a profile's scheduled sync is currently installed
@@ -23,7 +37,11 @@ final class SyncSetupService {
     }
 
     /// Generate and install the sync script and launchd plist for a profile
-    func install(profile: SyncProfile) throws {
+    /// - Parameters:
+    ///   - profile: The sync profile to install
+    ///   - loadAgent: Whether to load the launchd agent immediately (default: true).
+    ///                Set to false if you need to run resync first to avoid race conditions.
+    func install(profile: SyncProfile, loadAgent: Bool = true) throws {
         // Validate required settings
         guard !profile.rcloneRemote.isEmpty else {
             throw SetupError.missingRcloneRemote
@@ -56,7 +74,14 @@ final class SyncSetupService {
         let plist = generateLaunchdPlist(for: profile)
         try plist.write(toFile: profile.plistPath, atomically: true, encoding: .utf8)
 
-        // Load the launchd agent
+        // Load the launchd agent (unless deferred for resync)
+        if loadAgent {
+            _ = runCommand("/bin/launchctl", arguments: ["load", profile.plistPath])
+        }
+    }
+
+    /// Load the launchd agent for a profile (used after deferred install)
+    func loadAgent(for profile: SyncProfile) {
         _ = runCommand("/bin/launchctl", arguments: ["load", profile.plistPath])
     }
 
@@ -90,6 +115,80 @@ final class SyncSetupService {
     func updateConfig(for profile: SyncProfile) throws {
         let config = generateProfileConfig(for: profile)
         try config.write(toFile: profile.configPath, atomically: true, encoding: .utf8)
+    }
+
+    /// Initializes sync paths by creating directories and check file (.synctray-check)
+    /// - Returns: nil on success, error message on failure
+    func initializeSyncPaths(for profile: SyncProfile) -> String? {
+        guard let rclonePath = findRclonePath() else {
+            return "rclone not found"
+        }
+
+        let fileManager = FileManager.default
+
+        // 1. Create local directory if needed
+        if !fileManager.fileExists(atPath: profile.localSyncPath) {
+            do {
+                try fileManager.createDirectory(atPath: profile.localSyncPath, withIntermediateDirectories: true)
+            } catch {
+                return "Failed to create local directory: \(error.localizedDescription)"
+            }
+        }
+
+        // 2. Create local check file (.synctray-check)
+        let localCheckFile = (profile.localSyncPath as NSString).appendingPathComponent(Self.checkFileName)
+
+        if !fileManager.fileExists(atPath: localCheckFile) {
+            fileManager.createFile(atPath: localCheckFile, contents: nil)
+        }
+
+        // 3. Create remote check file using rclone touch
+        let remoteCheckFile = "\(profile.rcloneRemote):\(profile.remotePath)/\(Self.checkFileName)"
+
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: rclonePath)
+        process.arguments = ["touch", remoteCheckFile]
+
+        do {
+            try process.run()
+            process.waitUntilExit()
+            if process.terminationStatus != 0 {
+                return "Failed to create remote check file (exit code \(process.terminationStatus))"
+            }
+        } catch {
+            return "Failed to run rclone touch: \(error.localizedDescription)"
+        }
+
+        return nil // Success
+    }
+
+    /// Checks if listing files exist for this profile's path combination
+    func hasExistingListings(for profile: SyncProfile) -> Bool {
+        let cacheDir = (("~/Library/Caches/rclone/bisync" as NSString).expandingTildeInPath)
+
+        // Build the path hash that rclone uses for listing filenames
+        // rclone format: {remote}_{remotePath}..{localPath} with / replaced by _ and leading _ removed
+        let remote = "\(profile.rcloneRemote)_\(profile.remotePath)"
+            .replacingOccurrences(of: ":", with: "_")
+            .replacingOccurrences(of: "/", with: "_")
+
+        // Remove leading slash before replacing to match rclone's format
+        var localPath = profile.localSyncPath
+        if localPath.hasPrefix("/") {
+            localPath = String(localPath.dropFirst())
+        }
+        let local = localPath.replacingOccurrences(of: "/", with: "_")
+
+        let baseName = "\(remote)..\(local)"
+
+        // Only check for .lst files (not .lst-new which are incomplete/partial)
+        // The .lst files are only created after a successful bisync completes
+        let listingPath1 = (cacheDir as NSString).appendingPathComponent("\(baseName).path1.lst")
+        let listingPath2 = (cacheDir as NSString).appendingPathComponent("\(baseName).path2.lst")
+
+        let fm = FileManager.default
+        // Both listing files must exist for sync to work without --resync
+        return fm.fileExists(atPath: listingPath1) && fm.fileExists(atPath: listingPath2)
     }
 
     // MARK: - Legacy Methods (for backward compatibility during migration)
@@ -181,7 +280,7 @@ final class SyncSetupService {
         echo "$(date '+%Y-%m-%d %H:%M:%S') - Starting bisync" >> "$LOG_FILE"
 
         # Build rclone command
-        RCLONE_CMD="/opt/homebrew/bin/rclone bisync \\"$REMOTE\\" \\"$LOCAL_PATH\\" --verbose --use-json-log --check-access --resilient --recover --conflict-resolve newer --conflict-loser num --conflict-suffix sync-conflict-{DateOnly}-"
+        RCLONE_CMD="/opt/homebrew/bin/rclone bisync \\"$REMOTE\\" \\"$LOCAL_PATH\\" --verbose --use-json-log --check-access --check-filename .synctray-check --resilient --recover --conflict-resolve newer --conflict-loser num --conflict-suffix sync-conflict-{DateOnly}-"
 
         if [[ -n "$ADDITIONAL_FLAGS" ]]; then
             RCLONE_CMD="$RCLONE_CMD $ADDITIONAL_FLAGS"

@@ -220,6 +220,11 @@ final class SyncManager: ObservableObject {
                 break
             }
 
+            // If the most recent sync was successful, there's no error to show
+            if line.contains("Bisync completed successfully") {
+                return nil
+            }
+
             // Mark that we found the failure point
             if line.contains("Bisync failed with exit code") {
                 foundFailedMarker = true

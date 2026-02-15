@@ -24,7 +24,7 @@ struct RecentChangesView: View {
                     }
                     .padding(.horizontal, 8)
                 }
-                .frame(maxHeight: 200)
+                .frame(maxHeight: 300)
             }
         }
     }

@@ -123,36 +123,80 @@ struct ProfileDetailView: View {
         setupService.isInstalled(profile: profile)
     }
 
+    /// Returns true if paths have changed and the new path combination needs initial sync
+    private var pathsNeedInitialSync: Bool {
+        // Check if paths have changed
+        let pathsChanged = rcloneRemote != profile.rcloneRemote ||
+                          remotePath != profile.remotePath ||
+                          localSyncPath != profile.localSyncPath
+
+        guard pathsChanged && canInstall else { return false }
+
+        // Check if listings exist for the NEW path combination
+        // Create a temporary profile with the new paths to check
+        var tempProfile = profile
+        tempProfile.rcloneRemote = rcloneRemote
+        tempProfile.remotePath = remotePath
+        tempProfile.localSyncPath = localSyncPath
+
+        return !setupService.hasExistingListings(for: tempProfile)
+    }
+
+    /// Returns the number of items in the local directory (excluding hidden .synctray folder)
+    private var localDirectoryItemCount: Int {
+        guard !localSyncPath.isEmpty else { return 0 }
+        let fm = FileManager.default
+        guard fm.fileExists(atPath: localSyncPath) else { return 0 }
+
+        do {
+            let contents = try fm.contentsOfDirectory(atPath: localSyncPath)
+            // Exclude .synctray directory from count
+            return contents.filter { !$0.hasPrefix(".synctray") }.count
+        } catch {
+            return 0
+        }
+    }
+
+    /// Returns true if local directory exists and has files that will be uploaded
+    private var localDirectoryHasContent: Bool {
+        localDirectoryItemCount > 0
+    }
+
     // MARK: - Body
 
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 20) {
-                // Profile Name
-                profileNameSection
+        VStack(spacing: 0) {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 20) {
+                    // Profile Name
+                    profileNameSection
 
-                Divider().padding(.vertical, 8)
+                    Divider().padding(.vertical, 8)
 
-                // Sync Configuration
-                sectionHeader("Sync Configuration", icon: "arrow.triangle.2.circlepath")
-                syncConfigurationSection
+                    // Sync Configuration
+                    sectionHeader("Sync Configuration", icon: "arrow.triangle.2.circlepath")
+                    syncConfigurationSection
 
-                Divider().padding(.vertical, 8)
+                    Divider().padding(.vertical, 8)
 
-                // Scheduled Sync Management
-                sectionHeader("Automatic Sync", icon: "calendar.badge.clock")
-                scheduledSyncSection
+                    // Scheduled Sync Management
+                    sectionHeader("Automatic Sync", icon: "calendar.badge.clock")
+                    scheduledSyncSection
 
-                Divider().padding(.vertical, 8)
+                    Divider().padding(.vertical, 8)
 
-                // Advanced Options
-                advancedSection
-
-                // Action Buttons
-                Divider().padding(.vertical, 8)
-                actionButtons
+                    // Advanced Options
+                    advancedSection
+                }
+                .padding(20)
             }
-            .padding(20)
+
+            // Fixed footer with Save/Revert buttons
+            Divider()
+            actionButtons
+                .padding(.horizontal, 20)
+                .padding(.vertical, 12)
+                .background(Color(nsColor: .windowBackgroundColor))
         }
         .onAppear {
             loadProfileValues()
@@ -329,6 +373,42 @@ struct ProfileDetailView: View {
                     .toggleStyle(.switch)
                     .padding(.top, 8)
                 }
+            }
+
+            // Warning when paths changed and need initial sync
+            if pathsNeedInitialSync {
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack(spacing: 8) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .foregroundColor(.orange)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Initial sync required")
+                                .font(.subheadline.weight(.medium))
+                            Text("These paths haven't been synced before. Saving will run an initial sync to establish the baseline.")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
+                    }
+
+                    // Additional warning if local directory has content
+                    if localDirectoryHasContent {
+                        HStack(spacing: 8) {
+                            Image(systemName: "arrow.up.circle.fill")
+                                .foregroundColor(.blue)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("Local folder contains \(localDirectoryItemCount) item\(localDirectoryItemCount == 1 ? "" : "s")")
+                                    .font(.subheadline.weight(.medium))
+                                Text("These files will be uploaded to the remote during initial sync.")
+                                    .font(.caption)
+                                    .foregroundColor(.secondary)
+                            }
+                        }
+                    }
+                }
+                .padding()
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(Color.orange.opacity(0.1))
+                .cornerRadius(6)
             }
         }
         .padding()
@@ -776,17 +856,38 @@ struct ProfileDetailView: View {
             return
         }
 
+        // Check if this needs initial sync before we start
+        let needsResync = !setupService.hasExistingListings(for: currentProfile)
+
         DispatchQueue.global(qos: .userInitiated).async {
             do {
-                try setupService.install(profile: currentProfile)
+                // 1. Install script, config, and launchd plist
+                // Defer loading the agent if we need to run resync first (to avoid race condition)
+                try setupService.install(profile: currentProfile, loadAgent: !needsResync)
+
+                // 2. Initialize paths (create dir and check files)
+                if let error = setupService.initializeSyncPaths(for: currentProfile) {
+                    DispatchQueue.main.async {
+                        isInstalling = false
+                        installError = error
+                    }
+                    return
+                }
 
                 DispatchQueue.main.async {
                     isInstalling = false
+
                     // Update profile to mark as enabled
                     var enabledProfile = currentProfile
                     enabledProfile.isEnabled = true
                     profileStore.update(enabledProfile)
                     syncManager.refreshSettings()
+
+                    // 3. Run initial resync if this is a new path combination
+                    // The agent will be loaded after resync completes
+                    if needsResync {
+                        runResync(loadAgentOnCompletion: true)
+                    }
                 }
             } catch {
                 DispatchQueue.main.async {
@@ -824,10 +925,13 @@ struct ProfileDetailView: View {
         installSync()
     }
 
-    private func runResync() {
+    private func runResync(loadAgentOnCompletion: Bool = false) {
         isRunningResync = true
         resyncOutput = ""
         showResyncOutput = true
+
+        // Capture profile for loading agent after completion
+        let currentProfile = profile
 
         DispatchQueue.global(qos: .userInitiated).async {
             let process = Process()
@@ -917,10 +1021,22 @@ struct ProfileDetailView: View {
                     let exitCode = process.terminationStatus
                     if exitCode == 0 {
                         resyncOutput += "\n✓ Resync completed successfully!"
+
+                        // Load the launchd agent now that resync is complete
+                        if loadAgentOnCompletion {
+                            setupService.loadAgent(for: currentProfile)
+                            resyncOutput += "\n✓ Scheduled sync is now active."
+                        }
+
                         // Clear the error state
                         syncManager.refreshSettings()
                     } else {
                         resyncOutput += "\n✗ Resync failed with exit code \(exitCode)"
+
+                        // Still load the agent even on failure so scheduled syncs can retry
+                        if loadAgentOnCompletion {
+                            setupService.loadAgent(for: currentProfile)
+                        }
                     }
 
                     isRunningResync = false
@@ -1031,7 +1147,7 @@ struct ProfileDetailView: View {
             case .retrySync:
                 return "Try running the sync again"
             case .createCheckFiles:
-                return "Create RCLONE_TEST files required for access check"
+                return "Create .synctray-check files required for access check"
             }
         }
     }
@@ -1047,8 +1163,8 @@ struct ProfileDetailView: View {
             return .resync
         }
 
-        // Check access failed - need to create RCLONE_TEST files
-        if error.contains("RCLONE_TEST") || error.contains("check file") || error.contains("Access test failed") {
+        // Check access failed - need to create check files
+        if error.contains("RCLONE_TEST") || error.contains(".synctray-check") || error.contains("check file") || error.contains("Access test failed") {
             return .createCheckFiles
         }
 
@@ -1115,38 +1231,41 @@ struct ProfileDetailView: View {
 
     private func createCheckFilesAndSync() {
         isRunningResync = true
-        resyncOutput = "Creating RCLONE_TEST check files...\n"
+        resyncOutput = "Creating check files (.synctray-check)...\n"
         showResyncOutput = true
 
         // Capture values from main thread before going to background
         let localPath = profile.localSyncPath
         let remote = profile.rcloneRemote
         let remoteFolder = profile.remotePath
-        let currentProfile = profile
+        let checkFileName = SyncSetupService.checkFileName
 
         DispatchQueue.global(qos: .userInitiated).async {
-            // Create local RCLONE_TEST file
-            let localTestFile = (localPath as NSString).appendingPathComponent("RCLONE_TEST")
-            let testContent = "rclone test file - do not delete\n"
+            let fileManager = FileManager.default
+
+            // Create local check file (.synctray-check)
+            let localCheckFile = (localPath as NSString).appendingPathComponent(checkFileName)
 
             DispatchQueue.main.async {
-                resyncOutput += "Local path: \(localTestFile)\n"
+                resyncOutput += "Local path: \(localCheckFile)\n"
             }
 
-            do {
-                try testContent.write(toFile: localTestFile, atomically: true, encoding: .utf8)
-                DispatchQueue.main.async {
-                    resyncOutput += "✓ Created local RCLONE_TEST file\n"
+            // Create check file
+            if !fileManager.fileExists(atPath: localCheckFile) {
+                if !fileManager.createFile(atPath: localCheckFile, contents: nil) {
+                    DispatchQueue.main.async {
+                        resyncOutput += "✗ Failed to create local check file\n"
+                        isRunningResync = false
+                    }
+                    return
                 }
-            } catch {
-                DispatchQueue.main.async {
-                    resyncOutput += "✗ Failed to create local file: \(error.localizedDescription)\n"
-                    isRunningResync = false
-                }
-                return
             }
 
-            // Create remote RCLONE_TEST file using rclone
+            DispatchQueue.main.async {
+                resyncOutput += "✓ Created local .synctray-check file\n"
+            }
+
+            // Create remote check file using rclone
             let rclonePaths = ["/opt/homebrew/bin/rclone", "/usr/local/bin/rclone", "/usr/bin/rclone"]
             var rclonePath: String?
 
@@ -1165,18 +1284,18 @@ struct ProfileDetailView: View {
                 return
             }
 
-            // Copy the local test file to remote
-            let remoteDest = "\(remote):\(remoteFolder)/RCLONE_TEST"
+            // Create remote check file using rclone touch
+            let remoteDest = "\(remote):\(remoteFolder)/\(checkFileName)"
             let process = Process()
             let pipe = Pipe()
 
             process.executableURL = URL(fileURLWithPath: path)
-            process.arguments = ["copyto", localTestFile, remoteDest]
+            process.arguments = ["touch", remoteDest]
             process.standardOutput = pipe
             process.standardError = pipe
 
             DispatchQueue.main.async {
-                resyncOutput += "Running: rclone copyto \"\(localTestFile)\" \"\(remoteDest)\"\n"
+                resyncOutput += "Running: rclone touch \"\(remoteDest)\"\n"
             }
 
             do {
@@ -1192,7 +1311,7 @@ struct ProfileDetailView: View {
                     }
 
                     if process.terminationStatus == 0 {
-                        resyncOutput += "✓ Created remote RCLONE_TEST file\n\n"
+                        resyncOutput += "✓ Created remote .synctray-check file\n\n"
                         resyncOutput += "Now running initial sync (--resync)...\n"
 
                         // Run resync after creating files (needed because check-access failure corrupts listing files)
