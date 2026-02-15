@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="SyncTray/Assets.xcassets/AppIcon.appiconset/128.png" alt="SyncTray Logo" width="128" height="128">
+  <img src="SyncTray/Assets.xcassets/AppIcon.appiconset/256.png" alt="SyncTray Logo" width="128" height="128">
 </p>
 
 <h1 align="center">SyncTray</h1>
