@@ -257,9 +257,9 @@ main() {
     fi
 
     # Confirm with user
-    read -p "Release ${new_version}? (y/N) " -n 1 -r
+    read -p "Release ${new_version}? (Y/n) " -n 1 -r
     echo ""
-    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+    if [[ $REPLY =~ ^[Nn]$ ]]; then
         log_warning "Aborted."
         exit 0
     fi
@@ -294,9 +294,9 @@ main() {
     echo ""
 
     # Push to remote
-    read -p "Push to remote and create GitHub release? (y/N) " -n 1 -r
+    read -p "Push to remote and create GitHub release? (Y/n) " -n 1 -r
     echo ""
-    if [[ $REPLY =~ ^[Yy]$ ]]; then
+    if [[ ! $REPLY =~ ^[Nn]$ ]]; then
         git push origin main
         git push origin "$new_version"
         log_success "Pushed to remote"
