@@ -955,16 +955,14 @@ struct ProfileDetailView: View {
             Text("• \(label):")
                 .font(.caption)
                 .foregroundColor(.secondary)
-            Button(action: {
-                NSWorkspace.shared.open(URL(fileURLWithPath: path))
-            }) {
-                Text(displayPath)
-                    .font(.caption)
-                    .foregroundColor(.accentColor)
-                    .underline()
-            }
-            .buttonStyle(.plain)
-            .help("Click to open in default app")
+            Text(displayPath)
+                .font(.caption)
+                .foregroundColor(.gray)
+                .textSelection(.enabled)
+                .onTapGesture {
+                    NSWorkspace.shared.open(URL(fileURLWithPath: path))
+                }
+                .help("Click to open, or select to copy path")
         }
     }
 
@@ -1050,7 +1048,7 @@ struct ProfileDetailView: View {
         }
 
         // Check access failed - need to create RCLONE_TEST files
-        if error.contains("RCLONE_TEST") || error.contains("check file check failed") || error.contains("Access test failed") {
+        if error.contains("RCLONE_TEST") || error.contains("check file") || error.contains("Access test failed") {
             return .createCheckFiles
         }
 
@@ -1120,10 +1118,20 @@ struct ProfileDetailView: View {
         resyncOutput = "Creating RCLONE_TEST check files...\n"
         showResyncOutput = true
 
+        // Capture values from main thread before going to background
+        let localPath = profile.localSyncPath
+        let remote = profile.rcloneRemote
+        let remoteFolder = profile.remotePath
+        let currentProfile = profile
+
         DispatchQueue.global(qos: .userInitiated).async {
             // Create local RCLONE_TEST file
-            let localTestFile = (localSyncPath as NSString).appendingPathComponent("RCLONE_TEST")
+            let localTestFile = (localPath as NSString).appendingPathComponent("RCLONE_TEST")
             let testContent = "rclone test file - do not delete\n"
+
+            DispatchQueue.main.async {
+                resyncOutput += "Local path: \(localTestFile)\n"
+            }
 
             do {
                 try testContent.write(toFile: localTestFile, atomically: true, encoding: .utf8)
@@ -1158,7 +1166,7 @@ struct ProfileDetailView: View {
             }
 
             // Copy the local test file to remote
-            let remoteDest = "\(rcloneRemote):\(remotePath)/RCLONE_TEST"
+            let remoteDest = "\(remote):\(remoteFolder)/RCLONE_TEST"
             let process = Process()
             let pipe = Pipe()
 
@@ -1185,11 +1193,12 @@ struct ProfileDetailView: View {
 
                     if process.terminationStatus == 0 {
                         resyncOutput += "✓ Created remote RCLONE_TEST file\n\n"
-                        resyncOutput += "Now running sync...\n\n"
+                        resyncOutput += "Now running initial sync (--resync)...\n"
 
-                        // Run sync after creating files
-                        isRunningResync = false
-                        syncManager.triggerManualSync(for: profile)
+                        // Run resync after creating files (needed because check-access failure corrupts listing files)
+                        DispatchQueue.main.async {
+                            runResync()
+                        }
                     } else {
                         resyncOutput += "✗ Failed to create remote file (exit code \(process.terminationStatus))\n"
                         isRunningResync = false

@@ -8,6 +8,12 @@
             "type": "shell",
             "command": "sh ./scripts/release.sh",
             "problemMatcher": []
-        }
+        },
+        {
+            "label": "install",
+            "type": "shell",
+            "command": "sh ./scripts/install.sh",
+            "problemMatcher": []
+        },
     ]
 }

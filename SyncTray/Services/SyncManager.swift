@@ -211,39 +211,69 @@ final class SyncManager: ObservableObject {
 
         // Look for error lines in reverse order (most recent first)
         let lines = content.components(separatedBy: .newlines).reversed()
+        var errorMessages: [String] = []
+        var foundFailedMarker = false
 
         for line in lines {
+            // Stop when we hit a "Starting bisync" marker (previous run)
+            if line.contains("Starting bisync") && foundFailedMarker {
+                break
+            }
+
+            // Mark that we found the failure point
+            if line.contains("Bisync failed with exit code") {
+                foundFailedMarker = true
+                continue
+            }
+
+            // Only collect errors after we found the failure marker
+            guard foundFailedMarker else { continue }
+
             // Check for rclone JSON error messages
-            if line.contains("\"level\":\"error\"") {
+            if line.contains("\"level\":\"error\"") || line.contains("\"level\":\"notice\"") {
                 // Parse the error message from JSON
                 if let msgRange = line.range(of: "\"msg\":\""),
                    let endRange = line[msgRange.upperBound...].range(of: "\"") {
                     var errorMsg = String(line[msgRange.upperBound..<endRange.lowerBound])
 
-                    // Clean up ANSI codes and common prefixes
-                    errorMsg = errorMsg.replacingOccurrences(of: "\\u001b[", with: "", options: .regularExpression)
+                    // Clean up ANSI codes
+                    errorMsg = errorMsg.replacingOccurrences(of: "\\u001b[", with: "")
                     errorMsg = errorMsg.replacingOccurrences(of: #"\[\d+m"#, with: "", options: .regularExpression)
+                    errorMsg = errorMsg.replacingOccurrences(of: "[0m", with: "")
+                    errorMsg = errorMsg.replacingOccurrences(of: "[31m", with: "")
+                    errorMsg = errorMsg.replacingOccurrences(of: "[33m", with: "")
+                    errorMsg = errorMsg.replacingOccurrences(of: "[35m", with: "")
+                    errorMsg = errorMsg.replacingOccurrences(of: "[36m", with: "")
 
+                    // Always skip generic "Bisync aborted" messages - they don't provide useful info
+                    if errorMsg.contains("Bisync aborted") || errorMsg.contains("Failed to bisync") {
+                        continue
+                    }
+
+                    // Clean up prefixes
                     if let range = errorMsg.range(of: "Bisync critical error: ") {
                         errorMsg = String(errorMsg[range.upperBound...])
-                    } else if let range = errorMsg.range(of: "Bisync aborted. ") {
-                        errorMsg = String(errorMsg[range.upperBound...])
                     }
 
-                    // Truncate if too long
-                    if errorMsg.count > 300 {
-                        errorMsg = String(errorMsg.prefix(300)) + "..."
+                    if !errorMsg.isEmpty && !errorMessages.contains(errorMsg) {
+                        errorMessages.append(errorMsg)
                     }
 
-                    return errorMsg.isEmpty ? nil : errorMsg
+                    // Stop after finding 2 meaningful errors
+                    if errorMessages.count >= 2 {
+                        break
+                    }
                 }
             }
+        }
 
-            // Check for plain text error markers
-            if line.contains("Bisync failed with exit code") {
-                // Try to find the preceding error message
-                continue
+        // Return the most specific error found
+        if let firstError = errorMessages.first {
+            // Truncate if too long
+            if firstError.count > 300 {
+                return String(firstError.prefix(300)) + "..."
             }
+            return firstError
         }
 
         return nil
