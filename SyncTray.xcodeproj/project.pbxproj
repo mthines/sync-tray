@@ -20,6 +20,7 @@
 		A1111111000000000000000E /* Settings.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000000000000000000000E /* Settings.swift */; };
 		A1111111000000000000000F /* SettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000000000000000000000F /* SettingsView.swift */; };
 		A11111110000000000000010 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000010 /* Assets.xcassets */; };
+		A11111110000000000000011 /* SyncSetupService.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000011 /* SyncSetupService.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -39,6 +40,7 @@
 		A1000000000000000000000E /* Settings.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Settings.swift; sourceTree = "<group>"; };
 		A1000000000000000000000F /* SettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsView.swift; sourceTree = "<group>"; };
 		A10000000000000000000010 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
+		A10000000000000000000011 /* SyncSetupService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SyncSetupService.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -91,6 +93,7 @@
 				A10000000000000000000005 /* LogParser.swift */,
 				A10000000000000000000006 /* NotificationService.swift */,
 				A10000000000000000000007 /* SyncManager.swift */,
+				A10000000000000000000011 /* SyncSetupService.swift */,
 			);
 			path = Services;
 			sourceTree = "<group>";
@@ -195,6 +198,7 @@
 				A11111110000000000000009 /* StatusHeaderView.swift in Sources */,
 				A1111111000000000000000A /* RecentChangesView.swift in Sources */,
 				A1111111000000000000000F /* SettingsView.swift in Sources */,
+				A11111110000000000000011 /* SyncSetupService.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

@@ -120,6 +120,11 @@ struct MenuBarView: View {
                 .buttonStyle(.plain)
                 .padding(.horizontal, 8)
                 .padding(.vertical, 6)
+                .simultaneousGesture(TapGesture().onEnded {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                        NSApp.activate(ignoringOtherApps: true)
+                    }
+                })
             } else {
                 Button(action: { openSettings() }) {
                     HStack {
@@ -156,6 +161,9 @@ struct MenuBarView: View {
 
     private func openSettings() {
         NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+            NSApp.activate(ignoringOtherApps: true)
+        }
     }
 }
 
