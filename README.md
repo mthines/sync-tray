@@ -1,6 +1,12 @@
-# SyncTray
+<p align="center">
+  <img src="SyncTray/Assets.xcassets/AppIcon.appiconset/128.png" alt="SyncTray Logo" width="128" height="128">
+</p>
 
-A native macOS menu bar app for monitoring rclone sync operations with real-time notifications.
+<h1 align="center">SyncTray</h1>
+
+<p align="center">
+  A native macOS menu bar app for monitoring rclone sync operations with real-time notifications.
+</p>
 
 ![macOS 13.0+](https://img.shields.io/badge/macOS-13.0+-blue)
 ![Swift 5](https://img.shields.io/badge/Swift-5-orange)
