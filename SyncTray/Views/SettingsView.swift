@@ -86,6 +86,7 @@ struct ProfileDetailView: View {
     @State private var isRunningResync: Bool = false
     @State private var resyncOutput: String = ""
     @State private var showResyncOutput: Bool = false
+    @State private var useTextInputForFolder: Bool = false
     @State private var remotesError: String?
     @State private var availableFolders: [String] = []
     @State private var isLoadingFolders: Bool = false
@@ -135,12 +136,6 @@ struct ProfileDetailView: View {
                 // Sync Configuration
                 sectionHeader("Sync Configuration", icon: "arrow.triangle.2.circlepath")
                 syncConfigurationSection
-
-                Divider().padding(.vertical, 8)
-
-                // Schedule
-                sectionHeader("Schedule", icon: "clock")
-                scheduleSection
 
                 Divider().padding(.vertical, 8)
 
@@ -226,7 +221,7 @@ struct ProfileDetailView: View {
                             ProgressView()
                                 .scaleEffect(0.7)
                                 .frame(maxWidth: .infinity, alignment: .leading)
-                        } else if !availableFolders.isEmpty {
+                        } else if !availableFolders.isEmpty && !useTextInputForFolder {
                             Picker("", selection: $remotePath) {
                                 Text("Select folder...").tag("")
                                 ForEach(availableFolders, id: \.self) { folder in
@@ -235,12 +230,23 @@ struct ProfileDetailView: View {
                             }
                             .frame(maxWidth: .infinity)
                         } else {
-                            TextField("Folder on remote", text: $remotePath)
+                            TextField("folder/subfolder", text: $remotePath)
                                 .textFieldStyle(.roundedBorder)
                         }
 
+                        // Toggle between picker and text input
+                        if !availableFolders.isEmpty {
+                            Button(action: { useTextInputForFolder.toggle() }) {
+                                Image(systemName: useTextInputForFolder ? "list.bullet" : "pencil")
+                            }
+                            .help(useTextInputForFolder ? "Switch to folder picker" : "Switch to text input for nested paths")
+                        }
+
                         // Refresh folders button
-                        Button(action: loadRemoteFolders) {
+                        Button(action: {
+                            useTextInputForFolder = false
+                            loadRemoteFolders()
+                        }) {
                             if isLoadingFolders {
                                 ProgressView()
                                     .scaleEffect(0.6)
@@ -399,21 +405,21 @@ struct ProfileDetailView: View {
                         .cornerRadius(4)
 
                     // Action buttons for common errors
-                    if lastError.contains("cannot find prior") || lastError.contains("--resync") || lastError.contains("retryable without --resync") {
+                    if let errorAction = detectErrorAction(from: lastError) {
                         HStack(spacing: 8) {
-                            Button(action: runResync) {
+                            Button(action: { handleErrorAction(errorAction) }) {
                                 if isRunningResync {
                                     ProgressView()
                                         .scaleEffect(0.7)
                                         .frame(width: 14, height: 14)
-                                    Text("Running resync...")
+                                    Text(errorAction.progressText)
                                 } else {
-                                    Label("Run Initial Sync (--resync)", systemImage: "arrow.triangle.2.circlepath")
+                                    Label(errorAction.buttonText, systemImage: errorAction.icon)
                                 }
                             }
                             .buttonStyle(.borderedProminent)
                             .disabled(isRunningResync)
-                            .help("This will establish the initial baseline for bidirectional sync")
+                            .help(errorAction.helpText)
                         }
                     }
 
@@ -469,6 +475,11 @@ struct ProfileDetailView: View {
             // Buttons
             HStack {
                 if isInstalled {
+                    Button(action: { syncManager.triggerManualSync(for: profile) }) {
+                        Label("Sync Now", systemImage: "arrow.triangle.2.circlepath")
+                    }
+                    .buttonStyle(.borderedProminent)
+
                     Button(action: { showingUninstallConfirm = true }) {
                         Label("Uninstall", systemImage: "trash")
                     }
@@ -530,7 +541,29 @@ struct ProfileDetailView: View {
             .buttonStyle(.plain)
 
             if showAdvanced {
-                VStack(alignment: .leading, spacing: 12) {
+                VStack(alignment: .leading, spacing: 16) {
+                    // Sync Interval
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Sync Interval")
+                            .font(.subheadline.weight(.medium))
+                        Text("How often to run the sync")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+
+                        Picker("", selection: $syncIntervalMinutes) {
+                            Text("5 minutes").tag(5)
+                            Text("10 minutes").tag(10)
+                            Text("15 minutes").tag(15)
+                            Text("30 minutes").tag(30)
+                            Text("1 hour").tag(60)
+                            Text("2 hours").tag(120)
+                        }
+                        .pickerStyle(.menu)
+                        .frame(width: 150)
+                    }
+
+                    Divider()
+
                     // Additional rclone flags
                     VStack(alignment: .leading, spacing: 4) {
                         Text("Additional rclone Flags")
@@ -932,6 +965,242 @@ struct ProfileDetailView: View {
             }
             .buttonStyle(.plain)
             .help("Click to open in default app")
+        }
+    }
+
+    // MARK: - Error Action Handling
+
+    enum ErrorAction {
+        case resync
+        case unlockAndResync
+        case unlock
+        case retrySync
+        case createCheckFiles
+
+        var buttonText: String {
+            switch self {
+            case .resync:
+                return "Run Initial Sync (--resync)"
+            case .unlockAndResync:
+                return "Unlock & Resync"
+            case .unlock:
+                return "Remove Lock File"
+            case .retrySync:
+                return "Retry Sync"
+            case .createCheckFiles:
+                return "Create Check Files & Sync"
+            }
+        }
+
+        var progressText: String {
+            switch self {
+            case .resync:
+                return "Running resync..."
+            case .unlockAndResync:
+                return "Unlocking & resyncing..."
+            case .unlock:
+                return "Removing lock..."
+            case .retrySync:
+                return "Syncing..."
+            case .createCheckFiles:
+                return "Creating check files..."
+            }
+        }
+
+        var icon: String {
+            switch self {
+            case .resync:
+                return "arrow.triangle.2.circlepath"
+            case .unlockAndResync:
+                return "lock.open"
+            case .unlock:
+                return "lock.slash"
+            case .retrySync:
+                return "arrow.clockwise"
+            case .createCheckFiles:
+                return "checkmark.circle"
+            }
+        }
+
+        var helpText: String {
+            switch self {
+            case .resync:
+                return "Establish initial baseline for bidirectional sync"
+            case .unlockAndResync:
+                return "Remove stale lock file and run resync"
+            case .unlock:
+                return "Remove the lock file blocking sync"
+            case .retrySync:
+                return "Try running the sync again"
+            case .createCheckFiles:
+                return "Create RCLONE_TEST files required for access check"
+            }
+        }
+    }
+
+    private func detectErrorAction(from error: String) -> ErrorAction? {
+        // Lock file error - needs unlock first
+        if error.contains("lock file found") || error.contains("prior lock file") {
+            return .unlockAndResync
+        }
+
+        // Missing baseline - needs resync
+        if error.contains("cannot find prior") || error.contains("--resync") {
+            return .resync
+        }
+
+        // Check access failed - need to create RCLONE_TEST files
+        if error.contains("RCLONE_TEST") || error.contains("check file check failed") || error.contains("Access test failed") {
+            return .createCheckFiles
+        }
+
+        // Generic errors - offer retry
+        if error.contains("bisync aborted") || error.contains("Failed to bisync") || error.contains("failed") {
+            return .retrySync
+        }
+
+        return nil
+    }
+
+    private func handleErrorAction(_ action: ErrorAction) {
+        switch action {
+        case .resync:
+            runResync()
+        case .unlockAndResync:
+            unlockAndResync()
+        case .unlock:
+            removeLockFile()
+        case .retrySync:
+            syncManager.triggerManualSync(for: profile)
+        case .createCheckFiles:
+            createCheckFilesAndSync()
+        }
+    }
+
+    private func removeLockFile() {
+        let lockPattern = "\(rcloneRemote)_\(remotePath.replacingOccurrences(of: "/", with: "_"))..\(localSyncPath.replacingOccurrences(of: "/", with: "_")).lck"
+        let bisyncDir = "\(NSHomeDirectory())/Library/Caches/rclone/bisync"
+
+        // Remove all matching lock files
+        if let files = try? FileManager.default.contentsOfDirectory(atPath: bisyncDir) {
+            for file in files where file.hasSuffix(".lck") {
+                let fullPath = "\(bisyncDir)/\(file)"
+                try? FileManager.default.removeItem(atPath: fullPath)
+            }
+        }
+    }
+
+    private func unlockAndResync() {
+        isRunningResync = true
+        resyncOutput = "Removing lock files...\n"
+        showResyncOutput = true
+
+        // Remove lock files first
+        let bisyncDir = "\(NSHomeDirectory())/Library/Caches/rclone/bisync"
+        if let files = try? FileManager.default.contentsOfDirectory(atPath: bisyncDir) {
+            for file in files where file.hasSuffix(".lck") {
+                let fullPath = "\(bisyncDir)/\(file)"
+                if (try? FileManager.default.removeItem(atPath: fullPath)) != nil {
+                    resyncOutput += "Removed: \(file)\n"
+                }
+            }
+        }
+
+        resyncOutput += "\nStarting resync...\n\n"
+
+        // Small delay then run resync
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+            self.isRunningResync = false
+            self.runResync()
+        }
+    }
+
+    private func createCheckFilesAndSync() {
+        isRunningResync = true
+        resyncOutput = "Creating RCLONE_TEST check files...\n"
+        showResyncOutput = true
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            // Create local RCLONE_TEST file
+            let localTestFile = (localSyncPath as NSString).appendingPathComponent("RCLONE_TEST")
+            let testContent = "rclone test file - do not delete\n"
+
+            do {
+                try testContent.write(toFile: localTestFile, atomically: true, encoding: .utf8)
+                DispatchQueue.main.async {
+                    resyncOutput += "✓ Created local RCLONE_TEST file\n"
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    resyncOutput += "✗ Failed to create local file: \(error.localizedDescription)\n"
+                    isRunningResync = false
+                }
+                return
+            }
+
+            // Create remote RCLONE_TEST file using rclone
+            let rclonePaths = ["/opt/homebrew/bin/rclone", "/usr/local/bin/rclone", "/usr/bin/rclone"]
+            var rclonePath: String?
+
+            for path in rclonePaths {
+                if FileManager.default.fileExists(atPath: path) {
+                    rclonePath = path
+                    break
+                }
+            }
+
+            guard let path = rclonePath else {
+                DispatchQueue.main.async {
+                    resyncOutput += "✗ rclone not found\n"
+                    isRunningResync = false
+                }
+                return
+            }
+
+            // Copy the local test file to remote
+            let remoteDest = "\(rcloneRemote):\(remotePath)/RCLONE_TEST"
+            let process = Process()
+            let pipe = Pipe()
+
+            process.executableURL = URL(fileURLWithPath: path)
+            process.arguments = ["copyto", localTestFile, remoteDest]
+            process.standardOutput = pipe
+            process.standardError = pipe
+
+            DispatchQueue.main.async {
+                resyncOutput += "Running: rclone copyto \"\(localTestFile)\" \"\(remoteDest)\"\n"
+            }
+
+            do {
+                try process.run()
+                process.waitUntilExit()
+
+                let data = pipe.fileHandleForReading.readDataToEndOfFile()
+                let output = String(data: data, encoding: .utf8) ?? ""
+
+                DispatchQueue.main.async {
+                    if !output.isEmpty {
+                        resyncOutput += output + "\n"
+                    }
+
+                    if process.terminationStatus == 0 {
+                        resyncOutput += "✓ Created remote RCLONE_TEST file\n\n"
+                        resyncOutput += "Now running sync...\n\n"
+
+                        // Run sync after creating files
+                        isRunningResync = false
+                        syncManager.triggerManualSync(for: profile)
+                    } else {
+                        resyncOutput += "✗ Failed to create remote file (exit code \(process.terminationStatus))\n"
+                        isRunningResync = false
+                    }
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    resyncOutput += "✗ Error: \(error.localizedDescription)\n"
+                    isRunningResync = false
+                }
+            }
         }
     }
 }
