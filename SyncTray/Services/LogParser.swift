@@ -4,11 +4,12 @@ struct ParsedLogEvent {
     enum EventType {
         case syncStarted
         case syncCompleted
-        case syncFailed(exitCode: Int)
+        case syncFailed(exitCode: Int, message: String?)
         case driveNotMounted
         case syncAlreadyRunning
         case fileChange(FileChange)
         case stats(transfers: Int, errors: Int)
+        case errorMessage(String)
         case unknown
     }
 
@@ -78,10 +79,35 @@ final class LogParser {
 
         // Check message for sync events (in JSON format)
         let msg = stripANSI(entry.msg)
+
+        // Capture error messages from rclone
+        if entry.level == "error" {
+            // Extract meaningful error message
+            var errorMsg = msg
+
+            // Clean up common rclone error prefixes
+            if let range = errorMsg.range(of: "Bisync critical error: ") {
+                errorMsg = String(errorMsg[range.upperBound...])
+            } else if let range = errorMsg.range(of: "Bisync aborted. ") {
+                errorMsg = String(errorMsg[range.upperBound...])
+            }
+
+            // Truncate very long messages
+            if errorMsg.count > 200 {
+                errorMsg = String(errorMsg.prefix(200)) + "..."
+            }
+
+            return ParsedLogEvent(
+                timestamp: timestamp,
+                type: .errorMessage(errorMsg),
+                rawLine: line
+            )
+        }
+
         if msg.contains("Failed to bisync") {
             return ParsedLogEvent(
                 timestamp: timestamp,
-                type: .syncFailed(exitCode: 1),
+                type: .syncFailed(exitCode: 1, message: msg),
                 rawLine: line
             )
         }
@@ -136,9 +162,9 @@ final class LogParser {
                let match = regex.firstMatch(in: message, range: NSRange(message.startIndex..., in: message)),
                let codeRange = Range(match.range(at: 1), in: message),
                let code = Int(message[codeRange]) {
-                return .syncFailed(exitCode: code)
+                return .syncFailed(exitCode: code, message: nil)
             }
-            return .syncFailed(exitCode: -1)
+            return .syncFailed(exitCode: -1, message: nil)
         }
 
         if lowercased.contains("drive not mounted") || lowercased.contains("not mounted") {

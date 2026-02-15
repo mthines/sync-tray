@@ -74,6 +74,9 @@ struct MenuBarIcon: View {
 }
 
 class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDelegate {
+    /// Profile ID to select when Settings window opens (set from notification tap)
+    static var pendingProfileSelection: UUID?
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         UNUserNotificationCenter.current().delegate = self
         requestNotificationPermissions()
@@ -91,8 +94,33 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
     func userNotificationCenter(_ center: UNUserNotificationCenter,
                                 didReceive response: UNNotificationResponse,
                                 withCompletionHandler completionHandler: @escaping () -> Void) {
-        if response.actionIdentifier == "OPEN_DIRECTORY" || response.actionIdentifier == UNNotificationDefaultActionIdentifier {
-            if let urlString = response.notification.request.content.userInfo["directoryPath"] as? String {
+        let userInfo = response.notification.request.content.userInfo
+
+        // Check if this notification has a profile ID (error notification)
+        if let profileIdString = userInfo["profileId"] as? String,
+           let profileId = UUID(uuidString: profileIdString) {
+            // Store the profile ID and open Settings
+            AppDelegate.pendingProfileSelection = profileId
+
+            // Post notification to select the profile
+            NotificationCenter.default.post(
+                name: .selectProfile,
+                object: nil,
+                userInfo: ["profileId": profileId]
+            )
+
+            // Open Settings window
+            DispatchQueue.main.async {
+                if #available(macOS 14.0, *) {
+                    NSApp.activate()
+                } else {
+                    NSApp.activate(ignoringOtherApps: true)
+                }
+                NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil)
+            }
+        } else if response.actionIdentifier == "OPEN_DIRECTORY" || response.actionIdentifier == UNNotificationDefaultActionIdentifier {
+            // Open directory action
+            if let urlString = userInfo["directoryPath"] as? String {
                 let url = URL(fileURLWithPath: urlString)
                 NSWorkspace.shared.open(url)
             }
@@ -106,4 +134,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
                                 withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void) {
         completionHandler([.banner, .sound])
     }
+}
+
+extension Notification.Name {
+    static let selectProfile = Notification.Name("selectProfile")
 }

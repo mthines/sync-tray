@@ -13,6 +13,9 @@ final class SyncManager: ObservableObject {
     /// State per profile (keyed by profile ID)
     @Published private(set) var profileStates: [UUID: SyncState] = [:]
 
+    /// Last error message per profile (for display in UI)
+    @Published private(set) var profileErrors: [UUID: String] = [:]
+
     let profileStore: ProfileStore
 
     private var logWatchers: [UUID: LogWatcher] = [:]
@@ -184,6 +187,66 @@ final class SyncManager: ObservableObject {
     /// Get state for a specific profile
     func state(for profileId: UUID) -> SyncState {
         profileStates[profileId] ?? .idle
+    }
+
+    /// Get last error message for a specific profile
+    func lastError(for profileId: UUID) -> String? {
+        // If we have a cached error, return it
+        if let error = profileErrors[profileId] {
+            return error
+        }
+
+        // Otherwise, try to read the last error from the log file
+        guard let profile = profileStore.profile(for: profileId) else { return nil }
+        return readLastErrorFromLog(profile.logPath)
+    }
+
+    /// Read the last error message from a log file
+    private func readLastErrorFromLog(_ logPath: String) -> String? {
+        guard FileManager.default.fileExists(atPath: logPath),
+              let data = FileManager.default.contents(atPath: logPath),
+              let content = String(data: data, encoding: .utf8) else {
+            return nil
+        }
+
+        // Look for error lines in reverse order (most recent first)
+        let lines = content.components(separatedBy: .newlines).reversed()
+
+        for line in lines {
+            // Check for rclone JSON error messages
+            if line.contains("\"level\":\"error\"") {
+                // Parse the error message from JSON
+                if let msgRange = line.range(of: "\"msg\":\""),
+                   let endRange = line[msgRange.upperBound...].range(of: "\"") {
+                    var errorMsg = String(line[msgRange.upperBound..<endRange.lowerBound])
+
+                    // Clean up ANSI codes and common prefixes
+                    errorMsg = errorMsg.replacingOccurrences(of: "\\u001b[", with: "", options: .regularExpression)
+                    errorMsg = errorMsg.replacingOccurrences(of: #"\[\d+m"#, with: "", options: .regularExpression)
+
+                    if let range = errorMsg.range(of: "Bisync critical error: ") {
+                        errorMsg = String(errorMsg[range.upperBound...])
+                    } else if let range = errorMsg.range(of: "Bisync aborted. ") {
+                        errorMsg = String(errorMsg[range.upperBound...])
+                    }
+
+                    // Truncate if too long
+                    if errorMsg.count > 300 {
+                        errorMsg = String(errorMsg.prefix(300)) + "..."
+                    }
+
+                    return errorMsg.isEmpty ? nil : errorMsg
+                }
+            }
+
+            // Check for plain text error markers
+            if line.contains("Bisync failed with exit code") {
+                // Try to find the preceding error message
+                continue
+            }
+        }
+
+        return nil
     }
 
     // MARK: - Private Methods
@@ -390,19 +453,34 @@ final class SyncManager: ObservableObject {
         switch event.type {
         case .syncStarted:
             profileStates[profileId] = .syncing
+            profileErrors[profileId] = nil  // Clear previous error on new sync
             currentSyncChanges.removeAll()
             notificationService.notifySyncStarted()
 
         case .syncCompleted:
             profileStates[profileId] = .idle
+            profileErrors[profileId] = nil  // Clear error on success
             lastSyncTime = event.timestamp
             notificationService.notifySyncCompleted(changesCount: currentSyncChanges.count)
             currentSyncChanges.removeAll()
 
-        case .syncFailed(let exitCode):
+        case .syncFailed(let exitCode, let message):
+            let errorMsg = message ?? "Exit code \(exitCode)"
             profileStates[profileId] = .error("Exit code \(exitCode)")
-            notificationService.notifySyncError("Sync failed with exit code \(exitCode)")
+            if let msg = message {
+                profileErrors[profileId] = msg
+            }
+            let profile = profileStore.profile(for: profileId)
+            notificationService.notifySyncError(
+                "Sync failed: \(errorMsg)",
+                profileId: profileId,
+                profileName: profile?.name
+            )
             currentSyncChanges.removeAll()
+
+        case .errorMessage(let message):
+            // Store error message for display (don't change state yet, wait for syncFailed)
+            profileErrors[profileId] = message
 
         case .driveNotMounted:
             profileStates[profileId] = .driveNotMounted
