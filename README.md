@@ -42,8 +42,8 @@ Download the latest `.app` from [Releases](../../releases) and drag to `/Applica
 
 ### Option 2: Build from Source
 ```bash
-git clone https://github.com/yourusername/SyncTray.git
-cd SyncTray
+git clone https://github.com/mthines/sync-tray.git
+cd sync-tray
 xcodebuild -project SyncTray.xcodeproj -scheme SyncTray -configuration Release build
 ```
 
@@ -155,6 +155,57 @@ SyncTray parses both JSON logs (from `--use-json-log`) and plain text markers:
 | Red warning triangle | Error |
 | Orange drive with X | Drive not mounted |
 | Yellow gear | Setup required |
+
+## Development
+
+### Building for Development
+
+```bash
+git clone https://github.com/mthines/sync-tray.git
+cd sync-tray
+xcodebuild -project SyncTray.xcodeproj -scheme SyncTray -configuration Debug build
+```
+
+### Commit Convention
+
+This project uses [Conventional Commits](https://www.conventionalcommits.org/) for automatic versioning:
+
+| Prefix | Version Bump | Example |
+|--------|-------------|---------|
+| `feat:` | Minor (0.X.0) | `feat: add dark mode support` |
+| `fix:` | Patch (0.0.X) | `fix: resolve crash on launch` |
+| `BREAKING CHANGE:` or `feat!:` | Major (X.0.0) | `feat!: redesign settings API` |
+| `chore:`, `docs:`, `refactor:` | Patch | `chore: update dependencies` |
+
+### Creating a Release
+
+The project includes an automated release script that handles versioning, building, and GitHub releases:
+
+```bash
+# Auto-detect version bump from commits
+./scripts/release.sh
+
+# Or specify bump type
+./scripts/release.sh --major
+./scripts/release.sh --minor
+./scripts/release.sh --patch
+
+# Or set exact version
+./scripts/release.sh v1.2.3
+```
+
+**What the script does:**
+1. Analyzes commits since last tag to determine version bump
+2. Updates `Info.plist` with the new version
+3. Creates a git tag
+4. Builds the Release configuration
+5. Creates `SyncTray-vX.Y.Z-macOS.zip`
+6. Generates changelog from commit history
+7. Pushes tag and creates GitHub release (with confirmation)
+
+**Requirements:**
+- Clean working directory (no uncommitted changes)
+- [GitHub CLI](https://cli.github.com/) (`brew install gh`) for creating releases
 
 ## Contributing
 
