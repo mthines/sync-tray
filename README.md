@@ -15,6 +15,10 @@
   <img src="https://img.shields.io/badge/License-MIT-green" alt="License: MIT">
 </p>
 
+<p align="center">
+  <img src="/docs/assets/settings.png" alt="SyncTray Logo" height="500">
+</p>
+
 ---
 
 ## What is SyncTray?
@@ -33,6 +37,10 @@ Instead of running complex terminal commands, SyncTray gives you:
 
 Think of it as a lightweight sync client that works with any rclone remote you've already configured.
 
+<p align="center">
+  <img src="/docs/assets/notification.png" alt="SyncTray Logo" height="450">
+</p>
+
 ## Features
 
 ### Live Status Monitoring
@@ -45,20 +53,11 @@ Think of it as a lightweight sync client that works with any rclone remote you'v
 - Click notifications to open the sync directory
 - Error notifications with actionable details
 
-<p align="center">
-  <img src="/docs/assets/notification.png" alt="SyncTray Logo" width="732" height="1120">
-</p>
-
 ### Multi-Profile Support
 - Create unlimited sync profiles (Work, Personal, Archive, etc.)
 - Each profile syncs on its own schedule
 - Independent enable/disable per profile
 - Per-profile status indicators in the menu
-
-<p align="center">
-  <img src="/docs/assets/settings.png" alt="SyncTray Logo" width="1624" height="1588">
-</p>
-
 
 ### Recent Changes
 - View last 20 synced files in the menu dropdown
@@ -75,10 +74,6 @@ Think of it as a lightweight sync client that works with any rclone remote you'v
 - **Sync Now**: Trigger immediate sync for all enabled profiles
 - **Open Directory**: Jump to your local sync folder
 - **View Log**: Open the sync log for troubleshooting
-
-## Screenshots
-
-*Coming soon*
 
 ## Requirements
 
