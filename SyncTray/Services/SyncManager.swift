@@ -9,6 +9,7 @@ final class SyncManager: ObservableObject {
     @Published private(set) var lastSyncTime: Date?
     @Published private(set) var recentChanges: [FileChange] = []
     @Published private(set) var isManualSyncRunning = false
+    @Published private(set) var syncProgress: SyncProgress?
 
     /// State per profile (keyed by profile ID)
     @Published private(set) var profileStates: [UUID: SyncState] = [:]
@@ -497,12 +498,14 @@ final class SyncManager: ObservableObject {
         case .syncStarted:
             profileStates[profileId] = .syncing
             profileErrors[profileId] = nil  // Clear previous error on new sync
+            syncProgress = nil  // Reset progress for new sync
             currentSyncChanges.removeAll()
             notificationService.notifySyncStarted()
 
         case .syncCompleted:
             profileStates[profileId] = .idle
             profileErrors[profileId] = nil  // Clear error on success
+            syncProgress = nil  // Clear progress when sync completes
             lastSyncTime = event.timestamp
             notificationService.notifySyncCompleted(changesCount: currentSyncChanges.count)
             currentSyncChanges.removeAll()
@@ -510,6 +513,7 @@ final class SyncManager: ObservableObject {
         case .syncFailed(let exitCode, let message):
             let errorMsg = message ?? "Exit code \(exitCode)"
             profileStates[profileId] = .error("Exit code \(exitCode)")
+            syncProgress = nil  // Clear progress on failure
             if let msg = message {
                 profileErrors[profileId] = msg
             }
@@ -537,8 +541,17 @@ final class SyncManager: ObservableObject {
             addRecentChange(change)
             notificationService.notifyFileChange(change)
 
-        case .stats:
-            break
+        case .stats(let stats):
+            if let bytes = stats.bytes, let totalBytes = stats.totalBytes, totalBytes > 0 {
+                syncProgress = SyncProgress(
+                    bytesTransferred: Int64(bytes),
+                    totalBytes: Int64(totalBytes),
+                    eta: stats.eta,
+                    speed: stats.speed,
+                    transfersDone: stats.transfers ?? 0,
+                    totalTransfers: stats.totalTransfers ?? 0
+                )
+            }
 
         case .unknown:
             break

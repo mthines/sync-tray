@@ -10,8 +10,13 @@ struct StatusHeaderView: View {
                 .frame(width: 36, height: 36)
 
             VStack(alignment: .leading, spacing: 2) {
-                Text(syncManager.currentState.statusText)
-                    .font(.headline)
+                if syncManager.currentState == .syncing, let progress = syncManager.syncProgress {
+                    Text(progress.formattedProgress)
+                        .font(.headline)
+                } else {
+                    Text(syncManager.currentState.statusText)
+                        .font(.headline)
+                }
 
                 if let lastSync = syncManager.lastSyncTime {
                     Text("Last sync: \(lastSync, formatter: relativeDateFormatter)")

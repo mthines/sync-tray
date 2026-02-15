@@ -1,5 +1,37 @@
 import SwiftUI
 
+struct SyncProgress: Equatable {
+    let bytesTransferred: Int64
+    let totalBytes: Int64
+    let eta: Int?          // seconds
+    let speed: Double?     // bytes/sec
+    let transfersDone: Int
+    let totalTransfers: Int
+
+    var percentage: Double {
+        guard totalBytes > 0 else { return 0 }
+        return Double(bytesTransferred) / Double(totalBytes) * 100
+    }
+
+    var formattedProgress: String {
+        let transferred = ByteCountFormatter.string(fromByteCount: bytesTransferred, countStyle: .file)
+        let total = ByteCountFormatter.string(fromByteCount: totalBytes, countStyle: .file)
+        let pct = Int(percentage)
+
+        if let eta = eta, eta > 0 {
+            let etaStr = formatETA(eta)
+            return "Syncing: \(transferred) / \(total) (\(pct)%) - ETA \(etaStr)"
+        }
+        return "Syncing: \(transferred) / \(total) (\(pct)%)"
+    }
+
+    private func formatETA(_ seconds: Int) -> String {
+        if seconds < 60 { return "\(seconds)s" }
+        if seconds < 3600 { return "\(seconds / 60)m \(seconds % 60)s" }
+        return "\(seconds / 3600)h \(seconds % 3600 / 60)m"
+    }
+}
+
 enum SyncState: Equatable {
     case idle
     case syncing

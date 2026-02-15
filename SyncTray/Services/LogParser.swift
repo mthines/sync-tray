@@ -8,7 +8,7 @@ struct ParsedLogEvent {
         case driveNotMounted
         case syncAlreadyRunning
         case fileChange(FileChange)
-        case stats(transfers: Int, errors: Int)
+        case stats(RcloneStats)
         case errorMessage(String)
         case unknown
     }
@@ -72,7 +72,7 @@ final class LogParser {
         if let stats = entry.stats {
             return ParsedLogEvent(
                 timestamp: timestamp,
-                type: .stats(transfers: stats.transfers ?? 0, errors: stats.errors ?? 0),
+                type: .stats(stats),
                 rawLine: line
             )
         }

@@ -49,20 +49,45 @@ extension RcloneLogEntry {
     }
 
     var fileChange: FileChange? {
-        guard let objectPath = object, !objectPath.isEmpty else {
+        // First, try with the object field (standard rclone format)
+        if let objectPath = object, !objectPath.isEmpty {
+            if let operation = parseOperation(from: msg) {
+                return FileChange(
+                    timestamp: date ?? Date(),
+                    path: objectPath,
+                    operation: operation
+                )
+            }
+        }
+
+        // Fall back to parsing bisync-style messages
+        return parseBisyncFileChange(from: msg)
+    }
+
+    /// Parse bisync-style messages like:
+    /// - "- Path1    File was deleted          - KAIJU/file.mp4"
+    /// - "- Path2    File is new               - folder/newfile.txt"
+    private func parseBisyncFileChange(from message: String) -> FileChange? {
+        let pattern = #"- Path[12]\s+(.+?)\s+-\s+(.+)$"#
+        guard let regex = try? NSRegularExpression(pattern: pattern),
+              let match = regex.firstMatch(in: message, range: NSRange(message.startIndex..., in: message)),
+              let opRange = Range(match.range(at: 1), in: message),
+              let pathRange = Range(match.range(at: 2), in: message) else {
             return nil
         }
 
-        let operation = parseOperation(from: msg)
-        guard operation != nil else {
-            return nil
-        }
+        let opText = String(message[opRange]).lowercased()
+        let filePath = String(message[pathRange])
+            .trimmingCharacters(in: .whitespaces)
+            .trimmingCharacters(in: CharacterSet(charactersIn: "\""))
 
-        return FileChange(
-            timestamp: date ?? Date(),
-            path: objectPath,
-            operation: operation!
-        )
+        let operation: FileChange.Operation?
+        if opText.contains("deleted") { operation = .deleted }
+        else if opText.contains("new") { operation = .copied }
+        else if opText.contains("changed") || opText.contains("newer") || opText.contains("older") { operation = .updated }
+        else { return nil }
+
+        return FileChange(timestamp: date ?? Date(), path: filePath, operation: operation!)
     }
 
     private func parseOperation(from message: String) -> FileChange.Operation? {
