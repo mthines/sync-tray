@@ -3,11 +3,26 @@ import UniformTypeIdentifiers
 
 struct SettingsView: View {
     @EnvironmentObject var syncManager: SyncManager
+    @Environment(\.dismiss) private var dismiss
 
     @State private var logFilePath: String = SyncTraySettings.logFilePath
     @State private var syncScriptPath: String = SyncTraySettings.syncScriptPath
     @State private var syncDirectoryPath: String = SyncTraySettings.syncDirectoryPath
     @State private var drivePathToMonitor: String = SyncTraySettings.drivePathToMonitor
+
+    private var hasChanges: Bool {
+        logFilePath != SyncTraySettings.logFilePath ||
+        syncScriptPath != SyncTraySettings.syncScriptPath ||
+        syncDirectoryPath != SyncTraySettings.syncDirectoryPath ||
+        drivePathToMonitor != SyncTraySettings.drivePathToMonitor
+    }
+
+    private var isAtDefaults: Bool {
+        logFilePath == SyncTraySettings.defaultLogFilePath &&
+        syncScriptPath == SyncTraySettings.defaultSyncScriptPath &&
+        syncDirectoryPath == "" &&
+        drivePathToMonitor == ""
+    }
 
     var body: some View {
         Form {
@@ -96,14 +111,24 @@ struct SettingsView: View {
 
             Section {
                 HStack {
+                    if hasChanges {
+                        Text("You have unsaved changes")
+                            .font(.caption)
+                            .foregroundColor(.orange)
+                    }
                     Spacer()
                     Button("Reset to Defaults") {
                         resetToDefaults()
                     }
+                    .disabled(isAtDefaults)
+
                     Button("Save") {
                         saveSettings()
+                        dismiss()
                     }
                     .keyboardShortcut(.defaultAction)
+                    .disabled(!hasChanges)
+                    .buttonStyle(.borderedProminent)
                 }
                 .padding()
             }
