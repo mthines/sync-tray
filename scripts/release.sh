@@ -187,7 +187,7 @@ create_zip() {
     fi
 
     cd "$BUILD_DIR/DerivedData/Build/Products/Release"
-    zip -r "$zip_path" "${PROJECT_NAME}.app"
+    zip -rq "$zip_path" "${PROJECT_NAME}.app"
 
     log_success "Created $zip_name ($(du -h "$zip_path" | cut -f1))"
     echo "$zip_path"
@@ -202,32 +202,18 @@ create_github_release() {
     if ! command -v gh &> /dev/null; then
         log_warning "GitHub CLI (gh) not installed. Skipping GitHub release."
         log_info "Install with: brew install gh"
+        log_info "Then run: gh release create $version \"$zip_path\" --title \"$PROJECT_NAME $version\" --notes-file -"
         return
     fi
 
-    # Verify zip exists
-    if [ ! -f "$zip_path" ]; then
-        log_error "Zip file not found: $zip_path"
-    fi
-
     log_info "Creating GitHub release..."
-    log_info "Uploading: $zip_path"
 
-    # Write changelog to temp file (more reliable than piping)
-    local notes_file=$(mktemp)
-    echo "$changelog" > "$notes_file"
-
-    if gh release create "$version" \
+    echo "$changelog" | gh release create "$version" \
         "$zip_path" \
         --title "${PROJECT_NAME} ${version}" \
-        --notes-file "$notes_file" \
-        --verify-tag; then
-        log_success "GitHub release created: $version"
-    else
-        log_error "Failed to create GitHub release"
-    fi
+        --notes-file -
 
-    rm -f "$notes_file"
+    log_success "GitHub release created: $version"
 }
 
 # =============================================================================
