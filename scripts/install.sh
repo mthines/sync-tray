@@ -13,14 +13,22 @@ INSTALL_PATH="/Applications/$APP_NAME.app"
 echo "Cleaning build artifacts..."
 rm -rf "$BUILD_DIR"
 DERIVED_DATA="$HOME/Library/Developer/Xcode/DerivedData"
-if ls "$DERIVED_DATA"/SyncTray-* 1>/dev/null 2>&1; then
-    echo "Removing DerivedData: $(ls -d "$DERIVED_DATA"/SyncTray-*)"
-    rm -rf "$DERIVED_DATA"/SyncTray-*
-fi
+# Remove ALL SyncTray DerivedData to force full recompile
+rm -rf "$DERIVED_DATA"/SyncTray-* 2>/dev/null && echo "Removed DerivedData cache"
+# Also clean via xcodebuild
 xcodebuild -scheme SyncTray clean -quiet 2>/dev/null || true
 
-echo "Building $APP_NAME..."
-xcodebuild -scheme SyncTray -configuration Debug build -quiet SYMROOT="$BUILD_DIR"
+echo "Building $APP_NAME (full rebuild)..."
+# Build with explicit derived data path to ensure clean state
+xcodebuild -scheme SyncTray -configuration Debug build \
+    SYMROOT="$BUILD_DIR" \
+    -derivedDataPath "$BUILD_DIR/DerivedData" \
+    2>&1 | grep -E "(error:|warning:.*error|BUILD)" || true
+
+if [ ! -d "$BUILD_PATH" ]; then
+    echo "ERROR: Build failed - no app bundle found"
+    exit 1
+fi
 echo "Build succeeded"
 
 # Kill running app if present
