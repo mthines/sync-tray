@@ -15,5 +15,11 @@
             "command": "sh ./scripts/install.sh",
             "problemMatcher": []
         },
+        {
+            "label": "install:launch",
+            "type": "shell",
+            "command": "sh ./scripts/install.sh --launch",
+            "problemMatcher": []
+        },
     ]
 }
