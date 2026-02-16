@@ -44,6 +44,11 @@ struct SyncProfile: Identifiable, Codable, Equatable {
         "\(NSHomeDirectory())/.local/log/synctray-sync-\(shortId).log"
     }
 
+    /// Profile-specific exclude filter file
+    var filterFilePath: String {
+        "\(Self.configDirectory)/\(shortId)-exclude.txt"
+    }
+
     var launchdLabel: String {
         "com.synctray.sync.\(shortId)"
     }

@@ -511,23 +511,27 @@ final class SyncManager: ObservableObject {
             currentSyncChanges.removeAll()
 
         case .syncFailed(let exitCode, let message):
-            let errorMsg = message ?? "Exit code \(exitCode)"
             profileStates[profileId] = .error("Exit code \(exitCode)")
             syncProgress = nil  // Clear progress on failure
-            if let msg = message {
+            // Only use the syncFailed message if we don't already have a more specific error
+            if profileErrors[profileId] == nil, let msg = message {
                 profileErrors[profileId] = msg
             }
             let profile = profileStore.profile(for: profileId)
+            let errorDescription = profileErrors[profileId] ?? message ?? "Exit code \(exitCode)"
             notificationService.notifySyncError(
-                "Sync failed: \(errorMsg)",
+                "Sync failed: \(errorDescription)",
                 profileId: profileId,
                 profileName: profile?.name
             )
             currentSyncChanges.removeAll()
 
         case .errorMessage(let message):
-            // Store error message for display (don't change state yet, wait for syncFailed)
-            profileErrors[profileId] = message
+            // Store first error message for display - don't overwrite with subsequent less-specific errors
+            // (e.g., keep "path1 and path2 are out of sync" instead of generic "Bisync aborted")
+            if profileErrors[profileId] == nil {
+                profileErrors[profileId] = message
+            }
 
         case .driveNotMounted:
             profileStates[profileId] = .driveNotMounted

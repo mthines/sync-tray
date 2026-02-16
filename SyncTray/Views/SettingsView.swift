@@ -552,6 +552,7 @@ struct ProfileDetailView: View {
                         .foregroundColor(.secondary)
                     filePathLink(label: "Script", path: SyncProfile.sharedScriptPath)
                     filePathLink(label: "Config", path: profile.configPath)
+                    filePathLink(label: "Exclude Filter", path: profile.filterFilePath)
                     filePathLink(label: "Schedule", path: profile.plistPath)
                     filePathLink(label: "Log", path: profile.logPath)
                 }
@@ -1161,8 +1162,9 @@ struct ProfileDetailView: View {
             return .unlockAndResync
         }
 
-        // Missing baseline - needs resync
-        if error.contains("cannot find prior") || error.contains("--resync") {
+        // Missing baseline or out of sync - needs resync
+        if error.contains("cannot find prior") || error.contains("--resync") ||
+           error.contains("out of sync") || error.contains("resync to recover") {
             return .resync
         }
 

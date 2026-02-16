@@ -13,6 +13,28 @@ final class SyncSetupService {
     /// Note: rclone's --check-filename expects a filename, not a path
     static let checkFileName = ".synctray-check"
 
+    /// Default content for the exclude filter file
+    private static let defaultExcludeFilter = """
+# macOS metadata
+._*
+.DS_Store
+.fseventsd
+
+# Windows thumbs/previews
+Thumbs.db
+Thumbs.db:Encryptable
+ehthumbs.db
+desktop.ini
+
+# Synology-specific (thumbnail caches)
+@eaDir/**
+
+# Other temp/junk
+*.tmp
+*.temp
+~$*
+"""
+
     // MARK: - Rclone Path Helper
 
     private func findRclonePath() -> String? {
@@ -70,6 +92,9 @@ final class SyncSetupService {
         let config = generateProfileConfig(for: profile)
         try config.write(toFile: profile.configPath, atomically: true, encoding: .utf8)
 
+        // Generate and write exclude filter (preserves existing user edits)
+        try writeExcludeFilter(for: profile)
+
         // Generate and write plist
         let plist = generateLaunchdPlist(for: profile)
         try plist.write(toFile: profile.plistPath, atomically: true, encoding: .utf8)
@@ -99,6 +124,10 @@ final class SyncSetupService {
 
         if fm.fileExists(atPath: profile.configPath) {
             try fm.removeItem(atPath: profile.configPath)
+        }
+
+        if fm.fileExists(atPath: profile.filterFilePath) {
+            try fm.removeItem(atPath: profile.filterFilePath)
         }
 
         // Note: We don't remove the shared script as other profiles may use it
@@ -249,6 +278,7 @@ final class SyncSetupService {
         LOCK_FILE=$(parse_json "lockFile" "")
         DRIVE_PATH=$(parse_json "drivePath" "")
         ADDITIONAL_FLAGS=$(parse_json "additionalFlags" "")
+        FILTER_FILE=$(parse_json "filterPath" "")
 
         if [[ -z "$REMOTE" || -z "$LOCAL_PATH" ]]; then
             echo "Error: Invalid config - missing remote or localPath"
@@ -280,7 +310,7 @@ final class SyncSetupService {
         echo "$(date '+%Y-%m-%d %H:%M:%S') - Starting bisync" >> "$LOG_FILE"
 
         # Build rclone command
-        RCLONE_CMD="/opt/homebrew/bin/rclone bisync \\"$REMOTE\\" \\"$LOCAL_PATH\\" --verbose --use-json-log --check-access --check-filename .synctray-check --resilient --recover --conflict-resolve newer --conflict-loser num --conflict-suffix sync-conflict-{DateOnly}-"
+        RCLONE_CMD="/opt/homebrew/bin/rclone bisync \\"$REMOTE\\" \\"$LOCAL_PATH\\" --verbose --use-json-log --filter-from \\"$FILTER_FILE\\" --check-access --check-filename .synctray-check --resilient --recover --conflict-resolve newer --conflict-loser num --conflict-suffix sync-conflict-{DateOnly}-"
 
         if [[ -n "$ADDITIONAL_FLAGS" ]]; then
             RCLONE_CMD="$RCLONE_CMD $ADDITIONAL_FLAGS"
@@ -312,6 +342,7 @@ final class SyncSetupService {
             "lockFile": profile.lockFilePath,
             "drivePath": profile.drivePathToMonitor,
             "additionalFlags": profile.additionalRcloneFlags,
+            "filterPath": profile.filterFilePath,
             "syncIntervalMinutes": profile.syncIntervalMinutes
         ]
 
@@ -391,6 +422,15 @@ final class SyncSetupService {
         let agentsDir = (profile.plistPath as NSString).deletingLastPathComponent
         if !fm.fileExists(atPath: agentsDir) {
             try fm.createDirectory(atPath: agentsDir, withIntermediateDirectories: true)
+        }
+    }
+
+    /// Write the exclude filter file for a profile (only if it doesn't exist)
+    private func writeExcludeFilter(for profile: SyncProfile) throws {
+        let filterPath = profile.filterFilePath
+        // Only create if it doesn't exist (preserve user edits)
+        if !FileManager.default.fileExists(atPath: filterPath) {
+            try Self.defaultExcludeFilter.write(toFile: filterPath, atomically: true, encoding: .utf8)
         }
     }
 
