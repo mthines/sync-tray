@@ -34,6 +34,7 @@ final class SyncManager: ObservableObject {
         self.profileStore = profileStore ?? ProfileStore()
         setupWorkspaceObserver()
         setupProfileObserver()
+        cleanupStaleLockFiles()
         checkInitialState()
         startWatchingAllProfiles()
     }
@@ -191,15 +192,18 @@ final class SyncManager: ObservableObject {
     }
 
     /// Get last error message for a specific profile
+    /// Only returns errors detected during this session (not persisted across app restarts)
     func lastError(for profileId: UUID) -> String? {
-        // If we have a cached error, return it
-        if let error = profileErrors[profileId] {
-            return error
-        }
+        return profileErrors[profileId]
+    }
 
-        // Otherwise, try to read the last error from the log file
-        guard let profile = profileStore.profile(for: profileId) else { return nil }
-        return readLastErrorFromLog(profile.logPath)
+    /// Clear the cached error for a profile (call when config changes or fix is attempted)
+    func clearError(for profileId: UUID) {
+        profileErrors[profileId] = nil
+        if case .error = profileStates[profileId] {
+            profileStates[profileId] = .idle
+        }
+        updateAggregateState()
     }
 
     /// Read the last error message from a log file
@@ -213,6 +217,7 @@ final class SyncManager: ObservableObject {
         // Look for error lines in reverse order (most recent first)
         let lines = content.components(separatedBy: .newlines).reversed()
         var errorMessages: [String] = []
+        var criticalErrors: [String] = []  // Track critical/actionable errors separately
         var foundFailedMarker = false
 
         for line in lines {
@@ -235,57 +240,107 @@ final class SyncManager: ObservableObject {
             // Only collect errors after we found the failure marker
             guard foundFailedMarker else { continue }
 
+            var errorMsg: String?
+
+            // Check for plain text CRITICAL errors (format: "2026/02/16 06:42:11 CRITICAL: ...")
+            if line.contains("CRITICAL:") {
+                if let range = line.range(of: "CRITICAL: ") {
+                    errorMsg = String(line[range.upperBound...]).trimmingCharacters(in: .whitespaces)
+                }
+            }
             // Check for rclone JSON error messages
-            if line.contains("\"level\":\"error\"") || line.contains("\"level\":\"notice\"") {
+            else if line.contains("\"level\":\"error\"") || line.contains("\"level\":\"notice\"") {
                 // Parse the error message from JSON
                 if let msgRange = line.range(of: "\"msg\":\""),
                    let endRange = line[msgRange.upperBound...].range(of: "\"") {
-                    var errorMsg = String(line[msgRange.upperBound..<endRange.lowerBound])
-
-                    // Clean up ANSI codes
-                    errorMsg = errorMsg.replacingOccurrences(of: "\\u001b[", with: "")
-                    errorMsg = errorMsg.replacingOccurrences(of: #"\[\d+m"#, with: "", options: .regularExpression)
-                    errorMsg = errorMsg.replacingOccurrences(of: "[0m", with: "")
-                    errorMsg = errorMsg.replacingOccurrences(of: "[31m", with: "")
-                    errorMsg = errorMsg.replacingOccurrences(of: "[33m", with: "")
-                    errorMsg = errorMsg.replacingOccurrences(of: "[35m", with: "")
-                    errorMsg = errorMsg.replacingOccurrences(of: "[36m", with: "")
-
-                    // Always skip generic "Bisync aborted" messages - they don't provide useful info
-                    if errorMsg.contains("Bisync aborted") || errorMsg.contains("Failed to bisync") {
-                        continue
-                    }
-
-                    // Clean up prefixes
-                    if let range = errorMsg.range(of: "Bisync critical error: ") {
-                        errorMsg = String(errorMsg[range.upperBound...])
-                    }
-
-                    if !errorMsg.isEmpty && !errorMessages.contains(errorMsg) {
-                        errorMessages.append(errorMsg)
-                    }
-
-                    // Stop after finding 2 meaningful errors
-                    if errorMessages.count >= 2 {
-                        break
-                    }
+                    errorMsg = String(line[msgRange.upperBound..<endRange.lowerBound])
                 }
+            }
+
+            guard var msg = errorMsg else { continue }
+
+            // Clean up ANSI codes
+            msg = msg.replacingOccurrences(of: "\\u001b[", with: "")
+            msg = msg.replacingOccurrences(of: #"\[\d+m"#, with: "", options: .regularExpression)
+            msg = msg.replacingOccurrences(of: "[0m", with: "")
+            msg = msg.replacingOccurrences(of: "[31m", with: "")
+            msg = msg.replacingOccurrences(of: "[33m", with: "")
+            msg = msg.replacingOccurrences(of: "[35m", with: "")
+            msg = msg.replacingOccurrences(of: "[36m", with: "")
+
+            // Always skip generic "Bisync aborted" messages - they don't provide useful info
+            if msg.contains("Bisync aborted") || msg.contains("Failed to bisync") {
+                continue
+            }
+
+            // Clean up prefixes
+            if let range = msg.range(of: "Bisync critical error: ") {
+                msg = String(msg[range.upperBound...])
+            }
+
+            guard !msg.isEmpty else { continue }
+
+            // Track critical/actionable errors separately (they're more useful to show)
+            let isCritical = msg.contains("out of sync") ||
+                            msg.contains("resync") ||
+                            msg.contains("lock file") ||
+                            msg.contains("check file") ||
+                            msg.contains("Access test failed") ||
+                            msg.contains("Failed to initialise") ||
+                            msg.contains("malformed rule")
+
+            if isCritical && !criticalErrors.contains(msg) {
+                criticalErrors.append(msg)
+            } else if !errorMessages.contains(msg) {
+                errorMessages.append(msg)
+            }
+
+            // Stop after finding enough errors
+            if criticalErrors.count >= 1 || errorMessages.count >= 2 {
+                break
             }
         }
 
-        // Return the most specific error found
-        if let firstError = errorMessages.first {
+        // Prefer critical errors over general errors
+        let bestError = criticalErrors.first ?? errorMessages.first
+
+        if let error = bestError {
             // Truncate if too long
-            if firstError.count > 300 {
-                return String(firstError.prefix(300)) + "..."
+            if error.count > 300 {
+                return String(error.prefix(300)) + "..."
             }
-            return firstError
+            return error
         }
 
         return nil
     }
 
     // MARK: - Private Methods
+
+    /// Clean up stale lock files on app startup
+    /// Removes /tmp lock files where the PID is no longer running
+    private func cleanupStaleLockFiles() {
+        let fm = FileManager.default
+
+        for profile in profileStore.profiles {
+            let lockPath = profile.lockFilePath
+            guard fm.fileExists(atPath: lockPath) else { continue }
+
+            // Read PID and check if process is still running
+            if let pidString = try? String(contentsOfFile: lockPath, encoding: .utf8)
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+               let pid = Int32(pidString) {
+                // kill with signal 0 checks if process exists without sending a signal
+                if kill(pid, 0) != 0 {
+                    // Process not running - remove stale lock
+                    try? fm.removeItem(atPath: lockPath)
+                }
+            } else {
+                // Could not read/parse PID - remove the lock file
+                try? fm.removeItem(atPath: lockPath)
+            }
+        }
+    }
 
     private func setupProfileObserver() {
         profileStore.$profiles
@@ -527,9 +582,26 @@ final class SyncManager: ObservableObject {
             currentSyncChanges.removeAll()
 
         case .errorMessage(let message):
-            // Store first error message for display - don't overwrite with subsequent less-specific errors
-            // (e.g., keep "path1 and path2 are out of sync" instead of generic "Bisync aborted")
-            if profileErrors[profileId] == nil {
+            // Prefer critical/actionable errors over file-level errors
+            // Critical errors tell us what to do (e.g., "out of sync", "resync")
+            // File-level errors (e.g., "Path1 file not found") are less actionable
+            let isCriticalError = message.contains("out of sync") ||
+                                  message.contains("resync") ||
+                                  message.contains("critical") ||
+                                  message.contains("lock file") ||
+                                  message.contains("check file") ||
+                                  message.contains("Access test failed")
+            let existingIsCritical = profileErrors[profileId].map { existing in
+                existing.contains("out of sync") ||
+                existing.contains("resync") ||
+                existing.contains("critical") ||
+                existing.contains("lock file") ||
+                existing.contains("check file") ||
+                existing.contains("Access test failed")
+            } ?? false
+
+            // Store error if: no existing error, OR new error is critical and existing isn't
+            if profileErrors[profileId] == nil || (isCriticalError && !existingIsCritical) {
                 profileErrors[profileId] = message
             }
 
@@ -586,13 +658,26 @@ final class SyncManager: ObservableObject {
 
 extension SyncManager: LogWatcherDelegate {
     nonisolated func logWatcher(_ watcher: LogWatcher, didReceiveNewLines lines: [String]) {
-        Task { @MainActor in
-            guard let profileId = profileId(for: watcher) else { return }
+        // Process synchronously when already on main thread for immediate state updates
+        // This fixes the race condition where UI renders before state is updated
+        if Thread.isMainThread {
+            MainActor.assumeIsolated {
+                processLogLinesForWatcher(watcher, lines: lines)
+            }
+        } else {
+            Task { @MainActor in
+                self.processLogLinesForWatcher(watcher, lines: lines)
+            }
+        }
+    }
 
-            for line in lines {
-                if let event = logParser.parse(line: line) {
-                    processLogEvent(event, profileId: profileId)
-                }
+    /// Process log lines for a watcher (must be called on main actor)
+    private func processLogLinesForWatcher(_ watcher: LogWatcher, lines: [String]) {
+        guard let profileId = profileId(for: watcher) else { return }
+
+        for line in lines {
+            if let event = logParser.parse(line: line) {
+                processLogEvent(event, profileId: profileId)
             }
         }
     }

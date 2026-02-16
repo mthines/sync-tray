@@ -12,7 +12,11 @@ struct SyncTrayApp: App {
         Self.performMigrationIfNeeded()
 
         // Create the sync manager
-        _syncManager = StateObject(wrappedValue: SyncManager())
+        let manager = SyncManager()
+        _syncManager = StateObject(wrappedValue: manager)
+
+        // Share with AppDelegate for window creation
+        AppDelegate.sharedSyncManager = manager
     }
 
     var body: some Scene {
@@ -23,11 +27,6 @@ struct SyncTrayApp: App {
             MenuBarIcon(state: syncManager.currentState)
         }
         .menuBarExtraStyle(.window)
-
-        Settings {
-            SettingsView()
-                .environmentObject(syncManager)
-        }
     }
 
     /// Migrate from single-profile to multi-profile if needed
@@ -74,10 +73,24 @@ struct MenuBarIcon: View {
 }
 
 class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDelegate {
+    /// Shared instance for easy access
+    static var shared: AppDelegate?
+
     /// Profile ID to select when Settings window opens (set from notification tap)
     static var pendingProfileSelection: UUID?
 
+    /// Flag to open settings on first view appearance
+    static var shouldOpenSettingsOnLaunch = true
+
+    /// Shared sync manager (set by SyncTrayApp)
+    static var sharedSyncManager: SyncManager?
+
+    /// The settings window
+    private var settingsWindow: NSWindow?
+
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // Store shared instance
+        AppDelegate.shared = self
         // Check if another instance is already running
         let runningApps = NSWorkspace.shared.runningApplications
         let myBundleId = Bundle.main.bundleIdentifier
@@ -96,6 +109,68 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
 
         UNUserNotificationCenter.current().delegate = self
         requestNotificationPermissions()
+
+        // Open Settings window on launch
+        if AppDelegate.shouldOpenSettingsOnLaunch {
+            AppDelegate.shouldOpenSettingsOnLaunch = false
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                self.openSettingsWindow()
+            }
+        }
+    }
+
+    func openSettingsWindow() {
+        print("[SyncTray] openSettingsWindow called, shared=\(AppDelegate.shared != nil), manager=\(AppDelegate.sharedSyncManager != nil)")
+
+        // Activate app first
+        if #available(macOS 14.0, *) {
+            NSApp.activate()
+        } else {
+            NSApp.activate(ignoringOtherApps: true)
+        }
+
+        // If window already exists, just show it
+        if let window = settingsWindow {
+            print("[SyncTray] Showing existing window")
+            window.makeKeyAndOrderFront(nil)
+            // Ensure app is frontmost
+            if #available(macOS 14.0, *) {
+                NSApp.activate()
+            } else {
+                NSApp.activate(ignoringOtherApps: true)
+            }
+            return
+        }
+
+        // Create the settings window with SwiftUI content
+        guard let syncManager = AppDelegate.sharedSyncManager else {
+            print("[SyncTray] ERROR: sharedSyncManager is nil!")
+            return
+        }
+        print("[SyncTray] Creating new settings window")
+
+        let settingsView = SettingsView()
+            .environmentObject(syncManager)
+
+        let hostingController = NSHostingController(rootView: settingsView)
+
+        let window = NSWindow(contentViewController: hostingController)
+        window.title = "SyncTray Settings"
+        window.styleMask = [.titled, .closable, .miniaturizable, .resizable]
+        window.setContentSize(NSSize(width: 700, height: 650))
+        window.minSize = NSSize(width: 600, height: 500)
+        window.center()
+        window.isReleasedWhenClosed = false
+
+        self.settingsWindow = window
+        window.makeKeyAndOrderFront(nil)
+        // Ensure app is frontmost
+        if #available(macOS 14.0, *) {
+            NSApp.activate()
+        } else {
+            NSApp.activate(ignoringOtherApps: true)
+        }
+        print("[SyncTray] Window created and shown")
     }
 
     private func requestNotificationPermissions() {
@@ -119,17 +194,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
             AppDelegate.pendingProfileSelection = profileId
 
             // Open Settings window first, then post notification to select profile
-            // (posting after ensures SettingsView is ready to receive it)
             DispatchQueue.main.async {
-                if #available(macOS 14.0, *) {
-                    NSApp.activate()
-                } else {
-                    NSApp.activate(ignoringOtherApps: true)
-                }
-                NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil)
+                self.openSettingsWindow()
 
                 // Post notification after a short delay to ensure Settings window is ready
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
                     NotificationCenter.default.post(
                         name: .selectProfile,
                         object: nil,
@@ -157,4 +226,5 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
 
 extension Notification.Name {
     static let selectProfile = Notification.Name("selectProfile")
+    static let openSettingsWindow = Notification.Name("openSettingsWindow")
 }

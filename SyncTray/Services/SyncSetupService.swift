@@ -13,27 +13,30 @@ final class SyncSetupService {
     /// Note: rclone's --check-filename expects a filename, not a path
     static let checkFileName = ".synctray-check"
 
-    /// Default content for the exclude filter file
+    /// Default content for the exclude filter file (uses rclone filter-from format)
+    /// Each exclude rule must be prefixed with "- "
     private static let defaultExcludeFilter = """
-# macOS metadata
-._*
-.DS_Store
-.fseventsd
+        # macOS metadata
+        - ._*
+        - .DS_Store
+        - .fseventsd
 
-# Windows thumbs/previews
-Thumbs.db
-Thumbs.db:Encryptable
-ehthumbs.db
-desktop.ini
+        # Windows thumbs/previews
+        - Thumbs.db
+        - Thumbs.db:Encryptable
+        - ehthumbs.db
+        - desktop.ini
 
-# Synology-specific (thumbnail caches)
-@eaDir/**
+        # Synology system folders
+        - #recycle/**
+        - #snapshot/**
+        - @eadir/**
 
-# Other temp/junk
-*.tmp
-*.temp
-~$*
-"""
+        # Other temp/junk
+        - *.tmp
+        - *.temp
+        - ~$*
+        """
 
     // MARK: - Rclone Path Helper
 
@@ -47,9 +50,8 @@ desktop.ini
     /// Check if a profile's scheduled sync is currently installed
     func isInstalled(profile: SyncProfile) -> Bool {
         let fm = FileManager.default
-        return fm.fileExists(atPath: profile.plistPath) &&
-               fm.fileExists(atPath: profile.configPath) &&
-               fm.fileExists(atPath: SyncProfile.sharedScriptPath)
+        return fm.fileExists(atPath: profile.plistPath) && fm.fileExists(atPath: profile.configPath)
+            && fm.fileExists(atPath: SyncProfile.sharedScriptPath)
     }
 
     /// Check if a profile's launchd agent is currently loaded
@@ -106,8 +108,16 @@ desktop.ini
     }
 
     /// Load the launchd agent for a profile (used after deferred install)
-    func loadAgent(for profile: SyncProfile) {
-        _ = runCommand("/bin/launchctl", arguments: ["load", profile.plistPath])
+    /// - Returns: true if agent loaded successfully
+    @discardableResult
+    func loadAgent(for profile: SyncProfile) -> Bool {
+        let plistPath = profile.plistPath
+        print("[SyncTray] loadAgent called for plist: \(plistPath)")
+        print("[SyncTray] plist exists: \(FileManager.default.fileExists(atPath: plistPath))")
+
+        let result = runCommand("/bin/launchctl", arguments: ["load", plistPath])
+        print("[SyncTray] launchctl load exit code: \(result.exitCode), output: \(result.output)")
+        return result.exitCode == 0
     }
 
     /// Uninstall the sync configuration for a profile
@@ -130,8 +140,46 @@ desktop.ini
             try fm.removeItem(atPath: profile.filterFilePath)
         }
 
+        // Clean up /tmp lock file
+        if fm.fileExists(atPath: profile.lockFilePath) {
+            try? fm.removeItem(atPath: profile.lockFilePath)
+        }
+
+        // Clean up rclone bisync cache files (listings, locks)
+        cleanupBisyncCache(for: profile)
+
         // Note: We don't remove the shared script as other profiles may use it
         // Note: We don't remove log files to preserve history
+    }
+
+    /// Remove rclone bisync cache files for a profile (listing files, lock files)
+    private func cleanupBisyncCache(for profile: SyncProfile) {
+        let cacheDir = (("~/Library/Caches/rclone/bisync" as NSString).expandingTildeInPath)
+        let fm = FileManager.default
+
+        guard fm.fileExists(atPath: cacheDir) else { return }
+
+        // Build the base name that rclone uses for cache files
+        // Format: {remote}_{remotePath}..{localPath}
+        let remote = "\(profile.rcloneRemote)_\(profile.remotePath)"
+            .replacingOccurrences(of: ":", with: "_")
+            .replacingOccurrences(of: "/", with: "_")
+
+        var localPath = profile.localSyncPath
+        if localPath.hasPrefix("/") {
+            localPath = String(localPath.dropFirst())
+        }
+        let local = localPath.replacingOccurrences(of: "/", with: "_")
+
+        let baseName = "\(remote)..\(local)"
+
+        // Find and remove all files matching this profile's base name
+        if let files = try? fm.contentsOfDirectory(atPath: cacheDir) {
+            for file in files where file.hasPrefix(baseName) {
+                let fullPath = (cacheDir as NSString).appendingPathComponent(file)
+                try? fm.removeItem(atPath: fullPath)
+            }
+        }
     }
 
     /// Reload the launchd agent for a profile
@@ -158,14 +206,16 @@ desktop.ini
         // 1. Create local directory if needed
         if !fileManager.fileExists(atPath: profile.localSyncPath) {
             do {
-                try fileManager.createDirectory(atPath: profile.localSyncPath, withIntermediateDirectories: true)
+                try fileManager.createDirectory(
+                    atPath: profile.localSyncPath, withIntermediateDirectories: true)
             } catch {
                 return "Failed to create local directory: \(error.localizedDescription)"
             }
         }
 
         // 2. Create local check file (.synctray-check)
-        let localCheckFile = (profile.localSyncPath as NSString).appendingPathComponent(Self.checkFileName)
+        let localCheckFile = (profile.localSyncPath as NSString).appendingPathComponent(
+            Self.checkFileName)
 
         if !fileManager.fileExists(atPath: localCheckFile) {
             fileManager.createFile(atPath: localCheckFile, contents: nil)
@@ -188,7 +238,7 @@ desktop.ini
             return "Failed to run rclone touch: \(error.localizedDescription)"
         }
 
-        return nil // Success
+        return nil  // Success
     }
 
     /// Checks if listing files exist for this profile's path combination
@@ -229,7 +279,8 @@ desktop.ini
 
         // Check if it's the old-style script (without config file support)
         if FileManager.default.fileExists(atPath: scriptPath),
-           let content = try? String(contentsOfFile: scriptPath, encoding: .utf8) {
+            let content = try? String(contentsOfFile: scriptPath, encoding: .utf8)
+        {
             // Old scripts have hardcoded REMOTE= values, new ones read from config
             return content.contains("REMOTE=\"") && !content.contains("CONFIG_FILE=")
         }
@@ -255,80 +306,80 @@ desktop.ini
     /// Generate the shared sync script that reads config from JSON
     private func generateSyncScript() -> String {
         return """
-        #!/bin/bash
-        # SyncTray Sync Script
-        # This script reads profile configuration from a JSON file
-        # DO NOT EDIT - This file is managed by SyncTray
+            #!/bin/bash
+            # SyncTray Sync Script
+            # This script reads profile configuration from a JSON file
+            # DO NOT EDIT - This file is managed by SyncTray
 
-        CONFIG_FILE="$1"
+            CONFIG_FILE="$1"
 
-        if [[ -z "$CONFIG_FILE" || ! -f "$CONFIG_FILE" ]]; then
-            echo "Error: Config file not specified or not found: $CONFIG_FILE"
-            exit 1
-        fi
+            if [[ -z "$CONFIG_FILE" || ! -f "$CONFIG_FILE" ]]; then
+                echo "Error: Config file not specified or not found: $CONFIG_FILE"
+                exit 1
+            fi
 
-        # Parse JSON config using Python (available on all macOS)
-        parse_json() {
-            python3 -c "import json,sys; d=json.load(open('$CONFIG_FILE')); print(d.get('$1', '$2'))"
-        }
+            # Parse JSON config using Python (available on all macOS)
+            parse_json() {
+                python3 -c "import json,sys; d=json.load(open('$CONFIG_FILE')); print(d.get('$1', '$2'))"
+            }
 
-        REMOTE=$(parse_json "remote" "")
-        LOCAL_PATH=$(parse_json "localPath" "")
-        LOG_FILE=$(parse_json "logPath" "")
-        LOCK_FILE=$(parse_json "lockFile" "")
-        DRIVE_PATH=$(parse_json "drivePath" "")
-        ADDITIONAL_FLAGS=$(parse_json "additionalFlags" "")
-        FILTER_FILE=$(parse_json "filterPath" "")
+            REMOTE=$(parse_json "remote" "")
+            LOCAL_PATH=$(parse_json "localPath" "")
+            LOG_FILE=$(parse_json "logPath" "")
+            LOCK_FILE=$(parse_json "lockFile" "")
+            DRIVE_PATH=$(parse_json "drivePath" "")
+            ADDITIONAL_FLAGS=$(parse_json "additionalFlags" "")
+            FILTER_FILE=$(parse_json "filterPath" "")
 
-        if [[ -z "$REMOTE" || -z "$LOCAL_PATH" ]]; then
-            echo "Error: Invalid config - missing remote or localPath"
-            exit 1
-        fi
+            if [[ -z "$REMOTE" || -z "$LOCAL_PATH" ]]; then
+                echo "Error: Invalid config - missing remote or localPath"
+                exit 1
+            fi
 
-        # Check if drive is mounted (if configured)
-        if [[ -n "$DRIVE_PATH" && ! -d "$DRIVE_PATH" ]]; then
-            echo "$(date '+%Y-%m-%d %H:%M:%S') - Drive not mounted, skipping sync" >> "$LOG_FILE"
-            exit 0
-        fi
-
-        # Check if another sync is already running
-        if [[ -f "$LOCK_FILE" ]]; then
-            PID=$(cat "$LOCK_FILE")
-            if ps -p "$PID" > /dev/null 2>&1; then
-                echo "$(date '+%Y-%m-%d %H:%M:%S') - Sync already running (PID $PID), skipping" >> "$LOG_FILE"
+            # Check if drive is mounted (if configured)
+            if [[ -n "$DRIVE_PATH" && ! -d "$DRIVE_PATH" ]]; then
+                echo "$(date '+%Y-%m-%d %H:%M:%S') - Drive not mounted, skipping sync" >> "$LOG_FILE"
                 exit 0
             fi
-        fi
 
-        # Create lock file
-        echo $$ > "$LOCK_FILE"
-        trap "rm -f $LOCK_FILE" EXIT
+            # Check if another sync is already running
+            if [[ -f "$LOCK_FILE" ]]; then
+                PID=$(cat "$LOCK_FILE")
+                if ps -p "$PID" > /dev/null 2>&1; then
+                    echo "$(date '+%Y-%m-%d %H:%M:%S') - Sync already running (PID $PID), skipping" >> "$LOG_FILE"
+                    exit 0
+                fi
+            fi
 
-        # Ensure sync directory exists
-        mkdir -p "$LOCAL_PATH"
+            # Create lock file
+            echo $$ > "$LOCK_FILE"
+            trap "rm -f $LOCK_FILE" EXIT
 
-        echo "$(date '+%Y-%m-%d %H:%M:%S') - Starting bisync" >> "$LOG_FILE"
+            # Ensure sync directory exists
+            mkdir -p "$LOCAL_PATH"
 
-        # Build rclone command
-        RCLONE_CMD="/opt/homebrew/bin/rclone bisync \\"$REMOTE\\" \\"$LOCAL_PATH\\" --verbose --use-json-log --filter-from \\"$FILTER_FILE\\" --check-access --check-filename .synctray-check --resilient --recover --conflict-resolve newer --conflict-loser num --conflict-suffix sync-conflict-{DateOnly}-"
+            echo "$(date '+%Y-%m-%d %H:%M:%S') - Starting bisync" >> "$LOG_FILE"
 
-        if [[ -n "$ADDITIONAL_FLAGS" ]]; then
-            RCLONE_CMD="$RCLONE_CMD $ADDITIONAL_FLAGS"
-        fi
+            # Build rclone command
+            RCLONE_CMD="/opt/homebrew/bin/rclone bisync \\"$REMOTE\\" \\"$LOCAL_PATH\\" --verbose --use-json-log --filter-from \\"$FILTER_FILE\\" --check-access --check-filename .synctray-check --resilient --recover --conflict-resolve newer --conflict-loser num --conflict-suffix sync-conflict-{DateOnly}-"
 
-        # Run bisync
-        eval "$RCLONE_CMD" 2>&1 | tee -a "$LOG_FILE"
+            if [[ -n "$ADDITIONAL_FLAGS" ]]; then
+                RCLONE_CMD="$RCLONE_CMD $ADDITIONAL_FLAGS"
+            fi
 
-        EXIT_CODE=${PIPESTATUS[0]}
+            # Run bisync
+            eval "$RCLONE_CMD" 2>&1 | tee -a "$LOG_FILE"
 
-        if [[ $EXIT_CODE -eq 0 ]]; then
-            echo "$(date '+%Y-%m-%d %H:%M:%S') - Bisync completed successfully" >> "$LOG_FILE"
-        else
-            echo "$(date '+%Y-%m-%d %H:%M:%S') - Bisync failed with exit code $EXIT_CODE" >> "$LOG_FILE"
-        fi
+            EXIT_CODE=${PIPESTATUS[0]}
 
-        echo "" >> "$LOG_FILE"
-        """
+            if [[ $EXIT_CODE -eq 0 ]]; then
+                echo "$(date '+%Y-%m-%d %H:%M:%S') - Bisync completed successfully" >> "$LOG_FILE"
+            else
+                echo "$(date '+%Y-%m-%d %H:%M:%S') - Bisync failed with exit code $EXIT_CODE" >> "$LOG_FILE"
+            fi
+
+            echo "" >> "$LOG_FILE"
+            """
     }
 
     /// Generate profile-specific JSON config
@@ -343,11 +394,13 @@ desktop.ini
             "drivePath": profile.drivePathToMonitor,
             "additionalFlags": profile.additionalRcloneFlags,
             "filterPath": profile.filterFilePath,
-            "syncIntervalMinutes": profile.syncIntervalMinutes
+            "syncIntervalMinutes": profile.syncIntervalMinutes,
         ]
 
-        if let data = try? JSONSerialization.data(withJSONObject: config, options: [.prettyPrinted, .sortedKeys]),
-           let json = String(data: data, encoding: .utf8) {
+        if let data = try? JSONSerialization.data(
+            withJSONObject: config, options: [.prettyPrinted, .sortedKeys]),
+            let json = String(data: data, encoding: .utf8)
+        {
             return json
         }
         return "{}"
@@ -361,39 +414,39 @@ desktop.ini
         let launchdLogPath = logDir + "/synctray-launchd-\(profile.shortId).log"
 
         return """
-        <?xml version="1.0" encoding="UTF-8"?>
-        <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-        <plist version="1.0">
-        <dict>
-            <key>Label</key>
-            <string>\(profile.launchdLabel)</string>
-
-            <key>ProgramArguments</key>
-            <array>
-                <string>\(scriptPath)</string>
-                <string>\(configPath)</string>
-            </array>
-
-            <key>StartInterval</key>
-            <integer>\(intervalSeconds)</integer>
-
-            <key>RunAtLoad</key>
-            <true/>
-
-            <key>StandardOutPath</key>
-            <string>\(launchdLogPath)</string>
-
-            <key>StandardErrorPath</key>
-            <string>\(launchdLogPath)</string>
-
-            <key>EnvironmentVariables</key>
+            <?xml version="1.0" encoding="UTF-8"?>
+            <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+            <plist version="1.0">
             <dict>
-                <key>PATH</key>
-                <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+                <key>Label</key>
+                <string>\(profile.launchdLabel)</string>
+
+                <key>ProgramArguments</key>
+                <array>
+                    <string>\(scriptPath)</string>
+                    <string>\(configPath)</string>
+                </array>
+
+                <key>StartInterval</key>
+                <integer>\(intervalSeconds)</integer>
+
+                <key>RunAtLoad</key>
+                <true/>
+
+                <key>StandardOutPath</key>
+                <string>\(launchdLogPath)</string>
+
+                <key>StandardErrorPath</key>
+                <string>\(launchdLogPath)</string>
+
+                <key>EnvironmentVariables</key>
+                <dict>
+                    <key>PATH</key>
+                    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+                </dict>
             </dict>
-        </dict>
-        </plist>
-        """
+            </plist>
+            """
     }
 
     // MARK: - Helpers
@@ -415,7 +468,8 @@ desktop.ini
 
         // Create ~/.config/synctray/profiles if needed
         if !fm.fileExists(atPath: SyncProfile.configDirectory) {
-            try fm.createDirectory(atPath: SyncProfile.configDirectory, withIntermediateDirectories: true)
+            try fm.createDirectory(
+                atPath: SyncProfile.configDirectory, withIntermediateDirectories: true)
         }
 
         // LaunchAgents directory should already exist, but just in case
@@ -430,11 +484,14 @@ desktop.ini
         let filterPath = profile.filterFilePath
         // Only create if it doesn't exist (preserve user edits)
         if !FileManager.default.fileExists(atPath: filterPath) {
-            try Self.defaultExcludeFilter.write(toFile: filterPath, atomically: true, encoding: .utf8)
+            try Self.defaultExcludeFilter.write(
+                toFile: filterPath, atomically: true, encoding: .utf8)
         }
     }
 
-    private func runCommand(_ command: String, arguments: [String]) -> (output: String, exitCode: Int32) {
+    private func runCommand(_ command: String, arguments: [String]) -> (
+        output: String, exitCode: Int32
+    ) {
         let process = Process()
         let pipe = Pipe()
 
