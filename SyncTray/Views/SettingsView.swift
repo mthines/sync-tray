@@ -523,32 +523,33 @@ struct ProfileDetailView: View {
                         }
                     }
 
-                    // Show resync output if available
-                    if showResyncOutput && !resyncOutput.isEmpty {
-                        VStack(alignment: .leading, spacing: 4) {
-                            HStack {
-                                Text("Resync output:")
-                                    .font(.caption.weight(.medium))
-                                Spacer()
-                                Button(action: { showResyncOutput = false }) {
-                                    Image(systemName: "xmark.circle.fill")
-                                        .foregroundColor(.secondary)
-                                }
-                                .buttonStyle(.plain)
-                            }
-                            ScrollView {
-                                Text(resyncOutput)
-                                    .font(.system(size: 10, design: .monospaced))
-                                    .foregroundColor(.secondary)
-                                    .textSelection(.enabled)
-                                    .frame(maxWidth: .infinity, alignment: .leading)
-                            }
-                            .frame(maxHeight: 150)
-                            .padding(8)
-                            .background(Color(nsColor: .textBackgroundColor))
-                            .cornerRadius(4)
+                }
+            }
+
+            // Show resync output if available (independent of error state)
+            if showResyncOutput && !resyncOutput.isEmpty {
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack {
+                        Text("Sync output:")
+                            .font(.caption.weight(.medium))
+                        Spacer()
+                        Button(action: { showResyncOutput = false }) {
+                            Image(systemName: "xmark.circle.fill")
+                                .foregroundColor(.secondary)
                         }
+                        .buttonStyle(.plain)
                     }
+                    ScrollView {
+                        Text(resyncOutput)
+                            .font(.system(size: 10, design: .monospaced))
+                            .foregroundColor(.secondary)
+                            .textSelection(.enabled)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    .frame(maxHeight: 200)
+                    .padding(8)
+                    .background(Color(nsColor: .textBackgroundColor))
+                    .cornerRadius(4)
                 }
             }
 
@@ -596,15 +597,17 @@ struct ProfileDetailView: View {
                         Label("Sync Now", systemImage: "arrow.triangle.2.circlepath")
                     }
                     .buttonStyle(.borderedProminent)
+                    .disabled(isRunningResync || syncManager.state(for: profile.id) == .syncing)
 
                     Button(action: { showingUninstallConfirm = true }) {
                         Label("Uninstall", systemImage: "trash")
                     }
+                    .disabled(isRunningResync || syncManager.state(for: profile.id) == .syncing)
 
                     Button(action: reinstallSync) {
                         Label("Reinstall", systemImage: "arrow.clockwise")
                     }
-                    .disabled(!canInstall || isInstalling)
+                    .disabled(!canInstall || isInstalling || isRunningResync || syncManager.state(for: profile.id) == .syncing)
                 } else {
                     Button(action: installSync) {
                         if isInstalling {
@@ -962,7 +965,7 @@ struct ProfileDetailView: View {
         // Clear installing state so resync output panel is visible
         isInstalling = false
         isRunningResync = true
-        resyncOutput = ""
+        resyncOutput = "Starting initial sync...\n"
         showResyncOutput = true
 
         // Clear any cached error since we're attempting a fix
