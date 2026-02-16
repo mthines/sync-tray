@@ -968,8 +968,9 @@ struct ProfileDetailView: View {
         resyncOutput = "Starting initial sync...\n"
         showResyncOutput = true
 
-        // Clear any cached error since we're attempting a fix
+        // Clear any cached error and set syncing state (updates menu bar icon)
         syncManager.clearError(for: profile.id)
+        syncManager.setSyncing(for: profile.id, isSyncing: true)
 
         // Capture all values from main thread before going to background
         let currentProfile = profile
@@ -1039,25 +1040,52 @@ struct ProfileDetailView: View {
             do {
                 try process.run()
 
-                // Read output in real-time
+                // Read output in batches to reduce UI updates and lag
                 let outputHandle = pipe.fileHandleForReading
                 let errorHandle = errorPipe.fileHandleForReading
+                var outputBuffer = ""
+                var lastUpdateTime = Date()
+                let updateInterval: TimeInterval = 0.5  // Update UI at most every 0.5 seconds
+                let bufferLock = NSLock()
+
+                let flushBuffer = {
+                    bufferLock.lock()
+                    let output = outputBuffer
+                    outputBuffer = ""
+                    bufferLock.unlock()
+
+                    if !output.isEmpty {
+                        DispatchQueue.main.async {
+                            self.resyncOutput += output
+                        }
+                    }
+                }
 
                 outputHandle.readabilityHandler = { handle in
                     let data = handle.availableData
                     if let str = String(data: data, encoding: .utf8), !str.isEmpty {
-                        DispatchQueue.main.async {
-                            self.resyncOutput += str
-                        }
+                        bufferLock.lock()
+                        outputBuffer += str
+                        let now = Date()
+                        let shouldFlush = now.timeIntervalSince(lastUpdateTime) >= updateInterval
+                        if shouldFlush { lastUpdateTime = now }
+                        bufferLock.unlock()
+
+                        if shouldFlush { flushBuffer() }
                     }
                 }
 
                 errorHandle.readabilityHandler = { handle in
                     let data = handle.availableData
                     if let str = String(data: data, encoding: .utf8), !str.isEmpty {
-                        DispatchQueue.main.async {
-                            self.resyncOutput += str
-                        }
+                        bufferLock.lock()
+                        outputBuffer += str
+                        let now = Date()
+                        let shouldFlush = now.timeIntervalSince(lastUpdateTime) >= updateInterval
+                        if shouldFlush { lastUpdateTime = now }
+                        bufferLock.unlock()
+
+                        if shouldFlush { flushBuffer() }
                     }
                 }
 
@@ -1065,6 +1093,9 @@ struct ProfileDetailView: View {
 
                 outputHandle.readabilityHandler = nil
                 errorHandle.readabilityHandler = nil
+
+                // Flush any remaining buffered output
+                flushBuffer()
 
                 // Read any remaining data
                 let remainingOutput = outputHandle.readDataToEndOfFile()
@@ -1088,7 +1119,8 @@ struct ProfileDetailView: View {
                             self.resyncOutput += "\n✓ Scheduled sync is now active."
                         }
 
-                        // Clear the error state
+                        // Clear the syncing state and refresh
+                        self.syncManager.setSyncing(for: currentProfile.id, isSyncing: false)
                         self.syncManager.refreshSettings()
                     } else {
                         self.resyncOutput += "\n✗ Resync failed with exit code \(exitCode)"
@@ -1097,6 +1129,9 @@ struct ProfileDetailView: View {
                         if loadAgentOnCompletion {
                             self.setupService.loadAgent(for: currentProfile)
                         }
+
+                        // Clear syncing state (will show error from log if any)
+                        self.syncManager.setSyncing(for: currentProfile.id, isSyncing: false)
                     }
 
                     self.isRunningResync = false
@@ -1104,6 +1139,7 @@ struct ProfileDetailView: View {
             } catch {
                 DispatchQueue.main.async {
                     self.resyncOutput += "Error running rclone: \(error.localizedDescription)"
+                    self.syncManager.setSyncing(for: currentProfile.id, isSyncing: false)
                     self.isRunningResync = false
                 }
             }

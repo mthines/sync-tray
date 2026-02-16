@@ -206,6 +206,17 @@ final class SyncManager: ObservableObject {
         updateAggregateState()
     }
 
+    /// Set the syncing state for a profile (used by views running direct resyncs)
+    func setSyncing(for profileId: UUID, isSyncing: Bool) {
+        if isSyncing {
+            profileStates[profileId] = .syncing
+            profileErrors[profileId] = nil
+        } else {
+            profileStates[profileId] = .idle
+        }
+        updateAggregateState()
+    }
+
     /// Read the last error message from a log file
     private func readLastErrorFromLog(_ logPath: String) -> String? {
         guard FileManager.default.fileExists(atPath: logPath),
