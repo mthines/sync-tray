@@ -33,7 +33,7 @@ struct MenuBarView: View {
                 .padding(.horizontal, 8)
                 .padding(.vertical, 8)
         }
-        .frame(width: 320)
+        .frame(width: 390)
     }
 
     private var profileStatusSection: some View {

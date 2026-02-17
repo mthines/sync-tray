@@ -24,7 +24,7 @@ struct RecentChangesView: View {
                     }
                     .padding(.horizontal, 8)
                 }
-                .frame(height: 180)
+                .frame(height: 210)
             }
         }
     }
@@ -59,30 +59,29 @@ struct FileChangeRow: View {
 
             VStack(alignment: .leading, spacing: 1) {
                 // Profile name + filename on same line
-                // Profile name has priority (doesn't truncate unless > ~120pt), filename truncates to fit
                 HStack(spacing: 0) {
                     if !change.profileName.isEmpty {
                         Text(change.profileName)
-                            .font(.system(size: 12, weight: .medium))
+                            .font(.system(size: 11, weight: .medium))
                             .lineLimit(1)
                             .truncationMode(.tail)
-                            .frame(maxWidth: 120, alignment: .leading)  // Cap at ~50% of typical menu width
+                            .frame(maxWidth: 50, alignment: .leading)  // Compact profile name
                             .fixedSize(horizontal: false, vertical: false)
-                            .layoutPriority(1)
 
                         Text(" - ")
-                            .font(.system(size: 12, weight: .medium))
+                            .font(.system(size: 11, weight: .medium))
                             .fixedSize()
                     }
 
                     Text(change.fileName)
-                        .font(.system(size: 12, weight: .medium))
+                        .font(.system(size: 11, weight: .medium))
                         .lineLimit(1)
                         .truncationMode(.middle)
+                        .layoutPriority(1)  // Give filename more space
                 }
 
                 Text(change.directory)
-                    .font(.system(size: 10))
+                    .font(.system(size: 9))
                     .foregroundColor(.secondary)
                     .lineLimit(1)
                     .truncationMode(.head)
