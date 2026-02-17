@@ -34,6 +34,87 @@ struct RcloneStats: Codable {
     let totalTransfers: Int?
     let transferTime: Double?
     let transfers: Int?
+
+    // Per-file transfer progress (active transfers)
+    let transferring: [TransferringFile]?
+    // Files currently being checked
+    let checking: [String]?
+    // Last error message
+    let lastError: String?
+    // Number of files listed during scan phase
+    let listed: Int?
+}
+
+/// Per-file transfer progress information from rclone stats
+struct TransferringFile: Codable, Identifiable, Equatable {
+    let name: String
+    let size: Int64?
+    let bytes: Int64?
+    let percentage: Int?
+    let speed: Double?
+    let speedAvg: Double?
+    let eta: Int?
+
+    var id: String { name }
+
+    /// Format the progress line for display
+    /// Example: "44% /11.2Gi, 4.2Mi/s, 24m51s"
+    var formattedProgress: String {
+        var parts: [String] = []
+
+        // Percentage
+        if let pct = percentage {
+            parts.append("\(pct)%")
+        }
+
+        // Size (total)
+        if let totalSize = size, totalSize > 0 {
+            let sizeStr = ByteCountFormatter.string(fromByteCount: totalSize, countStyle: .file)
+            parts.append("/\(sizeStr)")
+        }
+
+        // Speed
+        if let spd = speed ?? speedAvg, spd > 0 {
+            let speedStr = ByteCountFormatter.string(fromByteCount: Int64(spd), countStyle: .file)
+            parts.append("\(speedStr)/s")
+        }
+
+        // ETA
+        if let etaSecs = eta, etaSecs > 0 {
+            parts.append(formatETA(etaSecs))
+        }
+
+        return parts.joined(separator: ", ")
+    }
+
+    /// Truncate filename to fit in available space
+    func truncatedName(maxLength: Int = 40) -> String {
+        guard maxLength > 0 else { return "" }
+        guard name.count > maxLength else { return name }
+
+        // Try to show the meaningful part (usually the filename)
+        let components = name.components(separatedBy: "/")
+        if let fileName = components.last, fileName.count <= maxLength {
+            let prefixLength = maxLength - fileName.count - 3  // -3 for "…/"
+            if prefixLength > 0 {
+                let pathPrefix = String(name.prefix(prefixLength))
+                return "\(pathPrefix)…/\(fileName)"
+            }
+            // Not enough room for path prefix, fall through to middle truncation
+        }
+
+        // Just truncate from the middle
+        let halfLen = (maxLength - 1) / 2
+        let start = name.prefix(halfLen)
+        let end = name.suffix(halfLen)
+        return "\(start)…\(end)"
+    }
+
+    private func formatETA(_ seconds: Int) -> String {
+        if seconds < 60 { return "\(seconds)s" }
+        if seconds < 3600 { return "\(seconds / 60)m\(seconds % 60)s" }
+        return "\(seconds / 3600)h\(seconds % 3600 / 60)m\(seconds % 60)s"
+    }
 }
 
 extension RcloneLogEntry {
@@ -49,9 +130,12 @@ extension RcloneLogEntry {
     }
 
     var fileChange: FileChange? {
+        // Strip ANSI codes from msg before parsing
+        let cleanMsg = stripANSICodes(msg)
+
         // First, try with the object field (standard rclone format)
         if let objectPath = object, !objectPath.isEmpty {
-            if let operation = parseOperation(from: msg) {
+            if let operation = parseOperation(from: cleanMsg) {
                 return FileChange(
                     timestamp: date ?? Date(),
                     path: objectPath,
@@ -61,7 +145,15 @@ extension RcloneLogEntry {
         }
 
         // Fall back to parsing bisync-style messages
-        return parseBisyncFileChange(from: msg)
+        return parseBisyncFileChange(from: cleanMsg)
+    }
+
+    private func stripANSICodes(_ text: String) -> String {
+        // Remove ANSI escape codes like \u001b[36m, \u001b[0m, etc.
+        let pattern = #"\u{001B}\[[0-9;]*[A-Za-z]"#
+        guard let regex = try? NSRegularExpression(pattern: pattern) else { return text }
+        let range = NSRange(text.startIndex..., in: text)
+        return regex.stringByReplacingMatches(in: text, range: range, withTemplate: "")
     }
 
     /// Parse bisync-style messages like:

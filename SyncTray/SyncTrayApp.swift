@@ -187,6 +187,18 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
                                 withCompletionHandler completionHandler: @escaping () -> Void) {
         let userInfo = response.notification.request.content.userInfo
 
+        // Handle mute action
+        if response.actionIdentifier == "MUTE_CURRENT_SYNC" {
+            if let profileIdString = userInfo["profileId"] as? String,
+               let profileId = UUID(uuidString: profileIdString) {
+                DispatchQueue.main.async {
+                    AppDelegate.sharedSyncManager?.muteNotifications(for: profileId)
+                }
+            }
+            completionHandler()
+            return
+        }
+
         // Check if this notification has a profile ID (error notification)
         if let profileIdString = userInfo["profileId"] as? String,
            let profileId = UUID(uuidString: profileIdString) {

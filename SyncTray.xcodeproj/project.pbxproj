@@ -24,6 +24,8 @@
 		A11111110000000000000012 /* SyncProfile.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000012 /* SyncProfile.swift */; };
 		A11111110000000000000013 /* ProfileStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000013 /* ProfileStore.swift */; };
 		A11111110000000000000014 /* ProfileListView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000014 /* ProfileListView.swift */; };
+		A11111110000000000000015 /* SyncProgressDetailView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000015 /* SyncProgressDetailView.swift */; };
+		A11111110000000000000016 /* DirectoryWatcher.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000016 /* DirectoryWatcher.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -47,6 +49,8 @@
 		A10000000000000000000012 /* SyncProfile.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SyncProfile.swift; sourceTree = "<group>"; };
 		A10000000000000000000013 /* ProfileStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProfileStore.swift; sourceTree = "<group>"; };
 		A10000000000000000000014 /* ProfileListView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProfileListView.swift; sourceTree = "<group>"; };
+		A10000000000000000000015 /* SyncProgressDetailView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SyncProgressDetailView.swift; sourceTree = "<group>"; };
+		A10000000000000000000016 /* DirectoryWatcher.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DirectoryWatcher.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -96,6 +100,7 @@
 		A13000000000000000000004 /* Services */ = {
 			isa = PBXGroup;
 			children = (
+				A10000000000000000000016 /* DirectoryWatcher.swift */,
 				A10000000000000000000004 /* LogWatcher.swift */,
 				A10000000000000000000005 /* LogParser.swift */,
 				A10000000000000000000006 /* NotificationService.swift */,
@@ -114,6 +119,7 @@
 				A1000000000000000000000A /* RecentChangesView.swift */,
 				A1000000000000000000000F /* SettingsView.swift */,
 				A10000000000000000000014 /* ProfileListView.swift */,
+				A10000000000000000000015 /* SyncProgressDetailView.swift */,
 			);
 			path = Views;
 			sourceTree = "<group>";
@@ -211,6 +217,8 @@
 				A1111111000000000000000A /* RecentChangesView.swift in Sources */,
 				A1111111000000000000000F /* SettingsView.swift in Sources */,
 				A11111110000000000000014 /* ProfileListView.swift in Sources */,
+				A11111110000000000000015 /* SyncProgressDetailView.swift in Sources */,
+				A11111110000000000000016 /* DirectoryWatcher.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

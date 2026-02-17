@@ -58,10 +58,28 @@ struct FileChangeRow: View {
                 .frame(width: 16)
 
             VStack(alignment: .leading, spacing: 1) {
-                Text(change.fileName)
-                    .font(.system(size: 12, weight: .medium))
-                    .lineLimit(1)
-                    .truncationMode(.middle)
+                // Profile name + filename on same line
+                // Profile name has priority (doesn't truncate unless > ~120pt), filename truncates to fit
+                HStack(spacing: 0) {
+                    if !change.profileName.isEmpty {
+                        Text(change.profileName)
+                            .font(.system(size: 12, weight: .medium))
+                            .lineLimit(1)
+                            .truncationMode(.tail)
+                            .frame(maxWidth: 120, alignment: .leading)  // Cap at ~50% of typical menu width
+                            .fixedSize(horizontal: false, vertical: false)
+                            .layoutPriority(1)
+
+                        Text(" - ")
+                            .font(.system(size: 12, weight: .medium))
+                            .fixedSize()
+                    }
+
+                    Text(change.fileName)
+                        .font(.system(size: 12, weight: .medium))
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
 
                 Text(change.directory)
                     .font(.system(size: 10))

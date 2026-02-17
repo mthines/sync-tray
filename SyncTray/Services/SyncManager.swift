@@ -17,16 +17,29 @@ final class SyncManager: ObservableObject {
     /// Last error message per profile (for display in UI)
     @Published private(set) var profileErrors: [UUID: String] = [:]
 
+    /// Profiles with muted file change notifications (for current sync only)
+    @Published private(set) var mutedProfileNotifications: Set<UUID> = []
+
     let profileStore: ProfileStore
 
     private var logWatchers: [UUID: LogWatcher] = [:]
+    private var directoryWatchers: [UUID: DirectoryWatcher] = [:]
     private let logParser = LogParser()
     private let notificationService = NotificationService.shared
     private let setupService = SyncSetupService.shared
 
     private var workspaceObserver: NSObjectProtocol?
-    private var currentSyncChanges: [FileChange] = []
+    private var currentSyncChanges: [UUID: [FileChange]] = [:]
     private var cancellables = Set<AnyCancellable>()
+
+    /// Track the last error message per profile (for correlating with syncFailed events)
+    private var lastSeenErrorMessage: [UUID: String] = [:]
+
+    /// Profiles where we're monitoring an externally-started sync
+    private var monitoringExternalSyncs: Set<UUID> = []
+
+    /// Timers polling for sync completion
+    private var syncCompletionPollers: [UUID: DispatchSourceTimer] = [:]
 
     private let maxRecentChanges = 20
 
@@ -35,11 +48,24 @@ final class SyncManager: ObservableObject {
         setupWorkspaceObserver()
         setupProfileObserver()
         cleanupStaleLockFiles()
+        detectAndResumeRunningSyncs()  // After cleanup, detect external syncs
         checkInitialState()
         startWatchingAllProfiles()
     }
 
     deinit {
+        // Cancel all sync completion pollers
+        for timer in syncCompletionPollers.values {
+            timer.cancel()
+        }
+        syncCompletionPollers.removeAll()
+
+        // Stop all directory watchers
+        for watcher in directoryWatchers.values {
+            watcher.stop()
+        }
+        directoryWatchers.removeAll()
+
         if let observer = workspaceObserver {
             NSWorkspace.shared.notificationCenter.removeObserver(observer)
         }
@@ -71,8 +97,13 @@ final class SyncManager: ObservableObject {
         isManualSyncRunning = true
 
         Task {
-            for profile in profilesToSync {
-                await runSyncScript(for: profile)
+            // Run all profile syncs in parallel for better performance
+            await withTaskGroup(of: Void.self) { group in
+                for profile in profilesToSync {
+                    group.addTask {
+                        await self.runSyncScript(for: profile)
+                    }
+                }
             }
             await MainActor.run {
                 isManualSyncRunning = false
@@ -217,6 +248,28 @@ final class SyncManager: ObservableObject {
         updateAggregateState()
     }
 
+    /// Returns true if we're monitoring an externally-started sync for this profile
+    func isMonitoringExternalSync(for profileId: UUID) -> Bool {
+        monitoringExternalSyncs.contains(profileId)
+    }
+
+    // MARK: - Notification Muting
+
+    /// Mute file change notifications for a profile's current sync
+    func muteNotifications(for profileId: UUID) {
+        mutedProfileNotifications.insert(profileId)
+    }
+
+    /// Unmute notifications for a profile (called when sync ends)
+    func unmuteNotifications(for profileId: UUID) {
+        mutedProfileNotifications.remove(profileId)
+    }
+
+    /// Check if notifications are muted for a profile
+    func isNotificationsMuted(for profileId: UUID) -> Bool {
+        mutedProfileNotifications.contains(profileId)
+    }
+
     /// Read the last error message from a log file
     private func readLastErrorFromLog(_ logPath: String) -> String? {
         guard FileManager.default.fileExists(atPath: logPath),
@@ -232,18 +285,18 @@ final class SyncManager: ObservableObject {
         var foundFailedMarker = false
 
         for line in lines {
-            // Stop when we hit a "Starting bisync" marker (previous run)
-            if line.contains("Starting bisync") && foundFailedMarker {
+            // Stop when we hit a sync start marker (previous run)
+            if SyncLogPatterns.isSyncStarted(line) && foundFailedMarker {
                 break
             }
 
             // If the most recent sync was successful, there's no error to show
-            if line.contains("Bisync completed successfully") {
+            if SyncLogPatterns.isSyncCompleted(line) {
                 return nil
             }
 
             // Mark that we found the failure point
-            if line.contains("Bisync failed with exit code") {
+            if SyncLogPatterns.isSyncFailed(line) {
                 foundFailedMarker = true
                 continue
             }
@@ -251,56 +304,29 @@ final class SyncManager: ObservableObject {
             // Only collect errors after we found the failure marker
             guard foundFailedMarker else { continue }
 
-            var errorMsg: String?
-
-            // Check for plain text CRITICAL errors (format: "2026/02/16 06:42:11 CRITICAL: ...")
-            if line.contains("CRITICAL:") {
-                if let range = line.range(of: "CRITICAL: ") {
-                    errorMsg = String(line[range.upperBound...]).trimmingCharacters(in: .whitespaces)
-                }
-            }
-            // Check for rclone JSON error messages
-            else if line.contains("\"level\":\"error\"") || line.contains("\"level\":\"notice\"") {
-                // Parse the error message from JSON
-                if let msgRange = line.range(of: "\"msg\":\""),
-                   let endRange = line[msgRange.upperBound...].range(of: "\"") {
-                    errorMsg = String(line[msgRange.upperBound..<endRange.lowerBound])
-                }
-            }
-
-            guard var msg = errorMsg else { continue }
+            // Extract error message from line (supports CRITICAL and JSON formats)
+            guard let rawMsg = SyncLogPatterns.extractErrorMessage(from: line) else { continue }
 
             // Clean up ANSI codes
-            msg = msg.replacingOccurrences(of: "\\u001b[", with: "")
-            msg = msg.replacingOccurrences(of: #"\[\d+m"#, with: "", options: .regularExpression)
-            msg = msg.replacingOccurrences(of: "[0m", with: "")
-            msg = msg.replacingOccurrences(of: "[31m", with: "")
-            msg = msg.replacingOccurrences(of: "[33m", with: "")
-            msg = msg.replacingOccurrences(of: "[35m", with: "")
-            msg = msg.replacingOccurrences(of: "[36m", with: "")
+            var msg = SyncLogPatterns.stripANSICodes(rawMsg)
 
-            // Always skip generic "Bisync aborted" messages - they don't provide useful info
-            if msg.contains("Bisync aborted") || msg.contains("Failed to bisync") {
+            // Skip generic abort messages - they don't provide useful info
+            if SyncLogPatterns.isGenericAbortMessage(msg) {
                 continue
             }
 
-            // Clean up prefixes
-            if let range = msg.range(of: "Bisync critical error: ") {
-                msg = String(msg[range.upperBound...])
+            // Transient "all files were changed" error should not be shown
+            if SyncLogPatterns.isTransientAllFilesChangedError(msg) {
+                continue
             }
+
+            // Clean up error message prefixes
+            msg = SyncLogPatterns.cleanErrorMessage(msg)
 
             guard !msg.isEmpty else { continue }
 
             // Track critical/actionable errors separately (they're more useful to show)
-            let isCritical = msg.contains("out of sync") ||
-                            msg.contains("resync") ||
-                            msg.contains("lock file") ||
-                            msg.contains("check file") ||
-                            msg.contains("Access test failed") ||
-                            msg.contains("Failed to initialise") ||
-                            msg.contains("malformed rule")
-
-            if isCritical && !criticalErrors.contains(msg) {
+            if SyncLogPatterns.isCriticalError(msg) && !criticalErrors.contains(msg) {
                 criticalErrors.append(msg)
             } else if !errorMessages.contains(msg) {
                 errorMessages.append(msg)
@@ -328,11 +354,80 @@ final class SyncManager: ObservableObject {
 
     // MARK: - Private Methods
 
+    /// Check if a sync is currently running for this profile via lock file
+    /// Returns the PID if found, nil otherwise
+    private func detectRunningSyncPID(for profile: SyncProfile) -> Int32? {
+        let lockPath = profile.lockFilePath
+        guard FileManager.default.fileExists(atPath: lockPath),
+              let pidStr = try? String(contentsOfFile: lockPath, encoding: .utf8)
+                  .trimmingCharacters(in: .whitespacesAndNewlines),
+              let pid = Int32(pidStr),
+              kill(pid, 0) == 0 else {
+            return nil
+        }
+        return pid
+    }
+
+    /// Detect running syncs at startup and start monitoring them
+    private func detectAndResumeRunningSyncs() {
+        for profile in profileStore.enabledProfiles {
+            if let pid = detectRunningSyncPID(for: profile) {
+                profileStates[profile.id] = .syncing
+                monitoringExternalSyncs.insert(profile.id)
+                startPollingForSyncCompletion(profile: profile, pid: pid)
+            }
+        }
+        updateAggregateState()
+    }
+
+    /// Poll until the sync process exits
+    private func startPollingForSyncCompletion(profile: SyncProfile, pid: Int32) {
+        let timer = DispatchSource.makeTimerSource(queue: .global(qos: .utility))
+        timer.schedule(deadline: .now() + 3, repeating: 3.0)
+
+        let profileId = profile.id
+        let lockPath = profile.lockFilePath
+
+        timer.setEventHandler { [weak self] in
+            // Check if process exited or lock file removed
+            if kill(pid, 0) != 0 || !FileManager.default.fileExists(atPath: lockPath) {
+                timer.cancel()
+                DispatchQueue.main.async {
+                    self?.handleExternalSyncCompleted(profileId: profileId)
+                }
+            }
+        }
+
+        syncCompletionPollers[profile.id] = timer
+        timer.resume()
+    }
+
+    /// Handle when an externally-monitored sync completes
+    private func handleExternalSyncCompleted(profileId: UUID) {
+        syncCompletionPollers[profileId]?.cancel()
+        syncCompletionPollers.removeValue(forKey: profileId)
+        monitoringExternalSyncs.remove(profileId)
+
+        // Determine success/failure from log
+        if let profile = profileStore.profile(for: profileId),
+           let error = readLastErrorFromLog(profile.logPath) {
+            profileStates[profileId] = .error("Sync failed")
+            profileErrors[profileId] = error
+        } else {
+            profileStates[profileId] = .idle
+            lastSyncTime = Date()
+        }
+
+        updateAggregateState()
+    }
+
     /// Clean up stale lock files on app startup
     /// Removes /tmp lock files where the PID is no longer running
+    /// Also removes rclone bisync .lck files if no rclone process is running
     private func cleanupStaleLockFiles() {
         let fm = FileManager.default
 
+        // Clean up SyncTray's /tmp lock files
         for profile in profileStore.profiles {
             let lockPath = profile.lockFilePath
             guard fm.fileExists(atPath: lockPath) else { continue }
@@ -351,6 +446,52 @@ final class SyncManager: ObservableObject {
                 try? fm.removeItem(atPath: lockPath)
             }
         }
+
+        // Clean up rclone bisync lock files if no rclone process is running
+        cleanupRcloneBisyncLocks()
+    }
+
+    /// Remove stale rclone bisync .lck files when no rclone process is running
+    /// This allows sync to continue from where it left off after an interrupted sync
+    private func cleanupRcloneBisyncLocks() {
+        let fm = FileManager.default
+        let bisyncDir = "\(NSHomeDirectory())/Library/Caches/rclone/bisync"
+
+        // Check if any rclone process is running
+        let rcloneRunning = isRcloneProcessRunning()
+
+        if rcloneRunning {
+            // rclone is running, don't remove lock files
+            return
+        }
+
+        // No rclone running - remove all stale .lck files
+        guard let files = try? fm.contentsOfDirectory(atPath: bisyncDir) else { return }
+
+        for file in files where file.hasSuffix(".lck") {
+            let fullPath = "\(bisyncDir)/\(file)"
+            try? fm.removeItem(atPath: fullPath)
+            SyncTraySettings.debugLog("Removed stale rclone bisync lock: \(file)")
+        }
+    }
+
+    /// Check if any rclone process is currently running
+    private func isRcloneProcessRunning() -> Bool {
+        let process = Process()
+        let pipe = Pipe()
+
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep")
+        process.arguments = ["-x", "rclone"]
+        process.standardOutput = pipe
+        process.standardError = pipe
+
+        do {
+            try process.run()
+            process.waitUntilExit()
+            return process.terminationStatus == 0
+        } catch {
+            return false
+        }
     }
 
     private func setupProfileObserver() {
@@ -363,15 +504,22 @@ final class SyncManager: ObservableObject {
     }
 
     private func startWatchingAllProfiles() {
-        // Stop all existing watchers
+        // Stop all existing log watchers
         for (id, watcher) in logWatchers {
             watcher.stopWatching()
             logWatchers.removeValue(forKey: id)
         }
 
+        // Stop all existing directory watchers
+        for (id, watcher) in directoryWatchers {
+            watcher.stop()
+            directoryWatchers.removeValue(forKey: id)
+        }
+
         // Start watchers for all enabled profiles
         for profile in profileStore.enabledProfiles {
-            startWatching(profile: profile)
+            startWatching(profile: profile)        // Log watcher
+            startWatchingDirectory(for: profile)   // Directory watcher
         }
     }
 
@@ -380,12 +528,77 @@ final class SyncManager: ObservableObject {
         watcher.delegate = self
         watcher.startWatching()
         logWatchers[profile.id] = watcher
-        profileStates[profile.id] = .idle
+
+        // If a sync is already running (detected at startup), use faster polling
+        if profileStates[profile.id] == .syncing {
+            watcher.setActivelySyncing(true)
+        } else {
+            profileStates[profile.id] = .idle
+        }
+    }
+
+    /// Start watching a profile's local sync directory for file changes
+    private func startWatchingDirectory(for profile: SyncProfile) {
+        guard !profile.localSyncPath.isEmpty else { return }
+        guard FileManager.default.fileExists(atPath: profile.localSyncPath) else { return }
+
+        let profileId = profile.id
+        let profileName = profile.name
+        let watchPath = profile.localSyncPath
+        let shortId = String(profileId.uuidString.prefix(8))
+        SyncTraySettings.debugLog("Starting watcher for '\(profileName)' [id:\(shortId)] at: \(watchPath)")
+
+        let watcher = DirectoryWatcher(
+            paths: [watchPath],
+            debounceInterval: 5.0,
+            debugLabel: "\(profileName) [\(shortId)]"
+        ) { [weak self] in
+            Task { @MainActor in
+                SyncTraySettings.debugLog("Change callback fired for '\(profileName)' [id:\(shortId)] -> triggering sync")
+                self?.handleDirectoryChange(for: profileId)
+            }
+        }
+        watcher.start()
+        directoryWatchers[profile.id] = watcher
+    }
+
+    /// Handle file system changes detected by DirectoryWatcher
+    private func handleDirectoryChange(for profileId: UUID) {
+        // Skip if profile is already syncing (avoid duplicate work)
+        if profileStates[profileId] == .syncing {
+            SyncTraySettings.debugLog("DirectoryWatcher: Skipping sync for \(profileId.uuidString.prefix(8)) - already syncing")
+            return
+        }
+
+        // Skip if drive not mounted
+        if profileStates[profileId] == .driveNotMounted {
+            SyncTraySettings.debugLog("DirectoryWatcher: Skipping sync for \(profileId.uuidString.prefix(8)) - drive not mounted")
+            return
+        }
+
+        // Get profile and verify it's still valid
+        guard let profile = profileStore.profile(for: profileId),
+              profile.isEnabled else {
+            SyncTraySettings.debugLog("DirectoryWatcher: Skipping sync for \(profileId.uuidString.prefix(8)) - profile not found or disabled")
+            return
+        }
+
+        SyncTraySettings.debugLog("DirectoryWatcher: Triggering sync for '\(profile.name)' (path: \(profile.localSyncPath))")
+
+        // Trigger sync for this specific profile
+        // Note: Lock file in sync script handles concurrent sync prevention
+        Task {
+            await runSyncScript(for: profile)
+        }
     }
 
     private func stopWatching(profileId: UUID) {
         logWatchers[profileId]?.stopWatching()
         logWatchers.removeValue(forKey: profileId)
+
+        directoryWatchers[profileId]?.stop()
+        directoryWatchers.removeValue(forKey: profileId)
+
         profileStates.removeValue(forKey: profileId)
     }
 
@@ -483,10 +696,15 @@ final class SyncManager: ObservableObject {
             guard !drivePath.isEmpty else { continue }
 
             if drivePath.hasPrefix(volumePath) || volumePath == drivePath {
-                notificationService.resetDriveNotMountedState()
+                notificationService.resetDriveNotMountedState(for: profile.id)
                 if profileStates[profile.id] == .driveNotMounted {
                     profileStates[profile.id] = .idle
                 }
+
+                // Restart directory watcher for this profile (path is now available)
+                directoryWatchers[profile.id]?.stop()
+                directoryWatchers.removeValue(forKey: profile.id)
+                startWatchingDirectory(for: profile)
             }
         }
 
@@ -504,7 +722,7 @@ final class SyncManager: ObservableObject {
 
             if drivePath.hasPrefix(volumePath) || volumePath == drivePath {
                 profileStates[profile.id] = .driveNotMounted
-                notificationService.notifyDriveNotMounted()
+                notificationService.notifyDriveNotMounted(profileId: profile.id, profileName: profile.name)
             }
         }
 
@@ -517,7 +735,7 @@ final class SyncManager: ObservableObject {
            !FileManager.default.fileExists(atPath: profile.drivePathToMonitor) {
             await MainActor.run {
                 profileStates[profile.id] = .driveNotMounted
-                notificationService.notifyDriveNotMounted()
+                notificationService.notifyDriveNotMounted(profileId: profile.id, profileName: profile.name)
                 updateAggregateState()
             }
             return
@@ -560,55 +778,84 @@ final class SyncManager: ObservableObject {
     }
 
     private func processLogEvent(_ event: ParsedLogEvent, profileId: UUID) {
+        let profile = profileStore.profile(for: profileId)
+        let profileName = profile?.name ?? "Unknown"
+        let syncDirectoryPath = profile?.localSyncPath ?? ""
+
         switch event.type {
         case .syncStarted:
             profileStates[profileId] = .syncing
             profileErrors[profileId] = nil  // Clear previous error on new sync
+            lastSeenErrorMessage[profileId] = nil  // Clear last seen error
             syncProgress = nil  // Reset progress for new sync
-            currentSyncChanges.removeAll()
-            notificationService.notifySyncStarted()
+            currentSyncChanges[profileId] = []
+            logWatchers[profileId]?.setActivelySyncing(true)  // Increase polling frequency
+            notificationService.notifySyncStarted(profileId: profileId, profileName: profileName)
 
         case .syncCompleted:
             profileStates[profileId] = .idle
             profileErrors[profileId] = nil  // Clear error on success
+            lastSeenErrorMessage[profileId] = nil
             syncProgress = nil  // Clear progress when sync completes
+            unmuteNotifications(for: profileId)  // Clear mute state
+            logWatchers[profileId]?.setActivelySyncing(false)  // Reduce polling frequency
             lastSyncTime = event.timestamp
-            notificationService.notifySyncCompleted(changesCount: currentSyncChanges.count)
-            currentSyncChanges.removeAll()
+            let changesCount = currentSyncChanges[profileId]?.count ?? 0
+            notificationService.notifySyncCompleted(
+                changesCount: changesCount,
+                profileId: profileId,
+                profileName: profileName,
+                syncDirectoryPath: syncDirectoryPath
+            )
+            currentSyncChanges[profileId] = nil
 
         case .syncFailed(let exitCode, let message):
+            // Check if the error message (or the last seen error) is a transient one
+            let errorToCheck = message ?? lastSeenErrorMessage[profileId]
+            if let msg = errorToCheck, SyncLogPatterns.isTransientAllFilesChangedError(msg) {
+                // Transient "all files were changed" - just clear state, don't show error
+                syncProgress = nil
+                lastSeenErrorMessage[profileId] = nil
+                unmuteNotifications(for: profileId)  // Clear mute state even on transient
+                logWatchers[profileId]?.setActivelySyncing(false)  // Reduce polling frequency
+                currentSyncChanges.removeAll()
+                // Reset to idle since this isn't a real error
+                profileStates[profileId] = .idle
+                break
+            }
+
             profileStates[profileId] = .error("Exit code \(exitCode)")
             syncProgress = nil  // Clear progress on failure
+            lastSeenErrorMessage[profileId] = nil
+            unmuteNotifications(for: profileId)  // Clear mute state on failure
+            logWatchers[profileId]?.setActivelySyncing(false)  // Reduce polling frequency
             // Only use the syncFailed message if we don't already have a more specific error
             if profileErrors[profileId] == nil, let msg = message {
                 profileErrors[profileId] = msg
             }
-            let profile = profileStore.profile(for: profileId)
             let errorDescription = profileErrors[profileId] ?? message ?? "Exit code \(exitCode)"
             notificationService.notifySyncError(
                 "Sync failed: \(errorDescription)",
                 profileId: profileId,
                 profileName: profile?.name
             )
-            currentSyncChanges.removeAll()
+            currentSyncChanges[profileId] = nil
 
         case .errorMessage(let message):
+            // Track all error messages so we can correlate with syncFailed events
+            lastSeenErrorMessage[profileId] = message
+
+            // Transient "all files were changed" error should not be stored as a displayed error
+            if SyncLogPatterns.isTransientAllFilesChangedError(message) {
+                break
+            }
+
             // Prefer critical/actionable errors over file-level errors
             // Critical errors tell us what to do (e.g., "out of sync", "resync")
             // File-level errors (e.g., "Path1 file not found") are less actionable
-            let isCriticalError = message.contains("out of sync") ||
-                                  message.contains("resync") ||
-                                  message.contains("critical") ||
-                                  message.contains("lock file") ||
-                                  message.contains("check file") ||
-                                  message.contains("Access test failed")
-            let existingIsCritical = profileErrors[profileId].map { existing in
-                existing.contains("out of sync") ||
-                existing.contains("resync") ||
-                existing.contains("critical") ||
-                existing.contains("lock file") ||
-                existing.contains("check file") ||
-                existing.contains("Access test failed")
+            let isCriticalError = SyncLogPatterns.isCriticalError(message)
+            let existingIsCritical = profileErrors[profileId].map {
+                SyncLogPatterns.isCriticalError($0)
             } ?? false
 
             // Store error if: no existing error, OR new error is critical and existing isn't
@@ -618,15 +865,22 @@ final class SyncManager: ObservableObject {
 
         case .driveNotMounted:
             profileStates[profileId] = .driveNotMounted
-            notificationService.notifyDriveNotMounted()
+            notificationService.notifyDriveNotMounted(profileId: profileId, profileName: profileName)
 
         case .syncAlreadyRunning:
             break
 
-        case .fileChange(let change):
-            currentSyncChanges.append(change)
+        case .fileChange(var change):
+            change.profileName = profileName
+            if currentSyncChanges[profileId] == nil {
+                currentSyncChanges[profileId] = []
+            }
+            currentSyncChanges[profileId]?.append(change)
             addRecentChange(change)
-            notificationService.notifyFileChange(change)
+            // Only send notification if not muted
+            if !mutedProfileNotifications.contains(profileId) {
+                notificationService.notifyFileChange(change, profileId: profileId, syncDirectoryPath: syncDirectoryPath)
+            }
 
         case .stats(let stats):
             if let bytes = stats.bytes, let totalBytes = stats.totalBytes, totalBytes > 0 {
@@ -636,7 +890,13 @@ final class SyncManager: ObservableObject {
                     eta: stats.eta,
                     speed: stats.speed,
                     transfersDone: stats.transfers ?? 0,
-                    totalTransfers: stats.totalTransfers ?? 0
+                    totalTransfers: stats.totalTransfers ?? 0,
+                    checksDone: stats.checks ?? 0,
+                    totalChecks: stats.totalChecks ?? 0,
+                    elapsedTime: stats.elapsedTime,
+                    errors: stats.errors ?? 0,
+                    transferringFiles: stats.transferring ?? [],
+                    listedCount: stats.listed
                 )
             }
 

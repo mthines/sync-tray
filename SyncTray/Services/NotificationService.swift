@@ -4,17 +4,21 @@ import UserNotifications
 final class NotificationService {
     static let shared = NotificationService()
 
-    private var pendingFileChanges: [FileChange] = []
-    private var batchTimer: Timer?
+    /// Per-profile pending file changes (keyed by profile ID)
+    private var pendingFileChanges: [UUID: [FileChange]] = [:]
+    /// Per-profile batch timers (keyed by profile ID)
+    private var batchTimers: [UUID: Timer] = [:]
     private let batchDelay: TimeInterval = 2.0
 
-    private var hasNotifiedDriveNotMounted = false
+    /// Per-profile "drive not mounted" notification state (keyed by profile ID)
+    private var hasNotifiedDriveNotMounted: [UUID: Bool] = [:]
 
     private let categoryIdentifier = "SYNC_NOTIFICATION"
     private let openDirectoryActionIdentifier = "OPEN_DIRECTORY"
+    private let muteActionIdentifier = "MUTE_CURRENT_SYNC"
 
-    /// Current sync directory path, set by SyncManager when processing changes
-    var currentSyncDirectoryPath: String = ""
+    /// Per-profile sync directory paths (keyed by profile ID)
+    private var syncDirectoryPaths: [UUID: String] = [:]
 
     private init() {
         setupNotificationCategories()
@@ -27,9 +31,15 @@ final class NotificationService {
             options: [.foreground]
         )
 
+        let muteAction = UNNotificationAction(
+            identifier: muteActionIdentifier,
+            title: "Mute Current Sync",
+            options: []  // No .foreground - runs in background
+        )
+
         let category = UNNotificationCategory(
             identifier: categoryIdentifier,
-            actions: [openDirectoryAction],
+            actions: [openDirectoryAction, muteAction],
             intentIdentifiers: [],
             options: []
         )
@@ -37,43 +47,63 @@ final class NotificationService {
         UNUserNotificationCenter.current().setNotificationCategories([category])
     }
 
-    func notifySyncStarted() {
-        pendingFileChanges.removeAll()
-        batchTimer?.invalidate()
+    func notifySyncStarted(profileId: UUID, profileName: String) {
+        // Clear only this profile's pending changes
+        pendingFileChanges[profileId] = nil
+        batchTimers[profileId]?.invalidate()
+        batchTimers[profileId] = nil
 
         sendNotification(
-            title: "SyncTray",
+            title: "SyncTray: \(profileName)",
             body: "Sync started...",
-            sound: nil
+            sound: nil,
+            profileId: profileId
         )
     }
 
-    func notifyFileChange(_ change: FileChange) {
-        pendingFileChanges.append(change)
+    func notifyFileChange(_ change: FileChange, profileId: UUID, syncDirectoryPath: String) {
+        // Store sync directory path for this profile
+        syncDirectoryPaths[profileId] = syncDirectoryPath
 
-        batchTimer?.invalidate()
-        batchTimer = Timer.scheduledTimer(withTimeInterval: batchDelay, repeats: false) { [weak self] _ in
-            self?.sendBatchedFileNotification()
+        // Append to this profile's pending changes
+        if pendingFileChanges[profileId] == nil {
+            pendingFileChanges[profileId] = []
+        }
+        pendingFileChanges[profileId]?.append(change)
+
+        // Invalidate and create a new timer for this profile
+        batchTimers[profileId]?.invalidate()
+        batchTimers[profileId] = Timer.scheduledTimer(withTimeInterval: batchDelay, repeats: false) { [weak self, profileId] _ in
+            self?.sendBatchedFileNotification(for: profileId)
         }
     }
 
-    func notifySyncCompleted(changesCount: Int) {
-        batchTimer?.invalidate()
+    func notifySyncCompleted(changesCount: Int, profileId: UUID, profileName: String, syncDirectoryPath: String) {
+        // Store sync directory path for this profile
+        syncDirectoryPaths[profileId] = syncDirectoryPath
 
-        if !pendingFileChanges.isEmpty {
-            sendBatchedFileNotification()
+        // Invalidate this profile's timer
+        batchTimers[profileId]?.invalidate()
+        batchTimers[profileId] = nil
+
+        if let changes = pendingFileChanges[profileId], !changes.isEmpty {
+            sendBatchedFileNotification(for: profileId, profileName: profileName)
         } else if changesCount == 0 {
             return
         }
+
+        // Clean up this profile's state
+        pendingFileChanges[profileId] = nil
+        syncDirectoryPaths[profileId] = nil
     }
 
-    private func sendBatchedFileNotification() {
-        guard !pendingFileChanges.isEmpty else { return }
+    private func sendBatchedFileNotification(for profileId: UUID, profileName: String? = nil) {
+        guard let changes = pendingFileChanges[profileId], !changes.isEmpty else { return }
 
-        let changes = pendingFileChanges
-        pendingFileChanges.removeAll()
+        // Clear this profile's pending changes
+        pendingFileChanges[profileId] = nil
 
-        let title = "SyncTray"
+        let title = profileName != nil ? "SyncTray: \(profileName!)" : "SyncTray"
         let body: String
 
         if changes.count <= 3 {
@@ -88,7 +118,7 @@ final class NotificationService {
         // Get directory from first change for "Open Directory" action
         let directoryPath: String?
         if let firstChange = changes.first {
-            let syncDir = currentSyncDirectoryPath
+            let syncDir = syncDirectoryPaths[profileId] ?? ""
             if !syncDir.isEmpty {
                 directoryPath = (syncDir as NSString).appendingPathComponent(firstChange.directory)
             } else {
@@ -102,7 +132,8 @@ final class NotificationService {
             title: title,
             body: body,
             sound: .default,
-            directoryPath: directoryPath
+            directoryPath: directoryPath,
+            profileId: profileId
         )
     }
 
@@ -117,19 +148,25 @@ final class NotificationService {
         )
     }
 
-    func notifyDriveNotMounted() {
-        guard !hasNotifiedDriveNotMounted else { return }
-        hasNotifiedDriveNotMounted = true
+    func notifyDriveNotMounted(profileId: UUID, profileName: String) {
+        guard hasNotifiedDriveNotMounted[profileId] != true else { return }
+        hasNotifiedDriveNotMounted[profileId] = true
 
         sendNotification(
-            title: "SyncTray",
+            title: "SyncTray: \(profileName)",
             body: "External drive not mounted. Sync paused.",
-            sound: nil
+            sound: nil,
+            profileId: profileId
         )
     }
 
-    func resetDriveNotMountedState() {
-        hasNotifiedDriveNotMounted = false
+    /// Reset the "drive not mounted" notification state for a specific profile or all profiles
+    func resetDriveNotMountedState(for profileId: UUID? = nil) {
+        if let profileId = profileId {
+            hasNotifiedDriveNotMounted[profileId] = nil
+        } else {
+            hasNotifiedDriveNotMounted.removeAll()
+        }
     }
 
     private func sendNotification(
@@ -156,8 +193,8 @@ final class NotificationService {
         // Add directory path for "Open Directory" action
         if let path = directoryPath {
             content.userInfo["directoryPath"] = path
-        } else if !currentSyncDirectoryPath.isEmpty {
-            content.userInfo["directoryPath"] = currentSyncDirectoryPath
+        } else if let profileId = profileId, let syncDir = syncDirectoryPaths[profileId], !syncDir.isEmpty {
+            content.userInfo["directoryPath"] = syncDir
         }
 
         // Add profile ID to open specific profile in Settings

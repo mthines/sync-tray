@@ -10,6 +10,13 @@ final class LogWatcher {
     private var source: DispatchSourceFileSystemObject?
     private var lastReadPosition: UInt64 = 0
 
+    // Polling fallback for reliability
+    private var pollTimer: DispatchSourceTimer?
+    private var isActivelySyncing: Bool = false
+    private let pollQueue = DispatchQueue(label: "com.synctray.logwatcher.poll", qos: .utility)
+    private static let heartbeatInterval: TimeInterval = 5.0
+    private static let activePollingInterval: TimeInterval = 2.5
+
     weak var delegate: LogWatcherDelegate?
 
     init(logPath: String) {
@@ -63,15 +70,73 @@ final class LogWatcher {
         self.source = source
         source.resume()
 
+        // Start polling fallback timer
+        startPollTimer()
+
         // Read recent content for context (last 50 lines)
         readRecentLines(count: 50)
     }
 
     func stopWatching() {
+        pollTimer?.cancel()
+        pollTimer = nil
         source?.cancel()
         source = nil
         fileHandle?.closeFile()
         fileHandle = nil
+    }
+
+    /// Adjust polling frequency based on sync activity
+    func setActivelySyncing(_ active: Bool) {
+        guard isActivelySyncing != active else { return }
+        isActivelySyncing = active
+
+        // Restart poll timer with new interval
+        if pollTimer != nil {
+            startPollTimer()
+        }
+    }
+
+    // MARK: - Polling Fallback
+
+    private func startPollTimer() {
+        pollTimer?.cancel()
+
+        let timer = DispatchSource.makeTimerSource(queue: pollQueue)
+        let interval = isActivelySyncing ? Self.activePollingInterval : Self.heartbeatInterval
+        timer.schedule(deadline: .now() + interval, repeating: interval)
+
+        timer.setEventHandler { [weak self] in
+            self?.pollForChanges()
+        }
+
+        pollTimer = timer
+        timer.resume()
+    }
+
+    private func pollForChanges() {
+        do {
+            let attributes = try FileManager.default.attributesOfItem(atPath: logPath)
+            let currentSize = attributes[.size] as? UInt64 ?? 0
+
+            if currentSize > lastReadPosition {
+                // Missed content - read it
+                let missedBytes = currentSize - lastReadPosition
+                SyncTraySettings.debugLog("LogWatcher: Polling detected \(missedBytes) missed bytes")
+                DispatchQueue.main.async { [weak self] in
+                    self?.handleFileChange()
+                }
+            }
+        } catch {
+            // File may have been deleted - trigger recovery
+            SyncTraySettings.debugLog("LogWatcher: Polling error - \(error.localizedDescription)")
+            DispatchQueue.main.async { [weak self] in
+                self?.stopWatching()
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
+                    self?.startWatching()
+                }
+            }
+        }
     }
 
     private func handleFileChange() {

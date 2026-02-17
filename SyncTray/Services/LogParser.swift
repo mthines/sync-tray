@@ -82,15 +82,8 @@ final class LogParser {
 
         // Capture error messages from rclone
         if entry.level == "error" {
-            // Extract meaningful error message
-            var errorMsg = msg
-
-            // Clean up common rclone error prefixes
-            if let range = errorMsg.range(of: "Bisync critical error: ") {
-                errorMsg = String(errorMsg[range.upperBound...])
-            } else if let range = errorMsg.range(of: "Bisync aborted. ") {
-                errorMsg = String(errorMsg[range.upperBound...])
-            }
+            // Clean up error message using centralized patterns
+            var errorMsg = SyncLogPatterns.cleanErrorMessage(msg)
 
             // Truncate very long messages
             if errorMsg.count > 200 {
@@ -104,10 +97,20 @@ final class LogParser {
             )
         }
 
-        if msg.contains("Failed to bisync") {
+        // Check for sync failure messages (notice level)
+        if SyncLogPatterns.isSyncFailed(msg) {
+            // Transient "all files were changed" error should not trigger error UI
+            if SyncLogPatterns.isTransientAllFilesChangedError(msg) {
+                return ParsedLogEvent(
+                    timestamp: timestamp,
+                    type: .unknown,
+                    rawLine: line
+                )
+            }
+            let exitCode = SyncLogPatterns.extractExitCode(from: msg) ?? 1
             return ParsedLogEvent(
                 timestamp: timestamp,
-                type: .syncFailed(exitCode: 1, message: msg),
+                type: .syncFailed(exitCode: exitCode, message: msg),
                 rawLine: line
             )
         }
@@ -146,32 +149,24 @@ final class LogParser {
     }
 
     private func parseEventType(from message: String) -> ParsedLogEvent.EventType {
-        let lowercased = message.lowercased()
-
-        if lowercased.contains("starting bisync") || lowercased.contains("starting sync") {
+        if SyncLogPatterns.isSyncStarted(message) {
             return .syncStarted
         }
 
-        if lowercased.contains("completed successfully") || lowercased.contains("sync complete") {
+        if SyncLogPatterns.isSyncCompleted(message) {
             return .syncCompleted
         }
 
-        if lowercased.contains("failed with exit code") {
-            let pattern = #"exit code (\d+)"#
-            if let regex = try? NSRegularExpression(pattern: pattern),
-               let match = regex.firstMatch(in: message, range: NSRange(message.startIndex..., in: message)),
-               let codeRange = Range(match.range(at: 1), in: message),
-               let code = Int(message[codeRange]) {
-                return .syncFailed(exitCode: code, message: nil)
-            }
-            return .syncFailed(exitCode: -1, message: nil)
+        if SyncLogPatterns.isSyncFailed(message) {
+            let exitCode = SyncLogPatterns.extractExitCode(from: message) ?? -1
+            return .syncFailed(exitCode: exitCode, message: nil)
         }
 
-        if lowercased.contains("drive not mounted") || lowercased.contains("not mounted") {
+        if SyncLogPatterns.isDriveNotMounted(message) {
             return .driveNotMounted
         }
 
-        if lowercased.contains("already running") {
+        if SyncLogPatterns.isSyncAlreadyRunning(message) {
             return .syncAlreadyRunning
         }
 

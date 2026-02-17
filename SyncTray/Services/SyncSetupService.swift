@@ -361,7 +361,7 @@ final class SyncSetupService {
             echo "$(date '+%Y-%m-%d %H:%M:%S') - Starting bisync" >> "$LOG_FILE"
 
             # Build rclone command
-            RCLONE_CMD="/opt/homebrew/bin/rclone bisync \\"$REMOTE\\" \\"$LOCAL_PATH\\" --verbose --use-json-log --filter-from \\"$FILTER_FILE\\" --check-access --check-filename .synctray-check --resilient --recover --conflict-resolve newer --conflict-loser num --conflict-suffix sync-conflict-{DateOnly}-"
+            RCLONE_CMD="/opt/homebrew/bin/rclone bisync \\"$REMOTE\\" \\"$LOCAL_PATH\\" --verbose --use-json-log --stats 2s --filter-from \\"$FILTER_FILE\\" --check-access --check-filename .synctray-check --resilient --recover --conflict-resolve newer --conflict-loser num --conflict-suffix sync-conflict-{DateOnly}-"
 
             if [[ -n "$ADDITIONAL_FLAGS" ]]; then
                 RCLONE_CMD="$RCLONE_CMD $ADDITIONAL_FLAGS"

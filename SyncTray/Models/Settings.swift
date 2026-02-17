@@ -1,7 +1,9 @@
 import Foundation
+import os.log
 
 /// Global app settings (not profile-specific)
 struct SyncTraySettings {
+    private static let logger = Logger(subsystem: "com.synctray.app", category: "debug")
     private static let defaults = UserDefaults.standard
 
     private enum Keys {
@@ -19,6 +21,23 @@ struct SyncTraySettings {
 
         // Migration flag
         static let hasCompletedMultiProfileMigration = "hasCompletedMultiProfileMigration"
+
+        // Debug settings
+        static let debugLoggingEnabled = "debugLoggingEnabled"
+    }
+
+    // MARK: - Debug Settings
+
+    /// Enable verbose debug logging for file watchers and sync triggers
+    static var debugLoggingEnabled: Bool {
+        get { defaults.bool(forKey: Keys.debugLoggingEnabled) }
+        set { defaults.set(newValue, forKey: Keys.debugLoggingEnabled) }
+    }
+
+    /// Log a debug message if debug logging is enabled
+    static func debugLog(_ message: String) {
+        guard debugLoggingEnabled else { return }
+        logger.info("\(message, privacy: .public)")
     }
 
     // MARK: - Migration Support
