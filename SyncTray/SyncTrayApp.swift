@@ -24,7 +24,10 @@ struct SyncTrayApp: App {
             MenuBarView()
                 .environmentObject(syncManager)
         } label: {
-            MenuBarIcon(state: syncManager.currentState)
+            MenuBarIcon(
+                state: syncManager.currentState,
+                progress: syncManager.syncProgress?.percentage
+            )
         }
         .menuBarExtraStyle(.window)
     }
@@ -64,11 +67,66 @@ struct SyncTrayApp: App {
 
 struct MenuBarIcon: View {
     let state: SyncState
+    let progress: Double?  // 0-100, nil when not syncing
 
     var body: some View {
-        Image(systemName: state.iconName)
-            .symbolRenderingMode(.palette)
-            .foregroundStyle(state.iconColor)
+        if state == .syncing {
+            CircularProgressIcon(percentage: progress ?? 0)
+        } else {
+            Image(systemName: state.iconName)
+                .symbolRenderingMode(.palette)
+                .foregroundStyle(state.iconColor)
+        }
+    }
+}
+
+struct CircularProgressIcon: View {
+    let percentage: Double  // 0-100
+
+    var body: some View {
+        Image(nsImage: createProgressImage(percentage: percentage))
+    }
+
+    private func createProgressImage(percentage: Double) -> NSImage {
+        let size: CGFloat = 14
+        let lineWidth: CGFloat = 2
+        let imageSize = NSSize(width: size, height: size)
+
+        let image = NSImage(size: imageSize, flipped: false) { rect in
+            let inset = lineWidth / 2
+            let circleRect = rect.insetBy(dx: inset, dy: inset)
+
+            // Background circle (gray)
+            let backgroundPath = NSBezierPath(ovalIn: circleRect)
+            NSColor.gray.withAlphaComponent(0.4).setStroke()
+            backgroundPath.lineWidth = lineWidth
+            backgroundPath.stroke()
+
+            // Progress arc (blue, clockwise from top)
+            if percentage > 0 {
+                let center = NSPoint(x: rect.midX, y: rect.midY)
+                let radius = (min(rect.width, rect.height) - lineWidth) / 2
+                let startAngle: CGFloat = 90  // Top (in AppKit coordinates)
+                let endAngle = 90 - (percentage / 100 * 360)
+
+                let progressPath = NSBezierPath()
+                progressPath.appendArc(
+                    withCenter: center,
+                    radius: radius,
+                    startAngle: startAngle,
+                    endAngle: endAngle,
+                    clockwise: true
+                )
+                progressPath.lineWidth = lineWidth
+                progressPath.lineCapStyle = .round
+                NSColor.systemBlue.setStroke()
+                progressPath.stroke()
+            }
+
+            return true
+        }
+        image.isTemplate = false  // Keep colors (don't use template rendering)
+        return image
     }
 }
 
