@@ -66,15 +66,14 @@ struct SyncProgressDetailView: View {
                     .font(.caption.weight(.medium))
                     .foregroundStyle(.secondary)
 
-                ForEach(progress.transferringFiles.prefix(4)) { file in
-                    TransferringFileRow(file: file)
+                ScrollView {
+                    LazyVStack(spacing: 2) {
+                        ForEach(progress.transferringFiles.prefix(20)) { file in
+                            TransferringFileRow(file: file)
+                        }
+                    }
                 }
-
-                if progress.transferringFiles.count > 4 {
-                    Text("  + \(progress.transferringFiles.count - 4) more...")
-                        .font(.system(size: 10, design: .monospaced))
-                        .foregroundStyle(.tertiary)
-                }
+                .frame(maxHeight: 150)
             }
         }
         .padding(10)
@@ -86,23 +85,61 @@ struct SyncProgressDetailView: View {
 /// Row showing individual file transfer progress
 struct TransferringFileRow: View {
     let file: TransferringFile
+    @State private var isHovered = false
 
     var body: some View {
-        HStack(alignment: .top, spacing: 4) {
-            Text("*")
-                .font(.system(size: 10, design: .monospaced))
-                .foregroundStyle(.secondary)
+        HStack(spacing: 8) {
+            // Progress percentage circle
+            ZStack {
+                Circle()
+                    .stroke(Color.gray.opacity(0.3), lineWidth: 2)
+                    .frame(width: 16, height: 16)
+
+                Circle()
+                    .trim(from: 0, to: CGFloat(file.percentage ?? 0) / 100)
+                    .stroke(Color.blue, style: StrokeStyle(lineWidth: 2, lineCap: .round))
+                    .frame(width: 16, height: 16)
+                    .rotationEffect(.degrees(-90))
+            }
+            .frame(width: 16)
 
             VStack(alignment: .leading, spacing: 1) {
-                Text(file.truncatedName(maxLength: 45))
-                    .font(.system(size: 10, design: .monospaced))
+                // Filename
+                Text(file.fileName)
+                    .font(.system(size: 11, weight: .medium))
                     .lineLimit(1)
-                    .foregroundStyle(.primary)
+                    .truncationMode(.middle)
 
-                Text(file.formattedProgress)
-                    .font(.system(size: 10, design: .monospaced))
-                    .foregroundStyle(.secondary)
+                // Directory path
+                Text(file.directory)
+                    .font(.system(size: 9))
+                    .foregroundColor(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.head)
             }
+
+            Spacer()
+
+            // Progress info (percentage, speed)
+            VStack(alignment: .trailing, spacing: 1) {
+                if let pct = file.percentage {
+                    Text("\(pct)%")
+                        .font(.system(size: 10, weight: .medium))
+                }
+                if let spd = file.speed ?? file.speedAvg, spd > 0 {
+                    let speedStr = ByteCountFormatter.string(fromByteCount: Int64(spd), countStyle: .file)
+                    Text("\(speedStr)/s")
+                        .font(.system(size: 9))
+                        .foregroundColor(.secondary)
+                }
+            }
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 4)
+        .background(isHovered ? Color.primary.opacity(0.1) : Color.clear)
+        .cornerRadius(4)
+        .onHover { hovering in
+            isHovered = hovering
         }
     }
 }

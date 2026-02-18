@@ -57,6 +57,17 @@ struct TransferringFile: Codable, Identifiable, Equatable {
 
     var id: String { name }
 
+    /// The filename component of the path
+    var fileName: String {
+        (name as NSString).lastPathComponent
+    }
+
+    /// The directory component of the path
+    var directory: String {
+        let dir = (name as NSString).deletingLastPathComponent
+        return dir.isEmpty ? "/" : dir
+    }
+
     /// Format the progress line for display
     /// Example: "44% /11.2Gi, 4.2Mi/s, 24m51s"
     var formattedProgress: String {

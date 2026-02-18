@@ -1165,6 +1165,10 @@ struct ProfileDetailView: View {
         syncManager.clearError(for: profile.id)
         syncManager.setSyncing(for: profile.id, isSyncing: true)
 
+        // Automatically mute notifications for initial sync (resync)
+        // This prevents notification spam when many files are being synced for the first time
+        syncManager.muteNotifications(for: profile.id)
+
         // Capture all values from main thread before going to background
         let currentProfile = profile
         let capturedRcloneRemote = rcloneRemote

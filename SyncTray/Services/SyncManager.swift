@@ -9,7 +9,9 @@ final class SyncManager: ObservableObject {
     @Published private(set) var lastSyncTime: Date?
     @Published private(set) var recentChanges: [FileChange] = []
     @Published private(set) var isManualSyncRunning = false
-    @Published private(set) var syncProgress: SyncProgress?
+
+    /// Sync progress per profile (keyed by profile ID)
+    @Published private(set) var profileProgress: [UUID: SyncProgress] = [:]
 
     /// State per profile (keyed by profile ID)
     @Published private(set) var profileStates: [UUID: SyncState] = [:]
@@ -787,7 +789,7 @@ final class SyncManager: ObservableObject {
             profileStates[profileId] = .syncing
             profileErrors[profileId] = nil  // Clear previous error on new sync
             lastSeenErrorMessage[profileId] = nil  // Clear last seen error
-            syncProgress = nil  // Reset progress for new sync
+            profileProgress[profileId] = nil  // Reset progress for new sync
             currentSyncChanges[profileId] = []
             logWatchers[profileId]?.setActivelySyncing(true)  // Increase polling frequency
             notificationService.notifySyncStarted(profileId: profileId, profileName: profileName)
@@ -796,7 +798,7 @@ final class SyncManager: ObservableObject {
             profileStates[profileId] = .idle
             profileErrors[profileId] = nil  // Clear error on success
             lastSeenErrorMessage[profileId] = nil
-            syncProgress = nil  // Clear progress when sync completes
+            profileProgress[profileId] = nil  // Clear progress when sync completes
             unmuteNotifications(for: profileId)  // Clear mute state
             logWatchers[profileId]?.setActivelySyncing(false)  // Reduce polling frequency
             lastSyncTime = event.timestamp
@@ -814,7 +816,7 @@ final class SyncManager: ObservableObject {
             let errorToCheck = message ?? lastSeenErrorMessage[profileId]
             if let msg = errorToCheck, SyncLogPatterns.isTransientAllFilesChangedError(msg) {
                 // Transient "all files were changed" - just clear state, don't show error
-                syncProgress = nil
+                profileProgress[profileId] = nil
                 lastSeenErrorMessage[profileId] = nil
                 unmuteNotifications(for: profileId)  // Clear mute state even on transient
                 logWatchers[profileId]?.setActivelySyncing(false)  // Reduce polling frequency
@@ -825,7 +827,7 @@ final class SyncManager: ObservableObject {
             }
 
             profileStates[profileId] = .error("Exit code \(exitCode)")
-            syncProgress = nil  // Clear progress on failure
+            profileProgress[profileId] = nil  // Clear progress on failure
             lastSeenErrorMessage[profileId] = nil
             unmuteNotifications(for: profileId)  // Clear mute state on failure
             logWatchers[profileId]?.setActivelySyncing(false)  // Reduce polling frequency
@@ -884,7 +886,7 @@ final class SyncManager: ObservableObject {
 
         case .stats(let stats):
             if let bytes = stats.bytes, let totalBytes = stats.totalBytes, totalBytes > 0 {
-                syncProgress = SyncProgress(
+                profileProgress[profileId] = SyncProgress(
                     bytesTransferred: Int64(bytes),
                     totalBytes: Int64(totalBytes),
                     eta: stats.eta,

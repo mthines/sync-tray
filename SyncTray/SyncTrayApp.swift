@@ -70,9 +70,12 @@ struct MenuBarIcon: View {
     let progress: Double?  // 0-100, nil when not syncing
 
     var body: some View {
-        if state == .syncing {
-            CircularProgressIcon(percentage: progress ?? 0)
-        } else {
+        switch state {
+        case .syncing:
+            CircularProgressIcon(percentage: progress ?? 0, color: .systemBlue)
+        case .idle:
+            CircularProgressIcon(percentage: 100, color: .gray)
+        default:
             Image(systemName: state.iconName)
                 .symbolRenderingMode(.palette)
                 .foregroundStyle(state.iconColor)
@@ -82,12 +85,13 @@ struct MenuBarIcon: View {
 
 struct CircularProgressIcon: View {
     let percentage: Double  // 0-100
+    let color: NSColor      // Progress arc color
 
     var body: some View {
-        Image(nsImage: createProgressImage(percentage: percentage))
+        Image(nsImage: createProgressImage(percentage: percentage, color: color))
     }
 
-    private func createProgressImage(percentage: Double) -> NSImage {
+    private func createProgressImage(percentage: Double, color: NSColor) -> NSImage {
         let size: CGFloat = 14
         let lineWidth: CGFloat = 2
         let imageSize = NSSize(width: size, height: size)
@@ -102,7 +106,7 @@ struct CircularProgressIcon: View {
             backgroundPath.lineWidth = lineWidth
             backgroundPath.stroke()
 
-            // Progress arc (blue, clockwise from top)
+            // Progress arc (clockwise from top)
             if percentage > 0 {
                 let center = NSPoint(x: rect.midX, y: rect.midY)
                 let radius = (min(rect.width, rect.height) - lineWidth) / 2
@@ -119,7 +123,7 @@ struct CircularProgressIcon: View {
                 )
                 progressPath.lineWidth = lineWidth
                 progressPath.lineCapStyle = .round
-                NSColor.systemBlue.setStroke()
+                color.setStroke()
                 progressPath.stroke()
             }
 
