@@ -9,6 +9,7 @@ final class LogWatcher {
     private var fileHandle: FileHandle?
     private var source: DispatchSourceFileSystemObject?
     private var lastReadPosition: UInt64 = 0
+    private var lineBuffer: String = ""  // Buffer for partial lines between reads
 
     // Polling fallback for reliability
     private var pollTimer: DispatchSourceTimer?
@@ -31,6 +32,7 @@ final class LogWatcher {
 
     func startWatching() {
         stopWatching()
+        lineBuffer = ""  // Reset buffer on start
 
         // Create log file and directory if they don't exist
         let fileManager = FileManager.default
@@ -84,6 +86,7 @@ final class LogWatcher {
         source = nil
         fileHandle?.closeFile()
         fileHandle = nil
+        lineBuffer = ""  // Clear buffer on stop
     }
 
     /// Adjust polling frequency based on sync activity
@@ -151,6 +154,7 @@ final class LogWatcher {
                 // File was truncated, restart from beginning
                 handle.seek(toFileOffset: 0)
                 lastReadPosition = 0
+                lineBuffer = ""  // Clear buffer on truncation
             }
         } catch {
             // File might have been deleted, try to reopen
@@ -170,12 +174,26 @@ final class LogWatcher {
             return
         }
 
-        let lines = content.components(separatedBy: "\n")
+        // Prepend any buffered partial line from previous read
+        let fullContent = lineBuffer + content
+
+        // Split into lines
+        var lines = fullContent.components(separatedBy: "\n")
+
+        // If content doesn't end with newline, last element is partial - buffer it
+        if !content.hasSuffix("\n") && !lines.isEmpty {
+            lineBuffer = lines.removeLast()
+        } else {
+            lineBuffer = ""
+        }
+
+        // Process complete lines only
+        let completeLines = lines
             .map { $0.trimmingCharacters(in: .whitespaces) }
             .filter { !$0.isEmpty }
 
-        if !lines.isEmpty {
-            delegate?.logWatcher(self, didReceiveNewLines: lines)
+        if !completeLines.isEmpty {
+            delegate?.logWatcher(self, didReceiveNewLines: completeLines)
         }
     }
 
@@ -194,14 +212,24 @@ final class LogWatcher {
 
         let data = handle.readDataToEndOfFile()
         lastReadPosition = handle.offsetInFile
+        lineBuffer = ""  // Clear buffer when reading recent lines
 
         guard let content = String(data: data, encoding: .utf8) else { return }
 
-        let allLines = content.components(separatedBy: "\n")
+        // For recent lines, we want complete lines only
+        // Split and take only lines that end with newline (all but potentially last)
+        var allLines = content.components(separatedBy: "\n")
+
+        // If content doesn't end with newline, last line is partial - discard it
+        if !content.hasSuffix("\n") && !allLines.isEmpty {
+            allLines.removeLast()
+        }
+
+        let cleanLines = allLines
             .map { $0.trimmingCharacters(in: .whitespaces) }
             .filter { !$0.isEmpty }
 
-        let recentLines = Array(allLines.suffix(count))
+        let recentLines = Array(cleanLines.suffix(count))
         if !recentLines.isEmpty {
             delegate?.logWatcher(self, didReceiveNewLines: recentLines)
         }
