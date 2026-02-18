@@ -13,6 +13,17 @@ final class SyncManager: ObservableObject {
     /// Sync progress per profile (keyed by profile ID)
     @Published private(set) var profileProgress: [UUID: SyncProgress] = [:]
 
+    /// Aggregate sync progress (first syncing profile's progress) - for menu bar icon
+    var syncProgress: SyncProgress? {
+        // Find the first profile that is currently syncing and has progress
+        for (profileId, state) in profileStates {
+            if state == .syncing, let progress = profileProgress[profileId] {
+                return progress
+            }
+        }
+        return nil
+    }
+
     /// State per profile (keyed by profile ID)
     @Published private(set) var profileStates: [UUID: SyncState] = [:]
 

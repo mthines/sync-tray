@@ -518,7 +518,7 @@ struct ProfileDetailView: View {
             // Sync progress indicator
             if isRunningResync || syncManager.state(for: profile.id) == .syncing {
                 HStack {
-                    if let progress = syncManager.syncProgress {
+                    if let progress = syncManager.profileProgress[profile.id] {
                         SyncProgressDetailView(progress: progress)
                     } else {
                         HStack(spacing: 8) {
@@ -650,7 +650,7 @@ struct ProfileDetailView: View {
             }
 
             // Show resync output if available (hide when detailed progress is shown)
-            if showResyncOutput && !resyncOutputLines.isEmpty && syncManager.syncProgress == nil {
+            if showResyncOutput && !resyncOutputLines.isEmpty && syncManager.profileProgress[profile.id] == nil {
                 VStack(alignment: .leading, spacing: 4) {
                     HStack {
                         Text("Sync output:")
@@ -1176,6 +1176,7 @@ struct ProfileDetailView: View {
         let capturedLocalSyncPath = localSyncPath
         let capturedAdditionalFlags = additionalRcloneFlags
         let capturedFilterPath = profile.filterFilePath  // Exclude filter file
+        let capturedLockPath = profile.lockFilePath  // Lock file to prevent concurrent scheduled syncs
         let bisyncDir = "\(NSHomeDirectory())/Library/Caches/rclone/bisync"
         let capturedMaxLines = maxOutputLines
         let syncLogPath = profile.logPath  // Use main log file (same as scheduled syncs)
@@ -1278,6 +1279,10 @@ struct ProfileDetailView: View {
             do {
                 try process.run()
 
+                // Create lock file with process PID to prevent concurrent scheduled syncs
+                let pid = process.processIdentifier
+                try? "\(pid)".write(toFile: capturedLockPath, atomically: true, encoding: .utf8)
+
                 // Read output in batches to reduce UI updates and lag
                 let outputHandle = pipe.fileHandleForReading
                 let errorHandle = errorPipe.fileHandleForReading
@@ -1354,6 +1359,9 @@ struct ProfileDetailView: View {
                 }
 
                 process.waitUntilExit()
+
+                // Remove lock file now that process has finished
+                try? fileManager.removeItem(atPath: capturedLockPath)
 
                 outputHandle.readabilityHandler = nil
                 errorHandle.readabilityHandler = nil
