@@ -110,12 +110,21 @@ struct TransferringFileRow: View {
                     .lineLimit(1)
                     .truncationMode(.middle)
 
-                // Directory path
-                Text(file.directory)
-                    .font(.system(size: 9))
-                    .foregroundColor(.secondary)
-                    .lineLimit(1)
-                    .truncationMode(.head)
+                // Directory path + size info
+                HStack(spacing: 4) {
+                    Text(file.directory)
+                        .lineLimit(1)
+                        .truncationMode(.head)
+
+                    if let bytes = file.bytes, let size = file.size, size > 0 {
+                        Text("•")
+                        let downloadedStr = ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)
+                        let totalStr = ByteCountFormatter.string(fromByteCount: size, countStyle: .file)
+                        Text("\(downloadedStr) / \(totalStr)")
+                    }
+                }
+                .font(.system(size: 9))
+                .foregroundColor(.secondary)
             }
 
             Spacer()
