@@ -11,8 +11,8 @@ struct StatusHeaderView: View {
 
             VStack(alignment: .leading, spacing: 2) {
                 if syncManager.currentState == .syncing, let progress = syncManager.syncProgress {
-                    // Line 1: Bytes progress with ETA
-                    Text(progress.formattedTransferLine)
+                    // Line 1: Bytes progress and percentage
+                    Text(formatBytesProgress(progress))
                         .font(.headline)
                         .lineLimit(1)
 
@@ -27,6 +27,13 @@ struct StatusHeaderView: View {
                     }
                     .font(.caption)
                     .foregroundColor(.secondary)
+
+                    // Line 3: Speed and ETA
+                    if let speedEta = formatSpeedEta(progress) {
+                        Text(speedEta)
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
                 } else {
                     Text(syncManager.currentState.statusText)
                         .font(.headline)
@@ -72,6 +79,36 @@ struct StatusHeaderView: View {
         let formatter = RelativeDateTimeFormatter()
         formatter.unitsStyle = .abbreviated
         return formatter
+    }
+
+    /// Format bytes transferred / total with percentage
+    private func formatBytesProgress(_ progress: SyncProgress) -> String {
+        let transferred = ByteCountFormatter.string(fromByteCount: progress.bytesTransferred, countStyle: .file)
+        let total = ByteCountFormatter.string(fromByteCount: progress.totalBytes, countStyle: .file)
+        let pct = Int(progress.percentage)
+        return "\(transferred) / \(total), \(pct)%"
+    }
+
+    /// Format speed and ETA (returns nil if neither available)
+    private func formatSpeedEta(_ progress: SyncProgress) -> String? {
+        var parts: [String] = []
+
+        if let speed = progress.speed, speed > 0 {
+            let speedStr = ByteCountFormatter.string(fromByteCount: Int64(speed), countStyle: .file)
+            parts.append("\(speedStr)/s")
+        }
+
+        if let eta = progress.eta, eta > 0 {
+            parts.append("ETA \(formatETA(eta))")
+        }
+
+        return parts.isEmpty ? nil : parts.joined(separator: ", ")
+    }
+
+    private func formatETA(_ seconds: Int) -> String {
+        if seconds < 60 { return "\(seconds)s" }
+        if seconds < 3600 { return "\(seconds / 60)m\(seconds % 60)s" }
+        return "\(seconds / 3600)h\(seconds % 3600 / 60)m"
     }
 }
 
