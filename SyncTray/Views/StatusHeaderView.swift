@@ -99,16 +99,10 @@ struct StatusHeaderView: View {
         }
 
         if let eta = progress.eta, eta > 0 {
-            parts.append("ETA \(formatETA(eta))")
+            parts.append("ETA \(SyncFormatters.formatETA(eta))")
         }
 
         return parts.isEmpty ? nil : parts.joined(separator: ", ")
-    }
-
-    private func formatETA(_ seconds: Int) -> String {
-        if seconds < 60 { return "\(seconds)s" }
-        if seconds < 3600 { return "\(seconds / 60)m\(seconds % 60)s" }
-        return "\(seconds / 3600)h\(seconds % 3600 / 60)m"
     }
 }
 

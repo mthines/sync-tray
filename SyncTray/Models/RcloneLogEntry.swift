@@ -92,7 +92,7 @@ struct TransferringFile: Codable, Identifiable, Equatable {
 
         // ETA
         if let etaSecs = eta, etaSecs > 0 {
-            parts.append(formatETA(etaSecs))
+            parts.append(SyncFormatters.formatETAWithSeconds(etaSecs))
         }
 
         return parts.joined(separator: ", ")
@@ -119,12 +119,6 @@ struct TransferringFile: Codable, Identifiable, Equatable {
         let start = name.prefix(halfLen)
         let end = name.suffix(halfLen)
         return "\(start)…\(end)"
-    }
-
-    private func formatETA(_ seconds: Int) -> String {
-        if seconds < 60 { return "\(seconds)s" }
-        if seconds < 3600 { return "\(seconds / 60)m\(seconds % 60)s" }
-        return "\(seconds / 3600)h\(seconds % 3600 / 60)m\(seconds % 60)s"
     }
 }
 

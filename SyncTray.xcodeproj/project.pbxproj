@@ -26,6 +26,8 @@
 		A11111110000000000000014 /* ProfileListView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000014 /* ProfileListView.swift */; };
 		A11111110000000000000015 /* SyncProgressDetailView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000015 /* SyncProgressDetailView.swift */; };
 		A11111110000000000000016 /* DirectoryWatcher.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000016 /* DirectoryWatcher.swift */; };
+		A11111110000000000000017 /* Formatters.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000017 /* Formatters.swift */; };
+		A11111110000000000000018 /* ProfileDetailView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000018 /* ProfileDetailView.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -51,6 +53,8 @@
 		A10000000000000000000014 /* ProfileListView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProfileListView.swift; sourceTree = "<group>"; };
 		A10000000000000000000015 /* SyncProgressDetailView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SyncProgressDetailView.swift; sourceTree = "<group>"; };
 		A10000000000000000000016 /* DirectoryWatcher.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DirectoryWatcher.swift; sourceTree = "<group>"; };
+		A10000000000000000000017 /* Formatters.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Formatters.swift; sourceTree = "<group>"; };
+		A10000000000000000000018 /* ProfileDetailView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProfileDetailView.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -82,6 +86,7 @@
 				A13000000000000000000003 /* Models */,
 				A13000000000000000000004 /* Services */,
 				A13000000000000000000005 /* Views */,
+				A13000000000000000000007 /* Utilities */,
 			);
 			path = SyncTray;
 			sourceTree = "<group>";
@@ -120,8 +125,25 @@
 				A1000000000000000000000F /* SettingsView.swift */,
 				A10000000000000000000014 /* ProfileListView.swift */,
 				A10000000000000000000015 /* SyncProgressDetailView.swift */,
+				A13000000000000000000008 /* Settings */,
 			);
 			path = Views;
+			sourceTree = "<group>";
+		};
+		A13000000000000000000007 /* Utilities */ = {
+			isa = PBXGroup;
+			children = (
+				A10000000000000000000017 /* Formatters.swift */,
+			);
+			path = Utilities;
+			sourceTree = "<group>";
+		};
+		A13000000000000000000008 /* Settings */ = {
+			isa = PBXGroup;
+			children = (
+				A10000000000000000000018 /* ProfileDetailView.swift */,
+			);
+			path = Settings;
 			sourceTree = "<group>";
 		};
 		A13000000000000000000006 /* Products */ = {
@@ -219,6 +241,8 @@
 				A11111110000000000000014 /* ProfileListView.swift in Sources */,
 				A11111110000000000000015 /* SyncProgressDetailView.swift in Sources */,
 				A11111110000000000000016 /* DirectoryWatcher.swift in Sources */,
+				A11111110000000000000017 /* Formatters.swift in Sources */,
+				A11111110000000000000018 /* ProfileDetailView.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

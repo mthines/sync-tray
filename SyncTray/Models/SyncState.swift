@@ -37,7 +37,7 @@ struct SyncProgress: Equatable {
         let pct = Int(percentage)
 
         if let eta = eta, eta > 0 {
-            let etaStr = formatETA(eta)
+            let etaStr = SyncFormatters.formatETA(eta)
             return "Syncing: \(transferred) / \(total) (\(pct)%) - ETA \(etaStr)"
         }
         return "Syncing: \(transferred) / \(total) (\(pct)%)"
@@ -57,7 +57,7 @@ struct SyncProgress: Equatable {
         }
 
         if let eta = eta, eta > 0 {
-            parts.append("ETA \(formatETA(eta))")
+            parts.append("ETA \(SyncFormatters.formatETA(eta))")
         }
 
         return parts.joined(separator: ", ")
@@ -94,12 +94,6 @@ struct SyncProgress: Equatable {
         let mins = (totalSeconds % 3600) / 60
         let secs = totalSeconds % 60
         return "\(hours)h\(mins)m\(secs)s"
-    }
-
-    private func formatETA(_ seconds: Int) -> String {
-        if seconds < 60 { return "\(seconds)s" }
-        if seconds < 3600 { return "\(seconds / 60)m\(seconds % 60)s" }
-        return "\(seconds / 3600)h\(seconds % 3600 / 60)m"
     }
 
     /// Create with default values for optional fields (for backward compatibility)
