@@ -628,6 +628,11 @@ final class SyncManager: ObservableObject {
 
         // Check each enabled profile
         for profile in profileStore.enabledProfiles {
+            // Don't override state for profiles that are currently syncing
+            if profileStates[profile.id] == .syncing {
+                continue
+            }
+
             if !profile.drivePathToMonitor.isEmpty &&
                !FileManager.default.fileExists(atPath: profile.drivePathToMonitor) {
                 profileStates[profile.id] = .driveNotMounted
