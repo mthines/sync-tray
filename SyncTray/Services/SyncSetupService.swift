@@ -36,6 +36,9 @@ final class SyncSetupService {
         - *.tmp
         - *.temp
         - ~$*
+
+        # rclone partial transfer files (prevents cascading .partial.partial... issue)
+        - *.partial
         """
 
     // MARK: - Rclone Path Helper

@@ -517,22 +517,27 @@ final class SyncManager: ObservableObject {
     }
 
     private func startWatchingAllProfiles() {
-        // Stop all existing log watchers
-        for (id, watcher) in logWatchers {
-            watcher.stopWatching()
+        let enabledProfileIds = Set(profileStore.enabledProfiles.map { $0.id })
+
+        // Remove watchers for profiles that are no longer enabled
+        // (Don't touch watchers for profiles that are still enabled - avoids interrupting active syncs)
+        for id in logWatchers.keys where !enabledProfileIds.contains(id) {
+            logWatchers[id]?.stopWatching()
             logWatchers.removeValue(forKey: id)
         }
-
-        // Stop all existing directory watchers
-        for (id, watcher) in directoryWatchers {
-            watcher.stop()
+        for id in directoryWatchers.keys where !enabledProfileIds.contains(id) {
+            directoryWatchers[id]?.stop()
             directoryWatchers.removeValue(forKey: id)
         }
 
-        // Start watchers for all enabled profiles
+        // Add watchers only for profiles that don't already have them
         for profile in profileStore.enabledProfiles {
-            startWatching(profile: profile)        // Log watcher
-            startWatchingDirectory(for: profile)   // Directory watcher
+            if logWatchers[profile.id] == nil {
+                startWatching(profile: profile)
+            }
+            if directoryWatchers[profile.id] == nil {
+                startWatchingDirectory(for: profile)
+            }
         }
     }
 
@@ -831,7 +836,7 @@ final class SyncManager: ObservableObject {
                 lastSeenErrorMessage[profileId] = nil
                 unmuteNotifications(for: profileId)  // Clear mute state even on transient
                 logWatchers[profileId]?.setActivelySyncing(false)  // Reduce polling frequency
-                currentSyncChanges.removeAll()
+                currentSyncChanges[profileId] = nil  // Only clear this profile's changes
                 // Reset to idle since this isn't a real error
                 profileStates[profileId] = .idle
                 break

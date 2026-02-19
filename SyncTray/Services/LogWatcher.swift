@@ -10,6 +10,7 @@ final class LogWatcher {
     private var source: DispatchSourceFileSystemObject?
     private var lastReadPosition: UInt64 = 0
     private var lineBuffer: String = ""  // Buffer for partial lines between reads
+    private var lastKnownInode: UInt64 = 0  // Track file inode to detect file replacement
 
     // Polling fallback for reliability
     private var pollTimer: DispatchSourceTimer?
@@ -33,6 +34,7 @@ final class LogWatcher {
     func startWatching() {
         stopWatching()
         lineBuffer = ""  // Reset buffer on start
+        lastKnownInode = 0  // Reset inode tracking
 
         // Create log file and directory if they don't exist
         let fileManager = FileManager.default
@@ -52,6 +54,11 @@ final class LogWatcher {
         // Seek to end to only watch new content
         handle.seekToEndOfFile()
         lastReadPosition = handle.offsetInFile
+
+        // Store initial inode
+        if let attrs = try? FileManager.default.attributesOfItem(atPath: logPath) {
+            lastKnownInode = (attrs[.systemFileNumber] as? NSNumber)?.uint64Value ?? 0
+        }
 
         let fd = handle.fileDescriptor
         let source = DispatchSource.makeFileSystemObjectSource(
@@ -89,6 +96,60 @@ final class LogWatcher {
         lineBuffer = ""  // Clear buffer on stop
     }
 
+    /// Reopen the log file after it has been replaced (e.g., by atomic write during truncation)
+    private func reopenFile() {
+        // Cancel current DispatchSource
+        source?.cancel()
+        source = nil
+
+        // Close current file handle
+        fileHandle?.closeFile()
+        fileHandle = nil
+
+        // Reset state
+        lineBuffer = ""
+        lastReadPosition = 0
+        lastKnownInode = 0
+
+        // Reopen file
+        guard let handle = FileHandle(forReadingAtPath: logPath) else {
+            SyncTraySettings.debugLog("LogWatcher: Failed to reopen file: \(logPath)")
+            return
+        }
+        fileHandle = handle
+
+        // Seek to end (only want new content going forward)
+        handle.seekToEndOfFile()
+        lastReadPosition = handle.offsetInFile
+
+        // Store new inode
+        if let attrs = try? FileManager.default.attributesOfItem(atPath: logPath) {
+            lastKnownInode = (attrs[.systemFileNumber] as? NSNumber)?.uint64Value ?? 0
+        }
+
+        // Create new DispatchSource
+        let fd = handle.fileDescriptor
+        let newSource = DispatchSource.makeFileSystemObjectSource(
+            fileDescriptor: fd,
+            eventMask: [.extend, .write, .rename, .delete],
+            queue: .main
+        )
+
+        newSource.setEventHandler { [weak self] in
+            self?.handleFileChange()
+        }
+
+        newSource.setCancelHandler { [weak self] in
+            self?.fileHandle?.closeFile()
+            self?.fileHandle = nil
+        }
+
+        source = newSource
+        newSource.resume()
+
+        SyncTraySettings.debugLog("LogWatcher: Successfully reopened file with new inode \(lastKnownInode)")
+    }
+
     /// Adjust polling frequency based on sync activity
     func setActivelySyncing(_ active: Bool) {
         guard isActivelySyncing != active else { return }
@@ -121,6 +182,16 @@ final class LogWatcher {
         do {
             let attributes = try FileManager.default.attributesOfItem(atPath: logPath)
             let currentSize = attributes[.size] as? UInt64 ?? 0
+            let currentInode = (attributes[.systemFileNumber] as? NSNumber)?.uint64Value ?? 0
+
+            // Detect file replacement (inode changed) - atomic writes create new files
+            if lastKnownInode != 0 && currentInode != lastKnownInode {
+                SyncTraySettings.debugLog("LogWatcher: Polling detected file replacement (inode changed from \(lastKnownInode) to \(currentInode))")
+                DispatchQueue.main.async { [weak self] in
+                    self?.reopenFile()
+                }
+                return
+            }
 
             if currentSize > lastReadPosition {
                 // Missed content - read it
@@ -145,10 +216,19 @@ final class LogWatcher {
     private func handleFileChange() {
         guard let handle = fileHandle else { return }
 
-        // Check if file was truncated or rotated
+        // Check if file was truncated, rotated, or replaced
         do {
             let attributes = try FileManager.default.attributesOfItem(atPath: logPath)
             let fileSize = attributes[.size] as? UInt64 ?? 0
+            let currentInode = (attributes[.systemFileNumber] as? NSNumber)?.uint64Value ?? 0
+
+            // Detect file replacement (inode changed) - atomic writes create new files
+            if lastKnownInode != 0 && currentInode != lastKnownInode {
+                SyncTraySettings.debugLog("LogWatcher: File replaced (inode changed from \(lastKnownInode) to \(currentInode)), reopening")
+                reopenFile()
+                return
+            }
+            lastKnownInode = currentInode
 
             if fileSize < lastReadPosition {
                 // File was truncated, restart from beginning

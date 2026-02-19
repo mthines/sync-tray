@@ -1206,7 +1206,7 @@ struct ProfileDetailView: View {
             // Track bytes written for periodic truncation
             var bytesWritten: Int64 = 0
             var lastTruncateTime = Date()
-            let maxLogSize: Int64 = 1_000_000  // ~1MB
+            let maxLogSize: Int64 = 10_000_000  // ~10MB (increased to reduce truncation frequency)
             let truncateInterval: TimeInterval = 30
 
             // Remove any existing lock files first (prevents "prior lock file found" errors)
@@ -1313,8 +1313,9 @@ struct ProfileDetailView: View {
                         if bytesWritten > maxLogSize && now.timeIntervalSince(lastTruncateTime) > truncateInterval {
                             if let content = try? String(contentsOfFile: syncLogPath, encoding: .utf8) {
                                 let logLines = content.components(separatedBy: "\n")
-                                let truncated = logLines.suffix(10000).joined(separator: "\n")
-                                try? truncated.write(toFile: syncLogPath, atomically: true, encoding: .utf8)
+                                let truncated = logLines.suffix(100000).joined(separator: "\n")
+                                // Use non-atomic write to preserve inode (prevents LogWatcher from losing track)
+                                try? truncated.write(toFile: syncLogPath, atomically: false, encoding: .utf8)
                             }
                             bytesWritten = 0
                             lastTruncateTime = now
@@ -2354,14 +2355,15 @@ struct ProfileDetailView: View {
     /// Truncate log file to keep only the last N lines (prevents unbounded growth)
     private func truncateInitialLogIfNeeded() {
         let logPath = profile.logPath
-        let maxLogLines = 10000  // ~1MB of text
+        let maxLogLines = 100000  // ~10MB of text (increased to reduce truncation frequency)
 
         guard let content = try? String(contentsOfFile: logPath, encoding: .utf8) else { return }
         let lines = content.components(separatedBy: "\n")
 
         if lines.count > maxLogLines {
             let truncated = lines.suffix(maxLogLines).joined(separator: "\n")
-            try? truncated.write(toFile: logPath, atomically: true, encoding: .utf8)
+            // Use non-atomic write to preserve inode (prevents LogWatcher from losing track)
+            try? truncated.write(toFile: logPath, atomically: false, encoding: .utf8)
         }
     }
 }
