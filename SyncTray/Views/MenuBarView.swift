@@ -61,6 +61,16 @@ struct MenuBarView: View {
                             .lineLimit(1)
                             .foregroundColor(syncManager.isPaused(for: profile.id) ? .secondary : .primary)
 
+                        if !profile.localSyncPath.isEmpty {
+                            Button(action: { syncManager.openSyncDirectory(for: profile) }) {
+                                Image(systemName: "folder")
+                                    .font(.system(size: 10))
+                                    .foregroundColor(.secondary)
+                            }
+                            .buttonStyle(.plain)
+                            .help("Open sync directory")
+                        }
+
                         Spacer()
 
                         if syncManager.state(for: profile.id) == .syncing {
@@ -133,25 +143,6 @@ struct MenuBarView: View {
             .background(Color.primary.opacity(0.05))
             .cornerRadius(6)
             .disabled(syncManager.currentState == .notConfigured)
-
-            // Open Sync Directory button (shows first enabled profile's directory)
-            if let firstProfile = syncManager.profileStore.enabledProfiles.first,
-               !firstProfile.localSyncPath.isEmpty {
-                Button(action: { syncManager.openSyncDirectory() }) {
-                    HStack {
-                        Image(systemName: "folder")
-                        Text("Open Sync Directory")
-                        Spacer()
-                    }
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-                .padding(.horizontal, 8)
-                .padding(.vertical, 6)
-                .background(Color.primary.opacity(0.05))
-                .cornerRadius(6)
-            }
 
             // View Log button
             Button(action: { syncManager.openLogFile() }) {
