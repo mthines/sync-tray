@@ -95,15 +95,28 @@ See [rclone's documentation](https://rclone.org/docs/) for detailed setup guides
 ## Installation
 
 ### Option 1: Homebrew (Recommended)
+
+The easiest way to install - no security warnings:
+
 ```bash
 brew tap mthines/synctray
 brew install --cask synctray
 ```
 
 ### Option 2: Download Release
-Download the latest `.app` from [Releases](../../releases) and drag to `/Applications`.
+
+Download the latest `.zip` from [Releases](../../releases), extract, and drag `SyncTray.app` to `/Applications`.
+
+**Important:** Since the app isn't notarized with Apple, you'll see a security warning on first launch. This is normal for open-source apps. To fix it, run once:
+
+```bash
+xattr -cr /Applications/SyncTray.app
+```
+
+Then open the app normally.
 
 ### Option 3: Build from Source
+
 ```bash
 git clone https://github.com/mthines/sync-tray.git
 cd sync-tray
@@ -187,12 +200,20 @@ SyncTray creates these files (per profile):
 
 ## Troubleshooting
 
-### "App can't be opened" security warning
-If you downloaded manually (not via Homebrew), macOS Gatekeeper may block the app. Fix with:
+### "App can't be opened" or "unidentified developer" warning
+
+macOS Gatekeeper blocks apps that aren't notarized with Apple. This is normal for open-source apps distributed outside the App Store.
+
+**Fix (run once in Terminal):**
 ```bash
 xattr -cr /Applications/SyncTray.app
 ```
-Then open the app normally. This is safe - it just removes the quarantine flag from the downloaded file.
+
+This removes the quarantine attribute from the downloaded file. It's safe - the same app, just without the download flag that triggers Gatekeeper.
+
+**Alternative:** Right-click the app → Open → Click "Open" in the dialog. You only need to do this once.
+
+**Note:** If you installed via Homebrew (`brew install --cask synctray`), this is handled automatically.
 
 ### Sync shows error state
 1. Click **View Log** in the menu to see detailed error messages
