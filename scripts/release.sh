@@ -324,6 +324,13 @@ main() {
     # Update Homebrew Cask
     update_cask "$new_version" "$zip_path"
 
+    # Commit cask update if changed
+    if [ -n "$(git status --porcelain Casks/synctray.rb 2>/dev/null)" ]; then
+        git add Casks/synctray.rb
+        git commit -m "feat(cask): update SyncTray to version ${new_version#v} with new SHA256 checksum"
+        log_success "Committed cask update"
+    fi
+
     # Generate changelog
     local changelog=$(generate_changelog "$current_version" "$new_version")
 

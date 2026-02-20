@@ -85,6 +85,13 @@ struct ProfileDetailView: View {
         setupService.isInstalled(profile: profile)
     }
 
+    /// Returns true if this profile uses an external drive that is currently unplugged
+    private var isExternalDriveUnplugged: Bool {
+        let drivePath = profile.drivePathToMonitor
+        guard !drivePath.isEmpty else { return false }
+        return !FileManager.default.fileExists(atPath: drivePath)
+    }
+
     /// Returns true if paths have changed and the new path combination needs initial sync
     private var pathsNeedInitialSync: Bool {
         // Check if paths have changed
@@ -454,6 +461,11 @@ struct ProfileDetailView: View {
                     default:
                         Label("Installed", systemImage: "checkmark.circle.fill")
                             .foregroundColor(.green)
+                        if isExternalDriveUnplugged {
+                            Text("(External drive unplugged)")
+                                .font(.caption)
+                                .foregroundColor(.orange)
+                        }
                     }
                 } else {
                     Label("Not Installed", systemImage: "circle.dashed")
