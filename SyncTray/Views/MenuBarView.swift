@@ -43,23 +43,36 @@ struct MenuBarView: View {
                 .foregroundColor(.secondary)
 
             ForEach(syncManager.profileStore.enabledProfiles) { profile in
-                HStack(spacing: 8) {
-                    Circle()
-                        .fill(statusColor(for: profile))
-                        .frame(width: 6, height: 6)
+                Button(action: { syncManager.togglePause(for: profile.id) }) {
+                    HStack(spacing: 8) {
+                        // Status indicator - show pause icon when paused
+                        if syncManager.isPaused(for: profile.id) {
+                            Image(systemName: "pause.circle.fill")
+                                .font(.system(size: 10))
+                                .foregroundColor(.gray)
+                        } else {
+                            Circle()
+                                .fill(statusColor(for: profile))
+                                .frame(width: 6, height: 6)
+                        }
 
-                    Text(profile.name)
-                        .font(.system(size: 12))
-                        .lineLimit(1)
+                        Text(profile.name)
+                            .font(.system(size: 12))
+                            .lineLimit(1)
+                            .foregroundColor(syncManager.isPaused(for: profile.id) ? .secondary : .primary)
 
-                    Spacer()
+                        Spacer()
 
-                    if syncManager.state(for: profile.id) == .syncing {
-                        ProgressView()
-                            .scaleEffect(0.5)
-                            .frame(width: 12, height: 12)
+                        if syncManager.state(for: profile.id) == .syncing {
+                            ProgressView()
+                                .scaleEffect(0.5)
+                                .frame(width: 12, height: 12)
+                        }
                     }
+                    .contentShape(Rectangle())
                 }
+                .buttonStyle(.plain)
+                .help(syncManager.isPaused(for: profile.id) ? "Click to resume syncing" : "Click to pause syncing")
             }
         }
     }
@@ -70,6 +83,8 @@ struct MenuBarView: View {
             return .green
         case .syncing:
             return .blue
+        case .paused:
+            return .gray
         case .error:
             return .red
         case .driveNotMounted:
@@ -100,7 +115,24 @@ struct MenuBarView: View {
             .padding(.vertical, 6)
             .background(Color.primary.opacity(0.05))
             .cornerRadius(6)
-            .disabled(syncManager.isManualSyncRunning || syncManager.currentState == .driveNotMounted || syncManager.currentState == .notConfigured)
+            .disabled(syncManager.isManualSyncRunning || syncManager.currentState == .driveNotMounted || syncManager.currentState == .notConfigured || syncManager.isAllPaused)
+
+            // Pause All / Resume All button
+            Button(action: { syncManager.togglePauseAll() }) {
+                HStack {
+                    Image(systemName: syncManager.isAllPaused ? "play.fill" : "pause.fill")
+                    Text(syncManager.isAllPaused ? "Resume All" : "Pause All")
+                    Spacer()
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 6)
+            .background(Color.primary.opacity(0.05))
+            .cornerRadius(6)
+            .disabled(syncManager.currentState == .notConfigured)
 
             // Open Sync Directory button (shows first enabled profile's directory)
             if let firstProfile = syncManager.profileStore.enabledProfiles.first,

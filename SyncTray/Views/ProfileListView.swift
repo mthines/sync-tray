@@ -18,10 +18,15 @@ struct ProfileListView: View {
                     ProfileRow(
                         profile: profile,
                         state: syncManager.state(for: profile.id),
-                        isInstalled: SyncSetupService.shared.isInstalled(profile: profile)
+                        isInstalled: SyncSetupService.shared.isInstalled(profile: profile),
+                        isPaused: syncManager.isPaused(for: profile.id)
                     )
                     .tag(profile.id)
                     .contextMenu {
+                        Button(syncManager.isPaused(for: profile.id) ? "Resume Syncing" : "Pause Syncing") {
+                            syncManager.togglePause(for: profile.id)
+                        }
+                        Divider()
                         Button("Delete", role: .destructive) {
                             deleteProfile(profile)
                         }
@@ -99,20 +104,33 @@ struct ProfileRow: View {
     let profile: SyncProfile
     let state: SyncState
     let isInstalled: Bool
+    var isPaused: Bool = false
 
     var body: some View {
         HStack(spacing: 8) {
-            // Status indicator
-            Circle()
-                .fill(statusColor)
-                .frame(width: 8, height: 8)
+            // Status indicator - show pause icon when paused
+            if isPaused {
+                Image(systemName: "pause.circle.fill")
+                    .font(.system(size: 10))
+                    .foregroundColor(.gray)
+            } else {
+                Circle()
+                    .fill(statusColor)
+                    .frame(width: 8, height: 8)
+            }
 
             VStack(alignment: .leading, spacing: 2) {
                 Text(profile.name.isEmpty ? "Untitled Profile" : profile.name)
                     .font(.system(size: 13, weight: .medium))
+                    .foregroundColor(isPaused ? .secondary : .primary)
                     .lineLimit(1)
 
-                if isInstalled {
+                if isPaused {
+                    Text("Paused")
+                        .font(.system(size: 11))
+                        .foregroundColor(.secondary)
+                        .italic()
+                } else if isInstalled {
                     Text(profile.fullRemotePath)
                         .font(.system(size: 11))
                         .foregroundColor(.secondary)
@@ -147,6 +165,8 @@ struct ProfileRow: View {
             return .green
         case .syncing:
             return .blue
+        case .paused:
+            return .gray
         case .error:
             return .red
         case .driveNotMounted:

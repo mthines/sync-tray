@@ -436,6 +436,9 @@ struct ProfileDetailView: View {
                 } else if isInstalled {
                     let state = syncManager.state(for: profile.id)
                     switch state {
+                    case .paused:
+                        Label("Paused", systemImage: "pause.circle.fill")
+                            .foregroundColor(.gray)
                     case .error:
                         Label("Error", systemImage: "exclamationmark.circle.fill")
                             .foregroundColor(.red)
@@ -684,6 +687,10 @@ struct ProfileDetailView: View {
                             showingSyncInProgressAlert = true
                             return
                         }
+                        // Don't sync if paused
+                        if syncManager.isPaused(for: profile.id) {
+                            return
+                        }
                         // Clean up stale lock file if exists but process not running
                         let lockPath = profile.lockFilePath
                         if FileManager.default.fileExists(atPath: lockPath) {
@@ -694,6 +701,17 @@ struct ProfileDetailView: View {
                         Label("Sync Now", systemImage: "arrow.triangle.2.circlepath")
                     }
                     .buttonStyle(.borderedProminent)
+                    .disabled(isSyncRunningForProfile || syncManager.isPaused(for: profile.id))
+
+                    // Pause/Resume button
+                    Button(action: {
+                        syncManager.togglePause(for: profile.id)
+                    }) {
+                        Label(
+                            syncManager.isPaused(for: profile.id) ? "Resume" : "Pause",
+                            systemImage: syncManager.isPaused(for: profile.id) ? "play.fill" : "pause.fill"
+                        )
+                    }
                     .disabled(isSyncRunningForProfile)
 
                     Button(action: { showingUninstallConfirm = true }) {

@@ -33,6 +33,9 @@ final class SyncManager: ObservableObject {
     /// Profiles with muted file change notifications (for current sync only)
     @Published private(set) var mutedProfileNotifications: Set<UUID> = []
 
+    /// Paused profiles (session-only, not persisted - resets on app restart)
+    @Published private(set) var pausedProfiles: Set<UUID> = []
+
     let profileStore: ProfileStore
 
     private var logWatchers: [UUID: LogWatcher] = [:]
@@ -97,9 +100,15 @@ final class SyncManager: ObservableObject {
 
         let profilesToSync: [SyncProfile]
         if let profile = profile {
+            // Skip if this specific profile is paused
+            guard !isPaused(for: profile.id) else {
+                SyncTraySettings.debugLog("Skipping manual sync for paused profile: \(profile.name)")
+                return
+            }
             profilesToSync = [profile]
         } else {
-            profilesToSync = profileStore.enabledProfiles
+            // Filter out paused profiles
+            profilesToSync = profileStore.enabledProfiles.filter { !isPaused(for: $0.id) }
         }
 
         guard !profilesToSync.isEmpty else {
@@ -281,6 +290,95 @@ final class SyncManager: ObservableObject {
     /// Check if notifications are muted for a profile
     func isNotificationsMuted(for profileId: UUID) -> Bool {
         mutedProfileNotifications.contains(profileId)
+    }
+
+    // MARK: - Pause/Resume
+
+    /// Check if a profile is paused
+    func isPaused(for profileId: UUID) -> Bool {
+        pausedProfiles.contains(profileId)
+    }
+
+    /// Check if all enabled profiles are paused
+    var isAllPaused: Bool {
+        let enabledIds = Set(profileStore.enabledProfiles.map { $0.id })
+        guard !enabledIds.isEmpty else { return false }
+        return enabledIds.isSubset(of: pausedProfiles)
+    }
+
+    /// Pause syncing for a specific profile (stops directory watcher, blocks manual/scheduled syncs)
+    func pauseProfile(_ profileId: UUID) {
+        guard let profile = profileStore.profile(for: profileId) else { return }
+
+        pausedProfiles.insert(profileId)
+
+        // Stop directory watcher for this profile
+        directoryWatchers[profileId]?.stop()
+        directoryWatchers.removeValue(forKey: profileId)
+
+        // Update profile state to paused
+        profileStates[profileId] = .paused
+
+        updateAggregateState()
+
+        SyncTraySettings.debugLog("Paused profile: \(profile.name)")
+    }
+
+    /// Resume syncing for a specific profile (restarts directory watcher)
+    func resumeProfile(_ profileId: UUID) {
+        guard let profile = profileStore.profile(for: profileId),
+              profile.isEnabled else { return }
+
+        pausedProfiles.remove(profileId)
+
+        // Restart directory watcher for this profile
+        startWatchingDirectory(for: profile)
+
+        // Reset state to idle (or check drive mount status)
+        if !profile.drivePathToMonitor.isEmpty &&
+           !FileManager.default.fileExists(atPath: profile.drivePathToMonitor) {
+            profileStates[profileId] = .driveNotMounted
+        } else {
+            profileStates[profileId] = .idle
+        }
+
+        updateAggregateState()
+
+        SyncTraySettings.debugLog("Resumed profile: \(profile.name)")
+    }
+
+    /// Pause all enabled profiles
+    func pauseAllProfiles() {
+        for profile in profileStore.enabledProfiles {
+            pauseProfile(profile.id)
+        }
+    }
+
+    /// Resume all paused profiles
+    func resumeAllProfiles() {
+        // Create a copy since we're modifying the set while iterating
+        let profilesToPause = pausedProfiles
+        for profileId in profilesToPause {
+            resumeProfile(profileId)
+        }
+    }
+
+    /// Toggle pause state for a specific profile
+    func togglePause(for profileId: UUID) {
+        if isPaused(for: profileId) {
+            resumeProfile(profileId)
+        } else {
+            pauseProfile(profileId)
+        }
+    }
+
+    /// Toggle pause state for all profiles
+    func togglePauseAll() {
+        if isAllPaused {
+            resumeAllProfiles()
+        } else {
+            pauseAllProfiles()
+        }
     }
 
     /// Read the last error message from a log file
@@ -582,6 +680,12 @@ final class SyncManager: ObservableObject {
 
     /// Handle file system changes detected by DirectoryWatcher
     private func handleDirectoryChange(for profileId: UUID) {
+        // Skip if profile is paused
+        if isPaused(for: profileId) {
+            SyncTraySettings.debugLog("DirectoryWatcher: Skipping sync for \(profileId.uuidString.prefix(8)) - profile paused")
+            return
+        }
+
         // Skip if profile is already syncing (avoid duplicate work)
         if profileStates[profileId] == .syncing {
             SyncTraySettings.debugLog("DirectoryWatcher: Skipping sync for \(profileId.uuidString.prefix(8)) - already syncing")
@@ -656,10 +760,11 @@ final class SyncManager: ObservableObject {
             return
         }
 
-        // Priority: error > syncing > driveNotMounted > idle
+        // Priority: error > syncing > driveNotMounted > paused > idle
         var hasError = false
         var hasSyncing = false
         var hasDriveNotMounted = false
+        var hasPaused = false
         var errorMessage: String?
 
         for state in profileStates.values {
@@ -671,6 +776,8 @@ final class SyncManager: ObservableObject {
                 hasSyncing = true
             case .driveNotMounted:
                 hasDriveNotMounted = true
+            case .paused:
+                hasPaused = true
             default:
                 break
             }
@@ -682,6 +789,9 @@ final class SyncManager: ObservableObject {
             currentState = .syncing
         } else if hasDriveNotMounted {
             currentState = .driveNotMounted
+        } else if hasPaused && isAllPaused {
+            // Only show paused aggregate state if ALL profiles are paused
+            currentState = .paused
         } else {
             currentState = .idle
         }
@@ -753,6 +863,12 @@ final class SyncManager: ObservableObject {
     }
 
     private func runSyncScript(for profile: SyncProfile) async {
+        // Check if profile is paused
+        if isPaused(for: profile.id) {
+            SyncTraySettings.debugLog("Skipping sync script for paused profile: \(profile.name)")
+            return
+        }
+
         // Check if drive is mounted
         if !profile.drivePathToMonitor.isEmpty &&
            !FileManager.default.fileExists(atPath: profile.drivePathToMonitor) {
