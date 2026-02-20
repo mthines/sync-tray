@@ -142,11 +142,19 @@ generate_changelog() {
     echo "---"
     echo ""
     echo "### Installation"
+    echo ""
+    echo "**Via Homebrew (recommended):**"
+    echo "\`\`\`bash"
+    echo "brew tap mthines/synctray"
+    echo "brew install --cask synctray"
+    echo "\`\`\`"
+    echo ""
+    echo "**Manual download:**"
     echo "1. Download \`${PROJECT_NAME}-${new_version}-macOS.zip\`"
     echo "2. Unzip and drag \`${PROJECT_NAME}.app\` to \`/Applications\`"
     echo "3. Launch and configure via Settings"
     echo ""
-    echo "**Requirements:** macOS 13.0+"
+    echo "**Requirements:** macOS 13.0+, [rclone](https://rclone.org/) installed"
 }
 
 # Update version in Info.plist
@@ -175,6 +183,63 @@ build_release() {
     log_success "Build completed"
 }
 
+# Sign and notarize the app (if Developer ID certificate is available)
+sign_and_notarize() {
+    local app_path="$1"
+
+    # Check for Developer ID certificate
+    local dev_id=$(security find-identity -v -p codesigning 2>/dev/null | grep "Developer ID Application" | head -1 | sed 's/.*"\(.*\)"/\1/')
+
+    if [ -z "$dev_id" ]; then
+        log_warning "No Developer ID certificate found. App will trigger Gatekeeper warning."
+        log_info "Users can bypass with: xattr -cr /Applications/SyncTray.app"
+        return 1
+    fi
+
+    log_info "Signing with: $dev_id"
+
+    # Sign the app with hardened runtime
+    codesign --force --deep --options runtime \
+        --sign "$dev_id" \
+        --entitlements "$PROJECT_DIR/SyncTray/SyncTray.entitlements" \
+        "$app_path"
+
+    log_success "Code signed"
+
+    # Check for notarytool credentials
+    if ! xcrun notarytool history --keychain-profile "notarytool" &>/dev/null; then
+        log_warning "Notarytool not configured. Skipping notarization."
+        log_info "Set up with: xcrun notarytool store-credentials \"notarytool\""
+        return 1
+    fi
+
+    # Create zip for notarization
+    local notarize_zip="/tmp/synctray-notarize.zip"
+    ditto -c -k --keepParent "$app_path" "$notarize_zip"
+
+    log_info "Submitting for notarization (this may take a few minutes)..."
+
+    # Submit for notarization
+    local result=$(xcrun notarytool submit "$notarize_zip" \
+        --keychain-profile "notarytool" \
+        --wait 2>&1)
+
+    if echo "$result" | grep -q "status: Accepted"; then
+        log_success "Notarization accepted"
+
+        # Staple the ticket
+        xcrun stapler staple "$app_path"
+        log_success "Notarization ticket stapled"
+    else
+        log_warning "Notarization failed or pending"
+        echo "$result" | tail -5
+        return 1
+    fi
+
+    rm -f "$notarize_zip"
+    return 0
+}
+
 # Create release zip
 create_zip() {
     local version="$1"
@@ -186,11 +251,44 @@ create_zip() {
         log_error "App not found at $app_path"
     fi
 
+    # Sign and notarize (if possible)
+    sign_and_notarize "$app_path" || true
+
     cd "$BUILD_DIR/DerivedData/Build/Products/Release"
     zip -rq "$zip_path" "${PROJECT_NAME}.app"
 
     log_success "Created $zip_name ($(du -h "$zip_path" | cut -f1))"
     echo "$zip_path"
+}
+
+# Update Homebrew Cask with new version and SHA256
+update_cask() {
+    local version="$1"
+    local zip_path="$2"
+    local cask_file="$PROJECT_DIR/Casks/synctray.rb"
+
+    if [ ! -f "$cask_file" ]; then
+        log_warning "Cask file not found at $cask_file. Skipping cask update."
+        return
+    fi
+
+    # Calculate SHA256
+    local sha256=$(shasum -a 256 "$zip_path" | awk '{print $1}')
+
+    # Update version
+    sed -i '' "s/version \"[^\"]*\"/version \"${version#v}\"/" "$cask_file"
+
+    # Update sha256
+    sed -i '' "s/sha256 .*/sha256 \"$sha256\"/" "$cask_file"
+
+    log_success "Updated Cask: version ${version#v}, sha256 ${sha256:0:12}..."
+
+    # Also update tap repo if it exists
+    local tap_cask="$PROJECT_DIR/../homebrew-synctray/Casks/synctray.rb"
+    if [ -f "$tap_cask" ]; then
+        cp "$cask_file" "$tap_cask"
+        log_success "Synced Cask to homebrew-synctray tap"
+    fi
 }
 
 # Create GitHub release
@@ -283,6 +381,9 @@ main() {
     # Create zip
     local zip_path=$(create_zip "$new_version")
 
+    # Update Homebrew Cask
+    update_cask "$new_version" "$zip_path"
+
     # Generate changelog
     local changelog=$(generate_changelog "$current_version" "$new_version")
 
@@ -302,6 +403,19 @@ main() {
         log_success "Pushed to remote"
 
         create_github_release "$new_version" "$zip_path" "$changelog"
+
+        # Update homebrew tap if it exists
+        local tap_dir="$PROJECT_DIR/../homebrew-synctray"
+        if [ -d "$tap_dir/.git" ]; then
+            log_info "Updating homebrew-synctray tap..."
+            cd "$tap_dir"
+            git add Casks/synctray.rb
+            git commit -m "Update synctray to ${new_version}" 2>/dev/null && \
+                git push origin main && \
+                log_success "Pushed tap update" || \
+                log_warning "No tap changes to push"
+            cd "$PROJECT_DIR"
+        fi
     else
         log_info "Skipped push. Run manually:"
         log_info "  git push origin main"
