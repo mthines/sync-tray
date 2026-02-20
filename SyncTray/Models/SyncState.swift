@@ -129,7 +129,6 @@ struct SyncProgress: Equatable {
 enum SyncState: Equatable {
     case idle
     case syncing
-    case paused
     case error(String)
     case driveNotMounted
     case notConfigured
@@ -140,8 +139,6 @@ enum SyncState: Equatable {
             return "arrow.triangle.2.circlepath"
         case .syncing:
             return "arrow.triangle.2.circlepath"
-        case .paused:
-            return "pause.circle.fill"
         case .error:
             return "exclamationmark.triangle.fill"
         case .driveNotMounted:
@@ -157,8 +154,6 @@ enum SyncState: Equatable {
             return .secondary
         case .syncing:
             return .blue
-        case .paused:
-            return .gray
         case .error:
             return .red
         case .driveNotMounted:
@@ -174,8 +169,6 @@ enum SyncState: Equatable {
             return "Idle"
         case .syncing:
             return "Syncing..."
-        case .paused:
-            return "Paused"
         case .error(let message):
             return "Error: \(message)"
         case .driveNotMounted:

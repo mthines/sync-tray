@@ -94,10 +94,16 @@ See [rclone's documentation](https://rclone.org/docs/) for detailed setup guides
 
 ## Installation
 
-### Option 1: Download Release
+### Option 1: Homebrew (Recommended)
+```bash
+brew tap mthines/synctray
+brew install --cask synctray
+```
+
+### Option 2: Download Release
 Download the latest `.app` from [Releases](../../releases) and drag to `/Applications`.
 
-### Option 2: Build from Source
+### Option 3: Build from Source
 ```bash
 git clone https://github.com/mthines/sync-tray.git
 cd sync-tray
@@ -180,6 +186,13 @@ SyncTray creates these files (per profile):
 | `~/Library/LaunchAgents/com.synctray.sync.{id}.plist` | Background scheduler |
 
 ## Troubleshooting
+
+### "App can't be opened" security warning
+If you downloaded manually (not via Homebrew), macOS Gatekeeper may block the app. Fix with:
+```bash
+xattr -cr /Applications/SyncTray.app
+```
+Then open the app normally. This is safe - it just removes the quarantine flag from the downloaded file.
 
 ### Sync shows error state
 1. Click **View Log** in the menu to see detailed error messages
