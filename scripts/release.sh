@@ -201,6 +201,26 @@ create_zip() {
     echo "$zip_path"
 }
 
+# Find the homebrew tap directory
+find_tap_dir() {
+    # Check sibling directory first (development setup)
+    local sibling_tap="$PROJECT_DIR/../homebrew-synctray"
+    if [ -d "$sibling_tap/.git" ]; then
+        echo "$sibling_tap"
+        return
+    fi
+
+    # Check Homebrew tap location
+    local brew_tap=$(brew --repository mthines/synctray 2>/dev/null)
+    if [ -n "$brew_tap" ] && [ -d "$brew_tap/.git" ]; then
+        echo "$brew_tap"
+        return
+    fi
+
+    # Not found
+    echo ""
+}
+
 # Update Homebrew Cask with new version and SHA256
 update_cask() {
     local version="$1"
@@ -208,8 +228,7 @@ update_cask() {
     local cask_file="$PROJECT_DIR/Casks/synctray.rb"
 
     if [ ! -f "$cask_file" ]; then
-        log_warning "Cask file not found at $cask_file. Skipping cask update."
-        return
+        log_error "Cask file not found at $cask_file"
     fi
 
     # Calculate SHA256
@@ -223,12 +242,19 @@ update_cask() {
 
     log_success "Updated Cask: version ${version#v}, sha256 ${sha256:0:12}..."
 
-    # Also update tap repo if it exists
-    local tap_cask="$PROJECT_DIR/../homebrew-synctray/Casks/synctray.rb"
-    if [ -f "$tap_cask" ]; then
-        cp "$cask_file" "$tap_cask"
-        log_success "Synced Cask to homebrew-synctray tap"
+    # Find and update tap repo
+    TAP_DIR=$(find_tap_dir)
+    if [ -z "$TAP_DIR" ]; then
+        log_error "Homebrew tap not found. Install with: brew tap mthines/synctray"
     fi
+
+    local tap_cask="$TAP_DIR/Casks/synctray.rb"
+    if [ ! -f "$tap_cask" ]; then
+        log_error "Tap cask file not found at $tap_cask"
+    fi
+
+    cp "$cask_file" "$tap_cask"
+    log_success "Synced Cask to homebrew-synctray tap at $TAP_DIR"
 }
 
 # Create GitHub release
@@ -351,18 +377,18 @@ main() {
 
         create_github_release "$new_version" "$zip_path" "$changelog"
 
-        # Update homebrew tap if it exists
-        local tap_dir="$PROJECT_DIR/../homebrew-synctray"
-        if [ -d "$tap_dir/.git" ]; then
-            log_info "Updating homebrew-synctray tap..."
-            cd "$tap_dir"
-            git add Casks/synctray.rb
-            git commit -m "Update synctray to ${new_version}" 2>/dev/null && \
-                git push origin main && \
-                log_success "Pushed tap update" || \
-                log_warning "No tap changes to push"
-            cd "$PROJECT_DIR"
+        # Update homebrew tap (TAP_DIR set by update_cask)
+        log_info "Updating homebrew-synctray tap at $TAP_DIR..."
+        cd "$TAP_DIR"
+        git add Casks/synctray.rb
+        if ! git commit -m "feat(cask): update SyncTray to ${new_version#v}"; then
+            log_error "Failed to commit tap update"
         fi
+        if ! git push origin main; then
+            log_error "Failed to push tap update to origin"
+        fi
+        log_success "Pushed tap update"
+        cd "$PROJECT_DIR"
     else
         log_info "Skipped push. Run manually:"
         log_info "  git push origin main"
