@@ -19,7 +19,8 @@ struct ProfileListView: View {
                         profile: profile,
                         state: syncManager.state(for: profile.id),
                         isInstalled: SyncSetupService.shared.isInstalled(profile: profile),
-                        isPaused: syncManager.isPaused(for: profile.id)
+                        isPaused: syncManager.isPaused(for: profile.id),
+                        progress: syncManager.profileProgress[profile.id]
                     )
                     .tag(profile.id)
                     .contextMenu {
@@ -105,6 +106,7 @@ struct ProfileRow: View {
     let state: SyncState
     let isInstalled: Bool
     var isPaused: Bool = false
+    var progress: SyncProgress? = nil
 
     var body: some View {
         HStack(spacing: 8) {
@@ -147,9 +149,18 @@ struct ProfileRow: View {
 
             // Sync indicator
             if state == .syncing {
-                ProgressView()
-                    .scaleEffect(0.6)
-                    .frame(width: 16, height: 16)
+                if let progress = progress, progress.totalBytes > 0 {
+                    // Show progress percentage when available
+                    Text("\(Int(progress.percentage))%")
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundColor(.secondary)
+                        .monospacedDigit()
+                } else {
+                    // Show spinner when syncing but no progress yet
+                    ProgressView()
+                        .scaleEffect(0.6)
+                        .frame(width: 16, height: 16)
+                }
             }
         }
         .padding(.vertical, 4)
