@@ -74,9 +74,19 @@ struct MenuBarView: View {
                         Spacer()
 
                         if syncManager.state(for: profile.id) == .syncing {
-                            ProgressView()
-                                .scaleEffect(0.5)
-                                .frame(width: 12, height: 12)
+                            if let progress = syncManager.profileProgress[profile.id],
+                               progress.totalBytes > 0 {
+                                // Show progress percentage when available
+                                Text("\(Int(progress.percentage))%")
+                                    .font(.system(size: 10, weight: .medium))
+                                    .foregroundColor(.secondary)
+                                    .monospacedDigit()
+                            } else {
+                                // Show spinner when syncing but no progress yet
+                                ProgressView()
+                                    .scaleEffect(0.5)
+                                    .frame(width: 12, height: 12)
+                            }
                         }
                     }
                     .contentShape(Rectangle())
