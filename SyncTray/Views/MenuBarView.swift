@@ -10,8 +10,8 @@ struct MenuBarView: View {
                 .padding(.top, 12)
                 .padding(.bottom, 8)
 
-            // Profile status section (if multiple profiles)
-            if syncManager.profileStore.enabledProfiles.count > 1 {
+            // Profile status section
+            if syncManager.profileStore.enabledProfiles.count >= 1 {
                 Divider()
                     .padding(.horizontal, 8)
 
@@ -43,24 +43,70 @@ struct MenuBarView: View {
                 .foregroundColor(.secondary)
 
             ForEach(syncManager.profileStore.enabledProfiles) { profile in
-                Button(action: { syncManager.togglePause(for: profile.id) }) {
-                    HStack(spacing: 8) {
-                        // Status indicator - show pause icon when paused
-                        if syncManager.isPaused(for: profile.id) {
-                            Image(systemName: "pause.circle.fill")
-                                .font(.system(size: 10))
-                                .foregroundColor(.gray)
+                HStack(spacing: 8) {
+                    // Status indicator - show pause icon when paused
+                    if syncManager.isPaused(for: profile.id) {
+                        Image(systemName: "pause.circle.fill")
+                            .font(.system(size: 10))
+                            .foregroundColor(.gray)
+                    } else {
+                        Circle()
+                            .fill(statusColor(for: profile))
+                            .frame(width: 6, height: 6)
+                    }
+
+                    Text(profile.name)
+                        .font(.system(size: 12))
+                        .lineLimit(1)
+                        .foregroundColor(syncManager.isPaused(for: profile.id) ? .secondary : .primary)
+
+                    Spacer()
+
+                    // Sync progress indicator
+                    if syncManager.state(for: profile.id) == .syncing {
+                        if let progress = syncManager.profileProgress[profile.id],
+                           progress.totalBytes > 0 {
+                            Text("\(Int(progress.percentage))%")
+                                .font(.system(size: 10, weight: .medium))
+                                .foregroundColor(.secondary)
+                                .monospacedDigit()
                         } else {
-                            Circle()
-                                .fill(statusColor(for: profile))
-                                .frame(width: 6, height: 6)
+                            ProgressView()
+                                .scaleEffect(0.5)
+                                .frame(width: 12, height: 12)
                         }
+                    }
 
-                        Text(profile.name)
-                            .font(.system(size: 12))
-                            .lineLimit(1)
-                            .foregroundColor(syncManager.isPaused(for: profile.id) ? .secondary : .primary)
+                    // Action buttons (UX order: settings, pause sync, notifications, folder)
+                    HStack(spacing: 4) {
+                        // Settings button - opens profile settings
+                        Button(action: { openSettingsForProfile(profile.id) }) {
+                            Image(systemName: "gearshape")
+                                .font(.system(size: 10))
+                                .foregroundColor(.secondary)
+                        }
+                        .buttonStyle(.plain)
+                        .help("Open settings for this profile")
 
+                        // Pause/resume sync button
+                        Button(action: { syncManager.togglePause(for: profile.id) }) {
+                            Image(systemName: syncManager.isPaused(for: profile.id) ? "play.fill" : "pause.fill")
+                                .font(.system(size: 10))
+                                .foregroundColor(syncManager.isPaused(for: profile.id) ? .green : .secondary)
+                        }
+                        .buttonStyle(.plain)
+                        .help(syncManager.isPaused(for: profile.id) ? "Resume syncing" : "Pause syncing")
+
+                        // Pause/resume notifications button
+                        Button(action: { toggleNotifications(for: profile.id) }) {
+                            Image(systemName: syncManager.isNotificationsMuted(for: profile.id) ? "bell.slash.fill" : "bell")
+                                .font(.system(size: 10))
+                                .foregroundColor(syncManager.isNotificationsMuted(for: profile.id) ? .orange : .secondary)
+                        }
+                        .buttonStyle(.plain)
+                        .help(syncManager.isNotificationsMuted(for: profile.id) ? "Resume notifications" : "Pause notifications")
+
+                        // Open folder button
                         if !profile.localSyncPath.isEmpty {
                             Button(action: { syncManager.openSyncDirectory(for: profile) }) {
                                 Image(systemName: "folder")
@@ -70,31 +116,23 @@ struct MenuBarView: View {
                             .buttonStyle(.plain)
                             .help("Open sync directory")
                         }
-
-                        Spacer()
-
-                        if syncManager.state(for: profile.id) == .syncing {
-                            if let progress = syncManager.profileProgress[profile.id],
-                               progress.totalBytes > 0 {
-                                // Show progress percentage when available
-                                Text("\(Int(progress.percentage))%")
-                                    .font(.system(size: 10, weight: .medium))
-                                    .foregroundColor(.secondary)
-                                    .monospacedDigit()
-                            } else {
-                                // Show spinner when syncing but no progress yet
-                                ProgressView()
-                                    .scaleEffect(0.5)
-                                    .frame(width: 12, height: 12)
-                            }
-                        }
                     }
-                    .contentShape(Rectangle())
                 }
-                .buttonStyle(.plain)
-                .help(syncManager.isPaused(for: profile.id) ? "Click to resume syncing" : "Click to pause syncing")
             }
         }
+    }
+
+    private func toggleNotifications(for profileId: UUID) {
+        if syncManager.isNotificationsMuted(for: profileId) {
+            syncManager.unmuteNotifications(for: profileId)
+        } else {
+            syncManager.muteNotifications(for: profileId)
+        }
+    }
+
+    private func openSettingsForProfile(_ profileId: UUID) {
+        AppDelegate.pendingProfileSelection = profileId
+        openSettingsWindow()
     }
 
     private func statusColor(for profile: SyncProfile) -> Color {
