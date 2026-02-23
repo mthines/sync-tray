@@ -143,6 +143,14 @@ struct MenuBarView: View {
     private func openSettingsForProfile(_ profileId: UUID) {
         AppDelegate.pendingProfileSelection = profileId
         openSettingsWindow()
+        // Post notification to select profile (handles case when window is already open)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+            NotificationCenter.default.post(
+                name: .selectProfile,
+                object: nil,
+                userInfo: ["profileId": profileId]
+            )
+        }
     }
 
     private func statusColor(for profile: SyncProfile) -> Color {
