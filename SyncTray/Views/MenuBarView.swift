@@ -77,7 +77,7 @@ struct MenuBarView: View {
                         }
                     }
 
-                    // Action buttons (UX order: settings, pause sync, notifications, folder)
+                    // Action buttons (order: settings, mute, folder, pause/play)
                     HStack(spacing: 4) {
                         // Settings button - opens profile settings
                         Button(action: { openSettingsForProfile(profile.id) }) {
@@ -88,23 +88,14 @@ struct MenuBarView: View {
                         .buttonStyle(.plain)
                         .help("Open settings for this profile")
 
-                        // Pause/resume sync button
-                        Button(action: { syncManager.togglePause(for: profile.id) }) {
-                            Image(systemName: syncManager.isPaused(for: profile.id) ? "play.fill" : "pause.fill")
-                                .font(.system(size: 10))
-                                .foregroundColor(syncManager.isPaused(for: profile.id) ? .green : .secondary)
-                        }
-                        .buttonStyle(.plain)
-                        .help(syncManager.isPaused(for: profile.id) ? "Resume syncing" : "Pause syncing")
-
-                        // Pause/resume notifications button
+                        // Mute/unmute notifications button
                         Button(action: { toggleNotifications(for: profile.id) }) {
                             Image(systemName: syncManager.isNotificationsMuted(for: profile.id) ? "bell.slash.fill" : "bell")
                                 .font(.system(size: 10))
                                 .foregroundColor(syncManager.isNotificationsMuted(for: profile.id) ? .orange : .secondary)
                         }
                         .buttonStyle(.plain)
-                        .help(syncManager.isNotificationsMuted(for: profile.id) ? "Resume notifications" : "Pause notifications")
+                        .help(syncManager.isNotificationsMuted(for: profile.id) ? "Unmute notifications" : "Mute notifications")
 
                         // Open folder button
                         if !profile.localSyncPath.isEmpty {
@@ -116,6 +107,15 @@ struct MenuBarView: View {
                             .buttonStyle(.plain)
                             .help("Open sync directory")
                         }
+
+                        // Pause/resume sync button (shows action: pause when running, play when paused)
+                        Button(action: { syncManager.togglePause(for: profile.id) }) {
+                            Image(systemName: syncManager.isPaused(for: profile.id) ? "play.fill" : "pause.fill")
+                                .font(.system(size: 10))
+                                .foregroundColor(.secondary)
+                        }
+                        .buttonStyle(.plain)
+                        .help(syncManager.isPaused(for: profile.id) ? "Resume syncing" : "Pause syncing")
                     }
                 }
             }
