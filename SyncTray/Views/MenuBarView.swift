@@ -108,6 +108,16 @@ struct MenuBarView: View {
                             .help("Open sync directory")
                         }
 
+                        // Sync now button for this profile
+                        Button(action: { syncManager.triggerManualSync(for: profile) }) {
+                            Image(systemName: "arrow.triangle.2.circlepath")
+                                .font(.system(size: 10))
+                                .foregroundColor(.secondary)
+                        }
+                        .buttonStyle(.plain)
+                        .help("Sync this profile now")
+                        .disabled(syncManager.isPaused(for: profile.id) || syncManager.state(for: profile.id) == .syncing)
+
                         // Pause/resume sync button (shows action: pause when running, play when paused)
                         Button(action: { syncManager.togglePause(for: profile.id) }) {
                             Image(systemName: syncManager.isPaused(for: profile.id) ? "play.fill" : "pause.fill")
