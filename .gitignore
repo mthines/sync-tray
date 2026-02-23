@@ -10,6 +10,8 @@ DerivedData/
 build/
 *.app
 
+tasks
+
 # macOS
 .DS_Store
 .AppleDouble
