@@ -30,9 +30,6 @@ final class SyncManager: ObservableObject {
     /// Last error message per profile (for display in UI)
     @Published private(set) var profileErrors: [UUID: String] = [:]
 
-    /// Profiles with muted file change notifications (persists until manually unmuted)
-    @Published private(set) var mutedProfileNotifications: Set<UUID> = []
-
     /// Paused profiles (session-only, not persisted - resets on app restart)
     @Published private(set) var pausedProfiles: Set<UUID> = []
 
@@ -277,19 +274,23 @@ final class SyncManager: ObservableObject {
 
     // MARK: - Notification Muting
 
-    /// Mute file change notifications for a profile (persists until manually unmuted)
+    /// Mute file change notifications for a profile (persisted)
     func muteNotifications(for profileId: UUID) {
-        mutedProfileNotifications.insert(profileId)
+        guard var profile = profileStore.profile(for: profileId) else { return }
+        profile.isMuted = true
+        profileStore.update(profile)
     }
 
-    /// Unmute notifications for a profile
+    /// Unmute notifications for a profile (persisted)
     func unmuteNotifications(for profileId: UUID) {
-        mutedProfileNotifications.remove(profileId)
+        guard var profile = profileStore.profile(for: profileId) else { return }
+        profile.isMuted = false
+        profileStore.update(profile)
     }
 
     /// Check if notifications are muted for a profile
     func isNotificationsMuted(for profileId: UUID) -> Bool {
-        mutedProfileNotifications.contains(profileId)
+        profileStore.profile(for: profileId)?.isMuted ?? false
     }
 
     // MARK: - Pause/Resume
@@ -1015,7 +1016,7 @@ final class SyncManager: ObservableObject {
             currentSyncChanges[profileId]?.append(change)
             addRecentChange(change)
             // Only send notification if not muted
-            if !mutedProfileNotifications.contains(profileId) {
+            if !isNotificationsMuted(for: profileId) {
                 notificationService.notifyFileChange(change, profileId: profileId, syncDirectoryPath: syncDirectoryPath)
             }
 
