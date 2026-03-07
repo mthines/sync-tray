@@ -11,6 +11,7 @@ struct SyncProfile: Identifiable, Codable, Equatable {
     var syncIntervalMinutes: Int        // default: 15
     var additionalRcloneFlags: String   // optional extra flags
     var isEnabled: Bool                 // whether scheduled sync is active
+    var isMuted: Bool                   // whether notifications are muted for this profile
 
     /// Short ID for file naming (first 8 chars of UUID)
     var shortId: String {
@@ -85,7 +86,8 @@ struct SyncProfile: Identifiable, Codable, Equatable {
         drivePathToMonitor: String = "",
         syncIntervalMinutes: Int = 15,
         additionalRcloneFlags: String = "",
-        isEnabled: Bool = false
+        isEnabled: Bool = false,
+        isMuted: Bool = false
     ) {
         self.id = id
         self.name = name
@@ -96,11 +98,37 @@ struct SyncProfile: Identifiable, Codable, Equatable {
         self.syncIntervalMinutes = syncIntervalMinutes
         self.additionalRcloneFlags = additionalRcloneFlags
         self.isEnabled = isEnabled
+        self.isMuted = isMuted
     }
 
     /// Create a new profile with default values
     static func newProfile() -> SyncProfile {
         SyncProfile(name: "New Profile")
+    }
+}
+
+// MARK: - Codable (backwards compatibility for isMuted)
+
+extension SyncProfile {
+    enum CodingKeys: String, CodingKey {
+        case id, name, rcloneRemote, remotePath, localSyncPath
+        case drivePathToMonitor, syncIntervalMinutes, additionalRcloneFlags
+        case isEnabled, isMuted
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(UUID.self, forKey: .id)
+        name = try container.decode(String.self, forKey: .name)
+        rcloneRemote = try container.decode(String.self, forKey: .rcloneRemote)
+        remotePath = try container.decode(String.self, forKey: .remotePath)
+        localSyncPath = try container.decode(String.self, forKey: .localSyncPath)
+        drivePathToMonitor = try container.decode(String.self, forKey: .drivePathToMonitor)
+        syncIntervalMinutes = try container.decode(Int.self, forKey: .syncIntervalMinutes)
+        additionalRcloneFlags = try container.decode(String.self, forKey: .additionalRcloneFlags)
+        isEnabled = try container.decode(Bool.self, forKey: .isEnabled)
+        // Backwards compatibility: default to false if not present
+        isMuted = try container.decodeIfPresent(Bool.self, forKey: .isMuted) ?? false
     }
 }
 

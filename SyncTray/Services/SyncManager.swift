@@ -30,8 +30,6 @@ final class SyncManager: ObservableObject {
     /// Last error message per profile (for display in UI)
     @Published private(set) var profileErrors: [UUID: String] = [:]
 
-    /// Profiles with muted file change notifications (for current sync only)
-    @Published private(set) var mutedProfileNotifications: Set<UUID> = []
 
     /// Paused profiles (session-only, not persisted - resets on app restart)
     @Published private(set) var pausedProfiles: Set<UUID> = []
@@ -277,19 +275,23 @@ final class SyncManager: ObservableObject {
 
     // MARK: - Notification Muting
 
-    /// Mute file change notifications for a profile's current sync
+    /// Mute file change notifications for a profile (persisted)
     func muteNotifications(for profileId: UUID) {
-        mutedProfileNotifications.insert(profileId)
+        guard var profile = profileStore.profile(for: profileId) else { return }
+        profile.isMuted = true
+        profileStore.update(profile)
     }
 
-    /// Unmute notifications for a profile (called when sync ends)
+    /// Unmute notifications for a profile (persisted)
     func unmuteNotifications(for profileId: UUID) {
-        mutedProfileNotifications.remove(profileId)
+        guard var profile = profileStore.profile(for: profileId) else { return }
+        profile.isMuted = false
+        profileStore.update(profile)
     }
 
     /// Check if notifications are muted for a profile
     func isNotificationsMuted(for profileId: UUID) -> Bool {
-        mutedProfileNotifications.contains(profileId)
+        profileStore.profile(for: profileId)?.isMuted ?? false
     }
 
     // MARK: - Pause/Resume
@@ -936,7 +938,6 @@ final class SyncManager: ObservableObject {
             profileErrors[profileId] = nil  // Clear error on success
             lastSeenErrorMessage[profileId] = nil
             profileProgress[profileId] = nil  // Clear progress when sync completes
-            unmuteNotifications(for: profileId)  // Clear mute state
             logWatchers[profileId]?.setActivelySyncing(false)  // Reduce polling frequency
             lastSyncTime = event.timestamp
             let changesCount = currentSyncChanges[profileId]?.count ?? 0
@@ -955,7 +956,6 @@ final class SyncManager: ObservableObject {
                 // Transient "all files were changed" - just clear state, don't show error
                 profileProgress[profileId] = nil
                 lastSeenErrorMessage[profileId] = nil
-                unmuteNotifications(for: profileId)  // Clear mute state even on transient
                 logWatchers[profileId]?.setActivelySyncing(false)  // Reduce polling frequency
                 currentSyncChanges[profileId] = nil  // Only clear this profile's changes
                 // Reset to idle since this isn't a real error
@@ -966,7 +966,6 @@ final class SyncManager: ObservableObject {
             profileStates[profileId] = .error("Exit code \(exitCode)")
             profileProgress[profileId] = nil  // Clear progress on failure
             lastSeenErrorMessage[profileId] = nil
-            unmuteNotifications(for: profileId)  // Clear mute state on failure
             logWatchers[profileId]?.setActivelySyncing(false)  // Reduce polling frequency
             // Only use the syncFailed message if we don't already have a more specific error
             if profileErrors[profileId] == nil, let msg = message {
@@ -1017,7 +1016,7 @@ final class SyncManager: ObservableObject {
             currentSyncChanges[profileId]?.append(change)
             addRecentChange(change)
             // Only send notification if not muted
-            if !mutedProfileNotifications.contains(profileId) {
+            if !isNotificationsMuted(for: profileId) {
                 notificationService.notifyFileChange(change, profileId: profileId, syncDirectoryPath: syncDirectoryPath)
             }
 
