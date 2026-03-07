@@ -508,8 +508,8 @@ struct ProfileDetailView: View {
                     }
                     .buttonStyle(.plain)
                     .help(syncManager.isNotificationsMuted(for: profile.id)
-                          ? "Unmute notifications"
-                          : "Mute notifications for this sync")
+                          ? "Unmute profile notifications"
+                          : "Mute profile notifications")
                 }
             }
 
@@ -1141,6 +1141,7 @@ struct ProfileDetailView: View {
 
         // Automatically mute notifications for initial sync (resync)
         // This prevents notification spam when many files are being synced for the first time
+        // Note: Mute state is persistent - user can unmute via menu bar or settings
         syncManager.muteNotifications(for: profile.id)
 
         // Capture all values from main thread before going to background

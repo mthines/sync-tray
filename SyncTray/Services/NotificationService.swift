@@ -33,7 +33,7 @@ final class NotificationService {
 
         let muteAction = UNNotificationAction(
             identifier: muteActionIdentifier,
-            title: "Mute Current Sync",
+            title: "Mute Profile",
             options: []  // No .foreground - runs in background
         )
 
