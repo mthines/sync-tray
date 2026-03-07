@@ -508,8 +508,8 @@ struct ProfileDetailView: View {
                     }
                     .buttonStyle(.plain)
                     .help(syncManager.isNotificationsMuted(for: profile.id)
-                          ? "Unmute notifications"
-                          : "Mute notifications for this sync")
+                          ? "Unmute profile notifications"
+                          : "Mute profile notifications")
                 }
             }
 

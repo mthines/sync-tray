@@ -95,7 +95,7 @@ struct MenuBarView: View {
                                 .foregroundColor(syncManager.isNotificationsMuted(for: profile.id) ? .orange : .secondary)
                         }
                         .buttonStyle(.plain)
-                        .help(syncManager.isNotificationsMuted(for: profile.id) ? "Unmute notifications" : "Mute notifications")
+                        .help(syncManager.isNotificationsMuted(for: profile.id) ? "Unmute profile notifications" : "Mute profile notifications")
 
                         // Open folder button
                         if !profile.localSyncPath.isEmpty {
