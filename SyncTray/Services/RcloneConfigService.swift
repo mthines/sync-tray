@@ -146,43 +146,34 @@ final class RcloneConfigService {
             return .failure(.rcloneNotFound)
         }
 
+        // Run on background thread to not block UI
         return await withCheckedContinuation { continuation in
-            let process = Process()
-            let pipe = Pipe()
-            var outputData = Data()
+            DispatchQueue.global(qos: .userInitiated).async {
+                let process = Process()
+                let outputPipe = Pipe()
+                let errorPipe = Pipe()
 
-            process.executableURL = URL(fileURLWithPath: rclonePath)
-            // Only add colon if there's no colon in the path at all
-            let remote = remotePath.contains(":") ? remotePath : "\(remotePath):"
-            process.arguments = ["lsd", remote, "--max-depth", "0"]
-            process.standardOutput = pipe
-            process.standardError = pipe
+                process.executableURL = URL(fileURLWithPath: rclonePath)
+                // Only add colon if there's no colon in the path at all
+                let remote = remotePath.contains(":") ? remotePath : "\(remotePath):"
+                process.arguments = ["lsd", remote, "--max-depth", "0"]
+                process.standardOutput = outputPipe
+                process.standardError = errorPipe
 
-            // Collect output data as it arrives to prevent pipe buffer filling up
-            pipe.fileHandleForReading.readabilityHandler = { handle in
-                let data = handle.availableData
-                if !data.isEmpty {
-                    outputData.append(data)
+                do {
+                    try process.run()
+                    process.waitUntilExit()
+
+                    if process.terminationStatus == 0 {
+                        continuation.resume(returning: .success(()))
+                    } else {
+                        let errorData = errorPipe.fileHandleForReading.readDataToEndOfFile()
+                        let error = String(data: errorData, encoding: .utf8) ?? "Unknown error"
+                        continuation.resume(returning: .failure(.connectionFailed(error)))
+                    }
+                } catch {
+                    continuation.resume(returning: .failure(.connectionFailed(error.localizedDescription)))
                 }
-            }
-
-            process.terminationHandler = { proc in
-                // Stop reading and get any remaining data
-                pipe.fileHandleForReading.readabilityHandler = nil
-
-                if proc.terminationStatus == 0 {
-                    continuation.resume(returning: .success(()))
-                } else {
-                    let error = String(data: outputData, encoding: .utf8) ?? "Unknown error"
-                    continuation.resume(returning: .failure(.connectionFailed(error)))
-                }
-            }
-
-            do {
-                try process.run()
-            } catch {
-                pipe.fileHandleForReading.readabilityHandler = nil
-                continuation.resume(returning: .failure(.connectionFailed(error.localizedDescription)))
             }
         }
     }

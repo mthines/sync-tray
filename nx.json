@@ -1,0 +1,41 @@
+{
+  "$schema": "https://raw.githubusercontent.com/nrwl/nx/master/packages/nx/schemas/nx-schema.json",
+  "namedInputs": {
+    "default": ["{projectRoot}/**/*"],
+    "swift-sources": [
+      "{projectRoot}/SyncTray/**/*.swift",
+      "{projectRoot}/SyncTray/**/*.plist",
+      "{projectRoot}/SyncTray/**/*.xcassets",
+      "{projectRoot}/SyncTray/**/*.xib",
+      "{projectRoot}/SyncTray/**/*.storyboard"
+    ],
+    "project-config": [
+      "{projectRoot}/SyncTray.xcodeproj/**/*",
+      "{projectRoot}/*.xcworkspace/**/*"
+    ],
+    "scripts": ["{projectRoot}/scripts/**/*.sh"],
+    "cask": ["{projectRoot}/Casks/**/*.rb"]
+  },
+  "targetDefaults": {
+    "build": {
+      "cache": true,
+      "inputs": ["swift-sources", "project-config"],
+      "outputs": ["{projectRoot}/build"]
+    },
+    "test": {
+      "cache": true,
+      "inputs": ["swift-sources", "project-config"],
+      "dependsOn": ["^build"]
+    },
+    "install": {
+      "cache": true,
+      "inputs": ["swift-sources", "project-config"],
+      "outputs": ["{projectRoot}/build"],
+      "dependsOn": ["clean"]
+    },
+    "clean": {
+      "cache": false
+    }
+  },
+  "defaultBase": "main"
+}
