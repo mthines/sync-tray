@@ -149,15 +149,15 @@ struct ProfileDetailView: View {
 
                     Divider().padding(.vertical, 4)
 
-                    // Sync Configuration
-                    sectionHeader("Sync Configuration", icon: "arrow.triangle.2.circlepath")
-                    syncConfigurationSection
-
-                    Divider().padding(.vertical, 4)
-
                     // Scheduled Sync Management
                     sectionHeader("Automatic Sync", icon: "calendar.badge.clock")
                     scheduledSyncSection
+
+                    Divider().padding(.vertical, 4)
+
+                    // Sync Configuration
+                    sectionHeader("Sync Configuration", icon: "arrow.triangle.2.circlepath")
+                    syncConfigurationSection
 
                     Divider().padding(.vertical, 4)
 
