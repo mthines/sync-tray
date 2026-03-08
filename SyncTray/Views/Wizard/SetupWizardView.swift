@@ -1,9 +1,15 @@
 import SwiftUI
 
-/// Main setup wizard view for creating new sync profiles with remote configuration
+/// Main setup wizard view for creating new sync profiles or editing existing ones
 struct SetupWizardView: View {
     @Environment(\.dismiss) private var dismiss
     @ObservedObject var profileStore: ProfileStore
+
+    /// Optional profile to edit. If nil, creates a new profile.
+    let editingProfile: SyncProfile?
+
+    /// Whether we're in edit mode (reconfiguring an existing profile)
+    var isEditMode: Bool { editingProfile != nil }
 
     // Wizard state
     @State private var currentStep: WizardStep = .welcome
@@ -24,6 +30,20 @@ struct SetupWizardView: View {
 
     // Services
     private let configService = RcloneConfigService.shared
+
+    // MARK: - Initializers
+
+    /// Create wizard for a new profile
+    init(profileStore: ProfileStore) {
+        self.profileStore = profileStore
+        self.editingProfile = nil
+    }
+
+    /// Create wizard to edit an existing profile
+    init(profileStore: ProfileStore, editing profile: SyncProfile) {
+        self.profileStore = profileStore
+        self.editingProfile = profile
+    }
 
     enum WizardStep: Int, CaseIterable {
         case welcome = 0
@@ -83,7 +103,26 @@ struct SetupWizardView: View {
         .frame(width: 600, height: 500)
         .onAppear {
             checkRcloneInstallation()
+            loadEditingProfile()
         }
+    }
+
+    /// Load values from an existing profile when in edit mode
+    private func loadEditingProfile() {
+        guard let profile = editingProfile else { return }
+
+        // Pre-populate fields from existing profile
+        profileName = profile.name
+        selectedRemote = profile.rcloneRemote.hasSuffix(":") ? profile.rcloneRemote : "\(profile.rcloneRemote):"
+        remotePath = profile.remotePath
+        localPath = profile.localSyncPath
+        syncMode = profile.syncMode
+        syncDirection = profile.syncDirection
+        syncInterval = profile.syncIntervalMinutes
+        isExternalDrive = !profile.drivePathToMonitor.isEmpty
+
+        // Skip to remote path step (user already has a remote)
+        currentStep = .remotePath
     }
 
     // MARK: - Progress Indicator
@@ -466,8 +505,8 @@ struct SetupWizardView: View {
             }
 
             if currentStep == .confirmation {
-                Button("Create Profile") {
-                    createProfile()
+                Button(isEditMode ? "Save Changes" : "Create Profile") {
+                    saveProfile()
                 }
                 .buttonStyle(.borderedProminent)
                 .disabled(isLoading)
@@ -589,7 +628,7 @@ struct SetupWizardView: View {
         }
     }
 
-    private func createProfile() {
+    private func saveProfile() {
         isLoading = true
         errorMessage = nil
 
@@ -604,18 +643,35 @@ struct SetupWizardView: View {
             }
         }
 
-        let profile = SyncProfile(
-            name: profileName.isEmpty ? "New Profile" : profileName,
-            rcloneRemote: remoteName,
-            remotePath: remotePath,
-            localSyncPath: localPath,
-            drivePathToMonitor: drivePath,
-            syncIntervalMinutes: syncInterval,
-            syncMode: syncMode,
-            syncDirection: syncDirection
-        )
+        if let existingProfile = editingProfile {
+            // Update existing profile
+            var updatedProfile = existingProfile
+            updatedProfile.name = profileName.isEmpty ? existingProfile.name : profileName
+            updatedProfile.rcloneRemote = remoteName
+            updatedProfile.remotePath = remotePath
+            updatedProfile.localSyncPath = localPath
+            updatedProfile.drivePathToMonitor = drivePath
+            updatedProfile.syncIntervalMinutes = syncInterval
+            updatedProfile.syncMode = syncMode
+            updatedProfile.syncDirection = syncDirection
 
-        profileStore.add(profile)
+            profileStore.update(updatedProfile)
+        } else {
+            // Create new profile
+            let profile = SyncProfile(
+                name: profileName.isEmpty ? "New Profile" : profileName,
+                rcloneRemote: remoteName,
+                remotePath: remotePath,
+                localSyncPath: localPath,
+                drivePathToMonitor: drivePath,
+                syncIntervalMinutes: syncInterval,
+                syncMode: syncMode,
+                syncDirection: syncDirection
+            )
+
+            profileStore.add(profile)
+        }
+
         isLoading = false
         dismiss()
     }

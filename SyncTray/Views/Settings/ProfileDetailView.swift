@@ -45,6 +45,9 @@ struct ProfileDetailView: View {
     // Alert for sync already in progress
     @State private var showingSyncInProgressAlert: Bool = false
 
+    // Setup wizard for reconfiguring the profile
+    @State private var showingReconfigureWizard: Bool = false
+
     private let setupService = SyncSetupService.shared
 
     // MARK: - Computed Properties
@@ -214,6 +217,9 @@ struct ProfileDetailView: View {
             Button("OK", role: .cancel) {}
         } message: {
             Text("A sync is already in progress for this profile. Please wait for it to complete before starting another sync.")
+        }
+        .sheet(isPresented: $showingReconfigureWizard) {
+            SetupWizardView(profileStore: profileStore, editing: profile)
         }
     }
 
@@ -901,6 +907,22 @@ struct ProfileDetailView: View {
                 }
                 .toggleStyle(.switch)
                 .controlSize(.small)
+            }
+
+            Divider()
+
+            // Reconfigure Remote
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Reconfigure Profile")
+                    .font(.subheadline.weight(.medium))
+                Text("Use the setup wizard to change remote settings or re-authenticate")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
+                Button(action: { showingReconfigureWizard = true }) {
+                    Label("Open Setup Wizard", systemImage: "wand.and.stars")
+                }
+                .buttonStyle(.bordered)
             }
         }
         .padding(12)
