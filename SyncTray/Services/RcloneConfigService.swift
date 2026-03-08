@@ -332,15 +332,15 @@ final class RcloneConfigService {
                     if process.terminationStatus == 0 {
                         let data = pipe.fileHandleForReading.readDataToEndOfFile()
                         if let output = String(data: data, encoding: .utf8) {
-                            // Parse lsd output format: "    -1 2024-01-01 12:00:00 FolderName"
-                            // Note: may have leading spaces, and folder name is everything after the time
+                            // Parse lsd output format: "     -1 2000-01-01 01:00:00        -1 FolderName"
+                            // Format: size date time count name (with variable whitespace)
                             let folders = output.components(separatedBy: "\n")
                                 .compactMap { line -> String? in
                                     let trimmed = line.trimmingCharacters(in: .whitespaces)
                                     guard !trimmed.isEmpty else { return nil }
-                                    // Match: -1 YYYY-MM-DD HH:MM:SS FolderName
-                                    // The folder name is everything after the timestamp
-                                    let pattern = #"^-?\d+\s+\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\s+(.+)$"#
+                                    // Match: -1 YYYY-MM-DD HH:MM:SS -1 FolderName
+                                    // (size) (date) (time) (count) (name)
+                                    let pattern = #"^-?\d+\s+\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\s+-?\d+\s+(.+)$"#
                                     if let regex = try? NSRegularExpression(pattern: pattern),
                                        let match = regex.firstMatch(in: trimmed, range: NSRange(trimmed.startIndex..., in: trimmed)),
                                        let folderRange = Range(match.range(at: 1), in: trimmed) {
