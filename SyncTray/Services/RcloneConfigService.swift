@@ -140,8 +140,8 @@ final class RcloneConfigService {
         }
     }
 
-    /// Test connection to a remote
-    func testConnection(_ remoteName: String) async -> Result<Void, ConfigError> {
+    /// Test connection to a remote path (e.g. "synology:" or "synology:Kaiju")
+    func testConnection(_ remotePath: String) async -> Result<Void, ConfigError> {
         guard let rclonePath = findRclonePath() else {
             return .failure(.rcloneNotFound)
         }
@@ -152,7 +152,8 @@ final class RcloneConfigService {
                 let pipe = Pipe()
 
                 process.executableURL = URL(fileURLWithPath: rclonePath)
-                let remote = remoteName.hasSuffix(":") ? remoteName : "\(remoteName):"
+                // Only add colon if there's no colon in the path at all
+                let remote = remotePath.contains(":") ? remotePath : "\(remotePath):"
                 process.arguments = ["lsd", remote, "--max-depth", "0"]
                 process.standardOutput = pipe
                 process.standardError = pipe
