@@ -149,6 +149,7 @@ final class RcloneConfigService {
         return await withCheckedContinuation { continuation in
             let process = Process()
             let pipe = Pipe()
+            var outputData = Data()
 
             process.executableURL = URL(fileURLWithPath: rclonePath)
             // Only add colon if there's no colon in the path at all
@@ -157,13 +158,22 @@ final class RcloneConfigService {
             process.standardOutput = pipe
             process.standardError = pipe
 
-            // Use termination handler to avoid pipe deadlock
+            // Collect output data as it arrives to prevent pipe buffer filling up
+            pipe.fileHandleForReading.readabilityHandler = { handle in
+                let data = handle.availableData
+                if !data.isEmpty {
+                    outputData.append(data)
+                }
+            }
+
             process.terminationHandler = { proc in
-                let data = pipe.fileHandleForReading.readDataToEndOfFile()
+                // Stop reading and get any remaining data
+                pipe.fileHandleForReading.readabilityHandler = nil
+
                 if proc.terminationStatus == 0 {
                     continuation.resume(returning: .success(()))
                 } else {
-                    let error = String(data: data, encoding: .utf8) ?? "Unknown error"
+                    let error = String(data: outputData, encoding: .utf8) ?? "Unknown error"
                     continuation.resume(returning: .failure(.connectionFailed(error)))
                 }
             }
@@ -171,6 +181,7 @@ final class RcloneConfigService {
             do {
                 try process.run()
             } catch {
+                pipe.fileHandleForReading.readabilityHandler = nil
                 continuation.resume(returning: .failure(.connectionFailed(error.localizedDescription)))
             }
         }
