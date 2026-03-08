@@ -114,7 +114,9 @@ struct RemotePathStepView: View {
 
     @State private var availableFolders: [String] = []
     @State private var isLoading: Bool = false
+    @State private var isTestingConnection: Bool = false
     @State private var errorMessage: String?
+    @State private var connectionTestSuccess: Bool = false
     @State private var useTextInput: Bool = false
 
     var body: some View {
@@ -126,72 +128,136 @@ struct RemotePathStepView: View {
             Text("Select a folder on \(remoteName) to sync:")
                 .foregroundColor(.secondary)
 
-            if isLoading {
-                HStack {
-                    ProgressView()
-                        .controlSize(.small)
-                    Text("Loading folders...")
-                        .foregroundColor(.secondary)
-                }
-            } else if let error = errorMessage {
-                VStack(alignment: .leading, spacing: 8) {
-                    Label(error, systemImage: "exclamationmark.triangle")
-                        .foregroundColor(.orange)
+            // Path input - always visible
+            pathInputSection
 
-                    Button("Retry") {
-                        loadFolders()
-                    }
-                }
-            } else if useTextInput || availableFolders.isEmpty {
-                VStack(alignment: .leading, spacing: 8) {
-                    TextField("e.g., Documents/Sync", text: $remotePath)
-                        .textFieldStyle(.roundedBorder)
+            // Connection test button and status
+            connectionTestSection
 
-                    if !availableFolders.isEmpty {
-                        Button("Show folder list") {
-                            useTextInput = false
-                        }
-                        .font(.caption)
-                    }
-                }
-            } else {
-                VStack(alignment: .leading, spacing: 8) {
-                    Picker("Folder", selection: $remotePath) {
-                        Text("Root (/)").tag("")
-                        ForEach(availableFolders, id: \.self) { folder in
-                            Text(folder).tag(folder)
-                        }
-                    }
-                    .pickerStyle(.menu)
-
-                    Button("Enter custom path") {
-                        useTextInput = true
-                    }
-                    .font(.caption)
-                }
-            }
-
-            // Test connection button
-            if !remotePath.isEmpty {
-                Divider()
-
-                Button(action: testConnection) {
-                    HStack {
-                        if isLoading {
-                            ProgressView()
-                                .controlSize(.small)
-                        } else {
-                            Image(systemName: "checkmark.circle")
-                        }
-                        Text("Test Connection")
-                    }
-                }
-                .disabled(isLoading)
-            }
+            // Error/success messages shown inline
+            statusMessageSection
         }
         .onAppear {
             loadFolders()
         }
+    }
+
+    @ViewBuilder
+    private var pathInputSection: some View {
+        if isLoading {
+            HStack {
+                ProgressView()
+                    .controlSize(.small)
+                Text("Loading folders...")
+                    .foregroundColor(.secondary)
+            }
+        } else if useTextInput || availableFolders.isEmpty {
+            VStack(alignment: .leading, spacing: 8) {
+                TextField("e.g., Documents/Sync", text: $remotePath)
+                    .textFieldStyle(.roundedBorder)
+                    .onChange(of: remotePath) { _ in
+                        // Clear status when path changes
+                        connectionTestSuccess = false
+                        if errorMessage?.contains("Connection") == true {
+                            errorMessage = nil
+                        }
+                    }
+
+                if !availableFolders.isEmpty {
+                    Button("Show folder list") {
+                        useTextInput = false
+                    }
+                    .font(.caption)
+                }
+            }
+        } else {
+            VStack(alignment: .leading, spacing: 8) {
+                Picker("Folder", selection: $remotePath) {
+                    Text("Root (/)").tag("")
+                    ForEach(availableFolders, id: \.self) { folder in
+                        Text(folder).tag(folder)
+                    }
+                }
+                .pickerStyle(.menu)
+                .onChange(of: remotePath) { _ in
+                    connectionTestSuccess = false
+                    if errorMessage?.contains("Connection") == true {
+                        errorMessage = nil
+                    }
+                }
+
+                Button("Enter custom path") {
+                    useTextInput = true
+                }
+                .font(.caption)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var connectionTestSection: some View {
+        HStack(spacing: 12) {
+            Button(action: testConnection) {
+                HStack {
+                    if isTestingConnection {
+                        ProgressView()
+                            .controlSize(.small)
+                    } else {
+                        Image(systemName: "checkmark.circle")
+                    }
+                    Text("Test Connection")
+                }
+            }
+            .disabled(isTestingConnection)
+
+            if let error = errorMessage, error.contains("Connection") || error.contains("ERROR") {
+                Button("Retry") {
+                    testConnection()
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var statusMessageSection: some View {
+        if connectionTestSuccess {
+            HStack(spacing: 6) {
+                Image(systemName: "checkmark.circle.fill")
+                    .foregroundColor(.green)
+                Text("Connection successful")
+                    .font(.caption)
+                    .foregroundColor(.green)
+            }
+        } else if let error = errorMessage {
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(alignment: .top, spacing: 6) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .foregroundColor(.orange)
+                    Text(cleanErrorMessage(error))
+                        .font(.caption)
+                        .foregroundColor(.orange)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+        }
+    }
+
+    /// Clean up rclone error messages for display
+    private func cleanErrorMessage(_ message: String) -> String {
+        // Remove timestamps like "2026/03/08 08:22:40"
+        var cleaned = message
+            .replacingOccurrences(of: #"\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2} "#, with: "", options: .regularExpression)
+
+        // Remove "ERROR :" prefix
+        cleaned = cleaned.replacingOccurrences(of: "ERROR : ", with: "")
+        cleaned = cleaned.replacingOccurrences(of: "NOTICE: ", with: "")
+
+        // Take just the first meaningful line if there are duplicates
+        let lines = cleaned.components(separatedBy: "\n")
+        if let firstLine = lines.first(where: { !$0.trimmingCharacters(in: .whitespaces).isEmpty }) {
+            return firstLine.trimmingCharacters(in: .whitespaces)
+        }
+        return cleaned.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     private func loadFolders() {
@@ -213,20 +279,23 @@ struct RemotePathStepView: View {
     }
 
     private func testConnection() {
-        isLoading = true
+        isTestingConnection = true
         errorMessage = nil
+        connectionTestSuccess = false
 
         let fullPath = remotePath.isEmpty ? remoteName : "\(remoteName.replacingOccurrences(of: ":", with: "")):\(remotePath)"
 
         Task {
             let result = await configService.testConnection(fullPath)
             await MainActor.run {
-                isLoading = false
+                isTestingConnection = false
                 switch result {
                 case .success:
+                    connectionTestSuccess = true
                     errorMessage = nil
                 case .failure(let error):
-                    errorMessage = error.localizedDescription
+                    connectionTestSuccess = false
+                    errorMessage = "Connection failed: \(error.localizedDescription)"
                 }
             }
         }

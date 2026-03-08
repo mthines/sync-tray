@@ -332,12 +332,21 @@ final class RcloneConfigService {
                     if process.terminationStatus == 0 {
                         let data = pipe.fileHandleForReading.readDataToEndOfFile()
                         if let output = String(data: data, encoding: .utf8) {
-                            // Parse lsd output: -1 2024-01-01 12:00:00 FolderName
+                            // Parse lsd output format: "    -1 2024-01-01 12:00:00 FolderName"
+                            // Note: may have leading spaces, and folder name is everything after the time
                             let folders = output.components(separatedBy: "\n")
                                 .compactMap { line -> String? in
-                                    let components = line.split(separator: " ", maxSplits: 3)
-                                    guard components.count >= 4 else { return nil }
-                                    return String(components[3])
+                                    let trimmed = line.trimmingCharacters(in: .whitespaces)
+                                    guard !trimmed.isEmpty else { return nil }
+                                    // Match: -1 YYYY-MM-DD HH:MM:SS FolderName
+                                    // The folder name is everything after the timestamp
+                                    let pattern = #"^-?\d+\s+\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\s+(.+)$"#
+                                    if let regex = try? NSRegularExpression(pattern: pattern),
+                                       let match = regex.firstMatch(in: trimmed, range: NSRange(trimmed.startIndex..., in: trimmed)),
+                                       let folderRange = Range(match.range(at: 1), in: trimmed) {
+                                        return String(trimmed[folderRange])
+                                    }
+                                    return nil
                                 }
                             continuation.resume(returning: .success(folders))
                         } else {
