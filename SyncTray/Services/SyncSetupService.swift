@@ -44,7 +44,7 @@ final class SyncSetupService {
     // MARK: - Rclone Path Helper
 
     private func findRclonePath() -> String? {
-        let paths = ["/opt/homebrew/bin/rclone", "/usr/local/bin/rclone", "/usr/bin/rclone"]
+        let paths = ["/usr/local/bin/rclone", "/opt/homebrew/bin/rclone", "/usr/bin/rclone"]
         return paths.first { FileManager.default.fileExists(atPath: $0) }
     }
 
@@ -408,9 +408,24 @@ final class SyncSetupService {
             VFS_CACHE_MODE=$(parse_json "vfsCacheMode" "full")
             VFS_CACHE_MAX_SIZE=$(parse_json "vfsCacheMaxSize" "10G")
             VFS_CACHE_PATH=$(parse_json "vfsCachePath" "$HOME/.cache/rclone/vfs")
+            ALLOW_NON_EMPTY=$(parse_json "allowNonEmptyMount" "false")
 
             if [[ -z "$REMOTE" || -z "$LOCAL_PATH" ]]; then
                 echo "Error: Invalid config - missing remote or localPath"
+                exit 1
+            fi
+
+            # Find rclone binary (check multiple locations)
+            RCLONE_BIN=""
+            for path in /usr/local/bin/rclone /opt/homebrew/bin/rclone /usr/bin/rclone; do
+                if [[ -x "$path" ]]; then
+                    RCLONE_BIN="$path"
+                    break
+                fi
+            done
+
+            if [[ -z "$RCLONE_BIN" ]]; then
+                echo "$(date '+%Y-%m-%d %H:%M:%S') - Error: rclone not found" >> "$LOG_FILE"
                 exit 1
             fi
 
@@ -452,21 +467,26 @@ final class SyncSetupService {
 
                 # Mount command with VFS cache settings
                 # Note: No --daemon flag - launchd manages the process lifecycle
-                RCLONE_CMD="/opt/homebrew/bin/rclone mount \\"$REMOTE\\" \\"$LOCAL_PATH\\" --vfs-cache-mode $VFS_CACHE_MODE --vfs-cache-max-size $VFS_CACHE_MAX_SIZE --cache-dir \\"$VFS_CACHE_PATH\\" --log-level INFO --use-json-log"
+                RCLONE_CMD="$RCLONE_BIN mount \\"$REMOTE\\" \\"$LOCAL_PATH\\" --vfs-cache-mode $VFS_CACHE_MODE --vfs-cache-max-size $VFS_CACHE_MAX_SIZE --cache-dir \\"$VFS_CACHE_PATH\\" --log-level INFO --use-json-log"
+
+                # Add --allow-non-empty flag if configured
+                if [[ "$ALLOW_NON_EMPTY" == "true" || "$ALLOW_NON_EMPTY" == "True" || "$ALLOW_NON_EMPTY" == "1" ]]; then
+                    RCLONE_CMD="$RCLONE_CMD --allow-non-empty"
+                fi
             elif [[ "$SYNC_MODE" == "bisync" ]]; then
                 # Two-way bidirectional sync
                 echo "$(date '+%Y-%m-%d %H:%M:%S') - Starting bisync" >> "$LOG_FILE"
-                RCLONE_CMD="/opt/homebrew/bin/rclone bisync \\"$REMOTE\\" \\"$LOCAL_PATH\\" --verbose --use-json-log --stats 2s --filter-from \\"$FILTER_FILE\\" --check-access --check-filename .synctray-check --resilient --recover --conflict-resolve newer --conflict-loser num --conflict-suffix sync-conflict-{DateOnly}-"
+                RCLONE_CMD="$RCLONE_BIN bisync \\"$REMOTE\\" \\"$LOCAL_PATH\\" --verbose --use-json-log --stats 2s --filter-from \\"$FILTER_FILE\\" --check-access --check-filename .synctray-check --resilient --recover --conflict-resolve newer --conflict-loser num --conflict-suffix sync-conflict-{DateOnly}-"
             else
                 # One-way sync
                 if [[ "$SYNC_DIRECTION" == "localToRemote" ]]; then
                     # Local is source, remote is destination (backup/upload)
                     echo "$(date '+%Y-%m-%d %H:%M:%S') - Starting sync (local → remote)" >> "$LOG_FILE"
-                    RCLONE_CMD="/opt/homebrew/bin/rclone sync \\"$LOCAL_PATH\\" \\"$REMOTE\\" --verbose --use-json-log --stats 2s --filter-from \\"$FILTER_FILE\\""
+                    RCLONE_CMD="$RCLONE_BIN sync \\"$LOCAL_PATH\\" \\"$REMOTE\\" --verbose --use-json-log --stats 2s --filter-from \\"$FILTER_FILE\\""
                 else
                     # Remote is source, local is destination (download/mirror)
                     echo "$(date '+%Y-%m-%d %H:%M:%S') - Starting sync (remote → local)" >> "$LOG_FILE"
-                    RCLONE_CMD="/opt/homebrew/bin/rclone sync \\"$REMOTE\\" \\"$LOCAL_PATH\\" --verbose --use-json-log --stats 2s --filter-from \\"$FILTER_FILE\\""
+                    RCLONE_CMD="$RCLONE_BIN sync \\"$REMOTE\\" \\"$LOCAL_PATH\\" --verbose --use-json-log --stats 2s --filter-from \\"$FILTER_FILE\\""
                 fi
             fi
 
@@ -515,6 +535,7 @@ final class SyncSetupService {
             "vfsCacheMode": profile.vfsCacheMode.rawValue,
             "vfsCacheMaxSize": profile.vfsCacheMaxSize,
             "vfsCachePath": profile.vfsCachePath,
+            "allowNonEmptyMount": profile.allowNonEmptyMount,
         ]
 
         if let data = try? JSONSerialization.data(

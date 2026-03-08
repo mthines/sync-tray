@@ -19,6 +19,7 @@ struct SyncProfile: Identifiable, Codable, Equatable {
     var vfsCacheMode: VFSCacheMode      // VFS cache mode for mount (default: full)
     var vfsCacheMaxSize: String         // Max cache size (e.g., "10G")
     var vfsCachePath: String            // Cache directory path (default: ~/.cache/rclone/vfs)
+    var allowNonEmptyMount: Bool        // Allow mounting to non-empty folders (default: false)
 
     /// Short ID for file naming (first 8 chars of UUID)
     var shortId: String {
@@ -104,7 +105,8 @@ struct SyncProfile: Identifiable, Codable, Equatable {
         syncDirection: SyncDirection = .localToRemote,
         vfsCacheMode: VFSCacheMode = .full,
         vfsCacheMaxSize: String = "10G",
-        vfsCachePath: String = ""
+        vfsCachePath: String = "",
+        allowNonEmptyMount: Bool = false
     ) {
         self.id = id
         self.name = name
@@ -121,6 +123,7 @@ struct SyncProfile: Identifiable, Codable, Equatable {
         self.vfsCacheMode = vfsCacheMode
         self.vfsCacheMaxSize = vfsCacheMaxSize
         self.vfsCachePath = vfsCachePath.isEmpty ? "\(NSHomeDirectory())/.cache/rclone/vfs" : vfsCachePath
+        self.allowNonEmptyMount = allowNonEmptyMount
     }
 
     /// Create a new profile with default values
@@ -136,7 +139,7 @@ extension SyncProfile {
         case id, name, rcloneRemote, remotePath, localSyncPath
         case drivePathToMonitor, syncIntervalMinutes, additionalRcloneFlags
         case isEnabled, isMuted, syncMode, syncDirection
-        case vfsCacheMode, vfsCacheMaxSize, vfsCachePath
+        case vfsCacheMode, vfsCacheMaxSize, vfsCachePath, allowNonEmptyMount
     }
 
     init(from decoder: Decoder) throws {
@@ -161,6 +164,8 @@ extension SyncProfile {
         vfsCacheMaxSize = try container.decodeIfPresent(String.self, forKey: .vfsCacheMaxSize) ?? "10G"
         let cachePath = try container.decodeIfPresent(String.self, forKey: .vfsCachePath) ?? ""
         vfsCachePath = cachePath.isEmpty ? "\(NSHomeDirectory())/.cache/rclone/vfs" : cachePath
+        // Backwards compatibility: default to false if not present
+        allowNonEmptyMount = try container.decodeIfPresent(Bool.self, forKey: .allowNonEmptyMount) ?? false
     }
 }
 

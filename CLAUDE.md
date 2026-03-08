@@ -6,11 +6,40 @@ SyncTray is a macOS menu bar application that provides Google Drive-style backgr
 
 ### Key Features
 - **Multi-profile support**: Configure multiple sync pairs (local folder ↔ cloud remote)
+- **Three sync modes**: Two-way sync (bisync), one-way sync (upload/download), and stream (mount)
 - **Background sync via launchd**: Scheduled syncs run automatically at configurable intervals
 - **Real-time file monitoring**: FSEvents-based directory watching triggers syncs on local changes
 - **External drive support**: Auto-detects when external drives are mounted/unmounted
 - **Live progress tracking**: Parses rclone JSON logs for real-time transfer progress
 - **macOS notifications**: Batch notifications for file changes with "Open Directory" action
+
+### Sync Modes
+
+| Mode | rclone Command | Description |
+|------|----------------|-------------|
+| Two-Way Sync | `rclone bisync` | Bidirectional sync - changes on either side sync to the other |
+| One-Way Upload | `rclone sync local remote` | Local is authoritative, uploads to remote |
+| One-Way Download | `rclone sync remote local` | Remote is authoritative, downloads to local |
+| Stream (Mount) | `rclone mount` | Virtual filesystem - files stream on-demand without local copy |
+
+#### Mount Mode Requirements
+Stream (Mount) mode requires additional setup:
+1. **macFUSE**: Install via `brew install --cask macfuse` (restart required)
+2. **Official rclone binary**: Homebrew's rclone doesn't support mount. Download from https://rclone.org/downloads/
+
+```bash
+# Install macFUSE
+brew install --cask macfuse
+# Restart Mac
+
+# Replace Homebrew rclone with official binary
+brew uninstall rclone
+curl -O https://downloads.rclone.org/rclone-current-osx-arm64.zip
+unzip rclone-current-osx-arm64.zip
+cd rclone-*-osx-arm64
+sudo cp rclone /usr/local/bin/
+sudo chmod +x /usr/local/bin/rclone
+```
 
 ### How It Works
 1. User configures a profile: local path, rclone remote, and sync interval

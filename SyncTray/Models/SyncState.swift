@@ -354,7 +354,10 @@ enum SyncLogPatterns {
         message.contains("check file") ||
         message.contains("Access test failed") ||
         message.contains("Failed to initialise") ||
-        message.contains("malformed rule")
+        message.contains("malformed rule") ||
+        message.contains("not empty") ||
+        message.contains("FUSE") ||
+        message.contains("failed to mount")
     }
 
     // MARK: - Error Message Cleanup
@@ -366,13 +369,27 @@ enum SyncLogPatterns {
         // Strip common prefixes
         let prefixes = [
             "Bisync critical error: ",
-            "Bisync aborted. "
+            "Bisync aborted. ",
+            "Fatal error: failed to mount FUSE fs: "
         ]
 
         for prefix in prefixes {
             if let range = cleaned.range(of: prefix) {
                 cleaned = String(cleaned[range.upperBound...])
                 break
+            }
+        }
+
+        // Provide user-friendly mount error messages
+        if cleaned.contains("is not empty") {
+            return "Mount point folder is not empty. Choose an empty folder or clear its contents first."
+        }
+        if cleaned.contains("not supported on MacOS when rclone is installed via Homebrew") {
+            return "Mount mode requires the official rclone binary from rclone.org (Homebrew version doesn't support mount)."
+        }
+        if cleaned.contains("macfuse") || cleaned.contains("FUSE") || cleaned.contains("fuse") {
+            if cleaned.contains("not found") || cleaned.contains("not installed") {
+                return "macFUSE is required for mount mode. Install via: brew install --cask macfuse"
             }
         }
 
@@ -400,9 +417,9 @@ enum SyncLogPatterns {
         line.contains("CRITICAL:")
     }
 
-    /// Check if a log line contains a JSON error or notice level message
+    /// Check if a log line contains a JSON error, notice, or critical level message
     static func isJSONErrorLine(_ line: String) -> Bool {
-        line.contains("\"level\":\"error\"") || line.contains("\"level\":\"notice\"")
+        line.contains("\"level\":\"error\"") || line.contains("\"level\":\"notice\"") || line.contains("\"level\":\"critical\"")
     }
 
     /// Extract error message from a log line (supports both CRITICAL and JSON formats)

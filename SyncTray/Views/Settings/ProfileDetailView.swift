@@ -23,6 +23,7 @@ struct ProfileDetailView: View {
     @State private var vfsCacheMode: VFSCacheMode = .full
     @State private var vfsCacheMaxSize: String = "10G"
     @State private var vfsCachePath: String = ""
+    @State private var allowNonEmptyMount: Bool = false
 
     // UI State
     @State private var showAdvanced: Bool = false
@@ -89,7 +90,8 @@ struct ProfileDetailView: View {
         syncDirection != profile.syncDirection ||
         vfsCacheMode != profile.vfsCacheMode ||
         vfsCacheMaxSize != profile.vfsCacheMaxSize ||
-        vfsCachePath != profile.vfsCachePath
+        vfsCachePath != profile.vfsCachePath ||
+        allowNonEmptyMount != profile.allowNonEmptyMount
     }
 
     private var canInstall: Bool {
@@ -642,6 +644,23 @@ struct ProfileDetailView: View {
                     }
                     .padding(.vertical, 4)
 
+                    // macFUSE requirement warning
+                    HStack(alignment: .top, spacing: 6) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .foregroundStyle(.orange)
+                            .font(.caption)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Requires macFUSE and official rclone binary")
+                                .font(.caption.weight(.medium))
+                            Text("Homebrew rclone doesn't support mount. Install macFUSE via `brew install --cask macfuse`, then download rclone from rclone.org/downloads")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    .padding(8)
+                    .background(Color.orange.opacity(0.1))
+                    .clipShape(.rect(cornerRadius: 6))
+
                     // VFS Cache Mode
                     VStack(alignment: .leading, spacing: 4) {
                         Text("Cache Mode")
@@ -685,6 +704,18 @@ struct ProfileDetailView: View {
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
+
+                    // Allow non-empty mount toggle
+                    Toggle(isOn: $allowNonEmptyMount) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Allow mounting to non-empty folder")
+                                .font(.subheadline)
+                            Text("Mount even if the local folder already contains files")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    .toggleStyle(.switch)
                 }
             }
 
@@ -1238,6 +1269,7 @@ struct ProfileDetailView: View {
         vfsCacheMode = profile.vfsCacheMode
         vfsCacheMaxSize = profile.vfsCacheMaxSize
         vfsCachePath = profile.vfsCachePath
+        allowNonEmptyMount = profile.allowNonEmptyMount
 
         // Show text input if the path contains "/" (nested path) or is a custom path
         // that won't be in the folder picker dropdown
@@ -1259,6 +1291,7 @@ struct ProfileDetailView: View {
         updatedProfile.vfsCacheMode = vfsCacheMode
         updatedProfile.vfsCacheMaxSize = vfsCacheMaxSize
         updatedProfile.vfsCachePath = vfsCachePath
+        updatedProfile.allowNonEmptyMount = allowNonEmptyMount
         return updatedProfile
     }
 
@@ -1504,6 +1537,20 @@ struct ProfileDetailView: View {
     }
 
     private func runResync(loadAgentOnCompletion: Bool = false) {
+        // For mount mode, skip initial sync entirely - just load the agent
+        if syncMode == .mount {
+            isInstalling = false
+            resyncOutputLines = ["Mount mode - starting mount service..."]
+            showResyncOutput = true
+
+            if loadAgentOnCompletion {
+                if !setupService.loadAgent(for: profile) {
+                    installError = "Failed to start mount service"
+                }
+            }
+            return
+        }
+
         // Clear installing state so resync output panel is visible
         isInstalling = false
         isRunningResync = true
@@ -1529,6 +1576,8 @@ struct ProfileDetailView: View {
         let bisyncDir = "\(NSHomeDirectory())/Library/Caches/rclone/bisync"
         let capturedMaxLines = maxOutputLines
         let syncLogPath = profile.logPath  // Use main log file (same as scheduled syncs)
+        let capturedSyncMode = syncMode
+        let capturedSyncDirection = syncDirection
 
         DispatchQueue.global(qos: .userInitiated).async {
             let fileManager = FileManager.default
@@ -1599,9 +1648,23 @@ struct ProfileDetailView: View {
                 return
             }
 
-            // Build the resync command with JSON logging and frequent stats updates
+            // Build the sync command based on mode
             let fullRemotePath = "\(capturedRcloneRemote):\(capturedRemotePath)"
-            var arguments = ["bisync", fullRemotePath, capturedLocalSyncPath, "--resync", "--verbose", "--use-json-log", "--stats", "2s"]
+            var arguments: [String]
+
+            if capturedSyncMode == .bisync {
+                // Two-way bidirectional sync with --resync to establish baseline
+                arguments = ["bisync", fullRemotePath, capturedLocalSyncPath, "--resync", "--verbose", "--use-json-log", "--stats", "2s"]
+            } else {
+                // One-way sync (sync mode) - direction determines source/destination
+                if capturedSyncDirection == .localToRemote {
+                    // Upload: local is source, remote is destination
+                    arguments = ["sync", capturedLocalSyncPath, fullRemotePath, "--verbose", "--use-json-log", "--stats", "2s"]
+                } else {
+                    // Download: remote is source, local is destination
+                    arguments = ["sync", fullRemotePath, capturedLocalSyncPath, "--verbose", "--use-json-log", "--stats", "2s"]
+                }
+            }
 
             // Add filter file if it exists (excludes ._* files, .DS_Store, etc.)
             if fileManager.fileExists(atPath: capturedFilterPath) {
@@ -1845,6 +1908,7 @@ struct ProfileDetailView: View {
         case retrySync
         case createCheckFiles
         case forceSync      // Override "too many deletes" safety check
+        case mountAnyway    // Enable non-empty mount and retry
 
         var buttonText: String {
             switch self {
@@ -1864,6 +1928,8 @@ struct ProfileDetailView: View {
                 return "Create Check Files & Sync"
             case .forceSync:
                 return "Force Sync (Override Safety)"
+            case .mountAnyway:
+                return "Mount Anyway"
             }
         }
 
@@ -1885,6 +1951,8 @@ struct ProfileDetailView: View {
                 return "Creating check files..."
             case .forceSync:
                 return "Force syncing..."
+            case .mountAnyway:
+                return "Mounting..."
             }
         }
 
@@ -1906,6 +1974,8 @@ struct ProfileDetailView: View {
                 return "checkmark.circle"
             case .forceSync:
                 return "exclamationmark.triangle"
+            case .mountAnyway:
+                return "folder.badge.plus"
             }
         }
 
@@ -1927,11 +1997,18 @@ struct ProfileDetailView: View {
                 return "Create .synctray-check files required for access check"
             case .forceSync:
                 return "Override the 50% deletion safety limit and proceed with sync"
+            case .mountAnyway:
+                return "Enable mounting to non-empty folder and retry"
             }
         }
     }
 
     private func detectErrorAction(from error: String) -> ErrorAction? {
+        // Mount mode: folder is not empty
+        if error.contains("is not empty") || error.contains("not empty") {
+            return .mountAnyway
+        }
+
         // Use Smart Fix for most common bisync errors that need orchestrated recovery
         // These errors typically require: unlock → check files → resync
 
@@ -2000,6 +2077,48 @@ struct ProfileDetailView: View {
             createCheckFilesAndSync()
         case .forceSync:
             runForceSync()
+        case .mountAnyway:
+            enableNonEmptyMountAndReinstall()
+        }
+    }
+
+    private func enableNonEmptyMountAndReinstall() {
+        // Enable the setting
+        allowNonEmptyMount = true
+
+        // Clear any cached error
+        syncManager.clearError(for: profile.id)
+
+        // Build updated profile and save
+        var updatedProfile = buildProfileFromForm()
+        updatedProfile.allowNonEmptyMount = true
+        profileStore.update(updatedProfile)
+
+        // Reinstall with the new setting
+        isInstalling = true
+        installError = nil
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            do {
+                // Uninstall first if already installed
+                if self.setupService.isInstalled(profile: updatedProfile) {
+                    try self.setupService.uninstall(profile: updatedProfile)
+                }
+
+                // Reinstall with new config
+                try self.setupService.install(profile: updatedProfile, loadAgent: true)
+
+                DispatchQueue.main.async {
+                    self.isInstalling = false
+                    self.resyncOutputLines = ["Mount service restarted with non-empty folder allowed"]
+                    self.showResyncOutput = true
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    self.isInstalling = false
+                    self.installError = "Failed to reinstall: \(error.localizedDescription)"
+                }
+            }
         }
     }
 
