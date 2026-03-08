@@ -179,6 +179,12 @@ run_tests() {
 
     local test_exit_code=$?
 
+    # Check if test target is not configured (skip gracefully)
+    if echo "$test_output" | grep -q "not currently configured for the test action"; then
+        log_warning "No test target configured. Skipping tests."
+        return 0
+    fi
+
     # Check if tests passed
     if [ $test_exit_code -ne 0 ]; then
         echo "$test_output" | tail -20
