@@ -232,6 +232,115 @@ struct ProfileDetailView: View {
             .foregroundColor(.primary)
     }
 
+    @ViewBuilder
+    private func syncModeCard(
+        mode: SyncMode,
+        isSelected: Bool,
+        title: String,
+        subtitle: String,
+        icon: String,
+        visualContent: () -> AnyView
+    ) -> some View {
+        Button {
+            withAnimation(.easeInOut(duration: 0.15)) {
+                syncMode = mode
+            }
+        } label: {
+            VStack(alignment: .leading, spacing: 6) {
+                HStack {
+                    Image(systemName: icon)
+                        .font(.title3)
+                        .foregroundStyle(isSelected ? .white : .secondary)
+                    Spacer()
+                    if isSelected {
+                        Image(systemName: "checkmark.circle.fill")
+                            .font(.caption)
+                            .foregroundStyle(.white)
+                    }
+                }
+
+                Text(title)
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(isSelected ? .white : .primary)
+
+                Text(subtitle)
+                    .font(.caption)
+                    .foregroundStyle(isSelected ? .white.opacity(0.8) : .secondary)
+
+                visualContent()
+                    .padding(.top, 2)
+            }
+            .padding(10)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(
+                RoundedRectangle(cornerRadius: 8)
+                    .fill(isSelected ? Color.accentColor : Color(nsColor: .controlBackgroundColor))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 8)
+                    .strokeBorder(isSelected ? Color.clear : Color(nsColor: .separatorColor), lineWidth: 1)
+            )
+        }
+        .buttonStyle(.plain)
+    }
+
+    @ViewBuilder
+    private func syncDirectionCard(
+        direction: SyncDirection,
+        isSelected: Bool,
+        title: String,
+        subtitle: String,
+        description: String,
+        leftIcon: String,
+        rightIcon: String
+    ) -> some View {
+        Button {
+            withAnimation(.easeInOut(duration: 0.15)) {
+                syncDirection = direction
+            }
+        } label: {
+            VStack(alignment: .leading, spacing: 6) {
+                HStack {
+                    Text(title)
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(isSelected ? .white : .primary)
+                    Spacer()
+                    if isSelected {
+                        Image(systemName: "checkmark.circle.fill")
+                            .font(.caption)
+                            .foregroundStyle(.white)
+                    }
+                }
+
+                // Visual direction indicator
+                HStack(spacing: 4) {
+                    Image(systemName: leftIcon)
+                        .font(.caption)
+                    Image(systemName: "arrow.right")
+                        .font(.caption2)
+                    Image(systemName: rightIcon)
+                        .font(.caption)
+                }
+                .foregroundStyle(isSelected ? .white.opacity(0.8) : .secondary)
+
+                Text(description)
+                    .font(.caption)
+                    .foregroundStyle(isSelected ? .white.opacity(0.8) : .secondary)
+            }
+            .padding(10)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(
+                RoundedRectangle(cornerRadius: 8)
+                    .fill(isSelected ? Color.accentColor : Color(nsColor: .controlBackgroundColor))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 8)
+                    .strokeBorder(isSelected ? Color.clear : Color(nsColor: .separatorColor), lineWidth: 1)
+            )
+        }
+        .buttonStyle(.plain)
+    }
+
     private var profileNameSection: some View {
         VStack(alignment: .leading, spacing: 4) {
             Text("Profile Name")
@@ -371,64 +480,111 @@ struct ProfileDetailView: View {
             }
 
             // Sync Mode
-            VStack(alignment: .leading, spacing: 4) {
+            VStack(alignment: .leading, spacing: 8) {
                 Text("Sync Mode")
                     .font(.subheadline.weight(.medium))
-                Text("How files are synchronized between local and remote")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
 
-                Picker("", selection: $syncMode) {
-                    ForEach(SyncMode.allCases) { mode in
-                        HStack {
-                            Image(systemName: mode.iconName)
-                            Text(mode.displayName)
+                HStack(spacing: 12) {
+                    // Two-Way Sync Card
+                    syncModeCard(
+                        mode: .bisync,
+                        isSelected: syncMode == .bisync,
+                        title: "Two-Way Sync",
+                        subtitle: "Keep both sides in sync",
+                        icon: "arrow.left.arrow.right",
+                        visualContent: {
+                            AnyView(
+                                HStack(spacing: 4) {
+                                    Image(systemName: "folder.fill")
+                                        .font(.caption)
+                                    Image(systemName: "arrow.left.arrow.right")
+                                        .font(.caption2)
+                                    Image(systemName: "cloud.fill")
+                                        .font(.caption)
+                                }
+                                .foregroundStyle(.secondary)
+                            )
                         }
-                        .tag(mode)
-                    }
-                }
-                .pickerStyle(.segmented)
-                .frame(maxWidth: 300)
+                    )
 
-                Text(syncMode.description)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .padding(.top, 2)
+                    // One-Way Sync Card
+                    syncModeCard(
+                        mode: .sync,
+                        isSelected: syncMode == .sync,
+                        title: "One-Way Sync",
+                        subtitle: "Mirror source to destination",
+                        icon: "arrow.right",
+                        visualContent: {
+                            AnyView(
+                                HStack(spacing: 4) {
+                                    Image(systemName: "folder.fill")
+                                        .font(.caption)
+                                    Image(systemName: "arrow.right")
+                                        .font(.caption2)
+                                    Image(systemName: "cloud.fill")
+                                        .font(.caption)
+                                }
+                                .foregroundStyle(.secondary)
+                            )
+                        }
+                    )
+                }
+
+                // Description based on selected mode
+                if syncMode == .bisync {
+                    HStack(spacing: 6) {
+                        Image(systemName: "checkmark.circle.fill")
+                            .foregroundStyle(.green)
+                            .font(.caption)
+                        Text("Changes made on either side will sync to the other")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    .padding(.top, 4)
+                }
             }
 
             // Sync Direction (only for one-way sync)
             if syncMode == .sync {
-                VStack(alignment: .leading, spacing: 4) {
-                    Text("Sync Direction")
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("Direction")
                         .font(.subheadline.weight(.medium))
 
-                    Picker("", selection: $syncDirection) {
-                        ForEach(SyncDirection.allCases) { direction in
-                            HStack {
-                                Image(systemName: direction.iconName)
-                                Text(direction.displayName)
-                            }
-                            .tag(direction)
-                        }
-                    }
-                    .pickerStyle(.segmented)
-                    .frame(maxWidth: 300)
+                    HStack(spacing: 12) {
+                        // Local → Remote
+                        syncDirectionCard(
+                            direction: .localToRemote,
+                            isSelected: syncDirection == .localToRemote,
+                            title: "Backup",
+                            subtitle: "Local → Remote",
+                            description: "Upload local files to cloud",
+                            leftIcon: "folder.fill",
+                            rightIcon: "cloud.fill"
+                        )
 
-                    Text(syncDirection.description)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .padding(.top, 2)
+                        // Remote → Local
+                        syncDirectionCard(
+                            direction: .remoteToLocal,
+                            isSelected: syncDirection == .remoteToLocal,
+                            title: "Mirror",
+                            subtitle: "Remote → Local",
+                            description: "Download cloud files to local",
+                            leftIcon: "cloud.fill",
+                            rightIcon: "folder.fill"
+                        )
+                    }
 
                     // Warning about one-way sync deleting files
                     HStack(spacing: 6) {
                         Image(systemName: "exclamationmark.triangle.fill")
                             .foregroundStyle(.orange)
+                            .font(.caption)
                         if syncDirection == .localToRemote {
-                            Text("Remote files not in local folder will be deleted")
+                            Text("Files on remote that don't exist locally will be deleted")
                                 .font(.caption)
                                 .foregroundStyle(.orange)
                         } else {
-                            Text("Local files not in remote will be deleted")
+                            Text("Local files that don't exist on remote will be deleted")
                                 .font(.caption)
                                 .foregroundStyle(.orange)
                         }
