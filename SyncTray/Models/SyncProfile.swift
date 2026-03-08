@@ -96,7 +96,7 @@ struct SyncProfile: Identifiable, Codable, Equatable {
         remotePath: String = "",
         localSyncPath: String = "",
         drivePathToMonitor: String = "",
-        syncIntervalMinutes: Int = 15,
+        syncIntervalMinutes: Int = 5,
         additionalRcloneFlags: String = "",
         isEnabled: Bool = false,
         isMuted: Bool = false,

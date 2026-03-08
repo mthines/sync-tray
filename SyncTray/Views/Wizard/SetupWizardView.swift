@@ -20,7 +20,7 @@ struct SetupWizardView: View {
     @State private var profileName: String = ""
     @State private var syncMode: SyncMode = .bisync
     @State private var syncDirection: SyncDirection = .localToRemote
-    @State private var syncInterval: Int = 15
+    @State private var syncInterval: Int = 5
     @State private var isExternalDrive: Bool = false
 
     // UI state
@@ -431,7 +431,17 @@ struct SetupWizardView: View {
                     .font(.subheadline)
                     .foregroundColor(.secondary)
 
-                Stepper("\(syncInterval) minutes", value: $syncInterval, in: 5...60, step: 5)
+                Picker("", selection: $syncInterval) {
+                    Text("1 minute").tag(1)
+                    Text("2 minutes").tag(2)
+                    Text("5 minutes").tag(5)
+                    Text("10 minutes").tag(10)
+                    Text("15 minutes").tag(15)
+                    Text("30 minutes").tag(30)
+                    Text("1 hour").tag(60)
+                }
+                .pickerStyle(.menu)
+                .labelsHidden()
             }
         }
     }

@@ -14,7 +14,7 @@ struct ProfileDetailView: View {
     @State private var remotePath: String = ""
     @State private var localSyncPath: String = ""
     @State private var isExternalDrive: Bool = false
-    @State private var syncIntervalMinutes: Int = 15
+    @State private var syncIntervalMinutes: Int = 5
     @State private var additionalRcloneFlags: String = ""
     @State private var syncMode: SyncMode = .bisync
     @State private var syncDirection: SyncDirection = .localToRemote
@@ -742,12 +742,13 @@ struct ProfileDetailView: View {
 
                 HStack {
                     Picker("", selection: $syncIntervalMinutes) {
+                        Text("1 minute").tag(1)
+                        Text("2 minutes").tag(2)
                         Text("5 minutes").tag(5)
                         Text("10 minutes").tag(10)
                         Text("15 minutes").tag(15)
                         Text("30 minutes").tag(30)
                         Text("1 hour").tag(60)
-                        Text("2 hours").tag(120)
                     }
                     .pickerStyle(.menu)
                     .frame(width: 150)
@@ -1117,12 +1118,13 @@ struct ProfileDetailView: View {
                         .foregroundStyle(.secondary)
 
                     Picker("", selection: $syncIntervalMinutes) {
+                        Text("1 minute").tag(1)
+                        Text("2 minutes").tag(2)
                         Text("5 minutes").tag(5)
                         Text("10 minutes").tag(10)
                         Text("15 minutes").tag(15)
                         Text("30 minutes").tag(30)
                         Text("1 hour").tag(60)
-                        Text("2 hours").tag(120)
                     }
                     .pickerStyle(.menu)
                     .frame(width: 150, alignment: .leading)
