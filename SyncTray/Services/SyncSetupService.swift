@@ -307,11 +307,13 @@ final class SyncSetupService {
     // MARK: - Script Generation
 
     /// Generate the shared sync script that reads config from JSON
+    /// Supports both bisync (two-way) and sync (one-way) modes
     private func generateSyncScript() -> String {
         return """
             #!/bin/bash
             # SyncTray Sync Script
             # This script reads profile configuration from a JSON file
+            # Supports both bisync (two-way) and sync (one-way) modes
             # DO NOT EDIT - This file is managed by SyncTray
 
             CONFIG_FILE="$1"
@@ -333,6 +335,8 @@ final class SyncSetupService {
             DRIVE_PATH=$(parse_json "drivePath" "")
             ADDITIONAL_FLAGS=$(parse_json "additionalFlags" "")
             FILTER_FILE=$(parse_json "filterPath" "")
+            SYNC_MODE=$(parse_json "syncMode" "bisync")
+            SYNC_DIRECTION=$(parse_json "syncDirection" "localToRemote")
 
             if [[ -z "$REMOTE" || -z "$LOCAL_PATH" ]]; then
                 echo "Error: Invalid config - missing remote or localPath"
@@ -358,27 +362,48 @@ final class SyncSetupService {
             echo $$ > "$LOCK_FILE"
             trap "rm -f $LOCK_FILE" EXIT
 
-            # Ensure sync directory exists
+            # Ensure local sync directory exists
             mkdir -p "$LOCAL_PATH"
 
-            echo "$(date '+%Y-%m-%d %H:%M:%S') - Starting bisync" >> "$LOG_FILE"
-
-            # Build rclone command
-            RCLONE_CMD="/opt/homebrew/bin/rclone bisync \\"$REMOTE\\" \\"$LOCAL_PATH\\" --verbose --use-json-log --stats 2s --filter-from \\"$FILTER_FILE\\" --check-access --check-filename .synctray-check --resilient --recover --conflict-resolve newer --conflict-loser num --conflict-suffix sync-conflict-{DateOnly}-"
+            # Build rclone command based on sync mode
+            if [[ "$SYNC_MODE" == "bisync" ]]; then
+                # Two-way bidirectional sync
+                echo "$(date '+%Y-%m-%d %H:%M:%S') - Starting bisync" >> "$LOG_FILE"
+                RCLONE_CMD="/opt/homebrew/bin/rclone bisync \\"$REMOTE\\" \\"$LOCAL_PATH\\" --verbose --use-json-log --stats 2s --filter-from \\"$FILTER_FILE\\" --check-access --check-filename .synctray-check --resilient --recover --conflict-resolve newer --conflict-loser num --conflict-suffix sync-conflict-{DateOnly}-"
+            else
+                # One-way sync
+                if [[ "$SYNC_DIRECTION" == "localToRemote" ]]; then
+                    # Local is source, remote is destination (backup/upload)
+                    echo "$(date '+%Y-%m-%d %H:%M:%S') - Starting sync (local → remote)" >> "$LOG_FILE"
+                    RCLONE_CMD="/opt/homebrew/bin/rclone sync \\"$LOCAL_PATH\\" \\"$REMOTE\\" --verbose --use-json-log --stats 2s --filter-from \\"$FILTER_FILE\\""
+                else
+                    # Remote is source, local is destination (download/mirror)
+                    echo "$(date '+%Y-%m-%d %H:%M:%S') - Starting sync (remote → local)" >> "$LOG_FILE"
+                    RCLONE_CMD="/opt/homebrew/bin/rclone sync \\"$REMOTE\\" \\"$LOCAL_PATH\\" --verbose --use-json-log --stats 2s --filter-from \\"$FILTER_FILE\\""
+                fi
+            fi
 
             if [[ -n "$ADDITIONAL_FLAGS" ]]; then
                 RCLONE_CMD="$RCLONE_CMD $ADDITIONAL_FLAGS"
             fi
 
-            # Run bisync
+            # Run sync command
             eval "$RCLONE_CMD" 2>&1 | tee -a "$LOG_FILE"
 
             EXIT_CODE=${PIPESTATUS[0]}
 
             if [[ $EXIT_CODE -eq 0 ]]; then
-                echo "$(date '+%Y-%m-%d %H:%M:%S') - Bisync completed successfully" >> "$LOG_FILE"
+                if [[ "$SYNC_MODE" == "bisync" ]]; then
+                    echo "$(date '+%Y-%m-%d %H:%M:%S') - Bisync completed successfully" >> "$LOG_FILE"
+                else
+                    echo "$(date '+%Y-%m-%d %H:%M:%S') - Sync completed successfully" >> "$LOG_FILE"
+                fi
             else
-                echo "$(date '+%Y-%m-%d %H:%M:%S') - Bisync failed with exit code $EXIT_CODE" >> "$LOG_FILE"
+                if [[ "$SYNC_MODE" == "bisync" ]]; then
+                    echo "$(date '+%Y-%m-%d %H:%M:%S') - Bisync failed with exit code $EXIT_CODE" >> "$LOG_FILE"
+                else
+                    echo "$(date '+%Y-%m-%d %H:%M:%S') - Sync failed with exit code $EXIT_CODE" >> "$LOG_FILE"
+                fi
             fi
 
             echo "" >> "$LOG_FILE"
@@ -398,6 +423,8 @@ final class SyncSetupService {
             "additionalFlags": profile.additionalRcloneFlags,
             "filterPath": profile.filterFilePath,
             "syncIntervalMinutes": profile.syncIntervalMinutes,
+            "syncMode": profile.syncMode.rawValue,
+            "syncDirection": profile.syncDirection.rawValue,
         ]
 
         if let data = try? JSONSerialization.data(

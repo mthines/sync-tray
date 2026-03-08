@@ -1,0 +1,17 @@
+{
+  "name": "synctray",
+  "version": "0.0.0",
+  "private": true,
+  "scripts": {
+    "build": "nx run synctray:build",
+    "install": "nx run synctray:install",
+    "install:launch": "nx run synctray:install:launch",
+    "release": "nx run synctray:release",
+    "dev": "nx run synctray:dev",
+    "clean": "nx run synctray:clean",
+    "test": "nx run synctray:test"
+  },
+  "devDependencies": {
+    "nx": "^21.0.0"
+  }
+}

@@ -1,0 +1,136 @@
+{
+  "name": "synctray",
+  "$schema": "https://raw.githubusercontent.com/nrwl/nx/master/packages/nx/schemas/project-schema.json",
+  "projectType": "application",
+  "sourceRoot": "SyncTray",
+  "targets": {
+    "build": {
+      "executor": "nx:run-commands",
+      "options": {
+        "command": "xcodebuild -scheme SyncTray -configuration Debug -derivedDataPath build SYMROOT=build build 2>&1 | grep -E '(error:|warning:.*error|BUILD)' || true",
+        "cwd": "{projectRoot}"
+      },
+      "inputs": ["swift-sources", "project-config"],
+      "outputs": ["{projectRoot}/build"],
+      "cache": true
+    },
+    "build:release": {
+      "executor": "nx:run-commands",
+      "options": {
+        "command": "xcodebuild -scheme SyncTray -configuration Release -derivedDataPath build/DerivedData clean build ONLY_ACTIVE_ARCH=NO 2>&1 | tail -5",
+        "cwd": "{projectRoot}"
+      },
+      "inputs": ["swift-sources", "project-config"],
+      "outputs": ["{projectRoot}/build"],
+      "cache": true
+    },
+    "test": {
+      "executor": "nx:run-commands",
+      "options": {
+        "command": "xcodebuild -project SyncTray.xcodeproj -scheme SyncTray -destination 'platform=macOS' test",
+        "cwd": "{projectRoot}"
+      },
+      "inputs": ["swift-sources", "project-config"],
+      "cache": true,
+      "dependsOn": ["build"]
+    },
+    "clean": {
+      "executor": "nx:run-commands",
+      "options": {
+        "commands": [
+          "rm -rf build",
+          "rm -rf $HOME/Library/Developer/Xcode/DerivedData/SyncTray-* 2>/dev/null || true",
+          "xcodebuild -scheme SyncTray clean -quiet 2>/dev/null || true"
+        ],
+        "cwd": "{projectRoot}",
+        "parallel": false
+      },
+      "cache": false
+    },
+    "install": {
+      "executor": "nx:run-commands",
+      "options": {
+        "commands": [
+          {
+            "command": "pkill -x SyncTray 2>/dev/null && sleep 1 || true",
+            "description": "Kill running app"
+          },
+          {
+            "command": "rm -rf /Applications/SyncTray.app 2>/dev/null || true",
+            "description": "Remove old installation"
+          },
+          {
+            "command": "cp -R build/Debug/SyncTray.app /Applications/SyncTray.app",
+            "description": "Install to Applications"
+          }
+        ],
+        "cwd": "{projectRoot}",
+        "parallel": false
+      },
+      "dependsOn": ["build"],
+      "cache": false
+    },
+    "install:launch": {
+      "executor": "nx:run-commands",
+      "options": {
+        "command": "open /Applications/SyncTray.app",
+        "cwd": "{projectRoot}"
+      },
+      "dependsOn": ["install"],
+      "cache": false
+    },
+    "install:full": {
+      "executor": "nx:run-commands",
+      "options": {
+        "command": "sh ./scripts/install.sh",
+        "cwd": "{projectRoot}"
+      },
+      "inputs": ["swift-sources", "project-config", "scripts"],
+      "outputs": ["{projectRoot}/build"],
+      "cache": true
+    },
+    "install:full:launch": {
+      "executor": "nx:run-commands",
+      "options": {
+        "command": "sh ./scripts/install.sh --launch",
+        "cwd": "{projectRoot}"
+      },
+      "dependsOn": ["install:full"],
+      "cache": false
+    },
+    "dev": {
+      "executor": "nx:run-commands",
+      "options": {
+        "command": "sh ./scripts/dev.sh",
+        "cwd": "{projectRoot}"
+      },
+      "cache": false
+    },
+    "release": {
+      "executor": "nx:run-commands",
+      "options": {
+        "command": "sh ./scripts/release.sh",
+        "cwd": "{projectRoot}"
+      },
+      "dependsOn": ["test"],
+      "cache": false
+    },
+    "setup-tap": {
+      "executor": "nx:run-commands",
+      "options": {
+        "command": "sh ./scripts/setup-tap.sh",
+        "cwd": "{projectRoot}"
+      },
+      "inputs": ["cask"],
+      "cache": false
+    },
+    "reset": {
+      "executor": "nx:run-commands",
+      "options": {
+        "command": "nx reset",
+        "cwd": "{projectRoot}"
+      },
+      "cache": false
+    }
+  }
+}

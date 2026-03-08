@@ -6,6 +6,7 @@ struct SettingsView: View {
     @Environment(\.dismiss) private var dismiss
 
     @State private var selectedProfileId: UUID?
+    @State private var showingSetupWizard: Bool = false
 
     var body: some View {
         NavigationSplitView {
@@ -54,6 +55,14 @@ struct SettingsView: View {
                 selectedProfileId = profileId
             }
         }
+        .sheet(isPresented: $showingSetupWizard) {
+            SetupWizardView(profileStore: syncManager.profileStore)
+        }
+    }
+
+    /// Show the setup wizard
+    func showWizard() {
+        showingSetupWizard = true
     }
 }
 

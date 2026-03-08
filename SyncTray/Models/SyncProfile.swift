@@ -12,6 +12,8 @@ struct SyncProfile: Identifiable, Codable, Equatable {
     var additionalRcloneFlags: String   // optional extra flags
     var isEnabled: Bool                 // whether scheduled sync is active
     var isMuted: Bool                   // whether notifications are muted for this profile
+    var syncMode: SyncMode              // bisync (two-way) or sync (one-way)
+    var syncDirection: SyncDirection    // direction for one-way sync
 
     /// Short ID for file naming (first 8 chars of UUID)
     var shortId: String {
@@ -87,7 +89,9 @@ struct SyncProfile: Identifiable, Codable, Equatable {
         syncIntervalMinutes: Int = 15,
         additionalRcloneFlags: String = "",
         isEnabled: Bool = false,
-        isMuted: Bool = false
+        isMuted: Bool = false,
+        syncMode: SyncMode = .bisync,
+        syncDirection: SyncDirection = .localToRemote
     ) {
         self.id = id
         self.name = name
@@ -99,6 +103,8 @@ struct SyncProfile: Identifiable, Codable, Equatable {
         self.additionalRcloneFlags = additionalRcloneFlags
         self.isEnabled = isEnabled
         self.isMuted = isMuted
+        self.syncMode = syncMode
+        self.syncDirection = syncDirection
     }
 
     /// Create a new profile with default values
@@ -107,13 +113,13 @@ struct SyncProfile: Identifiable, Codable, Equatable {
     }
 }
 
-// MARK: - Codable (backwards compatibility for isMuted)
+// MARK: - Codable (backwards compatibility)
 
 extension SyncProfile {
     enum CodingKeys: String, CodingKey {
         case id, name, rcloneRemote, remotePath, localSyncPath
         case drivePathToMonitor, syncIntervalMinutes, additionalRcloneFlags
-        case isEnabled, isMuted
+        case isEnabled, isMuted, syncMode, syncDirection
     }
 
     init(from decoder: Decoder) throws {
@@ -129,6 +135,10 @@ extension SyncProfile {
         isEnabled = try container.decode(Bool.self, forKey: .isEnabled)
         // Backwards compatibility: default to false if not present
         isMuted = try container.decodeIfPresent(Bool.self, forKey: .isMuted) ?? false
+        // Backwards compatibility: default to bisync if not present
+        syncMode = try container.decodeIfPresent(SyncMode.self, forKey: .syncMode) ?? .bisync
+        // Backwards compatibility: default to localToRemote if not present
+        syncDirection = try container.decodeIfPresent(SyncDirection.self, forKey: .syncDirection) ?? .localToRemote
     }
 }
 
