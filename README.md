@@ -59,6 +59,24 @@ Think of it as a lightweight sync client that works with any rclone remote you'v
 - Independent enable/disable per profile
 - Per-profile status indicators in the menu
 
+### Three Sync Modes
+
+**Two-Way Sync (bisync)** - Keep both sides in sync
+- Changes made on either local or remote sync to the other
+- Uses rclone bisync for bidirectional synchronization
+- Ideal for: Active working files, collaborative documents
+
+**One-Way Sync** - Mirror source to destination
+- Choose direction: Local → Remote (backup) or Remote → Local (mirror)
+- Destination is overwritten to match source
+- Ideal for: Backups, archiving, or pulling down read-only data
+
+**Stream (Mount)** - Access files on-demand without sync
+- Remote files appear as a virtual drive on your Mac
+- Files are streamed when accessed, not copied locally
+- Configurable VFS cache for performance (off/minimal/writes/full)
+- Ideal for: Large media libraries, archives you don't need locally all the time
+
 ### Recent Changes
 - View last 20 synced files in the menu dropdown
 - See operation type: Copied, Updated, Deleted, Renamed
@@ -79,6 +97,7 @@ Think of it as a lightweight sync client that works with any rclone remote you'v
 
 - **macOS 13.0** or later
 - **[rclone](https://rclone.org/)** installed and configured with at least one remote
+- **[macFUSE](https://osxfuse.github.io/)** (optional, only required for Mount mode)
 
 ### Installing rclone
 
@@ -91,6 +110,17 @@ rclone config
 ```
 
 See [rclone's documentation](https://rclone.org/docs/) for detailed setup guides for each provider.
+
+### Installing macFUSE (for Mount mode)
+
+Mount mode requires macFUSE to create virtual filesystems:
+
+```bash
+# Using Homebrew
+brew install --cask macfuse
+```
+
+Note: macFUSE requires a kernel extension, so you'll need to approve it in System Settings → Security & Privacy after installation and reboot.
 
 ## Installation
 
@@ -149,6 +179,24 @@ Click **Install** to activate the profile. SyncTray will:
 
 ### 4. You're Done!
 Your folder will now sync automatically on schedule. The menu bar shows sync status, and you'll get notifications when files change.
+
+### Using Mount Mode
+
+Mount mode is different from sync modes - it creates a virtual drive instead of syncing files:
+
+1. **Select Mount Mode**: When creating a profile, choose "Stream (Mount)" as the sync mode
+2. **Configure Mount Settings**:
+   - **Cache Mode**: Choose how aggressively to cache (Full recommended)
+   - **Cache Size**: Set maximum cache size (default: 10G)
+   - **Cache Directory**: Where cached files are stored (default: ~/.cache/rclone/vfs)
+3. **Mount Point**: The local path becomes your mount point (where files appear)
+4. **Install and Mount**: Click Install, then Mount in the menu bar
+
+**Mount vs Sync**:
+- Mount: Files stream on-demand, mount runs continuously
+- Sync: Files copied locally, sync runs periodically
+
+**Unmounting**: Click the eject button in the menu bar for the profile, or disable the profile.
 
 ## Menu Bar States
 
@@ -233,6 +281,38 @@ This removes the quarantine attribute from the downloaded file. It's safe - the 
 ### Files not appearing in Recent Changes
 - Only files actually transferred appear (unchanged files are skipped)
 - Check that `--use-json-log` is being used (automatic with SyncTray)
+
+### Mount mode: "macFUSE not installed" or mount fails
+
+Mount mode requires macFUSE to create virtual filesystems:
+
+```bash
+brew install --cask macfuse
+```
+
+After installation:
+1. Reboot your Mac
+2. Go to System Settings → Security & Privacy
+3. Approve the macFUSE kernel extension
+4. Try mounting again
+
+### Mount mode: Stale mount or "Device busy" error
+
+If a mount fails to unmount cleanly:
+
+```bash
+# Force unmount
+diskutil unmount force /path/to/mount/point
+
+# Or restart SyncTray (auto-cleans stale mounts)
+```
+
+### Mount mode: Slow file access
+
+Try adjusting cache settings:
+- Increase cache size (e.g., from 10G to 20G)
+- Use "Full" cache mode for better read performance
+- Check network speed to remote (mount streams over network)
 
 ## Development
 

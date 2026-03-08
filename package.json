@@ -4,12 +4,14 @@
   "private": true,
   "scripts": {
     "build": "nx run synctray:build",
-    "install": "nx run synctray:install",
-    "install:launch": "nx run synctray:install:launch",
+    "build:release": "nx run synctray:build:release",
+    "app:install": "nx run synctray:install",
+    "app:install:launch": "nx run synctray:install:launch",
     "release": "nx run synctray:release",
     "dev": "nx run synctray:dev",
     "clean": "nx run synctray:clean",
-    "test": "nx run synctray:test"
+    "test": "nx run synctray:test",
+    "reset": "nx reset"
   },
   "devDependencies": {
     "nx": "^21.0.0"

@@ -10,6 +10,8 @@ DerivedData/
 build/
 *.app
 
+.gw
+
 tasks
 
 .gw

@@ -14,10 +14,16 @@ struct ProfileDetailView: View {
     @State private var remotePath: String = ""
     @State private var localSyncPath: String = ""
     @State private var isExternalDrive: Bool = false
-    @State private var syncIntervalMinutes: Int = 15
+    @State private var syncIntervalMinutes: Int = 5
     @State private var additionalRcloneFlags: String = ""
     @State private var syncMode: SyncMode = .bisync
     @State private var syncDirection: SyncDirection = .localToRemote
+
+    // Mount mode specific settings
+    @State private var vfsCacheMode: VFSCacheMode = .full
+    @State private var vfsCacheMaxSize: String = "10G"
+    @State private var vfsCachePath: String = ""
+    @State private var allowNonEmptyMount: Bool = false
 
     // UI State
     @State private var showAdvanced: Bool = false
@@ -81,7 +87,11 @@ struct ProfileDetailView: View {
         syncIntervalMinutes != profile.syncIntervalMinutes ||
         additionalRcloneFlags != profile.additionalRcloneFlags ||
         syncMode != profile.syncMode ||
-        syncDirection != profile.syncDirection
+        syncDirection != profile.syncDirection ||
+        vfsCacheMode != profile.vfsCacheMode ||
+        vfsCacheMaxSize != profile.vfsCacheMaxSize ||
+        vfsCachePath != profile.vfsCachePath ||
+        allowNonEmptyMount != profile.allowNonEmptyMount
     }
 
     private var canInstall: Bool {
@@ -448,9 +458,11 @@ struct ProfileDetailView: View {
 
             // Local Folder
             VStack(alignment: .leading, spacing: 4) {
-                Text("Local Folder")
+                Text(syncMode == .mount ? "Mount Point" : "Local Folder")
                     .font(.subheadline.weight(.medium))
-                Text("The folder on your Mac that will be synced with the remote")
+                Text(syncMode == .mount ?
+                     "The folder where remote files will be mounted (accessed on-demand)" :
+                     "The folder on your Mac that will be synced with the remote")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 HStack {
@@ -528,6 +540,28 @@ struct ProfileDetailView: View {
                             )
                         }
                     )
+
+                    // Mount Mode Card
+                    syncModeCard(
+                        mode: .mount,
+                        isSelected: syncMode == .mount,
+                        title: "Stream (Mount)",
+                        subtitle: "Access files on-demand",
+                        icon: "externaldrive.badge.icloud",
+                        visualContent: {
+                            AnyView(
+                                HStack(spacing: 4) {
+                                    Image(systemName: "folder.fill")
+                                        .font(.caption)
+                                    Image(systemName: "arrow.up.arrow.down")
+                                        .font(.caption2)
+                                    Image(systemName: "cloud.fill")
+                                        .font(.caption)
+                                }
+                                .foregroundStyle(.secondary)
+                            )
+                        }
+                    )
                 }
 
                 // Description based on selected mode
@@ -593,6 +627,98 @@ struct ProfileDetailView: View {
                 }
             }
 
+            // Mount Mode Settings (only for mount mode)
+            if syncMode == .mount {
+                VStack(alignment: .leading, spacing: 12) {
+                    Text("Mount Settings")
+                        .font(.subheadline.weight(.medium))
+
+                    // Info about mount mode
+                    HStack(spacing: 6) {
+                        Image(systemName: "info.circle.fill")
+                            .foregroundStyle(.blue)
+                            .font(.caption)
+                        Text("Files will stream on-demand from the cloud. Local path becomes a mount point.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    .padding(.vertical, 4)
+
+                    // macFUSE requirement warning
+                    HStack(alignment: .top, spacing: 6) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .foregroundStyle(.orange)
+                            .font(.caption)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Requires macFUSE and official rclone binary")
+                                .font(.caption.weight(.medium))
+                            Text("Homebrew rclone doesn't support mount. Install macFUSE via `brew install --cask macfuse`, then download rclone from rclone.org/downloads")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    .padding(8)
+                    .background(Color.orange.opacity(0.1))
+                    .clipShape(.rect(cornerRadius: 6))
+
+                    // VFS Cache Mode
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Cache Mode")
+                            .font(.subheadline.weight(.medium))
+                        Picker("", selection: $vfsCacheMode) {
+                            ForEach(VFSCacheMode.allCases) { mode in
+                                Text("\(mode.displayName) - \(mode.description)").tag(mode)
+                            }
+                        }
+                        .labelsHidden()
+                    }
+
+                    // VFS Cache Size
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Cache Size")
+                            .font(.subheadline.weight(.medium))
+                        HStack {
+                            TextField("e.g., 10G", text: $vfsCacheMaxSize)
+                                .textFieldStyle(.roundedBorder)
+                                .frame(maxWidth: 150)
+                            Text("Suggested: 10G for most use cases")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+
+                    // VFS Cache Path
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Cache Directory")
+                            .font(.subheadline.weight(.medium))
+                        HStack {
+                            TextField("~/.cache/rclone/vfs", text: $vfsCachePath)
+                                .textFieldStyle(.roundedBorder)
+                            Button("Browse...") {
+                                browseForFolder(title: "Select Cache Directory") { path in
+                                    vfsCachePath = path
+                                }
+                            }
+                        }
+                        Text("Where cached files are stored locally")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+
+                    // Allow non-empty mount toggle
+                    Toggle(isOn: $allowNonEmptyMount) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Allow mounting to non-empty folder")
+                                .font(.subheadline)
+                            Text("Mount even if the local folder already contains files")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    .toggleStyle(.switch)
+                }
+            }
+
             // Warning when paths changed and need initial sync
             if pathsNeedInitialSync {
                 VStack(alignment: .leading, spacing: 8) {
@@ -647,12 +773,13 @@ struct ProfileDetailView: View {
 
                 HStack {
                     Picker("", selection: $syncIntervalMinutes) {
+                        Text("1 minute").tag(1)
+                        Text("2 minutes").tag(2)
                         Text("5 minutes").tag(5)
                         Text("10 minutes").tag(10)
                         Text("15 minutes").tag(15)
                         Text("30 minutes").tag(30)
                         Text("1 hour").tag(60)
-                        Text("2 hours").tag(120)
                     }
                     .pickerStyle(.menu)
                     .frame(width: 150)
@@ -1012,24 +1139,39 @@ struct ProfileDetailView: View {
 
     private var advancedSectionContent: some View {
         VStack(alignment: .leading, spacing: 16) {
-            // Sync Interval
-            VStack(alignment: .leading, spacing: 4) {
-                Text("Sync Interval")
-                    .font(.subheadline.weight(.medium))
-                Text("How often to run the sync")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+            // Sync Interval (not applicable for mount mode)
+            if syncMode != .mount {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Sync Interval")
+                        .font(.subheadline.weight(.medium))
+                    Text("How often to run the sync")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
 
-                Picker("", selection: $syncIntervalMinutes) {
-                    Text("5 minutes").tag(5)
-                    Text("10 minutes").tag(10)
-                    Text("15 minutes").tag(15)
-                    Text("30 minutes").tag(30)
-                    Text("1 hour").tag(60)
-                    Text("2 hours").tag(120)
+                    Picker("", selection: $syncIntervalMinutes) {
+                        Text("1 minute").tag(1)
+                        Text("2 minutes").tag(2)
+                        Text("5 minutes").tag(5)
+                        Text("10 minutes").tag(10)
+                        Text("15 minutes").tag(15)
+                        Text("30 minutes").tag(30)
+                        Text("1 hour").tag(60)
+                    }
+                    .pickerStyle(.menu)
+                    .frame(width: 150, alignment: .leading)
                 }
-                .pickerStyle(.menu)
-                .frame(width: 150, alignment: .leading)
+            } else {
+                // Mount mode info
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack(spacing: 6) {
+                        Image(systemName: "info.circle.fill")
+                            .foregroundStyle(.blue)
+                            .font(.caption)
+                        Text("Mount mode runs continuously - no periodic sync needed")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
             }
 
             Divider()
@@ -1124,6 +1266,10 @@ struct ProfileDetailView: View {
         additionalRcloneFlags = profile.additionalRcloneFlags
         syncMode = profile.syncMode
         syncDirection = profile.syncDirection
+        vfsCacheMode = profile.vfsCacheMode
+        vfsCacheMaxSize = profile.vfsCacheMaxSize
+        vfsCachePath = profile.vfsCachePath
+        allowNonEmptyMount = profile.allowNonEmptyMount
 
         // Show text input if the path contains "/" (nested path) or is a custom path
         // that won't be in the folder picker dropdown
@@ -1142,6 +1288,10 @@ struct ProfileDetailView: View {
         updatedProfile.additionalRcloneFlags = additionalRcloneFlags
         updatedProfile.syncMode = syncMode
         updatedProfile.syncDirection = syncDirection
+        updatedProfile.vfsCacheMode = vfsCacheMode
+        updatedProfile.vfsCacheMaxSize = vfsCacheMaxSize
+        updatedProfile.vfsCachePath = vfsCachePath
+        updatedProfile.allowNonEmptyMount = allowNonEmptyMount
         return updatedProfile
     }
 
@@ -1155,7 +1305,12 @@ struct ProfileDetailView: View {
             currentProfile.remotePath != updatedProfile.remotePath ||
             currentProfile.localSyncPath != updatedProfile.localSyncPath ||
             currentProfile.syncIntervalMinutes != updatedProfile.syncIntervalMinutes ||
-            currentProfile.additionalRcloneFlags != updatedProfile.additionalRcloneFlags
+            currentProfile.additionalRcloneFlags != updatedProfile.additionalRcloneFlags ||
+            currentProfile.syncMode != updatedProfile.syncMode ||
+            currentProfile.syncDirection != updatedProfile.syncDirection ||
+            currentProfile.vfsCacheMode != updatedProfile.vfsCacheMode ||
+            currentProfile.vfsCacheMaxSize != updatedProfile.vfsCacheMaxSize ||
+            currentProfile.vfsCachePath != updatedProfile.vfsCachePath
         )
 
         profileStore.update(updatedProfile)
@@ -1382,6 +1537,20 @@ struct ProfileDetailView: View {
     }
 
     private func runResync(loadAgentOnCompletion: Bool = false) {
+        // For mount mode, skip initial sync entirely - just load the agent
+        if syncMode == .mount {
+            isInstalling = false
+            resyncOutputLines = ["Mount mode - starting mount service..."]
+            showResyncOutput = true
+
+            if loadAgentOnCompletion {
+                if !setupService.loadAgent(for: profile) {
+                    installError = "Failed to start mount service"
+                }
+            }
+            return
+        }
+
         // Clear installing state so resync output panel is visible
         isInstalling = false
         isRunningResync = true
@@ -1407,6 +1576,8 @@ struct ProfileDetailView: View {
         let bisyncDir = "\(NSHomeDirectory())/Library/Caches/rclone/bisync"
         let capturedMaxLines = maxOutputLines
         let syncLogPath = profile.logPath  // Use main log file (same as scheduled syncs)
+        let capturedSyncMode = syncMode
+        let capturedSyncDirection = syncDirection
 
         DispatchQueue.global(qos: .userInitiated).async {
             let fileManager = FileManager.default
@@ -1477,9 +1648,23 @@ struct ProfileDetailView: View {
                 return
             }
 
-            // Build the resync command with JSON logging and frequent stats updates
+            // Build the sync command based on mode
             let fullRemotePath = "\(capturedRcloneRemote):\(capturedRemotePath)"
-            var arguments = ["bisync", fullRemotePath, capturedLocalSyncPath, "--resync", "--verbose", "--use-json-log", "--stats", "2s"]
+            var arguments: [String]
+
+            if capturedSyncMode == .bisync {
+                // Two-way bidirectional sync with --resync to establish baseline
+                arguments = ["bisync", fullRemotePath, capturedLocalSyncPath, "--resync", "--verbose", "--use-json-log", "--stats", "2s"]
+            } else {
+                // One-way sync (sync mode) - direction determines source/destination
+                if capturedSyncDirection == .localToRemote {
+                    // Upload: local is source, remote is destination
+                    arguments = ["sync", capturedLocalSyncPath, fullRemotePath, "--verbose", "--use-json-log", "--stats", "2s"]
+                } else {
+                    // Download: remote is source, local is destination
+                    arguments = ["sync", fullRemotePath, capturedLocalSyncPath, "--verbose", "--use-json-log", "--stats", "2s"]
+                }
+            }
 
             // Add filter file if it exists (excludes ._* files, .DS_Store, etc.)
             if fileManager.fileExists(atPath: capturedFilterPath) {
@@ -1723,6 +1908,7 @@ struct ProfileDetailView: View {
         case retrySync
         case createCheckFiles
         case forceSync      // Override "too many deletes" safety check
+        case mountAnyway    // Enable non-empty mount and retry
 
         var buttonText: String {
             switch self {
@@ -1742,6 +1928,8 @@ struct ProfileDetailView: View {
                 return "Create Check Files & Sync"
             case .forceSync:
                 return "Force Sync (Override Safety)"
+            case .mountAnyway:
+                return "Mount Anyway"
             }
         }
 
@@ -1763,6 +1951,8 @@ struct ProfileDetailView: View {
                 return "Creating check files..."
             case .forceSync:
                 return "Force syncing..."
+            case .mountAnyway:
+                return "Mounting..."
             }
         }
 
@@ -1784,6 +1974,8 @@ struct ProfileDetailView: View {
                 return "checkmark.circle"
             case .forceSync:
                 return "exclamationmark.triangle"
+            case .mountAnyway:
+                return "folder.badge.plus"
             }
         }
 
@@ -1805,11 +1997,18 @@ struct ProfileDetailView: View {
                 return "Create .synctray-check files required for access check"
             case .forceSync:
                 return "Override the 50% deletion safety limit and proceed with sync"
+            case .mountAnyway:
+                return "Enable mounting to non-empty folder and retry"
             }
         }
     }
 
     private func detectErrorAction(from error: String) -> ErrorAction? {
+        // Mount mode: folder is not empty
+        if error.contains("is not empty") || error.contains("not empty") {
+            return .mountAnyway
+        }
+
         // Use Smart Fix for most common bisync errors that need orchestrated recovery
         // These errors typically require: unlock → check files → resync
 
@@ -1878,6 +2077,48 @@ struct ProfileDetailView: View {
             createCheckFilesAndSync()
         case .forceSync:
             runForceSync()
+        case .mountAnyway:
+            enableNonEmptyMountAndReinstall()
+        }
+    }
+
+    private func enableNonEmptyMountAndReinstall() {
+        // Enable the setting
+        allowNonEmptyMount = true
+
+        // Clear any cached error
+        syncManager.clearError(for: profile.id)
+
+        // Build updated profile and save
+        var updatedProfile = buildProfileFromForm()
+        updatedProfile.allowNonEmptyMount = true
+        profileStore.update(updatedProfile)
+
+        // Reinstall with the new setting
+        isInstalling = true
+        installError = nil
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            do {
+                // Uninstall first if already installed
+                if self.setupService.isInstalled(profile: updatedProfile) {
+                    try self.setupService.uninstall(profile: updatedProfile)
+                }
+
+                // Reinstall with new config
+                try self.setupService.install(profile: updatedProfile, loadAgent: true)
+
+                DispatchQueue.main.async {
+                    self.isInstalling = false
+                    self.resyncOutputLines = ["Mount service restarted with non-empty folder allowed"]
+                    self.showResyncOutput = true
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    self.isInstalling = false
+                    self.installError = "Failed to reinstall: \(error.localizedDescription)"
+                }
+            }
         }
     }
 

@@ -44,7 +44,7 @@ final class SyncSetupService {
     // MARK: - Rclone Path Helper
 
     private func findRclonePath() -> String? {
-        let paths = ["/opt/homebrew/bin/rclone", "/usr/local/bin/rclone", "/usr/bin/rclone"]
+        let paths = ["/usr/local/bin/rclone", "/opt/homebrew/bin/rclone", "/usr/bin/rclone"]
         return paths.first { FileManager.default.fileExists(atPath: $0) }
     }
 
@@ -83,6 +83,15 @@ final class SyncSetupService {
         // Create directories if needed
         try createDirectories(for: profile)
 
+        // For mount mode, ensure VFS cache directory exists
+        if profile.isMountMode {
+            let cacheDir = (profile.vfsCachePath as NSString).expandingTildeInPath
+            if !FileManager.default.fileExists(atPath: cacheDir) {
+                try FileManager.default.createDirectory(
+                    atPath: cacheDir, withIntermediateDirectories: true)
+            }
+        }
+
         // Generate and write the shared script (only if it doesn't exist or needs update)
         let script = generateSyncScript()
         try script.write(toFile: SyncProfile.sharedScriptPath, atomically: true, encoding: .utf8)
@@ -98,7 +107,10 @@ final class SyncSetupService {
         try config.write(toFile: profile.configPath, atomically: true, encoding: .utf8)
 
         // Generate and write exclude filter (preserves existing user edits)
-        try writeExcludeFilter(for: profile)
+        // Only needed for sync modes, not mount
+        if !profile.isMountMode {
+            try writeExcludeFilter(for: profile)
+        }
 
         // Generate and write plist
         let plist = generateLaunchdPlist(for: profile)
@@ -195,6 +207,62 @@ final class SyncSetupService {
     func updateConfig(for profile: SyncProfile) throws {
         let config = generateProfileConfig(for: profile)
         try config.write(toFile: profile.configPath, atomically: true, encoding: .utf8)
+    }
+
+    // MARK: - Mount Mode Methods
+
+    /// Check if a profile's mount is currently active
+    func isMounted(profile: SyncProfile) -> Bool {
+        let result = runCommand("/sbin/mount", arguments: [])
+        return result.output.contains(" on \(profile.localSyncPath) ")
+    }
+
+    /// Unmount a mounted profile
+    func unmount(profile: SyncProfile) throws {
+        guard profile.isMountMode else {
+            throw SetupError.notMountMode
+        }
+
+        // Check if mounted
+        guard isMounted(profile: profile) else {
+            return // Already unmounted
+        }
+
+        // Try graceful unmount first
+        let result = runCommand("/usr/sbin/diskutil", arguments: ["unmount", profile.localSyncPath])
+
+        if result.exitCode != 0 {
+            // Force unmount if graceful fails
+            let forceResult = runCommand("/usr/sbin/diskutil", arguments: ["unmount", "force", profile.localSyncPath])
+            if forceResult.exitCode != 0 {
+                throw SetupError.unmountFailed(forceResult.output)
+            }
+        }
+    }
+
+    /// Clean up stale mounts on app startup
+    func cleanupStaleMounts() {
+        // Find all SyncTray mount points
+        let result = runCommand("/sbin/mount", arguments: [])
+        let lines = result.output.components(separatedBy: "\n")
+
+        for line in lines {
+            // Look for rclone mounts that match our pattern
+            if line.contains("rclone") {
+                // Extract mount point from line like "remote: on /path/to/mount (osxfuse..."
+                if let onRange = line.range(of: " on "),
+                   let parenRange = line.range(of: " (") {
+                    let mountPoint = String(line[line.index(onRange.upperBound, offsetBy: 0)..<parenRange.lowerBound])
+
+                    // Check if this is a SyncTray managed mount (has a corresponding config)
+                    let configExists = FileManager.default.fileExists(atPath: SyncProfile.configDirectory)
+                    if configExists {
+                        // Try to unmount stale mounts
+                        _ = runCommand("/usr/sbin/diskutil", arguments: ["unmount", "force", mountPoint])
+                    }
+                }
+            }
+        }
     }
 
     /// Initializes sync paths by creating directories and check file (.synctray-check)
@@ -307,13 +375,13 @@ final class SyncSetupService {
     // MARK: - Script Generation
 
     /// Generate the shared sync script that reads config from JSON
-    /// Supports both bisync (two-way) and sync (one-way) modes
+    /// Supports bisync (two-way), sync (one-way), and mount (streaming) modes
     private func generateSyncScript() -> String {
         return """
             #!/bin/bash
             # SyncTray Sync Script
             # This script reads profile configuration from a JSON file
-            # Supports both bisync (two-way) and sync (one-way) modes
+            # Supports bisync (two-way), sync (one-way), and mount (streaming) modes
             # DO NOT EDIT - This file is managed by SyncTray
 
             CONFIG_FILE="$1"
@@ -337,9 +405,27 @@ final class SyncSetupService {
             FILTER_FILE=$(parse_json "filterPath" "")
             SYNC_MODE=$(parse_json "syncMode" "bisync")
             SYNC_DIRECTION=$(parse_json "syncDirection" "localToRemote")
+            VFS_CACHE_MODE=$(parse_json "vfsCacheMode" "full")
+            VFS_CACHE_MAX_SIZE=$(parse_json "vfsCacheMaxSize" "10G")
+            VFS_CACHE_PATH=$(parse_json "vfsCachePath" "$HOME/.cache/rclone/vfs")
+            ALLOW_NON_EMPTY=$(parse_json "allowNonEmptyMount" "false")
 
             if [[ -z "$REMOTE" || -z "$LOCAL_PATH" ]]; then
                 echo "Error: Invalid config - missing remote or localPath"
+                exit 1
+            fi
+
+            # Find rclone binary (check multiple locations)
+            RCLONE_BIN=""
+            for path in /usr/local/bin/rclone /opt/homebrew/bin/rclone /usr/bin/rclone; do
+                if [[ -x "$path" ]]; then
+                    RCLONE_BIN="$path"
+                    break
+                fi
+            done
+
+            if [[ -z "$RCLONE_BIN" ]]; then
+                echo "$(date '+%Y-%m-%d %H:%M:%S') - Error: rclone not found" >> "$LOG_FILE"
                 exit 1
             fi
 
@@ -366,20 +452,41 @@ final class SyncSetupService {
             mkdir -p "$LOCAL_PATH"
 
             # Build rclone command based on sync mode
-            if [[ "$SYNC_MODE" == "bisync" ]]; then
+            if [[ "$SYNC_MODE" == "mount" ]]; then
+                # Mount mode - stream files on-demand
+                echo "$(date '+%Y-%m-%d %H:%M:%S') - Starting mount" >> "$LOG_FILE"
+
+                # Ensure mount point exists
+                mkdir -p "$LOCAL_PATH"
+
+                # Check if already mounted
+                if mount | grep -q " on $LOCAL_PATH "; then
+                    echo "$(date '+%Y-%m-%d %H:%M:%S') - Already mounted at $LOCAL_PATH" >> "$LOG_FILE"
+                    exit 0
+                fi
+
+                # Mount command with VFS cache settings
+                # Note: No --daemon flag - launchd manages the process lifecycle
+                RCLONE_CMD="$RCLONE_BIN mount \\"$REMOTE\\" \\"$LOCAL_PATH\\" --vfs-cache-mode $VFS_CACHE_MODE --vfs-cache-max-size $VFS_CACHE_MAX_SIZE --cache-dir \\"$VFS_CACHE_PATH\\" --log-level INFO --use-json-log"
+
+                # Add --allow-non-empty flag if configured
+                if [[ "$ALLOW_NON_EMPTY" == "true" || "$ALLOW_NON_EMPTY" == "True" || "$ALLOW_NON_EMPTY" == "1" ]]; then
+                    RCLONE_CMD="$RCLONE_CMD --allow-non-empty"
+                fi
+            elif [[ "$SYNC_MODE" == "bisync" ]]; then
                 # Two-way bidirectional sync
                 echo "$(date '+%Y-%m-%d %H:%M:%S') - Starting bisync" >> "$LOG_FILE"
-                RCLONE_CMD="/opt/homebrew/bin/rclone bisync \\"$REMOTE\\" \\"$LOCAL_PATH\\" --verbose --use-json-log --stats 2s --filter-from \\"$FILTER_FILE\\" --check-access --check-filename .synctray-check --resilient --recover --conflict-resolve newer --conflict-loser num --conflict-suffix sync-conflict-{DateOnly}-"
+                RCLONE_CMD="$RCLONE_BIN bisync \\"$REMOTE\\" \\"$LOCAL_PATH\\" --verbose --use-json-log --stats 2s --filter-from \\"$FILTER_FILE\\" --check-access --check-filename .synctray-check --resilient --recover --conflict-resolve newer --conflict-loser num --conflict-suffix sync-conflict-{DateOnly}-"
             else
                 # One-way sync
                 if [[ "$SYNC_DIRECTION" == "localToRemote" ]]; then
                     # Local is source, remote is destination (backup/upload)
                     echo "$(date '+%Y-%m-%d %H:%M:%S') - Starting sync (local → remote)" >> "$LOG_FILE"
-                    RCLONE_CMD="/opt/homebrew/bin/rclone sync \\"$LOCAL_PATH\\" \\"$REMOTE\\" --verbose --use-json-log --stats 2s --filter-from \\"$FILTER_FILE\\""
+                    RCLONE_CMD="$RCLONE_BIN sync \\"$LOCAL_PATH\\" \\"$REMOTE\\" --verbose --use-json-log --stats 2s --filter-from \\"$FILTER_FILE\\""
                 else
                     # Remote is source, local is destination (download/mirror)
                     echo "$(date '+%Y-%m-%d %H:%M:%S') - Starting sync (remote → local)" >> "$LOG_FILE"
-                    RCLONE_CMD="/opt/homebrew/bin/rclone sync \\"$REMOTE\\" \\"$LOCAL_PATH\\" --verbose --use-json-log --stats 2s --filter-from \\"$FILTER_FILE\\""
+                    RCLONE_CMD="$RCLONE_BIN sync \\"$REMOTE\\" \\"$LOCAL_PATH\\" --verbose --use-json-log --stats 2s --filter-from \\"$FILTER_FILE\\""
                 fi
             fi
 
@@ -425,6 +532,10 @@ final class SyncSetupService {
             "syncIntervalMinutes": profile.syncIntervalMinutes,
             "syncMode": profile.syncMode.rawValue,
             "syncDirection": profile.syncDirection.rawValue,
+            "vfsCacheMode": profile.vfsCacheMode.rawValue,
+            "vfsCacheMaxSize": profile.vfsCacheMaxSize,
+            "vfsCachePath": profile.vfsCachePath,
+            "allowNonEmptyMount": profile.allowNonEmptyMount,
         ]
 
         if let data = try? JSONSerialization.data(
@@ -437,46 +548,85 @@ final class SyncSetupService {
     }
 
     private func generateLaunchdPlist(for profile: SyncProfile) -> String {
-        let intervalSeconds = profile.syncIntervalMinutes * 60
         let scriptPath = SyncProfile.sharedScriptPath
         let configPath = profile.configPath
         let logDir = (profile.logPath as NSString).deletingLastPathComponent
         let launchdLogPath = logDir + "/synctray-launchd-\(profile.shortId).log"
 
-        return """
-            <?xml version="1.0" encoding="UTF-8"?>
-            <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-            <plist version="1.0">
-            <dict>
-                <key>Label</key>
-                <string>\(profile.launchdLabel)</string>
-
-                <key>ProgramArguments</key>
-                <array>
-                    <string>\(scriptPath)</string>
-                    <string>\(configPath)</string>
-                </array>
-
-                <key>StartInterval</key>
-                <integer>\(intervalSeconds)</integer>
-
-                <key>RunAtLoad</key>
-                <true/>
-
-                <key>StandardOutPath</key>
-                <string>\(launchdLogPath)</string>
-
-                <key>StandardErrorPath</key>
-                <string>\(launchdLogPath)</string>
-
-                <key>EnvironmentVariables</key>
+        if profile.isMountMode {
+            // Mount mode: use KeepAlive to maintain daemon
+            return """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+                <plist version="1.0">
                 <dict>
-                    <key>PATH</key>
-                    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+                    <key>Label</key>
+                    <string>\(profile.launchdLabel)</string>
+
+                    <key>ProgramArguments</key>
+                    <array>
+                        <string>\(scriptPath)</string>
+                        <string>\(configPath)</string>
+                    </array>
+
+                    <key>KeepAlive</key>
+                    <true/>
+
+                    <key>RunAtLoad</key>
+                    <true/>
+
+                    <key>StandardOutPath</key>
+                    <string>\(launchdLogPath)</string>
+
+                    <key>StandardErrorPath</key>
+                    <string>\(launchdLogPath)</string>
+
+                    <key>EnvironmentVariables</key>
+                    <dict>
+                        <key>PATH</key>
+                        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+                    </dict>
                 </dict>
-            </dict>
-            </plist>
-            """
+                </plist>
+                """
+        } else {
+            // Sync modes: use StartInterval for periodic execution
+            let intervalSeconds = profile.syncIntervalMinutes * 60
+            return """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+                <plist version="1.0">
+                <dict>
+                    <key>Label</key>
+                    <string>\(profile.launchdLabel)</string>
+
+                    <key>ProgramArguments</key>
+                    <array>
+                        <string>\(scriptPath)</string>
+                        <string>\(configPath)</string>
+                    </array>
+
+                    <key>StartInterval</key>
+                    <integer>\(intervalSeconds)</integer>
+
+                    <key>RunAtLoad</key>
+                    <true/>
+
+                    <key>StandardOutPath</key>
+                    <string>\(launchdLogPath)</string>
+
+                    <key>StandardErrorPath</key>
+                    <string>\(launchdLogPath)</string>
+
+                    <key>EnvironmentVariables</key>
+                    <dict>
+                        <key>PATH</key>
+                        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+                    </dict>
+                </dict>
+                </plist>
+                """
+        }
     }
 
     // MARK: - Helpers
@@ -551,6 +701,8 @@ final class SyncSetupService {
         case missingRemotePath
         case scriptGenerationFailed
         case plistGenerationFailed
+        case notMountMode
+        case unmountFailed(String)
 
         var errorDescription: String? {
             switch self {
@@ -564,6 +716,10 @@ final class SyncSetupService {
                 return "Failed to generate sync script"
             case .plistGenerationFailed:
                 return "Failed to generate launchd plist"
+            case .notMountMode:
+                return "Profile is not in mount mode"
+            case .unmountFailed(let message):
+                return "Failed to unmount: \(message)"
             }
         }
     }

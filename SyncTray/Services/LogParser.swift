@@ -80,8 +80,8 @@ final class LogParser {
         // Check message for sync events (in JSON format)
         let msg = stripANSI(entry.msg)
 
-        // Capture error messages from rclone
-        if entry.level == "error" {
+        // Capture error messages from rclone (error or critical level)
+        if entry.level == "error" || entry.level == "critical" {
             // Clean up error message using centralized patterns
             var errorMsg = SyncLogPatterns.cleanErrorMessage(msg)
 

@@ -10,6 +10,10 @@ enum SyncMode: String, Codable, CaseIterable, Identifiable {
     /// Source is authoritative, destination is overwritten
     case sync = "sync"
 
+    /// Mount remote as virtual filesystem (rclone mount)
+    /// Files are streamed on-demand without local sync
+    case mount = "mount"
+
     var id: String { rawValue }
 
     var displayName: String {
@@ -18,6 +22,8 @@ enum SyncMode: String, Codable, CaseIterable, Identifiable {
             return "Two-Way Sync"
         case .sync:
             return "One-Way Sync"
+        case .mount:
+            return "Stream (Mount)"
         }
     }
 
@@ -27,6 +33,8 @@ enum SyncMode: String, Codable, CaseIterable, Identifiable {
             return "Changes sync both ways between local and remote"
         case .sync:
             return "Source overwrites destination (backup or mirror)"
+        case .mount:
+            return "Stream files on-demand without local sync"
         }
     }
 
@@ -36,6 +44,8 @@ enum SyncMode: String, Codable, CaseIterable, Identifiable {
             return "arrow.left.arrow.right"
         case .sync:
             return "arrow.right"
+        case .mount:
+            return "externaldrive.badge.icloud"
         }
     }
 }
@@ -74,6 +84,49 @@ enum SyncDirection: String, Codable, CaseIterable, Identifiable {
             return "arrow.up.to.line"
         case .remoteToLocal:
             return "arrow.down.to.line"
+        }
+    }
+}
+
+/// VFS cache mode for mount mode
+enum VFSCacheMode: String, Codable, CaseIterable, Identifiable {
+    /// No caching - all operations go directly to remote
+    case off = "off"
+
+    /// Cache file structure only (metadata)
+    case minimal = "minimal"
+
+    /// Cache file structure and written files
+    case writes = "writes"
+
+    /// Full caching - cache reads and writes (recommended)
+    case full = "full"
+
+    var id: String { rawValue }
+
+    var displayName: String {
+        switch self {
+        case .off:
+            return "Off"
+        case .minimal:
+            return "Minimal"
+        case .writes:
+            return "Writes"
+        case .full:
+            return "Full"
+        }
+    }
+
+    var description: String {
+        switch self {
+        case .off:
+            return "No caching (slowest, saves space)"
+        case .minimal:
+            return "Cache metadata only"
+        case .writes:
+            return "Cache metadata and written files"
+        case .full:
+            return "Cache reads and writes (recommended)"
         }
     }
 }

@@ -1,25 +1,79 @@
 {
-    // See https://go.microsoft.com/fwlink/?LinkId=733558
-    // for the documentation about the tasks.json format
     "version": "2.0.0",
     "tasks": [
         {
-            "label": "release",
+            "label": "build",
             "type": "shell",
-            "command": "sh ./scripts/release.sh",
+            "command": "npx nx run synctray:build",
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            },
+            "problemMatcher": []
+        },
+        {
+            "label": "build:release",
+            "type": "shell",
+            "command": "npx nx run synctray:build:release",
+            "problemMatcher": []
+        },
+        {
+            "label": "test",
+            "type": "shell",
+            "command": "npx nx run synctray:test",
+            "group": {
+                "kind": "test",
+                "isDefault": true
+            },
+            "problemMatcher": []
+        },
+        {
+            "label": "clean",
+            "type": "shell",
+            "command": "npx nx run synctray:clean",
             "problemMatcher": []
         },
         {
             "label": "install",
             "type": "shell",
-            "command": "sh ./scripts/install.sh",
+            "command": "npx nx run synctray:install",
             "problemMatcher": []
         },
         {
             "label": "install:launch",
             "type": "shell",
-            "command": "sh ./scripts/install.sh --launch",
+            "command": "npx nx run synctray:install:launch",
             "problemMatcher": []
         },
+        {
+            "label": "install:full",
+            "type": "shell",
+            "command": "npx nx run synctray:install:full",
+            "problemMatcher": []
+        },
+        {
+            "label": "install:full:launch",
+            "type": "shell",
+            "command": "npx nx run synctray:install:full:launch",
+            "problemMatcher": []
+        },
+        {
+            "label": "dev",
+            "type": "shell",
+            "command": "npx nx run synctray:dev",
+            "problemMatcher": []
+        },
+        {
+            "label": "release",
+            "type": "shell",
+            "command": "npx nx run synctray:release",
+            "problemMatcher": []
+        },
+        {
+            "label": "reset",
+            "type": "shell",
+            "command": "npx nx reset",
+            "problemMatcher": []
+        }
     ]
 }
