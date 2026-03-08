@@ -19,6 +19,11 @@ struct ProfileDetailView: View {
     @State private var syncMode: SyncMode = .bisync
     @State private var syncDirection: SyncDirection = .localToRemote
 
+    // Mount mode specific settings
+    @State private var vfsCacheMode: VFSCacheMode = .full
+    @State private var vfsCacheMaxSize: String = "10G"
+    @State private var vfsCachePath: String = ""
+
     // UI State
     @State private var showAdvanced: Bool = false
     @State private var isInstalling: Bool = false
@@ -81,7 +86,10 @@ struct ProfileDetailView: View {
         syncIntervalMinutes != profile.syncIntervalMinutes ||
         additionalRcloneFlags != profile.additionalRcloneFlags ||
         syncMode != profile.syncMode ||
-        syncDirection != profile.syncDirection
+        syncDirection != profile.syncDirection ||
+        vfsCacheMode != profile.vfsCacheMode ||
+        vfsCacheMaxSize != profile.vfsCacheMaxSize ||
+        vfsCachePath != profile.vfsCachePath
     }
 
     private var canInstall: Bool {
@@ -448,9 +456,11 @@ struct ProfileDetailView: View {
 
             // Local Folder
             VStack(alignment: .leading, spacing: 4) {
-                Text("Local Folder")
+                Text(syncMode == .mount ? "Mount Point" : "Local Folder")
                     .font(.subheadline.weight(.medium))
-                Text("The folder on your Mac that will be synced with the remote")
+                Text(syncMode == .mount ?
+                     "The folder where remote files will be mounted (accessed on-demand)" :
+                     "The folder on your Mac that will be synced with the remote")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 HStack {
@@ -528,6 +538,28 @@ struct ProfileDetailView: View {
                             )
                         }
                     )
+
+                    // Mount Mode Card
+                    syncModeCard(
+                        mode: .mount,
+                        isSelected: syncMode == .mount,
+                        title: "Stream (Mount)",
+                        subtitle: "Access files on-demand",
+                        icon: "externaldrive.badge.icloud",
+                        visualContent: {
+                            AnyView(
+                                HStack(spacing: 4) {
+                                    Image(systemName: "folder.fill")
+                                        .font(.caption)
+                                    Image(systemName: "arrow.up.arrow.down")
+                                        .font(.caption2)
+                                    Image(systemName: "cloud.fill")
+                                        .font(.caption)
+                                }
+                                .foregroundStyle(.secondary)
+                            )
+                        }
+                    )
                 }
 
                 // Description based on selected mode
@@ -590,6 +622,69 @@ struct ProfileDetailView: View {
                         }
                     }
                     .padding(.top, 4)
+                }
+            }
+
+            // Mount Mode Settings (only for mount mode)
+            if syncMode == .mount {
+                VStack(alignment: .leading, spacing: 12) {
+                    Text("Mount Settings")
+                        .font(.subheadline.weight(.medium))
+
+                    // Info about mount mode
+                    HStack(spacing: 6) {
+                        Image(systemName: "info.circle.fill")
+                            .foregroundStyle(.blue)
+                            .font(.caption)
+                        Text("Files will stream on-demand from the cloud. Local path becomes a mount point.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    .padding(.vertical, 4)
+
+                    // VFS Cache Mode
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Cache Mode")
+                            .font(.subheadline.weight(.medium))
+                        Picker("", selection: $vfsCacheMode) {
+                            ForEach(VFSCacheMode.allCases) { mode in
+                                Text("\(mode.displayName) - \(mode.description)").tag(mode)
+                            }
+                        }
+                        .labelsHidden()
+                    }
+
+                    // VFS Cache Size
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Cache Size")
+                            .font(.subheadline.weight(.medium))
+                        HStack {
+                            TextField("e.g., 10G", text: $vfsCacheMaxSize)
+                                .textFieldStyle(.roundedBorder)
+                                .frame(maxWidth: 150)
+                            Text("Suggested: 10G for most use cases")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+
+                    // VFS Cache Path
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Cache Directory")
+                            .font(.subheadline.weight(.medium))
+                        HStack {
+                            TextField("~/.cache/rclone/vfs", text: $vfsCachePath)
+                                .textFieldStyle(.roundedBorder)
+                            Button("Browse...") {
+                                browseForFolder(title: "Select Cache Directory") { path in
+                                    vfsCachePath = path
+                                }
+                            }
+                        }
+                        Text("Where cached files are stored locally")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
                 }
             }
 
@@ -1012,24 +1107,38 @@ struct ProfileDetailView: View {
 
     private var advancedSectionContent: some View {
         VStack(alignment: .leading, spacing: 16) {
-            // Sync Interval
-            VStack(alignment: .leading, spacing: 4) {
-                Text("Sync Interval")
-                    .font(.subheadline.weight(.medium))
-                Text("How often to run the sync")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+            // Sync Interval (not applicable for mount mode)
+            if syncMode != .mount {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Sync Interval")
+                        .font(.subheadline.weight(.medium))
+                    Text("How often to run the sync")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
 
-                Picker("", selection: $syncIntervalMinutes) {
-                    Text("5 minutes").tag(5)
-                    Text("10 minutes").tag(10)
-                    Text("15 minutes").tag(15)
-                    Text("30 minutes").tag(30)
-                    Text("1 hour").tag(60)
-                    Text("2 hours").tag(120)
+                    Picker("", selection: $syncIntervalMinutes) {
+                        Text("5 minutes").tag(5)
+                        Text("10 minutes").tag(10)
+                        Text("15 minutes").tag(15)
+                        Text("30 minutes").tag(30)
+                        Text("1 hour").tag(60)
+                        Text("2 hours").tag(120)
+                    }
+                    .pickerStyle(.menu)
+                    .frame(width: 150, alignment: .leading)
                 }
-                .pickerStyle(.menu)
-                .frame(width: 150, alignment: .leading)
+            } else {
+                // Mount mode info
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack(spacing: 6) {
+                        Image(systemName: "info.circle.fill")
+                            .foregroundStyle(.blue)
+                            .font(.caption)
+                        Text("Mount mode runs continuously - no periodic sync needed")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
             }
 
             Divider()
@@ -1124,6 +1233,9 @@ struct ProfileDetailView: View {
         additionalRcloneFlags = profile.additionalRcloneFlags
         syncMode = profile.syncMode
         syncDirection = profile.syncDirection
+        vfsCacheMode = profile.vfsCacheMode
+        vfsCacheMaxSize = profile.vfsCacheMaxSize
+        vfsCachePath = profile.vfsCachePath
 
         // Show text input if the path contains "/" (nested path) or is a custom path
         // that won't be in the folder picker dropdown
@@ -1142,6 +1254,9 @@ struct ProfileDetailView: View {
         updatedProfile.additionalRcloneFlags = additionalRcloneFlags
         updatedProfile.syncMode = syncMode
         updatedProfile.syncDirection = syncDirection
+        updatedProfile.vfsCacheMode = vfsCacheMode
+        updatedProfile.vfsCacheMaxSize = vfsCacheMaxSize
+        updatedProfile.vfsCachePath = vfsCachePath
         return updatedProfile
     }
 
