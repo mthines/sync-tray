@@ -250,22 +250,22 @@ struct ProfileDetailView: View {
                 HStack {
                     Image(systemName: icon)
                         .font(.title3)
-                        .foregroundStyle(isSelected ? .white : .secondary)
+                        .foregroundStyle(isSelected ? .primary : .secondary)
                     Spacer()
                     if isSelected {
                         Image(systemName: "checkmark.circle.fill")
-                            .font(.caption)
-                            .foregroundStyle(.white)
+                            .font(.body)
+                            .foregroundStyle(Color.accentColor)
                     }
                 }
 
                 Text(title)
                     .font(.subheadline.weight(.semibold))
-                    .foregroundStyle(isSelected ? .white : .primary)
+                    .foregroundStyle(.primary)
 
                 Text(subtitle)
                     .font(.caption)
-                    .foregroundStyle(isSelected ? .white.opacity(0.8) : .secondary)
+                    .foregroundStyle(.secondary)
 
                 visualContent()
                     .padding(.top, 2)
@@ -274,11 +274,11 @@ struct ProfileDetailView: View {
             .frame(maxWidth: .infinity, alignment: .leading)
             .background(
                 RoundedRectangle(cornerRadius: 8)
-                    .fill(isSelected ? Color.accentColor : Color(nsColor: .controlBackgroundColor))
+                    .fill(isSelected ? Color(nsColor: .unemphasizedSelectedContentBackgroundColor) : Color(nsColor: .controlBackgroundColor))
             )
             .overlay(
                 RoundedRectangle(cornerRadius: 8)
-                    .strokeBorder(isSelected ? Color.clear : Color(nsColor: .separatorColor), lineWidth: 1)
+                    .strokeBorder(isSelected ? Color.accentColor : Color(nsColor: .separatorColor), lineWidth: isSelected ? 2 : 1)
             )
         }
         .buttonStyle(.plain)
@@ -303,12 +303,12 @@ struct ProfileDetailView: View {
                 HStack {
                     Text(title)
                         .font(.subheadline.weight(.semibold))
-                        .foregroundStyle(isSelected ? .white : .primary)
+                        .foregroundStyle(.primary)
                     Spacer()
                     if isSelected {
                         Image(systemName: "checkmark.circle.fill")
-                            .font(.caption)
-                            .foregroundStyle(.white)
+                            .font(.body)
+                            .foregroundStyle(Color.accentColor)
                     }
                 }
 
@@ -321,21 +321,21 @@ struct ProfileDetailView: View {
                     Image(systemName: rightIcon)
                         .font(.caption)
                 }
-                .foregroundStyle(isSelected ? .white.opacity(0.8) : .secondary)
+                .foregroundStyle(.secondary)
 
                 Text(description)
                     .font(.caption)
-                    .foregroundStyle(isSelected ? .white.opacity(0.8) : .secondary)
+                    .foregroundStyle(.secondary)
             }
             .padding(10)
             .frame(maxWidth: .infinity, alignment: .leading)
             .background(
                 RoundedRectangle(cornerRadius: 8)
-                    .fill(isSelected ? Color.accentColor : Color(nsColor: .controlBackgroundColor))
+                    .fill(isSelected ? Color(nsColor: .unemphasizedSelectedContentBackgroundColor) : Color(nsColor: .controlBackgroundColor))
             )
             .overlay(
                 RoundedRectangle(cornerRadius: 8)
-                    .strokeBorder(isSelected ? Color.clear : Color(nsColor: .separatorColor), lineWidth: 1)
+                    .strokeBorder(isSelected ? Color.accentColor : Color(nsColor: .separatorColor), lineWidth: isSelected ? 2 : 1)
             )
         }
         .buttonStyle(.plain)
@@ -555,9 +555,9 @@ struct ProfileDetailView: View {
                         syncDirectionCard(
                             direction: .localToRemote,
                             isSelected: syncDirection == .localToRemote,
-                            title: "Backup",
+                            title: "Upload",
                             subtitle: "Local → Remote",
-                            description: "Upload local files to cloud",
+                            description: "Send local files to cloud",
                             leftIcon: "folder.fill",
                             rightIcon: "cloud.fill"
                         )
@@ -566,9 +566,9 @@ struct ProfileDetailView: View {
                         syncDirectionCard(
                             direction: .remoteToLocal,
                             isSelected: syncDirection == .remoteToLocal,
-                            title: "Mirror",
+                            title: "Download",
                             subtitle: "Remote → Local",
-                            description: "Download cloud files to local",
+                            description: "Get cloud files to local",
                             leftIcon: "cloud.fill",
                             rightIcon: "folder.fill"
                         )
