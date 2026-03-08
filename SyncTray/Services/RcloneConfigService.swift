@@ -147,31 +147,31 @@ final class RcloneConfigService {
         }
 
         return await withCheckedContinuation { continuation in
-            DispatchQueue.global(qos: .userInitiated).async {
-                let process = Process()
-                let pipe = Pipe()
+            let process = Process()
+            let pipe = Pipe()
 
-                process.executableURL = URL(fileURLWithPath: rclonePath)
-                // Only add colon if there's no colon in the path at all
-                let remote = remotePath.contains(":") ? remotePath : "\(remotePath):"
-                process.arguments = ["lsd", remote, "--max-depth", "0"]
-                process.standardOutput = pipe
-                process.standardError = pipe
+            process.executableURL = URL(fileURLWithPath: rclonePath)
+            // Only add colon if there's no colon in the path at all
+            let remote = remotePath.contains(":") ? remotePath : "\(remotePath):"
+            process.arguments = ["lsd", remote, "--max-depth", "0"]
+            process.standardOutput = pipe
+            process.standardError = pipe
 
-                do {
-                    try process.run()
-                    process.waitUntilExit()
-
-                    if process.terminationStatus == 0 {
-                        continuation.resume(returning: .success(()))
-                    } else {
-                        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-                        let error = String(data: data, encoding: .utf8) ?? "Unknown error"
-                        continuation.resume(returning: .failure(.connectionFailed(error)))
-                    }
-                } catch {
-                    continuation.resume(returning: .failure(.connectionFailed(error.localizedDescription)))
+            // Use termination handler to avoid pipe deadlock
+            process.terminationHandler = { proc in
+                let data = pipe.fileHandleForReading.readDataToEndOfFile()
+                if proc.terminationStatus == 0 {
+                    continuation.resume(returning: .success(()))
+                } else {
+                    let error = String(data: data, encoding: .utf8) ?? "Unknown error"
+                    continuation.resume(returning: .failure(.connectionFailed(error)))
                 }
+            }
+
+            do {
+                try process.run()
+            } catch {
+                continuation.resume(returning: .failure(.connectionFailed(error.localizedDescription)))
             }
         }
     }
