@@ -1270,7 +1270,12 @@ struct ProfileDetailView: View {
             currentProfile.remotePath != updatedProfile.remotePath ||
             currentProfile.localSyncPath != updatedProfile.localSyncPath ||
             currentProfile.syncIntervalMinutes != updatedProfile.syncIntervalMinutes ||
-            currentProfile.additionalRcloneFlags != updatedProfile.additionalRcloneFlags
+            currentProfile.additionalRcloneFlags != updatedProfile.additionalRcloneFlags ||
+            currentProfile.syncMode != updatedProfile.syncMode ||
+            currentProfile.syncDirection != updatedProfile.syncDirection ||
+            currentProfile.vfsCacheMode != updatedProfile.vfsCacheMode ||
+            currentProfile.vfsCacheMaxSize != updatedProfile.vfsCacheMaxSize ||
+            currentProfile.vfsCachePath != updatedProfile.vfsCachePath
         )
 
         profileStore.update(updatedProfile)
