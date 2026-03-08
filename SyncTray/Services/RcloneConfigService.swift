@@ -146,30 +146,30 @@ final class RcloneConfigService {
             return .failure(.rcloneNotFound)
         }
 
-        // Run on background thread to not block UI
+        // Use exact same pattern as listFolders which works
         return await withCheckedContinuation { continuation in
             DispatchQueue.global(qos: .userInitiated).async {
                 let process = Process()
-                let errorPipe = Pipe()
+                let pipe = Pipe()
 
                 process.executableURL = URL(fileURLWithPath: rclonePath)
-                // Only add colon if there's no colon in the path at all
                 let remote = remotePath.contains(":") ? remotePath : "\(remotePath):"
-                process.arguments = ["lsd", remote, "--max-depth", "0"]
-                // Discard stdout - we only care about exit status
-                process.standardOutput = FileHandle.nullDevice
-                process.standardError = errorPipe
+                // Use rclone about - designed for connection testing, minimal output
+                process.arguments = ["about", remote, "--json"]
+                process.standardOutput = pipe
+                process.standardError = pipe
 
                 do {
                     try process.run()
-                    // Read error output BEFORE waitUntilExit to prevent pipe buffer blocking
-                    let errorData = errorPipe.fileHandleForReading.readDataToEndOfFile()
                     process.waitUntilExit()
+
+                    // Read after process exits (same pattern as working listFolders)
+                    let data = pipe.fileHandleForReading.readDataToEndOfFile()
 
                     if process.terminationStatus == 0 {
                         continuation.resume(returning: .success(()))
                     } else {
-                        let error = String(data: errorData, encoding: .utf8) ?? "Unknown error"
+                        let error = String(data: data, encoding: .utf8) ?? "Connection failed"
                         continuation.resume(returning: .failure(.connectionFailed(error)))
                     }
                 } catch {
