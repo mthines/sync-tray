@@ -12,12 +12,22 @@ struct SyncProfile: Identifiable, Codable, Equatable {
     var additionalRcloneFlags: String   // optional extra flags
     var isEnabled: Bool                 // whether scheduled sync is active
     var isMuted: Bool                   // whether notifications are muted for this profile
-    var syncMode: SyncMode              // bisync (two-way) or sync (one-way)
+    var syncMode: SyncMode              // bisync (two-way), sync (one-way), or mount (streaming)
     var syncDirection: SyncDirection    // direction for one-way sync
+
+    // Mount mode specific settings
+    var vfsCacheMode: VFSCacheMode      // VFS cache mode for mount (default: full)
+    var vfsCacheMaxSize: String         // Max cache size (e.g., "10G")
+    var vfsCachePath: String            // Cache directory path (default: ~/.cache/rclone/vfs)
 
     /// Short ID for file naming (first 8 chars of UUID)
     var shortId: String {
         String(id.uuidString.prefix(8)).lowercased()
+    }
+
+    /// Returns true if this profile is in mount mode
+    var isMountMode: Bool {
+        syncMode == .mount
     }
 
     // MARK: - Computed Paths
@@ -91,7 +101,10 @@ struct SyncProfile: Identifiable, Codable, Equatable {
         isEnabled: Bool = false,
         isMuted: Bool = false,
         syncMode: SyncMode = .bisync,
-        syncDirection: SyncDirection = .localToRemote
+        syncDirection: SyncDirection = .localToRemote,
+        vfsCacheMode: VFSCacheMode = .full,
+        vfsCacheMaxSize: String = "10G",
+        vfsCachePath: String = ""
     ) {
         self.id = id
         self.name = name
@@ -105,6 +118,9 @@ struct SyncProfile: Identifiable, Codable, Equatable {
         self.isMuted = isMuted
         self.syncMode = syncMode
         self.syncDirection = syncDirection
+        self.vfsCacheMode = vfsCacheMode
+        self.vfsCacheMaxSize = vfsCacheMaxSize
+        self.vfsCachePath = vfsCachePath.isEmpty ? "\(NSHomeDirectory())/.cache/rclone/vfs" : vfsCachePath
     }
 
     /// Create a new profile with default values
@@ -120,6 +136,7 @@ extension SyncProfile {
         case id, name, rcloneRemote, remotePath, localSyncPath
         case drivePathToMonitor, syncIntervalMinutes, additionalRcloneFlags
         case isEnabled, isMuted, syncMode, syncDirection
+        case vfsCacheMode, vfsCacheMaxSize, vfsCachePath
     }
 
     init(from decoder: Decoder) throws {
@@ -139,6 +156,11 @@ extension SyncProfile {
         syncMode = try container.decodeIfPresent(SyncMode.self, forKey: .syncMode) ?? .bisync
         // Backwards compatibility: default to localToRemote if not present
         syncDirection = try container.decodeIfPresent(SyncDirection.self, forKey: .syncDirection) ?? .localToRemote
+        // Backwards compatibility: mount mode settings with defaults
+        vfsCacheMode = try container.decodeIfPresent(VFSCacheMode.self, forKey: .vfsCacheMode) ?? .full
+        vfsCacheMaxSize = try container.decodeIfPresent(String.self, forKey: .vfsCacheMaxSize) ?? "10G"
+        let cachePath = try container.decodeIfPresent(String.self, forKey: .vfsCachePath) ?? ""
+        vfsCachePath = cachePath.isEmpty ? "\(NSHomeDirectory())/.cache/rclone/vfs" : cachePath
     }
 }
 

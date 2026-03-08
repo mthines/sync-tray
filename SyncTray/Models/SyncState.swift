@@ -186,6 +186,53 @@ enum SyncState: Equatable {
     }
 }
 
+/// Mount state for mount mode profiles
+enum MountState: Equatable {
+    case unmounted
+    case mounting
+    case mounted
+    case failed(String)
+
+    var iconName: String {
+        switch self {
+        case .unmounted:
+            return "externaldrive.badge.icloud"
+        case .mounting:
+            return "externaldrive.badge.icloud"
+        case .mounted:
+            return "externaldrive.fill.badge.checkmark"
+        case .failed:
+            return "externaldrive.badge.xmark"
+        }
+    }
+
+    var iconColor: Color {
+        switch self {
+        case .unmounted:
+            return .secondary
+        case .mounting:
+            return .blue
+        case .mounted:
+            return .green
+        case .failed:
+            return .red
+        }
+    }
+
+    var statusText: String {
+        switch self {
+        case .unmounted:
+            return "Not mounted"
+        case .mounting:
+            return "Mounting..."
+        case .mounted:
+            return "Mounted"
+        case .failed(let message):
+            return "Mount failed: \(message)"
+        }
+    }
+}
+
 struct FileChange: Identifiable, Equatable {
     let id = UUID()
     let timestamp: Date

@@ -11,7 +11,7 @@
         "cwd": "{projectRoot}"
       },
       "inputs": ["swift-sources", "project-config"],
-      "outputs": ["{projectRoot}/build"],
+      "outputs": [],
       "cache": true
     },
     "build:release": {
@@ -21,7 +21,7 @@
         "cwd": "{projectRoot}"
       },
       "inputs": ["swift-sources", "project-config"],
-      "outputs": ["{projectRoot}/build"],
+      "outputs": [],
       "cache": true
     },
     "test": {
@@ -86,7 +86,7 @@
         "cwd": "{projectRoot}"
       },
       "inputs": ["swift-sources", "project-config", "scripts"],
-      "outputs": ["{projectRoot}/build"],
+      "outputs": [],
       "cache": true
     },
     "install:full:launch": {

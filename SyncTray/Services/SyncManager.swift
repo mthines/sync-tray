@@ -30,6 +30,8 @@ final class SyncManager: ObservableObject {
     /// Last error message per profile (for display in UI)
     @Published private(set) var profileErrors: [UUID: String] = [:]
 
+    /// Mount state per profile (for mount mode profiles only)
+    @Published private(set) var profileMountStates: [UUID: MountState] = [:]
 
     /// Paused profiles (session-only, not persisted - resets on app restart)
     @Published private(set) var pausedProfiles: Set<UUID> = []
@@ -62,9 +64,11 @@ final class SyncManager: ObservableObject {
         setupWorkspaceObserver()
         setupProfileObserver()
         cleanupStaleLockFiles()
+        setupService.cleanupStaleMounts()  // Clean up stale mounts on startup
         detectAndResumeRunningSyncs()  // After cleanup, detect external syncs
         checkInitialState()
         startWatchingAllProfiles()
+        updateMountStates()  // Initialize mount states for mount mode profiles
     }
 
     deinit {
@@ -127,6 +131,81 @@ final class SyncManager: ObservableObject {
             }
             await MainActor.run {
                 isManualSyncRunning = false
+            }
+        }
+    }
+
+    // MARK: - Mount Mode Management
+
+    /// Mount a profile (for mount mode only)
+    func mountProfile(_ profile: SyncProfile) {
+        guard profile.isMountMode else { return }
+
+        profileMountStates[profile.id] = .mounting
+
+        Task {
+            do {
+                // Check if already mounted
+                if setupService.isMounted(profile: profile) {
+                    await MainActor.run {
+                        profileMountStates[profile.id] = .mounted
+                    }
+                    return
+                }
+
+                // Load the launchd agent (which will trigger the mount script)
+                let success = setupService.loadAgent(for: profile)
+
+                await MainActor.run {
+                    if success {
+                        // Give mount a moment to establish
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
+                            if self?.setupService.isMounted(profile: profile) == true {
+                                self?.profileMountStates[profile.id] = .mounted
+                            } else {
+                                self?.profileMountStates[profile.id] = .failed("Mount did not establish")
+                            }
+                        }
+                    } else {
+                        profileMountStates[profile.id] = .failed("Failed to load launchd agent")
+                    }
+                }
+            }
+        }
+    }
+
+    /// Unmount a profile (for mount mode only)
+    func unmountProfile(_ profile: SyncProfile) {
+        guard profile.isMountMode else { return }
+
+        Task {
+            do {
+                try setupService.unmount(profile: profile)
+                await MainActor.run {
+                    profileMountStates[profile.id] = .unmounted
+                }
+            } catch {
+                await MainActor.run {
+                    profileMountStates[profile.id] = .failed(error.localizedDescription)
+                }
+            }
+        }
+    }
+
+    /// Get mount state for a specific profile
+    func mountState(for profileId: UUID) -> MountState {
+        profileMountStates[profileId] ?? .unmounted
+    }
+
+    /// Update mount states for all mount mode profiles
+    func updateMountStates() {
+        for profile in profileStore.enabledProfiles where profile.isMountMode {
+            let isMounted = setupService.isMounted(profile: profile)
+            if isMounted {
+                profileMountStates[profile.id] = .mounted
+            } else if profileMountStates[profile.id] == nil || profileMountStates[profile.id] == .mounted {
+                // Only update to unmounted if it was previously mounted or unknown
+                profileMountStates[profile.id] = .unmounted
             }
         }
     }
@@ -637,7 +716,8 @@ final class SyncManager: ObservableObject {
             if logWatchers[profile.id] == nil {
                 startWatching(profile: profile)
             }
-            if directoryWatchers[profile.id] == nil {
+            // Skip directory watching for mount mode profiles (no need to watch - files stream on-demand)
+            if directoryWatchers[profile.id] == nil && !profile.isMountMode {
                 startWatchingDirectory(for: profile)
             }
         }
@@ -661,6 +741,8 @@ final class SyncManager: ObservableObject {
     private func startWatchingDirectory(for profile: SyncProfile) {
         guard !profile.localSyncPath.isEmpty else { return }
         guard FileManager.default.fileExists(atPath: profile.localSyncPath) else { return }
+        // Skip directory watching for mount mode (files stream on-demand, no sync needed)
+        guard !profile.isMountMode else { return }
 
         let profileId = profile.id
         let profileName = profile.name
