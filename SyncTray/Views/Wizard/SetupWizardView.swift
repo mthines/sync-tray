@@ -643,6 +643,8 @@ struct SetupWizardView: View {
             }
         }
 
+        var profileToInstall: SyncProfile
+
         if let existingProfile = editingProfile {
             // Update existing profile
             var updatedProfile = existingProfile
@@ -656,6 +658,7 @@ struct SetupWizardView: View {
             updatedProfile.syncDirection = syncDirection
 
             profileStore.update(updatedProfile)
+            profileToInstall = updatedProfile
         } else {
             // Create new profile
             let profile = SyncProfile(
@@ -670,6 +673,15 @@ struct SetupWizardView: View {
             )
 
             profileStore.add(profile)
+            profileToInstall = profile
+        }
+
+        // Automatically install the scheduled sync
+        do {
+            try SyncSetupService.shared.install(profile: profileToInstall)
+        } catch {
+            print("Failed to install scheduled sync: \(error)")
+            // Don't block - the user can manually install from settings
         }
 
         isLoading = false
