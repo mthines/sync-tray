@@ -25,3 +25,10 @@ tasks
 *.swp
 *.swo
 *~
+
+# Node / Nx
+node_modules/
+.nx/
+package-lock.json
+yarn.lock
+pnpm-lock.yaml

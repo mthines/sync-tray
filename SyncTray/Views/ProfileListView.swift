@@ -6,6 +6,7 @@ struct ProfileListView: View {
     @Binding var selection: UUID?
 
     @State private var showingDeleteConfirmation = false
+    @State private var showingSetupWizard = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -48,6 +49,13 @@ struct ProfileListView: View {
                 .buttonStyle(.borderless)
                 .help("Add Profile")
 
+                Button(action: { showingSetupWizard = true }) {
+                    Image(systemName: "wand.and.stars")
+                        .foregroundColor(.primary)
+                }
+                .buttonStyle(.borderless)
+                .help("Setup Wizard")
+
                 Button(action: { showingDeleteConfirmation = true }) {
                     Image(systemName: "trash")
                         .foregroundColor(selection == nil ? .secondary : .primary)
@@ -60,6 +68,9 @@ struct ProfileListView: View {
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 8)
+        }
+        .sheet(isPresented: $showingSetupWizard) {
+            SetupWizardView(profileStore: profileStore)
         }
         .alert("Delete Profile?", isPresented: $showingDeleteConfirmation) {
             Button("Cancel", role: .cancel) {}

@@ -186,6 +186,7 @@ final class SyncManager: ObservableObject {
         if #available(macOS 13.0, *) {
             do {
                 try SMAppService.mainApp.register()
+                objectWillChange.send()  // Notify SwiftUI to update UI
             } catch {
                 print("Failed to register login item: \(error)")
             }
@@ -196,6 +197,7 @@ final class SyncManager: ObservableObject {
         if #available(macOS 13.0, *) {
             do {
                 try SMAppService.mainApp.unregister()
+                objectWillChange.send()  // Notify SwiftUI to update UI
             } catch {
                 print("Failed to unregister login item: \(error)")
             }

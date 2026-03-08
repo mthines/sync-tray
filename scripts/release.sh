@@ -166,6 +166,34 @@ update_plist_version() {
     log_success "Updated Info.plist version to $version"
 }
 
+# Run unit tests
+run_tests() {
+    log_info "Running unit tests..."
+
+    local test_output
+    test_output=$(xcodebuild -project "$XCODEPROJ" \
+        -scheme "$SCHEME" \
+        -destination 'platform=macOS' \
+        test \
+        2>&1)
+
+    local test_exit_code=$?
+
+    # Check if tests passed
+    if [ $test_exit_code -ne 0 ]; then
+        echo "$test_output" | tail -20
+        log_error "Unit tests failed. Aborting release."
+    fi
+
+    # Check for test failures in output
+    if echo "$test_output" | grep -q "TEST FAILED"; then
+        echo "$test_output" | grep -A5 "TEST FAILED"
+        log_error "Unit tests failed. Aborting release."
+    fi
+
+    log_success "All tests passed"
+}
+
 # Build the release
 build_release() {
     log_info "Building release..."
@@ -327,6 +355,11 @@ main() {
         log_warning "Aborted."
         exit 0
     fi
+
+    echo ""
+
+    # Run tests first (before any changes)
+    run_tests
 
     echo ""
 
