@@ -7,6 +7,9 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		1D86AAFD8D8099734E2357A8 /* SyncMode.swift in Sources */ = {isa = PBXBuildFile; fileRef = 406416A46963E44FF701814B /* SyncMode.swift */; };
+		58578B4CF51E7600D4E39636 /* ProviderFieldsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 77CC26F6DC209C0F0B6626D7 /* ProviderFieldsView.swift */; };
+		7D9FBA7536F4EB2EDCAEE043 /* RcloneConfigService.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0DC6141FBB853681643F593 /* RcloneConfigService.swift */; };
 		A11111110000000000000001 /* SyncTrayApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000001 /* SyncTrayApp.swift */; };
 		A11111110000000000000002 /* SyncState.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000002 /* SyncState.swift */; };
 		A11111110000000000000003 /* RcloneLogEntry.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000003 /* RcloneLogEntry.swift */; };
@@ -28,9 +31,14 @@
 		A11111110000000000000016 /* DirectoryWatcher.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000016 /* DirectoryWatcher.swift */; };
 		A11111110000000000000017 /* Formatters.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000017 /* Formatters.swift */; };
 		A11111110000000000000018 /* ProfileDetailView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000018 /* ProfileDetailView.swift */; };
+		D1AA48876BFD939152611C3A /* RemoteProvider.swift in Sources */ = {isa = PBXBuildFile; fileRef = A50EAC070BD6E49AA1131944 /* RemoteProvider.swift */; };
+		D347B9A6D156102131579DED /* SetupWizardView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8DF29F3BB633D9E3DD12136A /* SetupWizardView.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
+		406416A46963E44FF701814B /* SyncMode.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = SyncMode.swift; sourceTree = "<group>"; };
+		77CC26F6DC209C0F0B6626D7 /* ProviderFieldsView.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = ProviderFieldsView.swift; sourceTree = "<group>"; };
+		8DF29F3BB633D9E3DD12136A /* SetupWizardView.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = SetupWizardView.swift; sourceTree = "<group>"; };
 		A10000000000000000000001 /* SyncTrayApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SyncTrayApp.swift; sourceTree = "<group>"; };
 		A10000000000000000000002 /* SyncState.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SyncState.swift; sourceTree = "<group>"; };
 		A10000000000000000000003 /* RcloneLogEntry.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RcloneLogEntry.swift; sourceTree = "<group>"; };
@@ -55,6 +63,8 @@
 		A10000000000000000000016 /* DirectoryWatcher.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DirectoryWatcher.swift; sourceTree = "<group>"; };
 		A10000000000000000000017 /* Formatters.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Formatters.swift; sourceTree = "<group>"; };
 		A10000000000000000000018 /* ProfileDetailView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProfileDetailView.swift; sourceTree = "<group>"; };
+		A50EAC070BD6E49AA1131944 /* RemoteProvider.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = RemoteProvider.swift; sourceTree = "<group>"; };
+		C0DC6141FBB853681643F593 /* RcloneConfigService.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = RcloneConfigService.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -68,6 +78,16 @@
 /* End PBXFrameworksBuildPhase section */
 
 /* Begin PBXGroup section */
+		42ECE8D209B7A77B61EABA9B /* Wizard */ = {
+			isa = PBXGroup;
+			children = (
+				8DF29F3BB633D9E3DD12136A /* SetupWizardView.swift */,
+				77CC26F6DC209C0F0B6626D7 /* ProviderFieldsView.swift */,
+			);
+			name = Wizard;
+			path = Wizard;
+			sourceTree = "<group>";
+		};
 		A13000000000000000000001 = {
 			isa = PBXGroup;
 			children = (
@@ -98,6 +118,8 @@
 				A10000000000000000000002 /* SyncState.swift */,
 				A10000000000000000000003 /* RcloneLogEntry.swift */,
 				A10000000000000000000012 /* SyncProfile.swift */,
+				406416A46963E44FF701814B /* SyncMode.swift */,
+				A50EAC070BD6E49AA1131944 /* RemoteProvider.swift */,
 			);
 			path = Models;
 			sourceTree = "<group>";
@@ -112,6 +134,7 @@
 				A10000000000000000000007 /* SyncManager.swift */,
 				A10000000000000000000011 /* SyncSetupService.swift */,
 				A10000000000000000000013 /* ProfileStore.swift */,
+				C0DC6141FBB853681643F593 /* RcloneConfigService.swift */,
 			);
 			path = Services;
 			sourceTree = "<group>";
@@ -126,8 +149,17 @@
 				A10000000000000000000014 /* ProfileListView.swift */,
 				A10000000000000000000015 /* SyncProgressDetailView.swift */,
 				A13000000000000000000008 /* Settings */,
+				42ECE8D209B7A77B61EABA9B /* Wizard */,
 			);
 			path = Views;
+			sourceTree = "<group>";
+		};
+		A13000000000000000000006 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				A1000000000000000000000C /* SyncTray.app */,
+			);
+			name = Products;
 			sourceTree = "<group>";
 		};
 		A13000000000000000000007 /* Utilities */ = {
@@ -144,14 +176,6 @@
 				A10000000000000000000018 /* ProfileDetailView.swift */,
 			);
 			path = Settings;
-			sourceTree = "<group>";
-		};
-		A13000000000000000000006 /* Products */ = {
-			isa = PBXGroup;
-			children = (
-				A1000000000000000000000C /* SyncTray.app */,
-			);
-			name = Products;
 			sourceTree = "<group>";
 		};
 /* End PBXGroup section */
@@ -243,6 +267,11 @@
 				A11111110000000000000016 /* DirectoryWatcher.swift in Sources */,
 				A11111110000000000000017 /* Formatters.swift in Sources */,
 				A11111110000000000000018 /* ProfileDetailView.swift in Sources */,
+				1D86AAFD8D8099734E2357A8 /* SyncMode.swift in Sources */,
+				D1AA48876BFD939152611C3A /* RemoteProvider.swift in Sources */,
+				7D9FBA7536F4EB2EDCAEE043 /* RcloneConfigService.swift in Sources */,
+				D347B9A6D156102131579DED /* SetupWizardView.swift in Sources */,
+				58578B4CF51E7600D4E39636 /* ProviderFieldsView.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -441,7 +470,6 @@
 			defaultConfigurationName = Release;
 		};
 /* End XCConfigurationList section */
-
 	};
 	rootObject = A17000000000000000000001 /* Project object */;
 }

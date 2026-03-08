@@ -16,6 +16,8 @@ struct ProfileDetailView: View {
     @State private var isExternalDrive: Bool = false
     @State private var syncIntervalMinutes: Int = 15
     @State private var additionalRcloneFlags: String = ""
+    @State private var syncMode: SyncMode = .bisync
+    @State private var syncDirection: SyncDirection = .localToRemote
 
     // UI State
     @State private var showAdvanced: Bool = false
@@ -74,7 +76,9 @@ struct ProfileDetailView: View {
         localSyncPath != profile.localSyncPath ||
         computedDrivePath != profile.drivePathToMonitor ||
         syncIntervalMinutes != profile.syncIntervalMinutes ||
-        additionalRcloneFlags != profile.additionalRcloneFlags
+        additionalRcloneFlags != profile.additionalRcloneFlags ||
+        syncMode != profile.syncMode ||
+        syncDirection != profile.syncDirection
     }
 
     private var canInstall: Bool {
@@ -357,6 +361,73 @@ struct ProfileDetailView: View {
                     }
                     .toggleStyle(.switch)
                     .padding(.top, 8)
+                }
+            }
+
+            // Sync Mode
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Sync Mode")
+                    .font(.subheadline.weight(.medium))
+                Text("How files are synchronized between local and remote")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
+                Picker("", selection: $syncMode) {
+                    ForEach(SyncMode.allCases) { mode in
+                        HStack {
+                            Image(systemName: mode.iconName)
+                            Text(mode.displayName)
+                        }
+                        .tag(mode)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .frame(maxWidth: 300)
+
+                Text(syncMode.description)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .padding(.top, 2)
+            }
+
+            // Sync Direction (only for one-way sync)
+            if syncMode == .sync {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Sync Direction")
+                        .font(.subheadline.weight(.medium))
+
+                    Picker("", selection: $syncDirection) {
+                        ForEach(SyncDirection.allCases) { direction in
+                            HStack {
+                                Image(systemName: direction.iconName)
+                                Text(direction.displayName)
+                            }
+                            .tag(direction)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                    .frame(maxWidth: 300)
+
+                    Text(syncDirection.description)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .padding(.top, 2)
+
+                    // Warning about one-way sync deleting files
+                    HStack(spacing: 6) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .foregroundStyle(.orange)
+                        if syncDirection == .localToRemote {
+                            Text("Remote files not in local folder will be deleted")
+                                .font(.caption)
+                                .foregroundStyle(.orange)
+                        } else {
+                            Text("Local files not in remote will be deleted")
+                                .font(.caption)
+                                .foregroundStyle(.orange)
+                        }
+                    }
+                    .padding(.top, 4)
                 }
             }
 
@@ -873,6 +944,8 @@ struct ProfileDetailView: View {
         isExternalDrive = !profile.drivePathToMonitor.isEmpty
         syncIntervalMinutes = profile.syncIntervalMinutes
         additionalRcloneFlags = profile.additionalRcloneFlags
+        syncMode = profile.syncMode
+        syncDirection = profile.syncDirection
 
         // Show text input if the path contains "/" (nested path) or is a custom path
         // that won't be in the folder picker dropdown
@@ -889,6 +962,8 @@ struct ProfileDetailView: View {
         updatedProfile.drivePathToMonitor = computedDrivePath
         updatedProfile.syncIntervalMinutes = syncIntervalMinutes
         updatedProfile.additionalRcloneFlags = additionalRcloneFlags
+        updatedProfile.syncMode = syncMode
+        updatedProfile.syncDirection = syncDirection
         return updatedProfile
     }
 
