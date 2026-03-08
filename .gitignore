@@ -12,6 +12,8 @@ build/
 
 tasks
 
+.gw
+
 # macOS
 .DS_Store
 .AppleDouble
