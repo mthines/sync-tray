@@ -150,24 +150,25 @@ final class RcloneConfigService {
         return await withCheckedContinuation { continuation in
             DispatchQueue.global(qos: .userInitiated).async {
                 let process = Process()
-                let outputPipe = Pipe()
                 let errorPipe = Pipe()
 
                 process.executableURL = URL(fileURLWithPath: rclonePath)
                 // Only add colon if there's no colon in the path at all
                 let remote = remotePath.contains(":") ? remotePath : "\(remotePath):"
                 process.arguments = ["lsd", remote, "--max-depth", "0"]
-                process.standardOutput = outputPipe
+                // Discard stdout - we only care about exit status
+                process.standardOutput = FileHandle.nullDevice
                 process.standardError = errorPipe
 
                 do {
                     try process.run()
+                    // Read error output BEFORE waitUntilExit to prevent pipe buffer blocking
+                    let errorData = errorPipe.fileHandleForReading.readDataToEndOfFile()
                     process.waitUntilExit()
 
                     if process.terminationStatus == 0 {
                         continuation.resume(returning: .success(()))
                     } else {
-                        let errorData = errorPipe.fileHandleForReading.readDataToEndOfFile()
                         let error = String(data: errorData, encoding: .utf8) ?? "Unknown error"
                         continuation.resume(returning: .failure(.connectionFailed(error)))
                     }
