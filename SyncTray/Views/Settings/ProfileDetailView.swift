@@ -278,7 +278,7 @@ struct ProfileDetailView: View {
             )
             .overlay(
                 RoundedRectangle(cornerRadius: 8)
-                    .strokeBorder(isSelected ? Color.accentColor : Color(nsColor: .separatorColor), lineWidth: isSelected ? 2 : 1)
+                    .strokeBorder(Color(nsColor: .separatorColor), lineWidth: 1)
             )
         }
         .buttonStyle(.plain)
@@ -335,7 +335,7 @@ struct ProfileDetailView: View {
             )
             .overlay(
                 RoundedRectangle(cornerRadius: 8)
-                    .strokeBorder(isSelected ? Color.accentColor : Color(nsColor: .separatorColor), lineWidth: isSelected ? 2 : 1)
+                    .strokeBorder(Color(nsColor: .separatorColor), lineWidth: 1)
             )
         }
         .buttonStyle(.plain)
