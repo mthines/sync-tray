@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="/docs/assets/synctray-logo.png" alt="SyncTray Logo" height="500">
+  <img src="/docs/assets/synctray-logo.png" alt="SyncTray Logo" height="300">
 </p>
 
 <h1 align="center">SyncTray</h1>
