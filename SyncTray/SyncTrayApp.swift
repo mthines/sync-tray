@@ -250,7 +250,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
         let userInfo = response.notification.request.content.userInfo
 
         // Handle mute action
-        if response.actionIdentifier == "MUTE_CURRENT_SYNC" {
+        if response.actionIdentifier == "MUTE_PROFILE" {
             if let profileIdString = userInfo["profileId"] as? String,
                let profileId = UUID(uuidString: profileIdString) {
                 DispatchQueue.main.async {

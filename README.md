@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/assets/synctray-logo.png" alt="SyncTray Logo" height="500">
+  <img src="/docs/assets/synctray-logo.png" alt="SyncTray Logo" height="300">
 </p>
 
 <h1 align="center">SyncTray</h1>
@@ -30,6 +30,7 @@ SyncTray brings the convenience of Google Drive or Dropbox sync to **any cloud s
 - **Object Storage**: Backblaze B2, Wasabi, MinIO
 
 Instead of running complex terminal commands, SyncTray gives you:
+
 - A **menu bar icon** showing sync status at a glance
 - **Three sync modes** to match your workflow
 - **Automatic scheduled syncing** that runs in the background
@@ -82,9 +83,6 @@ Access cloud files without downloading them. Files appear in a folder on your Ma
 ## Features
 
 ### Live Status Monitoring
-
-![Menu Bar](docs/assets/status-bar-idle.png)
-
 - Menu bar icon shows current state (idle, syncing, error, drive not mounted)
 - **Real-time progress** during sync: bytes transferred, percentage, ETA
 - Per-profile status indicators
@@ -97,30 +95,36 @@ View sync output and logs directly in the app:
 
 ![Sync Logs](docs/assets/profile-syncing-with-logs.png)
 
-### Smart Error Recovery
-
-When things go wrong, SyncTray detects the issue and offers one-click fixes:
-
-| Error | Fix Button | What It Does |
-|-------|------------|--------------|
-| Sync out of sync | Smart Fix | Unlocks, recreates check files, resyncs |
-| Lock file stuck | Remove Lock | Clears stale lock file |
-| Check files missing | Create Check Files | Creates access check files on both sides |
-| Mount folder not empty | Mount Anyway | Enables mounting to non-empty folders |
+### Smart Notifications
+- Batched file change notifications (lists 1-3 files, summarizes 4+)
+- Click notifications to open the sync directory
+- Error notifications with actionable details
 
 ### Multi-Profile Support
-
-![Profile Sidebar](docs/assets/prifle-settings.png)
-
 - Create unlimited sync profiles (Work, Personal, Archive, etc.)
 - Each profile syncs on its own schedule
 - Independent enable/disable per profile
-- Color-coded status indicators
+- Per-profile status indicators in the menu
+
+### Three Sync Modes
+
+**Two-Way Sync (bisync)** - Keep both sides in sync
+- Changes made on either local or remote sync to the other
+- Uses rclone bisync for bidirectional synchronization
+- Ideal for: Active working files, collaborative documents
+
+**One-Way Sync** - Mirror source to destination
+- Choose direction: Local → Remote (backup) or Remote → Local (mirror)
+- Destination is overwritten to match source
+- Ideal for: Backups, archiving, or pulling down read-only data
+
+**Stream (Mount)** - Access files on-demand without sync
+- Remote files appear as a virtual drive on your Mac
+- Files are streamed when accessed, not copied locally
+- Configurable VFS cache for performance (off/minimal/writes/full)
+- Ideal for: Large media libraries, archives you don't need locally all the time
 
 ### Recent Changes
-
-![Recent Changes](docs/assets/status-bar-recent-changes.png)
-
 - View last 20 synced files in the menu dropdown
 - See operation type: Copied, Updated, Deleted, Renamed
 - Click any file to reveal it in Finder
@@ -138,7 +142,10 @@ When things go wrong, SyncTray detects the issue and offers one-click fixes:
 - Lock file prevents overlapping syncs
 - Smart external drive detection - pauses when unmounted
 
----
+### One-Click Actions
+- **Sync Now**: Trigger immediate sync for all enabled profiles
+- **Open Directory**: Jump to your local sync folder
+- **View Log**: Open the sync log for troubleshooting
 
 ## Requirements
 
@@ -225,71 +232,60 @@ xcodebuild -scheme SyncTray -configuration Release build
 ## Getting Started
 
 ### 1. Launch SyncTray
+The app icon appears in your menu bar. A yellow gear indicates setup is needed.
 
-The app icon appears in your menu bar. Click it to access settings.
+### 2. Create a Sync Profile
+1. Click the menu bar icon → **Settings**
+2. Click **+** to add a new profile
+3. Configure:
+   - **Name**: Give it a descriptive name (e.g., "Work Documents")
+   - **Remote**: Select from your configured rclone remotes
+   - **Remote Path**: Choose which folder on the remote to sync
+   - **Local Path**: Pick the local folder to sync to
+   - **Sync Interval**: How often to sync (default: 15 minutes)
 
-### 2. Create a Profile
-
-Click **Settings** → **+** to add a new profile. The wizard guides you through setup:
-
-![New Profile Wizard](docs/assets/new-profile-wizard-intro.png)
-
-Select your cloud provider:
-
-![Select Provider](docs/assets/new-profile-wizard-provieders.png)
-
-### 3. Configure Your Sync
-
-#### For Two-Way Sync (Default)
-
-1. Select your **rclone remote** and **folder**
-2. Choose a **local folder** to sync
-3. Set your **sync interval**
-4. Click **Save** then **Install**
-
-![Two-Way Sync Configuration](docs/assets/profile-two-way.png)
-
-#### For One-Way Sync
-
-1. Change **Sync Mode** to "One-Way Sync"
-2. Choose **direction**: Local → Remote or Remote → Local
-3. Configure remote and local paths
-4. Click **Save** then **Install**
-
-#### For Stream (Mount)
-
-1. Change **Sync Mode** to "Stream (Mount)"
-2. Configure your remote
-3. Choose an **empty folder** as your mount point
-4. Adjust **VFS cache settings** as needed
-5. Click **Save** then **Install**
-
-![Stream (Mount) Configuration](docs/assets/profile-stream.png)
+### 3. Install the Profile
+Click **Install** to activate the profile. SyncTray will:
+- Create the local directory if needed
+- Set up sync check files for safety
+- Install a background scheduler (launchd agent)
+- Start monitoring for changes
 
 ### 4. You're Done!
+Your folder will now sync automatically on schedule. The menu bar shows sync status, and you'll get notifications when files change.
 
-Your profile is now active. The menu bar shows sync status, and you'll get notifications when files change.
+### Using Mount Mode
 
----
+Mount mode is different from sync modes - it creates a virtual drive instead of syncing files:
 
-## Menu Bar Icons
+1. **Select Mount Mode**: When creating a profile, choose "Stream (Mount)" as the sync mode
+2. **Configure Mount Settings**:
+   - **Cache Mode**: Choose how aggressively to cache (Full recommended)
+   - **Cache Size**: Set maximum cache size (default: 10G)
+   - **Cache Directory**: Where cached files are stored (default: ~/.cache/rclone/vfs)
+3. **Mount Point**: The local path becomes your mount point (where files appear)
+4. **Install and Mount**: Click Install, then Mount in the menu bar
+
+**Mount vs Sync**:
+- Mount: Files stream on-demand, mount runs continuously
+- Sync: Files copied locally, sync runs periodically
+
+**Unmounting**: Click the eject button in the menu bar for the profile, or disable the profile.
+
+## Menu Bar States
 
 | Icon | State | Meaning |
 |------|-------|---------|
-| ⟳ Gray | Idle | All syncs complete, system ready |
-| ⟳ Blue (animated) | Syncing | Sync in progress |
-| ⚠️ Red | Error | Last sync failed - check logs |
-| 💾 Orange | Drive Not Mounted | External drive disconnected |
-| ⚙️ Yellow | Setup Required | No profiles configured |
-
----
+| Gray sync arrows | Idle | All syncs complete, system ready |
+| Blue sync arrows (animated) | Syncing | Sync in progress |
+| Red warning triangle | Error | Last sync failed - check logs |
+| Orange drive with X | Drive Not Mounted | External drive disconnected |
+| Yellow gear | Setup Required | No profiles configured |
 
 ## Advanced Configuration
 
 ### Additional rclone Flags
-
-Each profile supports custom rclone flags:
-
+Each profile supports custom rclone flags. Common options:
 - `--exclude "*.tmp"` - Exclude patterns
 - `--bwlimit 1M` - Limit bandwidth
 - `--dry-run` - Test without making changes
@@ -303,16 +299,11 @@ When syncing to an external drive:
 3. Syncs pause when the drive is unmounted
 4. Resume automatically when reconnected
 
-### VFS Cache Settings (Mount Mode)
-
-| Cache Mode | Description |
-|------------|-------------|
-| Off | No caching - always stream from remote |
-| Minimal | Metadata only |
-| Writes | Cache writes, stream reads |
-| Full | Cache everything (recommended) |
-
-Increase cache size for better performance with large files.
+### Resync (Reset Sync State)
+If sync gets out of sync or shows persistent errors:
+1. Open Settings → Select the profile
+2. Click **Resync**
+3. This resets rclone's bisync cache and performs a fresh comparison
 
 ### Conflict Resolution
 
@@ -322,7 +313,16 @@ SyncTray uses rclone bisync with smart conflict handling:
 - Conflicts create backup copies with `-sync-conflict-` suffix
 - Check the log file for conflict details
 
----
+## File Locations
+
+SyncTray creates these files (per profile):
+
+| Location | Purpose |
+|----------|---------|
+| `~/.local/bin/synctray-sync.sh` | Shared sync script |
+| `~/.config/synctray/profiles/{id}.json` | Profile configuration |
+| `~/.local/log/synctray-sync-{id}.log` | Sync log output |
+| `~/Library/LaunchAgents/com.synctray.sync.{id}.plist` | Background scheduler |
 
 ## Troubleshooting
 
@@ -330,61 +330,61 @@ SyncTray uses rclone bisync with smart conflict handling:
 
 macOS blocks unsigned apps. Fix with:
 
+**Fix (run once in Terminal):**
 ```bash
 xattr -cr /Applications/SyncTray.app
 ```
 
 ### Sync shows error state
-
-1. Click **View Log** in the menu for details
-2. Common fixes:
-   - Network/credential issues → check rclone config
-   - "Out of sync" → click **Smart Fix**
-   - Lock file stuck → click **Remove Lock**
+1. Click **View Log** in the menu to see detailed error messages
+2. Common issues:
+   - Remote not accessible (check network/credentials)
+   - Check file missing (click Resync to recreate)
+   - Conflicting changes detected (check log for details)
 
 ### Sync not running on schedule
+1. Verify the profile is installed (green checkmark in Settings)
+2. Check if launchd agent is loaded:
+   ```bash
+   launchctl list | grep synctray
+   ```
+3. Try uninstalling and reinstalling the profile
+
+### Files not appearing in Recent Changes
+- Only files actually transferred appear (unchanged files are skipped)
+- Check that `--use-json-log` is being used (automatic with SyncTray)
+
+### Mount mode: "macFUSE not installed" or mount fails
+
+Mount mode requires macFUSE to create virtual filesystems:
 
 ```bash
-# Check if agent is loaded
-launchctl list | grep synctray
+brew install --cask macfuse
 ```
 
-If not listed, try **Reinstall** in profile settings.
+After installation:
+1. Reboot your Mac
+2. Go to System Settings → Security & Privacy
+3. Approve the macFUSE kernel extension
+4. Try mounting again
 
-### Mount: "Folder is not empty"
+### Mount mode: Stale mount or "Device busy" error
 
-Mount mode requires an empty folder by default. Either:
-- Click **Mount Anyway** to allow mounting to non-empty folders
-- Choose a different (empty) mount point
+If a mount fails to unmount cleanly:
 
-### Mount: "macFUSE not installed"
+```bash
+# Force unmount
+diskutil unmount force /path/to/mount/point
 
-See [Mount Mode Setup](#mount-mode-setup) above.
+# Or restart SyncTray (auto-cleans stale mounts)
+```
 
-### Mount: Homebrew rclone error
+### Mount mode: Slow file access
 
-Homebrew's rclone doesn't support mount. Install the [official binary](#2-install-official-rclone-binary).
-
-### Mount: Slow file access
-
-- Increase cache size (Settings → VFS Cache Max Size)
-- Use "Full" cache mode
-- Check network speed to your remote
-
----
-
-## File Locations
-
-| Location | Purpose |
-|----------|---------|
-| `~/.local/bin/synctray-sync.sh` | Shared sync script |
-| `~/.config/synctray/profiles/{id}.json` | Profile configuration |
-| `~/.config/synctray/profiles/{id}-exclude.txt` | Exclude filter (editable) |
-| `~/.local/log/synctray-sync-{id}.log` | Sync log output |
-| `~/Library/LaunchAgents/com.synctray.sync.{id}.plist` | Background scheduler |
-| `~/.cache/rclone/vfs/` | VFS cache (mount mode) |
-
----
+Try adjusting cache settings:
+- Increase cache size (e.g., from 10G to 20G)
+- Use "Full" cache mode for better read performance
+- Check network speed to remote (mount streams over network)
 
 ## Development
 
@@ -409,11 +409,11 @@ xcodebuild -scheme SyncTray -configuration Debug build
 
 Uses [Conventional Commits](https://www.conventionalcommits.org/):
 
-```
-feat: add new feature        → minor version bump
-fix: resolve bug             → patch version bump
-feat!: breaking change       → major version bump
-```
+| Prefix | Version Bump | Example |
+|--------|-------------|---------|
+| `feat:` | Minor (0.X.0) | `feat: add dark mode support` |
+| `fix:` | Patch (0.0.X) | `fix: resolve crash on launch` |
+| `feat!:` | Major (X.0.0) | `feat!: redesign settings API` |
 
 ### Creating a Release
 

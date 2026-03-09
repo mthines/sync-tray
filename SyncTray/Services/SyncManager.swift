@@ -1015,7 +1015,8 @@ final class SyncManager: ObservableObject {
             profileProgress[profileId] = nil  // Reset progress for new sync
             currentSyncChanges[profileId] = []
             logWatchers[profileId]?.setActivelySyncing(true)  // Increase polling frequency
-            notificationService.notifySyncStarted(profileId: profileId, profileName: profileName)
+            // Don't send notification - the menu bar icon updates to show syncing state
+            notificationService.clearPendingChanges(for: profileId)
 
         case .syncCompleted:
             profileStates[profileId] = .idle

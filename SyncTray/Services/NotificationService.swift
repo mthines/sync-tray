@@ -15,7 +15,7 @@ final class NotificationService {
 
     private let categoryIdentifier = "SYNC_NOTIFICATION"
     private let openDirectoryActionIdentifier = "OPEN_DIRECTORY"
-    private let muteActionIdentifier = "MUTE_CURRENT_SYNC"
+    private let muteActionIdentifier = "MUTE_PROFILE"
 
     /// Per-profile sync directory paths (keyed by profile ID)
     private var syncDirectoryPaths: [UUID: String] = [:]
@@ -33,7 +33,7 @@ final class NotificationService {
 
         let muteAction = UNNotificationAction(
             identifier: muteActionIdentifier,
-            title: "Mute Current Sync",
+            title: "Mute Profile",
             options: []  // No .foreground - runs in background
         )
 
@@ -47,18 +47,11 @@ final class NotificationService {
         UNUserNotificationCenter.current().setNotificationCategories([category])
     }
 
-    func notifySyncStarted(profileId: UUID, profileName: String) {
-        // Clear only this profile's pending changes
+    /// Clear pending file changes for a profile (called when sync starts)
+    func clearPendingChanges(for profileId: UUID) {
         pendingFileChanges[profileId] = nil
         batchTimers[profileId]?.invalidate()
         batchTimers[profileId] = nil
-
-        sendNotification(
-            title: "SyncTray: \(profileName)",
-            body: "Sync started...",
-            sound: nil,
-            profileId: profileId
-        )
     }
 
     func notifyFileChange(_ change: FileChange, profileId: UUID, syncDirectoryPath: String) {
