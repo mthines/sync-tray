@@ -16,7 +16,7 @@
 </p>
 
 <p align="center">
-  <img src="docs/assets/prifle-settings.png" alt="SyncTray Settings" width="700">
+  <img src="docs/assets/profile-settings.png" alt="SyncTray Settings" width="700">
 </p>
 
 ---
@@ -43,10 +43,10 @@ Instead of running complex terminal commands, SyncTray gives you:
 
 SyncTray offers three ways to connect your files to the cloud:
 
-| Mode | Best For | How It Works |
-|------|----------|--------------|
-| **Two-Way Sync** | Active working files | Changes on either side sync to the other |
-| **One-Way Sync** | Backups & mirrors | Source overwrites destination |
+| Mode               | Best For              | How It Works                              |
+| ------------------ | --------------------- | ----------------------------------------- |
+| **Two-Way Sync**   | Active working files  | Changes on either side sync to the other  |
+| **One-Way Sync**   | Backups & mirrors     | Source overwrites destination             |
 | **Stream (Mount)** | Large media libraries | Files appear locally but stream on-demand |
 
 ![Sync Mode Selection](docs/assets/profile-two-way.png)
@@ -83,6 +83,7 @@ Access cloud files without downloading them. Files appear in a folder on your Ma
 ## Features
 
 ### Live Status Monitoring
+
 - Menu bar icon shows current state (idle, syncing, error, drive not mounted)
 - **Real-time progress** during sync: bytes transferred, percentage, ETA
 - Per-profile status indicators
@@ -96,11 +97,13 @@ View sync output and logs directly in the app:
 ![Sync Logs](docs/assets/profile-syncing-with-logs.png)
 
 ### Smart Notifications
+
 - Batched file change notifications (lists 1-3 files, summarizes 4+)
 - Click notifications to open the sync directory
 - Error notifications with actionable details
 
 ### Multi-Profile Support
+
 - Create unlimited sync profiles (Work, Personal, Archive, etc.)
 - Each profile syncs on its own schedule
 - Independent enable/disable per profile
@@ -109,22 +112,26 @@ View sync output and logs directly in the app:
 ### Three Sync Modes
 
 **Two-Way Sync (bisync)** - Keep both sides in sync
+
 - Changes made on either local or remote sync to the other
 - Uses rclone bisync for bidirectional synchronization
 - Ideal for: Active working files, collaborative documents
 
 **One-Way Sync** - Mirror source to destination
+
 - Choose direction: Local → Remote (backup) or Remote → Local (mirror)
 - Destination is overwritten to match source
 - Ideal for: Backups, archiving, or pulling down read-only data
 
 **Stream (Mount)** - Access files on-demand without sync
+
 - Remote files appear as a virtual drive on your Mac
 - Files are streamed when accessed, not copied locally
 - Configurable VFS cache for performance (off/minimal/writes/full)
 - Ideal for: Large media libraries, archives you don't need locally all the time
 
 ### Recent Changes
+
 - View last 20 synced files in the menu dropdown
 - See operation type: Copied, Updated, Deleted, Renamed
 - Click any file to reveal it in Finder
@@ -143,6 +150,7 @@ View sync output and logs directly in the app:
 - Smart external drive detection - pauses when unmounted
 
 ### One-Click Actions
+
 - **Sync Now**: Trigger immediate sync for all enabled profiles
 - **Open Directory**: Jump to your local sync folder
 - **View Log**: Open the sync log for troubleshooting
@@ -175,6 +183,7 @@ brew install --cask macfuse
 ```
 
 After installation:
+
 1. **Restart your Mac**
 2. Go to **System Settings → Privacy & Security**
 3. Approve the macFUSE kernel extension
@@ -232,9 +241,11 @@ xcodebuild -scheme SyncTray -configuration Release build
 ## Getting Started
 
 ### 1. Launch SyncTray
+
 The app icon appears in your menu bar. A yellow gear indicates setup is needed.
 
 ### 2. Create a Sync Profile
+
 1. Click the menu bar icon → **Settings**
 2. Click **+** to add a new profile
 3. Configure:
@@ -245,13 +256,16 @@ The app icon appears in your menu bar. A yellow gear indicates setup is needed.
    - **Sync Interval**: How often to sync (default: 15 minutes)
 
 ### 3. Install the Profile
+
 Click **Install** to activate the profile. SyncTray will:
+
 - Create the local directory if needed
 - Set up sync check files for safety
 - Install a background scheduler (launchd agent)
 - Start monitoring for changes
 
 ### 4. You're Done!
+
 Your folder will now sync automatically on schedule. The menu bar shows sync status, and you'll get notifications when files change.
 
 ### Using Mount Mode
@@ -267,6 +281,7 @@ Mount mode is different from sync modes - it creates a virtual drive instead of 
 4. **Install and Mount**: Click Install, then Mount in the menu bar
 
 **Mount vs Sync**:
+
 - Mount: Files stream on-demand, mount runs continuously
 - Sync: Files copied locally, sync runs periodically
 
@@ -274,18 +289,20 @@ Mount mode is different from sync modes - it creates a virtual drive instead of 
 
 ## Menu Bar States
 
-| Icon | State | Meaning |
-|------|-------|---------|
-| Gray sync arrows | Idle | All syncs complete, system ready |
-| Blue sync arrows (animated) | Syncing | Sync in progress |
-| Red warning triangle | Error | Last sync failed - check logs |
-| Orange drive with X | Drive Not Mounted | External drive disconnected |
-| Yellow gear | Setup Required | No profiles configured |
+| Icon                        | State             | Meaning                          |
+| --------------------------- | ----------------- | -------------------------------- |
+| Gray sync arrows            | Idle              | All syncs complete, system ready |
+| Blue sync arrows (animated) | Syncing           | Sync in progress                 |
+| Red warning triangle        | Error             | Last sync failed - check logs    |
+| Orange drive with X         | Drive Not Mounted | External drive disconnected      |
+| Yellow gear                 | Setup Required    | No profiles configured           |
 
 ## Advanced Configuration
 
 ### Additional rclone Flags
+
 Each profile supports custom rclone flags. Common options:
+
 - `--exclude "*.tmp"` - Exclude patterns
 - `--bwlimit 1M` - Limit bandwidth
 - `--dry-run` - Test without making changes
@@ -300,7 +317,9 @@ When syncing to an external drive:
 4. Resume automatically when reconnected
 
 ### Resync (Reset Sync State)
+
 If sync gets out of sync or shows persistent errors:
+
 1. Open Settings → Select the profile
 2. Click **Resync**
 3. This resets rclone's bisync cache and performs a fresh comparison
@@ -317,12 +336,12 @@ SyncTray uses rclone bisync with smart conflict handling:
 
 SyncTray creates these files (per profile):
 
-| Location | Purpose |
-|----------|---------|
-| `~/.local/bin/synctray-sync.sh` | Shared sync script |
-| `~/.config/synctray/profiles/{id}.json` | Profile configuration |
-| `~/.local/log/synctray-sync-{id}.log` | Sync log output |
-| `~/Library/LaunchAgents/com.synctray.sync.{id}.plist` | Background scheduler |
+| Location                                              | Purpose               |
+| ----------------------------------------------------- | --------------------- |
+| `~/.local/bin/synctray-sync.sh`                       | Shared sync script    |
+| `~/.config/synctray/profiles/{id}.json`               | Profile configuration |
+| `~/.local/log/synctray-sync-{id}.log`                 | Sync log output       |
+| `~/Library/LaunchAgents/com.synctray.sync.{id}.plist` | Background scheduler  |
 
 ## Troubleshooting
 
@@ -331,11 +350,13 @@ SyncTray creates these files (per profile):
 macOS blocks unsigned apps. Fix with:
 
 **Fix (run once in Terminal):**
+
 ```bash
 xattr -cr /Applications/SyncTray.app
 ```
 
 ### Sync shows error state
+
 1. Click **View Log** in the menu to see detailed error messages
 2. Common issues:
    - Remote not accessible (check network/credentials)
@@ -343,6 +364,7 @@ xattr -cr /Applications/SyncTray.app
    - Conflicting changes detected (check log for details)
 
 ### Sync not running on schedule
+
 1. Verify the profile is installed (green checkmark in Settings)
 2. Check if launchd agent is loaded:
    ```bash
@@ -351,6 +373,7 @@ xattr -cr /Applications/SyncTray.app
 3. Try uninstalling and reinstalling the profile
 
 ### Files not appearing in Recent Changes
+
 - Only files actually transferred appear (unchanged files are skipped)
 - Check that `--use-json-log` is being used (automatic with SyncTray)
 
@@ -363,6 +386,7 @@ brew install --cask macfuse
 ```
 
 After installation:
+
 1. Reboot your Mac
 2. Go to System Settings → Security & Privacy
 3. Approve the macFUSE kernel extension
@@ -382,6 +406,7 @@ diskutil unmount force /path/to/mount/point
 ### Mount mode: Slow file access
 
 Try adjusting cache settings:
+
 - Increase cache size (e.g., from 10G to 20G)
 - Use "Full" cache mode for better read performance
 - Check network speed to remote (mount streams over network)
@@ -409,10 +434,10 @@ xcodebuild -scheme SyncTray -configuration Debug build
 
 Uses [Conventional Commits](https://www.conventionalcommits.org/):
 
-| Prefix | Version Bump | Example |
-|--------|-------------|---------|
-| `feat:` | Minor (0.X.0) | `feat: add dark mode support` |
-| `fix:` | Patch (0.0.X) | `fix: resolve crash on launch` |
+| Prefix   | Version Bump  | Example                        |
+| -------- | ------------- | ------------------------------ |
+| `feat:`  | Minor (0.X.0) | `feat: add dark mode support`  |
+| `fix:`   | Patch (0.0.X) | `fix: resolve crash on launch` |
 | `feat!:` | Major (X.0.0) | `feat!: redesign settings API` |
 
 ### Creating a Release
