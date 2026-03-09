@@ -16,7 +16,7 @@
 </p>
 
 <p align="center">
-  <img src="docs/assets/prifle-settings.png" alt="SyncTray Settings" width="700">
+  <img src="/docs/assets/profile-settings.png" alt="SyncTray Settings" height="600">
 </p>
 
 ---
@@ -49,7 +49,9 @@ SyncTray offers three ways to connect your files to the cloud:
 | **One-Way Sync** | Backups & mirrors | Source overwrites destination |
 | **Stream (Mount)** | Large media libraries | Files appear locally but stream on-demand |
 
-![Sync Mode Selection](docs/assets/profile-two-way.png)
+<p align="center">
+  <img src="/docs/assets/profile-two-way.png" alt="Two-Way Sync Configuration" height="600">
+</p>
 
 ### Two-Way Sync (Bisync)
 
@@ -76,6 +78,10 @@ Access cloud files without downloading them. Files appear in a folder on your Ma
 - Ideal for large media libraries or archives
 - Configurable VFS cache for performance
 
+<p align="center">
+  <img src="/docs/assets/profile-stream.png" alt="Stream (Mount) Configuration" height="600">
+</p>
+
 > **Note**: Mount mode requires [macFUSE](#mount-mode-setup) and the official rclone binary.
 
 ---
@@ -89,11 +95,15 @@ Access cloud files without downloading them. Files appear in a folder on your Ma
 
 During sync, see detailed transfer progress:
 
-![Sync Progress](docs/assets/profile-syncing-transfer-details.png)
+<p align="center">
+  <img src="/docs/assets/profile-syncing-transfer-details.png" alt="Sync Progress" height="600">
+</p>
 
 View sync output and logs directly in the app:
 
-![Sync Logs](docs/assets/profile-syncing-with-logs.png)
+<p align="center">
+  <img src="/docs/assets/profile-syncing-with-logs.png" alt="Sync Logs" height="600">
+</p>
 
 ### Smart Notifications
 - Batched file change notifications (lists 1-3 files, summarizes 4+)
@@ -106,34 +116,14 @@ View sync output and logs directly in the app:
 - Independent enable/disable per profile
 - Per-profile status indicators in the menu
 
-### Three Sync Modes
-
-**Two-Way Sync (bisync)** - Keep both sides in sync
-- Changes made on either local or remote sync to the other
-- Uses rclone bisync for bidirectional synchronization
-- Ideal for: Active working files, collaborative documents
-
-**One-Way Sync** - Mirror source to destination
-- Choose direction: Local → Remote (backup) or Remote → Local (mirror)
-- Destination is overwritten to match source
-- Ideal for: Backups, archiving, or pulling down read-only data
-
-**Stream (Mount)** - Access files on-demand without sync
-- Remote files appear as a virtual drive on your Mac
-- Files are streamed when accessed, not copied locally
-- Configurable VFS cache for performance (off/minimal/writes/full)
-- Ideal for: Large media libraries, archives you don't need locally all the time
-
 ### Recent Changes
 - View last 20 synced files in the menu dropdown
 - See operation type: Copied, Updated, Deleted, Renamed
 - Click any file to reveal it in Finder
 
-### Smart Notifications
-
-- Batched file change notifications (lists 1-3 files, summarizes 4+)
-- Click notifications to open the sync directory
-- Error notifications with actionable details
+<p align="center">
+  <img src="/docs/assets/status-bar-recent-changes.png" alt="Recent Changes" height="600">
+</p>
 
 ### Automatic Background Sync
 
@@ -237,7 +227,18 @@ The app icon appears in your menu bar. A yellow gear indicates setup is needed.
 ### 2. Create a Sync Profile
 1. Click the menu bar icon → **Settings**
 2. Click **+** to add a new profile
-3. Configure:
+
+<p align="center">
+  <img src="/docs/assets/new-profile-wizard-intro.png" alt="New Profile Wizard" height="600">
+</p>
+
+3. Select your cloud provider:
+
+<p align="center">
+  <img src="/docs/assets/new-profile-wizard-providers.png" alt="Select Provider" height="600">
+</p>
+
+4. Configure:
    - **Name**: Give it a descriptive name (e.g., "Work Documents")
    - **Remote**: Select from your configured rclone remotes
    - **Remote Path**: Choose which folder on the remote to sync
@@ -273,6 +274,10 @@ Mount mode is different from sync modes - it creates a virtual drive instead of 
 **Unmounting**: Click the eject button in the menu bar for the profile, or disable the profile.
 
 ## Menu Bar States
+
+<p align="center">
+  <img src="/docs/assets/status-bar-idle.png" alt="Menu Bar" height="600">
+</p>
 
 | Icon | State | Meaning |
 |------|-------|---------|
