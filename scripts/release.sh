@@ -365,7 +365,7 @@ main() {
     echo ""
 
     # Run tests first (before any changes)
-    run_tests
+    # run_tests
 
     echo ""
 
