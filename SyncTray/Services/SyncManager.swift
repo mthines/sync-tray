@@ -941,7 +941,9 @@ final class SyncManager: ObservableObject {
 
             if drivePath.hasPrefix(volumePath) || volumePath == drivePath {
                 profileStates[profile.id] = .driveNotMounted
-                notificationService.notifyDriveNotMounted(profileId: profile.id, profileName: profile.name)
+                if !isNotificationsMuted(for: profile.id) {
+                    notificationService.notifyDriveNotMounted(profileId: profile.id, profileName: profile.name)
+                }
             }
         }
 
@@ -960,7 +962,9 @@ final class SyncManager: ObservableObject {
            !FileManager.default.fileExists(atPath: profile.drivePathToMonitor) {
             await MainActor.run {
                 profileStates[profile.id] = .driveNotMounted
-                notificationService.notifyDriveNotMounted(profileId: profile.id, profileName: profile.name)
+                if !isNotificationsMuted(for: profile.id) {
+                    notificationService.notifyDriveNotMounted(profileId: profile.id, profileName: profile.name)
+                }
                 updateAggregateState()
             }
             return
@@ -1026,12 +1030,17 @@ final class SyncManager: ObservableObject {
             logWatchers[profileId]?.setActivelySyncing(false)  // Reduce polling frequency
             lastSyncTime = event.timestamp
             let changesCount = currentSyncChanges[profileId]?.count ?? 0
-            notificationService.notifySyncCompleted(
-                changesCount: changesCount,
-                profileId: profileId,
-                profileName: profileName,
-                syncDirectoryPath: syncDirectoryPath
-            )
+            if !isNotificationsMuted(for: profileId) {
+                notificationService.notifySyncCompleted(
+                    changesCount: changesCount,
+                    profileId: profileId,
+                    profileName: profileName,
+                    syncDirectoryPath: syncDirectoryPath
+                )
+            } else {
+                // Still clean up pending state even when muted
+                notificationService.clearPendingChanges(for: profileId)
+            }
             currentSyncChanges[profileId] = nil
 
         case .syncFailed(let exitCode, let message):
@@ -1057,11 +1066,13 @@ final class SyncManager: ObservableObject {
                 profileErrors[profileId] = msg
             }
             let errorDescription = profileErrors[profileId] ?? message ?? "Exit code \(exitCode)"
-            notificationService.notifySyncError(
-                "Sync failed: \(errorDescription)",
-                profileId: profileId,
-                profileName: profile?.name
-            )
+            if !isNotificationsMuted(for: profileId) {
+                notificationService.notifySyncError(
+                    "Sync failed: \(errorDescription)",
+                    profileId: profileId,
+                    profileName: profile?.name
+                )
+            }
             currentSyncChanges[profileId] = nil
 
         case .errorMessage(let message):
@@ -1088,7 +1099,9 @@ final class SyncManager: ObservableObject {
 
         case .driveNotMounted:
             profileStates[profileId] = .driveNotMounted
-            notificationService.notifyDriveNotMounted(profileId: profileId, profileName: profileName)
+            if !isNotificationsMuted(for: profileId) {
+                notificationService.notifyDriveNotMounted(profileId: profileId, profileName: profileName)
+            }
 
         case .syncAlreadyRunning:
             break
