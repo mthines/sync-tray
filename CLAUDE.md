@@ -12,6 +12,7 @@ SyncTray is a macOS menu bar application that provides Google Drive-style backgr
 - **External drive support**: Auto-detects when external drives are mounted/unmounted
 - **Live progress tracking**: Parses rclone JSON logs for real-time transfer progress
 - **macOS notifications**: Batch notifications for file changes with "Open Directory" action
+- **Fallback remote**: Automatic failover to an alternative remote when the primary is unreachable
 
 ### Sync Modes
 
@@ -63,8 +64,8 @@ SyncTray/
 
 | File | Purpose |
 |------|---------|
-| `SyncProfile.swift` | Profile model with sync paths, remote config, computed file paths |
-| `SyncState.swift` | Sync state enum, progress struct, file change model, `SyncLogPatterns` for log parsing |
+| `SyncProfile.swift` | Profile model with sync paths, remote config, fallback remote config, computed file paths |
+| `SyncState.swift` | Sync state enum, progress struct, file change model, `ActiveTransport`, `SyncLogPatterns` for log parsing |
 | `RcloneLogEntry.swift` | JSON models for parsing rclone `--use-json-log` output |
 | `Settings.swift` | Global app settings (debug logging toggle) |
 
@@ -123,6 +124,28 @@ SyncManager.triggerManualSync() called
 Sync script executed → log written → monitoring pipeline picks up
 ```
 
+### Fallback Remote Pipeline
+```
+Sync script starts
+        ↓
+Check if FALLBACK_REMOTE is configured (from profile JSON)
+        ↓
+If set: rclone lsd primary remote (3s connect timeout)
+        ↓
+Unreachable? → Log "using fallback: X"
+    ├─ Same paths (FALLBACK_PATH empty): env var overrides swap transport
+    │   (preserves bisync cache — remote name stays the same)
+    └─ Different paths: swap entire REMOTE reference
+        ↓
+Reachable? → Log "Using primary remote: X"
+        ↓
+LogParser detects transport message → SyncManager.profileTransports updated
+        ↓
+MenuBarView shows transport icon (wifi=primary, antenna=fallback)
+```
+
+**Bisync cache preservation:** When the fallback remote has the same directory structure as the primary (e.g., WebDAV LAN → WebDAV QuickConnect), the sync script uses `RCLONE_CONFIG_*` environment variable overrides to change the transport while keeping the rclone remote name unchanged. This means bisync's listing cache (keyed by remote name + path) remains valid. When paths differ (e.g., SMB → SFTP), the full remote reference is swapped and bisync will rebuild listings on first switch (~12s for 85K files, no data re-download).
+
 ## Key Design Patterns
 
 ### Multi-Profile State Management
@@ -133,6 +156,7 @@ SyncManager maintains parallel dictionaries keyed by profile UUID:
 @Published private(set) var profileStates: [UUID: SyncState] = [:]
 @Published private(set) var profileProgress: [UUID: SyncProgress] = [:]
 @Published private(set) var profileErrors: [UUID: String] = [:]
+@Published private(set) var profileTransports: [UUID: ActiveTransport] = [:]
 private var logWatchers: [UUID: LogWatcher] = [:]
 private var directoryWatchers: [UUID: DirectoryWatcher] = [:]
 ```

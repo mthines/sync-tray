@@ -103,11 +103,6 @@ struct SyncProfile: Identifiable, Codable, Equatable {
         return "\(remote):\(path)"
     }
 
-    /// Whether the fallback uses the same path as the primary (enables env var override for bisync cache preservation)
-    var fallbackUsesSamePath: Bool {
-        fallbackRemotePath.isEmpty || fallbackRemotePath == remotePath
-    }
-
     // MARK: - Validation
 
     var isValid: Bool {

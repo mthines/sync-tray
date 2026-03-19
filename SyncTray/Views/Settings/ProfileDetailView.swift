@@ -94,6 +94,8 @@ struct ProfileDetailView: View {
         additionalRcloneFlags != profile.additionalRcloneFlags ||
         syncMode != profile.syncMode ||
         syncDirection != profile.syncDirection ||
+        (fallbackEnabled ? fallbackRemote : "") != profile.fallbackRemote ||
+        ((fallbackEnabled && fallbackUseDifferentPath) ? fallbackRemotePath : "") != profile.fallbackRemotePath ||
         vfsCacheMode != profile.vfsCacheMode ||
         vfsCacheMaxSize != profile.vfsCacheMaxSize ||
         vfsCachePath != profile.vfsCachePath ||
