@@ -15,6 +15,10 @@ struct SyncProfile: Identifiable, Codable, Equatable {
     var syncMode: SyncMode              // bisync (two-way), sync (one-way), or mount (streaming)
     var syncDirection: SyncDirection    // direction for one-way sync
 
+    // Fallback remote (used when primary remote is unreachable)
+    var fallbackRemote: String          // e.g., "synology-sftp" (empty = no fallback)
+    var fallbackRemotePath: String      // e.g., "/volume1/Kaiju" (empty = same as primary remotePath)
+
     // Mount mode specific settings
     var vfsCacheMode: VFSCacheMode      // VFS cache mode for mount (default: full)
     var vfsCacheMaxSize: String         // Max cache size (e.g., "10G")
@@ -82,6 +86,28 @@ struct SyncProfile: Identifiable, Codable, Equatable {
         return "\(remote):\(remotePath)"
     }
 
+    // MARK: - Fallback
+
+    /// Whether a fallback remote is configured
+    var hasFallback: Bool {
+        !fallbackRemote.isEmpty
+    }
+
+    /// Full fallback remote path for rclone (e.g., "synology-sftp:/volume1/Kaiju")
+    var fullFallbackRemotePath: String {
+        let path = fallbackRemotePath.isEmpty ? remotePath : fallbackRemotePath
+        let remote = fallbackRemote.hasSuffix(":") ? String(fallbackRemote.dropLast()) : fallbackRemote
+        if path.isEmpty {
+            return "\(remote):"
+        }
+        return "\(remote):\(path)"
+    }
+
+    /// Whether the fallback uses the same path as the primary (enables env var override for bisync cache preservation)
+    var fallbackUsesSamePath: Bool {
+        fallbackRemotePath.isEmpty || fallbackRemotePath == remotePath
+    }
+
     // MARK: - Validation
 
     var isValid: Bool {
@@ -103,6 +129,8 @@ struct SyncProfile: Identifiable, Codable, Equatable {
         isMuted: Bool = false,
         syncMode: SyncMode = .bisync,
         syncDirection: SyncDirection = .localToRemote,
+        fallbackRemote: String = "",
+        fallbackRemotePath: String = "",
         vfsCacheMode: VFSCacheMode = .full,
         vfsCacheMaxSize: String = "10G",
         vfsCachePath: String = "",
@@ -120,6 +148,8 @@ struct SyncProfile: Identifiable, Codable, Equatable {
         self.isMuted = isMuted
         self.syncMode = syncMode
         self.syncDirection = syncDirection
+        self.fallbackRemote = fallbackRemote
+        self.fallbackRemotePath = fallbackRemotePath
         self.vfsCacheMode = vfsCacheMode
         self.vfsCacheMaxSize = vfsCacheMaxSize
         self.vfsCachePath = vfsCachePath.isEmpty ? "\(NSHomeDirectory())/.cache/rclone/vfs" : vfsCachePath
@@ -139,6 +169,7 @@ extension SyncProfile {
         case id, name, rcloneRemote, remotePath, localSyncPath
         case drivePathToMonitor, syncIntervalMinutes, additionalRcloneFlags
         case isEnabled, isMuted, syncMode, syncDirection
+        case fallbackRemote, fallbackRemotePath
         case vfsCacheMode, vfsCacheMaxSize, vfsCachePath, allowNonEmptyMount
     }
 
@@ -159,6 +190,9 @@ extension SyncProfile {
         syncMode = try container.decodeIfPresent(SyncMode.self, forKey: .syncMode) ?? .bisync
         // Backwards compatibility: default to localToRemote if not present
         syncDirection = try container.decodeIfPresent(SyncDirection.self, forKey: .syncDirection) ?? .localToRemote
+        // Backwards compatibility: fallback remote defaults to empty (disabled)
+        fallbackRemote = try container.decodeIfPresent(String.self, forKey: .fallbackRemote) ?? ""
+        fallbackRemotePath = try container.decodeIfPresent(String.self, forKey: .fallbackRemotePath) ?? ""
         // Backwards compatibility: mount mode settings with defaults
         vfsCacheMode = try container.decodeIfPresent(VFSCacheMode.self, forKey: .vfsCacheMode) ?? .full
         vfsCacheMaxSize = try container.decodeIfPresent(String.self, forKey: .vfsCacheMaxSize) ?? "10G"

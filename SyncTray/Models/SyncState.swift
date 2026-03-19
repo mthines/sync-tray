@@ -233,6 +233,39 @@ enum MountState: Equatable {
     }
 }
 
+/// Which transport is currently active for a profile's sync
+enum ActiveTransport: Equatable {
+    case primary
+    case fallback(remoteName: String)
+    case unknown
+
+    var isPrimary: Bool {
+        if case .primary = self { return true }
+        return false
+    }
+
+    var isFallback: Bool {
+        if case .fallback = self { return true }
+        return false
+    }
+
+    var iconName: String {
+        switch self {
+        case .primary: return "wifi"
+        case .fallback: return "antenna.radiowaves.left.and.right"
+        case .unknown: return "questionmark.circle"
+        }
+    }
+
+    var label: String {
+        switch self {
+        case .primary: return "Primary"
+        case .fallback(let name): return "Fallback (\(name))"
+        case .unknown: return "Unknown"
+        }
+    }
+}
+
 struct FileChange: Identifiable, Equatable {
     let id = UUID()
     let timestamp: Date
@@ -394,6 +427,25 @@ enum SyncLogPatterns {
         }
 
         return cleaned
+    }
+
+    // MARK: - Transport Detection
+
+    /// Check if message indicates fallback transport was activated
+    static func isFallbackActivated(_ message: String) -> Bool {
+        message.contains("using fallback:")
+    }
+
+    /// Check if message indicates primary transport is in use
+    static func isPrimaryTransport(_ message: String) -> Bool {
+        message.contains("Using primary remote:")
+    }
+
+    /// Extract the fallback remote name from a fallback log message
+    static func extractFallbackRemoteName(from message: String) -> String? {
+        // Format: "Primary remote unreachable, using fallback: synology-sftp"
+        guard let range = message.range(of: "using fallback: ") else { return nil }
+        return String(message[range.upperBound...]).trimmingCharacters(in: .whitespaces)
     }
 
     // MARK: - Exit Code Extraction

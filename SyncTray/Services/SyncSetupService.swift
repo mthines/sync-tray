@@ -405,6 +405,8 @@ final class SyncSetupService {
             FILTER_FILE=$(parse_json "filterPath" "")
             SYNC_MODE=$(parse_json "syncMode" "bisync")
             SYNC_DIRECTION=$(parse_json "syncDirection" "localToRemote")
+            FALLBACK_REMOTE=$(parse_json "fallbackRemote" "")
+            FALLBACK_PATH=$(parse_json "fallbackRemotePath" "")
             VFS_CACHE_MODE=$(parse_json "vfsCacheMode" "full")
             VFS_CACHE_MAX_SIZE=$(parse_json "vfsCacheMaxSize" "10G")
             VFS_CACHE_PATH=$(parse_json "vfsCachePath" "$HOME/.cache/rclone/vfs")
@@ -450,6 +452,34 @@ final class SyncSetupService {
 
             # Ensure local sync directory exists
             mkdir -p "$LOCAL_PATH"
+
+            # Remote fallback: if primary remote is unreachable, try fallback remote
+            if [[ -n "$FALLBACK_REMOTE" ]]; then
+                REMOTE_NAME="${REMOTE%%:*}"
+                # Quick reachability check on primary remote (3s connect timeout)
+                if ! $RCLONE_BIN lsd "${REMOTE_NAME}:" --contimeout 3s --timeout 8s --max-depth 0 &>/dev/null; then
+                    echo "$(date '+%Y-%m-%d %H:%M:%S') - Primary remote unreachable, using fallback: $FALLBACK_REMOTE" >> "$LOG_FILE"
+
+                    if [[ -z "$FALLBACK_PATH" ]]; then
+                        # Same path structure: use env var overrides to swap transport
+                        # This preserves bisync cache since the remote name stays the same
+                        UPPER_NAME=$(echo "$REMOTE_NAME" | tr '[:lower:]' '[:upper:]' | tr '-' '_')
+                        eval "$($RCLONE_BIN config dump 2>/dev/null | python3 -c "
+import json, sys
+d = json.load(sys.stdin).get('${FALLBACK_REMOTE}', {})
+name = '${UPPER_NAME}'
+for k, v in d.items():
+    safe_k = k.upper().replace('-', '_')
+    print(f'export RCLONE_CONFIG_{name}_{safe_k}=\\\"' + str(v).replace('\\\"', '\\\\\\\"') + '\\\"')
+")"
+                    else
+                        # Different path structure: swap entire REMOTE reference
+                        REMOTE="${FALLBACK_REMOTE}:${FALLBACK_PATH}"
+                    fi
+                else
+                    echo "$(date '+%Y-%m-%d %H:%M:%S') - Using primary remote: $REMOTE_NAME" >> "$LOG_FILE"
+                fi
+            fi
 
             # Build rclone command based on sync mode
             if [[ "$SYNC_MODE" == "mount" ]]; then
@@ -532,6 +562,8 @@ final class SyncSetupService {
             "syncIntervalMinutes": profile.syncIntervalMinutes,
             "syncMode": profile.syncMode.rawValue,
             "syncDirection": profile.syncDirection.rawValue,
+            "fallbackRemote": profile.fallbackRemote,
+            "fallbackRemotePath": profile.fallbackRemotePath,
             "vfsCacheMode": profile.vfsCacheMode.rawValue,
             "vfsCacheMaxSize": profile.vfsCacheMaxSize,
             "vfsCachePath": profile.vfsCachePath,

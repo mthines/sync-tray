@@ -19,6 +19,12 @@ struct ProfileDetailView: View {
     @State private var syncMode: SyncMode = .bisync
     @State private var syncDirection: SyncDirection = .localToRemote
 
+    // Fallback remote settings
+    @State private var fallbackEnabled: Bool = false
+    @State private var fallbackRemote: String = ""
+    @State private var fallbackRemotePath: String = ""
+    @State private var fallbackUseDifferentPath: Bool = false
+
     // Mount mode specific settings
     @State private var vfsCacheMode: VFSCacheMode = .full
     @State private var vfsCacheMaxSize: String = "10G"
@@ -168,6 +174,12 @@ struct ProfileDetailView: View {
                     // Sync Configuration
                     sectionHeader("Sync Configuration", icon: "arrow.triangle.2.circlepath")
                     syncConfigurationSection
+
+                    Divider().padding(.vertical, 4)
+
+                    // Fallback Remote
+                    sectionHeader("Fallback Remote", icon: "arrow.triangle.branch")
+                    fallbackRemoteSection
 
                     Divider().padding(.vertical, 4)
 
@@ -1137,6 +1149,121 @@ struct ProfileDetailView: View {
         )
     }
 
+    private var fallbackRemoteSection: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Toggle(isOn: $fallbackEnabled) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Enable Fallback Remote")
+                        .font(.subheadline.weight(.medium))
+                    Text("Use an alternative remote when the primary is unreachable (e.g., when away from home network)")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .toggleStyle(.switch)
+            .controlSize(.small)
+            .onChange(of: fallbackEnabled) { enabled in
+                if !enabled {
+                    fallbackRemote = ""
+                    fallbackRemotePath = ""
+                    fallbackUseDifferentPath = false
+                }
+            }
+
+            if fallbackEnabled {
+                // Fallback remote picker
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Fallback Remote")
+                        .font(.subheadline.weight(.medium))
+
+                    if isLoadingRemotes {
+                        ProgressView()
+                            .controlSize(.small)
+                    } else if availableRemotes.isEmpty {
+                        Text("No remotes found. Create one with the Setup Wizard first.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    } else {
+                        Picker("", selection: $fallbackRemote) {
+                            Text("Select a remote...").tag("")
+                            ForEach(availableRemotes.filter { $0 != rcloneRemote }, id: \.self) { remote in
+                                Text(remote).tag(remote)
+                            }
+                        }
+                        .pickerStyle(.menu)
+                        .frame(maxWidth: 250, alignment: .leading)
+                    }
+                }
+
+                // Different path toggle
+                Toggle(isOn: $fallbackUseDifferentPath) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Fallback uses a different path")
+                            .font(.subheadline.weight(.medium))
+                        Text("Enable if the fallback remote has a different directory structure (e.g., SMB share vs SFTP filesystem path)")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .toggleStyle(.switch)
+                .controlSize(.small)
+                .onChange(of: fallbackUseDifferentPath) { useDifferent in
+                    if !useDifferent {
+                        fallbackRemotePath = ""
+                    }
+                }
+
+                if fallbackUseDifferentPath {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Fallback Remote Path")
+                            .font(.subheadline.weight(.medium))
+                        Text("The path on the fallback remote (e.g., /volume1/MyShare/Folder)")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        TextField("/volume1/MyShare/Folder", text: $fallbackRemotePath)
+                            .textFieldStyle(.roundedBorder)
+                    }
+                }
+
+                // Active transport indicator (shown when profile has been synced)
+                if let profile = profileStore.profile(for: profile.id),
+                   profile.hasFallback {
+                    let transport = syncManager.activeTransport(for: profile.id)
+                    if transport != .unknown {
+                        HStack(spacing: 6) {
+                            Image(systemName: transport.iconName)
+                                .foregroundStyle(transport.isPrimary ? .green : .orange)
+                                .font(.caption)
+                            Text("Last sync used: \(transport.label)")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                }
+
+                // Info box about bisync behavior
+                if syncMode == .bisync && fallbackUseDifferentPath {
+                    HStack(alignment: .top, spacing: 6) {
+                        Image(systemName: "info.circle.fill")
+                            .foregroundStyle(.blue)
+                            .font(.caption)
+                        Text("When paths differ, the first sync after switching transports will rebuild file listings (~10-15 seconds). No data is re-downloaded.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    .padding(8)
+                    .background(Color.blue.opacity(0.1), in: .rect(cornerRadius: 6))
+                }
+            }
+        }
+        .padding(12)
+        .background(Color.black.opacity(0.15), in: .rect(cornerRadius: 8))
+        .overlay(
+            RoundedRectangle(cornerRadius: 8)
+                .strokeBorder(Color.white.opacity(0.06), lineWidth: 1)
+        )
+    }
+
     private var advancedSectionContent: some View {
         VStack(alignment: .leading, spacing: 16) {
             // Sync Interval (not applicable for mount mode)
@@ -1266,6 +1393,10 @@ struct ProfileDetailView: View {
         additionalRcloneFlags = profile.additionalRcloneFlags
         syncMode = profile.syncMode
         syncDirection = profile.syncDirection
+        fallbackRemote = profile.fallbackRemote
+        fallbackRemotePath = profile.fallbackRemotePath
+        fallbackEnabled = !profile.fallbackRemote.isEmpty
+        fallbackUseDifferentPath = !profile.fallbackRemotePath.isEmpty
         vfsCacheMode = profile.vfsCacheMode
         vfsCacheMaxSize = profile.vfsCacheMaxSize
         vfsCachePath = profile.vfsCachePath
@@ -1288,6 +1419,8 @@ struct ProfileDetailView: View {
         updatedProfile.additionalRcloneFlags = additionalRcloneFlags
         updatedProfile.syncMode = syncMode
         updatedProfile.syncDirection = syncDirection
+        updatedProfile.fallbackRemote = fallbackEnabled ? fallbackRemote : ""
+        updatedProfile.fallbackRemotePath = (fallbackEnabled && fallbackUseDifferentPath) ? fallbackRemotePath : ""
         updatedProfile.vfsCacheMode = vfsCacheMode
         updatedProfile.vfsCacheMaxSize = vfsCacheMaxSize
         updatedProfile.vfsCachePath = vfsCachePath
@@ -1308,6 +1441,8 @@ struct ProfileDetailView: View {
             currentProfile.additionalRcloneFlags != updatedProfile.additionalRcloneFlags ||
             currentProfile.syncMode != updatedProfile.syncMode ||
             currentProfile.syncDirection != updatedProfile.syncDirection ||
+            currentProfile.fallbackRemote != updatedProfile.fallbackRemote ||
+            currentProfile.fallbackRemotePath != updatedProfile.fallbackRemotePath ||
             currentProfile.vfsCacheMode != updatedProfile.vfsCacheMode ||
             currentProfile.vfsCacheMaxSize != updatedProfile.vfsCacheMaxSize ||
             currentProfile.vfsCachePath != updatedProfile.vfsCachePath

@@ -70,6 +70,17 @@ struct MenuBarView: View {
                         }
                     }
 
+                    // Transport indicator (only for profiles with fallback configured)
+                    if profile.hasFallback {
+                        let transport = syncManager.activeTransport(for: profile.id)
+                        if transport != .unknown {
+                            Image(systemName: transport.iconName)
+                                .font(.system(size: 9))
+                                .foregroundColor(transport.isPrimary ? .green : .orange)
+                                .help(transport.label)
+                        }
+                    }
+
                     Spacer()
 
                     // Sync progress indicator (for sync modes)
