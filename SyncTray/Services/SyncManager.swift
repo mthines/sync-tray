@@ -33,6 +33,9 @@ final class SyncManager: ObservableObject {
     /// Mount state per profile (for mount mode profiles only)
     @Published private(set) var profileMountStates: [UUID: MountState] = [:]
 
+    /// Active transport per profile (primary or fallback)
+    @Published private(set) var profileTransports: [UUID: ActiveTransport] = [:]
+
     /// Paused profiles (session-only, not persisted - resets on app restart)
     @Published private(set) var pausedProfiles: Set<UUID> = []
 
@@ -321,6 +324,11 @@ final class SyncManager: ObservableObject {
     /// Get state for a specific profile
     func state(for profileId: UUID) -> SyncState {
         profileStates[profileId] ?? .idle
+    }
+
+    /// Get active transport for a specific profile
+    func activeTransport(for profileId: UUID) -> ActiveTransport {
+        profileTransports[profileId] ?? .unknown
     }
 
     /// Get last error message for a specific profile
@@ -1074,6 +1082,9 @@ final class SyncManager: ObservableObject {
                 )
             }
             currentSyncChanges[profileId] = nil
+
+        case .transportChanged(let transport):
+            profileTransports[profileId] = transport
 
         case .errorMessage(let message):
             // Track all error messages so we can correlate with syncFailed events

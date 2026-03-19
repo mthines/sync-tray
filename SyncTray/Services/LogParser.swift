@@ -10,6 +10,7 @@ struct ParsedLogEvent {
         case fileChange(FileChange)
         case stats(RcloneStats)
         case errorMessage(String)
+        case transportChanged(ActiveTransport)
         case unknown
     }
 
@@ -168,6 +169,16 @@ final class LogParser {
 
         if SyncLogPatterns.isSyncAlreadyRunning(message) {
             return .syncAlreadyRunning
+        }
+
+        // Transport fallback detection
+        if SyncLogPatterns.isFallbackActivated(message) {
+            let remoteName = SyncLogPatterns.extractFallbackRemoteName(from: message) ?? "unknown"
+            return .transportChanged(.fallback(remoteName: remoteName))
+        }
+
+        if SyncLogPatterns.isPrimaryTransport(message) {
+            return .transportChanged(.primary)
         }
 
         return .unknown
