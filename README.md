@@ -136,6 +136,15 @@ View sync output and logs directly in the app:
 - Lock file prevents overlapping syncs
 - Smart external drive detection - pauses when unmounted
 
+### Fallback Remote
+
+Configure an alternative remote that activates automatically when the primary is unreachable - perfect for NAS users who sync via SMB/WebDAV at home but need access from other networks.
+
+- **Automatic failover**: Each sync checks if the primary remote is reachable (3-second timeout)
+- **Transparent switching**: Menu bar shows which transport is active (wifi icon = primary, antenna icon = fallback)
+- **Bisync cache preservation**: When the fallback uses the same directory structure, env var overrides swap the transport without invalidating rclone's bisync cache
+- **Flexible path mapping**: Supports fallback remotes with different path structures (e.g., SMB share root vs SFTP filesystem path)
+
 ### One-Click Actions
 
 - **Sync Now**: Trigger immediate sync for all enabled profiles
@@ -325,6 +334,32 @@ If sync gets out of sync or shows persistent errors:
 1. Open Settings → Select the profile
 2. Click **Resync**
 3. This resets rclone's bisync cache and performs a fresh comparison
+
+### Fallback Remote Setup
+
+If your primary remote is only accessible on a local network (e.g., Synology NAS via SMB or WebDAV), you can configure a fallback that kicks in when you're away:
+
+1. Open Settings → Select the profile
+2. Scroll to **Fallback Remote** section
+3. Toggle **Enable Fallback Remote**
+4. Select the fallback remote from the dropdown (must already exist in rclone config)
+5. If the fallback uses different paths (e.g., SFTP vs SMB), enable **"Fallback uses a different path"** and enter the correct path
+
+**Example: Synology NAS**
+
+| Setting | Primary (LAN) | Fallback (Remote) |
+|---------|--------------|-------------------|
+| Remote | `synology-webdav` (LAN IP) | `synology-quickconnect` (QuickConnect URL) |
+| Path | `MyShare/Documents` | `MyShare/Documents` (same) |
+
+Or with different path structures:
+
+| Setting | Primary (SMB) | Fallback (SFTP via Tailscale) |
+|---------|--------------|-------------------------------|
+| Remote | `synology` | `synology-sftp` |
+| Path | `Kaiju/KAIJU` | `/volume1/Kaiju/KAIJU` |
+
+The sync script automatically tries the primary first. If unreachable within 3 seconds, it falls back transparently. The menu bar shows which transport was used (wifi = primary, antenna = fallback).
 
 ### Conflict Resolution
 
