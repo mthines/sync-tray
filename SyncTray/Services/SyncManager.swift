@@ -55,6 +55,9 @@ final class SyncManager: ObservableObject {
     /// Track the last error message per profile (for correlating with syncFailed events)
     private var lastSeenErrorMessage: [UUID: String] = [:]
 
+    /// Track sync start times per profile for duration measurement
+    private var syncStartTimes: [UUID: Date] = [:]
+
     /// Profiles where we're monitoring an externally-started sync
     private var monitoringExternalSyncs: Set<UUID> = []
 
@@ -73,6 +76,8 @@ final class SyncManager: ObservableObject {
         checkInitialState()
         startWatchingAllProfiles()
         updateMountStates()  // Initialize mount states for mount mode profiles
+        // Report active profile count for telemetry
+        TelemetryService.shared.recordProfileCount(self.profileStore.enabledProfiles.count)
     }
 
     deinit {
@@ -1035,6 +1040,7 @@ final class SyncManager: ObservableObject {
             lastSeenErrorMessage[profileId] = nil  // Clear last seen error
             profileProgress[profileId] = nil  // Reset progress for new sync
             currentSyncChanges[profileId] = []
+            syncStartTimes[profileId] = Date()  // Record start time for duration tracking
             logWatchers[profileId]?.setActivelySyncing(true)  // Increase polling frequency
             // Don't send notification - the menu bar icon updates to show syncing state
             notificationService.clearPendingChanges(for: profileId)
@@ -1047,6 +1053,15 @@ final class SyncManager: ObservableObject {
             logWatchers[profileId]?.setActivelySyncing(false)  // Reduce polling frequency
             lastSyncTime = event.timestamp
             let changesCount = currentSyncChanges[profileId]?.count ?? 0
+            // Report telemetry for successful sync
+            let completedDuration = syncStartTimes[profileId].map { Date().timeIntervalSince($0) } ?? 0
+            syncStartTimes[profileId] = nil
+            TelemetryService.shared.recordSyncCompleted(
+                mode: profile?.syncMode ?? .bisync,
+                result: "success",
+                duration: completedDuration,
+                filesChanged: changesCount
+            )
             if !isNotificationsMuted(for: profileId) {
                 notificationService.notifySyncCompleted(
                     changesCount: changesCount,
@@ -1067,6 +1082,7 @@ final class SyncManager: ObservableObject {
                 // Transient "all files were changed" - just clear state, don't show error
                 profileProgress[profileId] = nil
                 lastSeenErrorMessage[profileId] = nil
+                syncStartTimes[profileId] = nil
                 logWatchers[profileId]?.setActivelySyncing(false)  // Reduce polling frequency
                 currentSyncChanges[profileId] = nil  // Only clear this profile's changes
                 // Reset to idle since this isn't a real error
@@ -1078,6 +1094,15 @@ final class SyncManager: ObservableObject {
             profileProgress[profileId] = nil  // Clear progress on failure
             lastSeenErrorMessage[profileId] = nil
             logWatchers[profileId]?.setActivelySyncing(false)  // Reduce polling frequency
+            // Report telemetry for failed sync
+            let failedDuration = syncStartTimes[profileId].map { Date().timeIntervalSince($0) } ?? 0
+            syncStartTimes[profileId] = nil
+            TelemetryService.shared.recordSyncCompleted(
+                mode: profile?.syncMode ?? .bisync,
+                result: "failure",
+                duration: failedDuration,
+                filesChanged: currentSyncChanges[profileId]?.count ?? 0
+            )
             // Only use the syncFailed message if we don't already have a more specific error
             if profileErrors[profileId] == nil, let msg = message {
                 profileErrors[profileId] = msg

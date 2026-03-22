@@ -36,6 +36,10 @@
 		E1A0B1C2D3E4F56789AB0001 /* VFSCacheService.swift in Sources */ = {isa = PBXBuildFile; fileRef = E1A0B1C2D3E4F56789AB0002 /* VFSCacheService.swift */; };
 		E1A0B1C2D3E4F56789AB0003 /* OfflineFilesSection.swift in Sources */ = {isa = PBXBuildFile; fileRef = E1A0B1C2D3E4F56789AB0004 /* OfflineFilesSection.swift */; };
 		F2B3C4D5E6F7089012AB0001 /* MigrationRunner.swift in Sources */ = {isa = PBXBuildFile; fileRef = F2B3C4D5E6F7089012AB0002 /* MigrationRunner.swift */; };
+		OT00000000000000000000B1 /* TelemetryService.swift in Sources */ = {isa = PBXBuildFile; fileRef = OT00000000000000000000A1 /* TelemetryService.swift */; };
+		OT00000000000000000000C1 /* OpenTelemetryApi in Frameworks */ = {isa = PBXBuildFile; productRef = OT00000000000000000000D1 /* OpenTelemetryApi */; };
+		OT00000000000000000000C2 /* OpenTelemetrySdk in Frameworks */ = {isa = PBXBuildFile; productRef = OT00000000000000000000D2 /* OpenTelemetrySdk */; };
+		OT00000000000000000000C3 /* OpenTelemetryProtocolExporterHTTP in Frameworks */ = {isa = PBXBuildFile; productRef = OT00000000000000000000D3 /* OpenTelemetryProtocolExporterHTTP */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -71,6 +75,7 @@
 		E1A0B1C2D3E4F56789AB0002 /* VFSCacheService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VFSCacheService.swift; sourceTree = "<group>"; };
 		E1A0B1C2D3E4F56789AB0004 /* OfflineFilesSection.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OfflineFilesSection.swift; sourceTree = "<group>"; };
 		F2B3C4D5E6F7089012AB0002 /* MigrationRunner.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MigrationRunner.swift; sourceTree = "<group>"; };
+		OT00000000000000000000A1 /* TelemetryService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TelemetryService.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -78,6 +83,9 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				OT00000000000000000000C1 /* OpenTelemetryApi in Frameworks */,
+				OT00000000000000000000C2 /* OpenTelemetrySdk in Frameworks */,
+				OT00000000000000000000C3 /* OpenTelemetryProtocolExporterHTTP in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -143,6 +151,7 @@
 				C0DC6141FBB853681643F593 /* RcloneConfigService.swift */,
 				E1A0B1C2D3E4F56789AB0002 /* VFSCacheService.swift */,
 				F2B3C4D5E6F7089012AB0002 /* MigrationRunner.swift */,
+				OT00000000000000000000A1 /* TelemetryService.swift */,
 			);
 			path = Services;
 			sourceTree = "<group>";
@@ -203,6 +212,11 @@
 			dependencies = (
 			);
 			name = SyncTray;
+			packageProductDependencies = (
+				OT00000000000000000000D1 /* OpenTelemetryApi */,
+				OT00000000000000000000D2 /* OpenTelemetrySdk */,
+				OT00000000000000000000D3 /* OpenTelemetryProtocolExporterHTTP */,
+			);
 			productName = SyncTray;
 			productReference = A1000000000000000000000C /* SyncTray.app */;
 			productType = "com.apple.product-type.application";
@@ -231,6 +245,9 @@
 				Base,
 			);
 			mainGroup = A13000000000000000000001;
+			packageReferences = (
+				OT00000000000000000000E2 /* XCRemoteSwiftPackageReference "opentelemetry-swift" */,
+			);
 			productRefGroup = A13000000000000000000006 /* Products */;
 			projectDirPath = "";
 			projectRoot = "";
@@ -284,6 +301,7 @@
 				E1A0B1C2D3E4F56789AB0001 /* VFSCacheService.swift in Sources */,
 				E1A0B1C2D3E4F56789AB0003 /* OfflineFilesSection.swift in Sources */,
 				F2B3C4D5E6F7089012AB0001 /* MigrationRunner.swift in Sources */,
+				OT00000000000000000000B1 /* TelemetryService.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -482,6 +500,35 @@
 			defaultConfigurationName = Release;
 		};
 /* End XCConfigurationList section */
+
+/* Begin XCRemoteSwiftPackageReference section */
+		OT00000000000000000000E2 /* XCRemoteSwiftPackageReference "opentelemetry-swift" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/open-telemetry/opentelemetry-swift";
+			requirement = {
+				kind = upToNextMajorVersion;
+				minimumVersion = 1.0.0;
+			};
+		};
+/* End XCRemoteSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		OT00000000000000000000D1 /* OpenTelemetryApi */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = OT00000000000000000000E2 /* XCRemoteSwiftPackageReference "opentelemetry-swift" */;
+			productName = OpenTelemetryApi;
+		};
+		OT00000000000000000000D2 /* OpenTelemetrySdk */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = OT00000000000000000000E2 /* XCRemoteSwiftPackageReference "opentelemetry-swift" */;
+			productName = OpenTelemetrySdk;
+		};
+		OT00000000000000000000D3 /* OpenTelemetryProtocolExporterHTTP */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = OT00000000000000000000E2 /* XCRemoteSwiftPackageReference "opentelemetry-swift" */;
+			productName = OpenTelemetryProtocolExporterHTTP;
+		};
+/* End XCSwiftPackageProductDependency section */
 	};
 	rootObject = A17000000000000000000001 /* Project object */;
 }

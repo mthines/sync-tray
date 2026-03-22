@@ -24,6 +24,29 @@ struct SyncTraySettings {
 
         // Debug settings
         static let debugLoggingEnabled = "debugLoggingEnabled"
+
+        // Telemetry settings
+        static let telemetryEnabled = "telemetryEnabled"
+        static let installationId = "installationId"
+    }
+
+    // MARK: - Telemetry Settings
+
+    /// Whether anonymous telemetry is enabled. Off by default (opt-in).
+    static var telemetryEnabled: Bool {
+        get { defaults.bool(forKey: Keys.telemetryEnabled) }
+        set { defaults.set(newValue, forKey: Keys.telemetryEnabled) }
+    }
+
+    /// A persistent anonymous installation ID (UUID) for correlating metrics.
+    /// Generated once and stored in UserDefaults. Never contains personal data.
+    static var installationId: String {
+        if let existing = defaults.string(forKey: Keys.installationId) {
+            return existing
+        }
+        let newId = UUID().uuidString
+        defaults.set(newId, forKey: Keys.installationId)
+        return newId
     }
 
     // MARK: - Debug Settings
