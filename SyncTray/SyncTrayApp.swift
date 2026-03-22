@@ -11,6 +11,9 @@ struct SyncTrayApp: App {
         // Perform migration if needed
         Self.performMigrationIfNeeded()
 
+        // Initialize telemetry (no-op if disabled)
+        TelemetryService.shared.configure()
+
         // Create the sync manager
         let manager = SyncManager()
         _syncManager = StateObject(wrappedValue: manager)
@@ -172,6 +175,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
         UNUserNotificationCenter.current().delegate = self
         requestNotificationPermissions()
 
+        // Record app launch telemetry
+        TelemetryService.shared.recordAppLaunch()
+
         // Open Settings window on launch
         if AppDelegate.shouldOpenSettingsOnLaunch {
             AppDelegate.shouldOpenSettingsOnLaunch = false
@@ -179,6 +185,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
                 self.openSettingsWindow()
             }
         }
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        TelemetryService.shared.shutdown()
     }
 
     func openSettingsWindow() {
