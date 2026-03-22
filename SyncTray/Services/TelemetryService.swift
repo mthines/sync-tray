@@ -18,7 +18,7 @@ final class TelemetryService {
         ProcessInfo.processInfo.environment["DASH0_AUTH_TOKEN"] ?? "YOUR_AUTH_TOKEN"
     }()
 
-    // MARK: - Metric Instruments (stable API concrete types)
+    // MARK: - Metric Instruments
 
     private var syncDurationHistogram: DoubleHistogramMeterSdk?
     private var syncCompletedCounter: LongCounterSdk?
@@ -52,6 +52,9 @@ final class TelemetryService {
     }
 
     private func setupOTel() {
+        // Skip setup if no valid auth token is configured
+        guard Self.authToken != "YOUR_AUTH_TOKEN" else { return }
+
         let resource = buildResource()
         let authHeaders: [(String, String)] = [("Authorization", "Bearer \(Self.authToken)")]
 
@@ -83,7 +86,7 @@ final class TelemetryService {
             envVarHeaders: authHeaders
         )
 
-        let spanProcessor = SimpleSpanProcessor(spanExporter: tracesExporter)
+        let spanProcessor = BatchSpanProcessor(spanExporter: tracesExporter)
 
         let tracerProviderSdk = TracerProviderBuilder()
             .with(resource: resource)
@@ -155,13 +158,6 @@ final class TelemetryService {
         recordSyncSpan(mode: mode, result: result, filesChanged: filesChanged)
     }
 
-    /// Record a mount operation result.
-    func recordMountResult(result: String) {
-        guard SyncTraySettings.telemetryEnabled else { return }
-        if tracer == nil { setupOTel() }
-        recordMountSpan(result: result)
-    }
-
     /// Record app launch.
     func recordAppLaunch() {
         guard SyncTraySettings.telemetryEnabled else { return }
@@ -223,14 +219,4 @@ final class TelemetryService {
         span.end()
     }
 
-    private func recordMountSpan(result: String) {
-        guard let tracer = tracer else { return }
-
-        let span = tracer.spanBuilder(spanName: "mount.execute")
-            .setSpanKind(spanKind: .internal)
-            .startSpan()
-
-        span.setAttribute(key: "sync.result", value: .string(result))
-        span.end()
-    }
 }
