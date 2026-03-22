@@ -1,7 +1,7 @@
 import Foundation
 import OpenTelemetryApi
 import OpenTelemetrySdk
-import OpenTelemetryProtocolExporterHTTP
+import OpenTelemetryProtocolExporterHttp
 
 /// Anonymous, opt-in telemetry service using OpenTelemetry.
 ///
@@ -18,14 +18,18 @@ final class TelemetryService {
         ProcessInfo.processInfo.environment["DASH0_AUTH_TOKEN"] ?? "YOUR_AUTH_TOKEN"
     }()
 
-    // MARK: - Metric Instruments
+    // MARK: - Metric Instruments (stable API concrete types)
 
-    // We store SDK concrete types so we can call non-mutating methods
     private var syncDurationHistogram: DoubleHistogramMeterSdk?
     private var syncCompletedCounter: LongCounterSdk?
     private var syncFilesChangedCounter: LongCounterSdk?
     private var activeProfilesGauge: LongUpDownCounterSdk?
     private var appLaunchCounter: LongCounterSdk?
+
+    // MARK: - Providers (kept alive for shutdown)
+
+    private var meterProvider: StableMeterProviderSdk?
+    private var tracerProvider: TracerProviderSdk?
 
     // MARK: - Tracer
 
@@ -49,35 +53,34 @@ final class TelemetryService {
 
     private func setupOTel() {
         let resource = buildResource()
-        let config = OtlpConfiguration(
-            timeout: 10,
-            headers: [("Authorization", "Bearer \(Self.authToken)")]
-        )
+        let authHeaders: [(String, String)] = [("Authorization", "Bearer \(Self.authToken)")]
 
-        // Configure OTLP HTTP metric exporter
+        // MARK: Metrics — stable API
+
         let metricsEndpoint = URL(string: "\(Self.endpoint)/v1/metrics")!
-        let metricsExporter = OtlpHttpMetricExporter(
+        let metricsExporter = StableOtlpHTTPMetricExporter(
             endpoint: metricsEndpoint,
-            config: config
+            envVarHeaders: authHeaders
         )
 
-        // Configure periodic reader (export every 60 seconds)
-        let metricReader = PeriodicMetricReaderBuilder(exporter: metricsExporter)
+        let metricReader = StablePeriodicMetricReaderBuilder(exporter: metricsExporter)
             .setInterval(timeInterval: 60)
             .build()
 
-        let meterProviderSdk = MeterProviderBuilder()
+        let stableMeterProvider = StableMeterProviderSdk.builder()
             .setResource(resource: resource)
             .registerMetricReader(reader: metricReader)
             .build()
 
-        OpenTelemetry.registerMeterProvider(meterProvider: meterProviderSdk)
+        meterProvider = stableMeterProvider
+        OpenTelemetry.registerStableMeterProvider(meterProvider: stableMeterProvider)
 
-        // Configure OTLP HTTP trace exporter
+        // MARK: Traces
+
         let tracesEndpoint = URL(string: "\(Self.endpoint)/v1/traces")!
         let tracesExporter = OtlpHttpTraceExporter(
             endpoint: tracesEndpoint,
-            config: config
+            envVarHeaders: authHeaders
         )
 
         let spanProcessor = SimpleSpanProcessor(spanExporter: tracesExporter)
@@ -87,10 +90,13 @@ final class TelemetryService {
             .add(spanProcessor: spanProcessor)
             .build()
 
+        tracerProvider = tracerProviderSdk
         OpenTelemetry.registerTracerProvider(tracerProvider: tracerProviderSdk)
+        tracer = tracerProviderSdk.get(instrumentationName: "synctray")
 
-        // Build metric instruments using the concrete MeterProviderSdk
-        let meter = meterProviderSdk.get(name: "synctray")
+        // MARK: Build metric instruments from the stable meter
+
+        let meter = stableMeterProvider.get(name: "synctray")
 
         syncDurationHistogram = meter
             .histogramBuilder(name: "synctray.sync.duration")
@@ -121,9 +127,6 @@ final class TelemetryService {
             .setDescription("Number of app launches")
             .setUnit("1")
             .build()
-
-        // Get tracer
-        tracer = tracerProviderSdk.get(instrumentationName: "synctray")
     }
 
     // MARK: - Recording Methods
@@ -139,12 +142,12 @@ final class TelemetryService {
         ]
 
         syncDurationHistogram?.record(value: duration, attributes: labels)
-        syncCompletedCounter?.add(value: 1, attributes: labels)
+        syncCompletedCounter?.add(value: 1, attribute: labels)
 
         if filesChanged > 0 {
             syncFilesChangedCounter?.add(
                 value: filesChanged,
-                attributes: ["sync.mode": .string(mode.rawValue)]
+                attribute: ["sync.mode": .string(mode.rawValue)]
             )
         }
 
@@ -163,7 +166,7 @@ final class TelemetryService {
     func recordAppLaunch() {
         guard SyncTraySettings.telemetryEnabled else { return }
         if appLaunchCounter == nil { setupOTel() }
-        appLaunchCounter?.add(value: 1, attributes: [:])
+        appLaunchCounter?.add(value: 1, attribute: [:])
     }
 
     /// Update the active profile count gauge.
@@ -181,12 +184,9 @@ final class TelemetryService {
 
     func shutdown() {
         guard SyncTraySettings.telemetryEnabled else { return }
-        if let provider = OpenTelemetry.instance.tracerProvider as? TracerProviderSdk {
-            provider.shutdown()
-        }
-        if let provider = OpenTelemetry.instance.meterProvider as? MeterProviderSdk {
-            _ = provider.shutdown()
-        }
+        _ = meterProvider?.forceFlush()
+        _ = meterProvider?.shutdown()
+        tracerProvider?.shutdown()
     }
 
     // MARK: - Private Helpers
