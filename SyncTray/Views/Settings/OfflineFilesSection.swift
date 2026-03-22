@@ -345,9 +345,11 @@ struct OfflineFilesSection: View {
 
             Spacer()
 
-            Text(ByteCountFormatter.string(fromByteCount: item.size, countStyle: .file))
-                .font(.caption2.monospacedDigit())
-                .foregroundStyle(.secondary)
+            if !item.isDirectory {
+                Text(ByteCountFormatter.string(fromByteCount: item.size, countStyle: .file))
+                    .font(.caption2.monospacedDigit())
+                    .foregroundStyle(.secondary)
+            }
 
             // Pin button (for directories)
             if item.isDirectory {
@@ -432,20 +434,25 @@ struct OfflineFilesSection: View {
     }
 
     private func deleteCachedItem(_ item: CachedItem) {
-        do {
-            try cacheService.deleteCachedItem(item)
-            cachedItems.removeAll { $0.id == item.id }
-            refreshCacheStats()
-        } catch {
-            // Item may already be gone
+        Task {
+            do {
+                try await cacheService.deleteCachedItem(item, rcPort: profile.rcPort)
+            } catch {
+                // Fallback: try sync delete if async failed
+                try? cacheService.deleteCachedItemSync(item)
+            }
+            await MainActor.run {
+                cachedItems.removeAll { $0.id == item.id }
+                refreshCacheStats()
+            }
         }
     }
 
     private func clearAllCache() {
         isClearing = true
-        DispatchQueue.global(qos: .userInitiated).async {
-            try? cacheService.clearCache(for: profile)
-            DispatchQueue.main.async {
+        Task {
+            try? await cacheService.clearCache(for: profile)
+            await MainActor.run {
                 isClearing = false
                 cachedItems = []
                 refreshCacheStats()
@@ -454,7 +461,10 @@ struct OfflineFilesSection: View {
     }
 
     private func addPinnedDir() {
-        let dir = newPinnedDir.trimmingCharacters(in: .whitespacesAndNewlines)
+        var dir = newPinnedDir.trimmingCharacters(in: .whitespacesAndNewlines)
+        // Strip leading/trailing slashes (rclone paths are relative)
+        while dir.hasPrefix("/") { dir = String(dir.dropFirst()) }
+        while dir.hasSuffix("/") { dir = String(dir.dropLast()) }
         guard !dir.isEmpty, !pinnedDirs.contains(dir) else { return }
         pinnedDirs.append(dir)
         newPinnedDir = ""

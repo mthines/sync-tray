@@ -133,9 +133,14 @@ struct SyncProfile: Identifiable, Codable, Equatable {
     }
 
     /// Generate a deterministic RC port from the profile UUID (range: 5800-5899)
+    /// Uses djb2 hash for stability (Swift's hashValue is randomized per process)
     static func defaultRCPort(for id: UUID) -> Int {
-        let hash = abs(id.uuidString.hashValue)
-        return 5800 + (hash % 100)
+        let bytes = Array(id.uuidString.utf8)
+        var hash: UInt32 = 5381
+        for byte in bytes {
+            hash = ((hash &<< 5) &+ hash) &+ UInt32(byte)
+        }
+        return 5800 + Int(hash % 100)
     }
 
     /// Create a new profile with default values

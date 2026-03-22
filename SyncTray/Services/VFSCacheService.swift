@@ -100,7 +100,7 @@ final class VFSCacheService {
                     name: name,
                     relativePath: itemRelPath,
                     fullPath: fullPath,
-                    size: isDir ? directorySize(at: fullPath) : size,
+                    size: size,  // For directories, shows metadata size (not recursive)
                     modifiedDate: modified,
                     isDirectory: isDir
                 )
@@ -142,12 +142,43 @@ final class VFSCacheService {
     }
 
     /// Delete a specific cached item (file or directory)
-    func deleteCachedItem(_ item: CachedItem) throws {
+    /// Prefers RC API when port > 0 (mount is active) to avoid corrupting open file handles
+    func deleteCachedItem(_ item: CachedItem, rcPort: Int = 0) async throws {
+        if rcPort > 0, item.isDirectory, await isRCAvailable(port: rcPort) {
+            try await forgetDirectory(item.relativePath, port: rcPort)
+        }
+        // Also remove from disk (RC forget only evicts from VFS layer, not disk cache)
+        try FileManager.default.removeItem(atPath: item.fullPath)
+    }
+
+    /// Synchronous delete for non-async contexts (use deleteCachedItem(_:rcPort:) when possible)
+    func deleteCachedItemSync(_ item: CachedItem) throws {
         try FileManager.default.removeItem(atPath: item.fullPath)
     }
 
     /// Clear all cached files for a profile
-    func clearCache(for profile: SyncProfile) throws {
+    /// Prefers RC API when mount is active to safely evict from VFS layer first
+    func clearCache(for profile: SyncProfile) async throws {
+        let port = profile.rcPort
+
+        // If RC is available, forget the root directory first to safely evict from VFS
+        if port > 0, await isRCAvailable(port: port) {
+            try? await forgetDirectory("", port: port)
+        }
+
+        // Then remove files from disk
+        guard let baseDir = cacheDirectory(for: profile) else { return }
+        let fm = FileManager.default
+        if let contents = try? fm.contentsOfDirectory(atPath: baseDir) {
+            for item in contents {
+                let path = (baseDir as NSString).appendingPathComponent(item)
+                try fm.removeItem(atPath: path)
+            }
+        }
+    }
+
+    /// Synchronous cache clear (for use in non-async contexts)
+    func clearCacheSync(for profile: SyncProfile) throws {
         guard let baseDir = cacheDirectory(for: profile) else { return }
         let fm = FileManager.default
         if let contents = try? fm.contentsOfDirectory(atPath: baseDir) {
@@ -236,23 +267,6 @@ final class VFSCacheService {
         for dir in profile.pinnedDirectories {
             try? await refreshDirectory(dir, port: port)
         }
-    }
-
-    // MARK: - Helpers
-
-    private func directorySize(at path: String) -> Int64 {
-        let fm = FileManager.default
-        guard let enumerator = fm.enumerator(atPath: path) else { return 0 }
-
-        var total: Int64 = 0
-        while let file = enumerator.nextObject() as? String {
-            let fullPath = (path as NSString).appendingPathComponent(file)
-            if let attrs = try? fm.attributesOfItem(atPath: fullPath),
-               (attrs[.type] as? FileAttributeType) != .typeDirectory {
-                total += (attrs[.size] as? Int64) ?? 0
-            }
-        }
-        return total
     }
 
     // MARK: - Errors
