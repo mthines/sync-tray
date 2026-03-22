@@ -409,6 +409,7 @@ final class SyncSetupService {
             VFS_CACHE_MAX_SIZE=$(parse_json "vfsCacheMaxSize" "10G")
             VFS_CACHE_PATH=$(parse_json "vfsCachePath" "$HOME/.cache/rclone/vfs")
             ALLOW_NON_EMPTY=$(parse_json "allowNonEmptyMount" "false")
+            RC_PORT=$(parse_json "rcPort" "0")
 
             if [[ -z "$REMOTE" || -z "$LOCAL_PATH" ]]; then
                 echo "Error: Invalid config - missing remote or localPath"
@@ -468,6 +469,11 @@ final class SyncSetupService {
                 # Mount command with VFS cache settings
                 # Note: No --daemon flag - launchd manages the process lifecycle
                 RCLONE_CMD="$RCLONE_BIN mount \\"$REMOTE\\" \\"$LOCAL_PATH\\" --vfs-cache-mode $VFS_CACHE_MODE --vfs-cache-max-size $VFS_CACHE_MAX_SIZE --cache-dir \\"$VFS_CACHE_PATH\\" --log-level INFO --use-json-log"
+
+                # Add RC (remote control) API for cache management
+                if [[ "$RC_PORT" != "0" && -n "$RC_PORT" ]]; then
+                    RCLONE_CMD="$RCLONE_CMD --rc --rc-addr=localhost:$RC_PORT --rc-no-auth"
+                fi
 
                 # Add --allow-non-empty flag if configured
                 if [[ "$ALLOW_NON_EMPTY" == "true" || "$ALLOW_NON_EMPTY" == "True" || "$ALLOW_NON_EMPTY" == "1" ]]; then
@@ -536,6 +542,8 @@ final class SyncSetupService {
             "vfsCacheMaxSize": profile.vfsCacheMaxSize,
             "vfsCachePath": profile.vfsCachePath,
             "allowNonEmptyMount": profile.allowNonEmptyMount,
+            "pinnedDirectories": profile.pinnedDirectories,
+            "rcPort": profile.rcPort,
         ]
 
         if let data = try? JSONSerialization.data(

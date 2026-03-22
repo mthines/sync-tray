@@ -169,6 +169,16 @@ struct ProfileDetailView: View {
                     sectionHeader("Sync Configuration", icon: "arrow.triangle.2.circlepath")
                     syncConfigurationSection
 
+                    // Offline Files (mount mode only)
+                    if syncMode == .mount {
+                        Divider().padding(.vertical, 4)
+                        OfflineFilesSection(
+                            profile: profile,
+                            profileStore: profileStore,
+                            syncManager: syncManager
+                        )
+                    }
+
                     Divider().padding(.vertical, 4)
 
                     // Advanced Options
