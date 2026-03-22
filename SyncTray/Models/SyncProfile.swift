@@ -18,7 +18,7 @@ struct SyncProfile: Identifiable, Codable, Equatable {
     // Mount mode specific settings
     var vfsCacheMode: VFSCacheMode      // VFS cache mode for mount (default: full)
     var vfsCacheMaxSize: String         // Max cache size (e.g., "10G")
-    var vfsCachePath: String            // Cache directory path (default: ~/.cache/rclone/vfs)
+    var vfsCachePath: String            // Cache directory path (default: ~/.cache/rclone)
     var allowNonEmptyMount: Bool        // Allow mounting to non-empty folders (default: false)
     var pinnedDirectories: [String]     // Directories to automatically cache offline (mount mode)
     var rcPort: Int                     // Port for rclone RC (remote control) API (mount mode)
@@ -126,7 +126,7 @@ struct SyncProfile: Identifiable, Codable, Equatable {
         self.syncDirection = syncDirection
         self.vfsCacheMode = vfsCacheMode
         self.vfsCacheMaxSize = vfsCacheMaxSize
-        self.vfsCachePath = vfsCachePath.isEmpty ? "\(NSHomeDirectory())/.cache/rclone/vfs" : vfsCachePath
+        self.vfsCachePath = vfsCachePath.isEmpty ? "\(NSHomeDirectory())/.cache/rclone" : vfsCachePath
         self.allowNonEmptyMount = allowNonEmptyMount
         self.pinnedDirectories = pinnedDirectories
         self.rcPort = rcPort > 0 ? rcPort : SyncProfile.defaultRCPort(for: id)
@@ -181,7 +181,7 @@ extension SyncProfile {
         vfsCacheMode = try container.decodeIfPresent(VFSCacheMode.self, forKey: .vfsCacheMode) ?? .full
         vfsCacheMaxSize = try container.decodeIfPresent(String.self, forKey: .vfsCacheMaxSize) ?? "10G"
         let cachePath = try container.decodeIfPresent(String.self, forKey: .vfsCachePath) ?? ""
-        vfsCachePath = cachePath.isEmpty ? "\(NSHomeDirectory())/.cache/rclone/vfs" : cachePath
+        vfsCachePath = cachePath.isEmpty ? "\(NSHomeDirectory())/.cache/rclone" : cachePath
         // Backwards compatibility: default to false if not present
         allowNonEmptyMount = try container.decodeIfPresent(Bool.self, forKey: .allowNonEmptyMount) ?? false
         // Backwards compatibility: default to empty array if not present

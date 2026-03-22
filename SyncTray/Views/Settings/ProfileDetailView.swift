@@ -702,7 +702,7 @@ struct ProfileDetailView: View {
                         Text("Cache Directory")
                             .font(.subheadline.weight(.medium))
                         HStack {
-                            TextField("~/.cache/rclone/vfs", text: $vfsCachePath)
+                            TextField("~/.cache/rclone", text: $vfsCachePath)
                                 .textFieldStyle(.roundedBorder)
                             Button("Browse...") {
                                 browseForFolder(title: "Select Cache Directory") { path in

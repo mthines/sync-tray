@@ -407,7 +407,7 @@ final class SyncSetupService {
             SYNC_DIRECTION=$(parse_json "syncDirection" "localToRemote")
             VFS_CACHE_MODE=$(parse_json "vfsCacheMode" "full")
             VFS_CACHE_MAX_SIZE=$(parse_json "vfsCacheMaxSize" "10G")
-            VFS_CACHE_PATH=$(parse_json "vfsCachePath" "$HOME/.cache/rclone/vfs")
+            VFS_CACHE_PATH=$(parse_json "vfsCachePath" "$HOME/.cache/rclone")
             ALLOW_NON_EMPTY=$(parse_json "allowNonEmptyMount" "false")
             RC_PORT=$(parse_json "rcPort" "0")
 
