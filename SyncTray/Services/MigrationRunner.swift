@@ -36,7 +36,7 @@ extension ProfileMigration {
 enum MigrationRunner {
     private static let schemaVersionKey = "synctray.schemaVersion"
     private static let profilesKey = "syncProfiles"
-    private static let configDirectory = "\(NSHomeDirectory())/.config/synctray/profiles"
+    private static let configDirectory = SyncProfile.configDirectory
 
     /// All registered migrations, in order.
     /// To add a new migration: create a struct conforming to ProfileMigration,
