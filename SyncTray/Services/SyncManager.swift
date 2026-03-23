@@ -43,6 +43,7 @@ final class SyncManager: ObservableObject {
     private let logParser = LogParser()
     private let notificationService = NotificationService.shared
     private let setupService = SyncSetupService.shared
+    private let cacheService = VFSCacheService.shared
 
     private var workspaceObserver: NSObjectProtocol?
     private var currentSyncChanges: [UUID: [FileChange]] = [:]
@@ -162,6 +163,14 @@ final class SyncManager: ObservableObject {
                         DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
                             if self?.setupService.isMounted(profile: profile) == true {
                                 self?.profileMountStates[profile.id] = .mounted
+                                // Auto-refresh pinned directories after successful mount
+                                if !profile.pinnedDirectories.isEmpty {
+                                    Task {
+                                        // Wait for RC API to be ready
+                                        try? await Task.sleep(nanoseconds: 2_000_000_000)
+                                        await self?.cacheService.refreshPinnedDirectories(for: profile)
+                                    }
+                                }
                             } else {
                                 self?.profileMountStates[profile.id] = .failed("Mount did not establish")
                             }

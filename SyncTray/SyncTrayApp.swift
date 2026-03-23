@@ -8,8 +8,8 @@ struct SyncTrayApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
 
     init() {
-        // Perform migration if needed
-        Self.performMigrationIfNeeded()
+        // Run any pending data migrations before loading profiles
+        MigrationRunner.runPendingMigrations()
 
         // Create the sync manager
         let manager = SyncManager()
@@ -32,37 +32,6 @@ struct SyncTrayApp: App {
         .menuBarExtraStyle(.window)
     }
 
-    /// Migrate from single-profile to multi-profile if needed
-    private static func performMigrationIfNeeded() {
-        guard SyncTraySettings.needsMultiProfileMigration else { return }
-
-        // Create a temporary profile store to perform migration
-        let profileStore = ProfileStore()
-
-        // Create a profile from legacy settings
-        if let profile = SyncTraySettings.createProfileFromLegacySettings() {
-            profileStore.add(profile)
-
-            // Try to uninstall legacy launchd agent
-            let setupService = SyncSetupService.shared
-            if setupService.isLegacyInstalled() {
-                try? setupService.uninstallLegacy()
-            }
-
-            // Install the new profile
-            do {
-                try setupService.install(profile: profile)
-            } catch {
-                print("Failed to install migrated profile: \(error)")
-            }
-        }
-
-        // Mark migration as complete
-        SyncTraySettings.markMigrationComplete()
-
-        // Optionally clear legacy settings
-        // SyncTraySettings.clearLegacySettings()
-    }
 }
 
 struct MenuBarIcon: View {
