@@ -11,11 +11,61 @@ import OpenTelemetryProtocolExporterHttp
 final class TelemetryService {
     static let shared = TelemetryService()
 
-    // MARK: - Constants
+    // MARK: - Configuration
+    //
+    // Lookup priority (first non-empty wins):
+    //   1. Process environment variables (shell, Xcode scheme, CI)
+    //   2. ~/.config/synctray/.env file (development convenience)
+    //   3. Info.plist values embedded at build time (release distribution)
 
-    private static let endpoint = "https://ingress.europe-west4.gcp.dash0-dev.com"
-    private static let authToken: String = {
-        ProcessInfo.processInfo.environment["DASH0_AUTH_TOKEN"] ?? "YOUR_AUTH_TOKEN"
+    private static let config: [String: String] = {
+        var env: [String: String] = [:]
+        // 3. Info.plist (lowest priority — embedded at build time)
+        if let token = Bundle.main.object(forInfoDictionaryKey: "Dash0AuthToken") as? String,
+           !token.isEmpty {
+            env["DASH0_AUTH_TOKEN"] = token
+        }
+        if let endpoint = Bundle.main.object(forInfoDictionaryKey: "OTelExporterEndpoint") as? String,
+           !endpoint.isEmpty {
+            env["OTEL_EXPORTER_OTLP_ENDPOINT"] = endpoint
+        }
+        // 2. .env file overrides Info.plist
+        for (key, value) in loadDotEnv() {
+            env[key] = value
+        }
+        // 1. Process environment overrides everything
+        for (key, value) in ProcessInfo.processInfo.environment {
+            env[key] = value
+        }
+        return env
+    }()
+
+    private static let endpoint: String = {
+        config["OTEL_EXPORTER_OTLP_ENDPOINT"]
+            ?? "https://ingress.europe-west4.gcp.dash0-dev.com"
+    }()
+
+    private static let serviceName: String = {
+        config["OTEL_SERVICE_NAME"] ?? "synctray"
+    }()
+
+    /// Auth header resolution:
+    ///   1. `OTEL_EXPORTER_OTLP_HEADERS` env var (standard OTel, comma-separated Key=Value)
+    ///   2. `DASH0_AUTH_TOKEN` env var or .env file or Info.plist (convenience)
+    private static let authHeaders: [(String, String)] = {
+        if let raw = config["OTEL_EXPORTER_OTLP_HEADERS"], !raw.isEmpty {
+            return raw.split(separator: ",").compactMap { pair in
+                let parts = pair.split(separator: "=", maxSplits: 1)
+                guard parts.count == 2 else { return nil }
+                return (String(parts[0]).trimmingCharacters(in: .whitespaces),
+                        String(parts[1]).trimmingCharacters(in: .whitespaces))
+            }
+        }
+        if let token = config["DASH0_AUTH_TOKEN"],
+           !token.isEmpty, token != "YOUR_AUTH_TOKEN" {
+            return [("Authorization", "Bearer \(token)")]
+        }
+        return []
     }()
 
     // MARK: - Metric Instruments
@@ -52,18 +102,17 @@ final class TelemetryService {
     }
 
     private func setupOTel() {
-        // Skip setup if no valid auth token is configured
-        guard Self.authToken != "YOUR_AUTH_TOKEN" else { return }
+        // Skip setup if no auth headers are configured
+        guard !Self.authHeaders.isEmpty else { return }
 
         let resource = buildResource()
-        let authHeaders: [(String, String)] = [("Authorization", "Bearer \(Self.authToken)")]
 
         // MARK: Metrics — stable API
 
         let metricsEndpoint = URL(string: "\(Self.endpoint)/v1/metrics")!
         let metricsExporter = StableOtlpHTTPMetricExporter(
             endpoint: metricsEndpoint,
-            envVarHeaders: authHeaders
+            envVarHeaders: Self.authHeaders
         )
 
         let metricReader = StablePeriodicMetricReaderBuilder(exporter: metricsExporter)
@@ -83,7 +132,7 @@ final class TelemetryService {
         let tracesEndpoint = URL(string: "\(Self.endpoint)/v1/traces")!
         let tracesExporter = OtlpHttpTraceExporter(
             endpoint: tracesEndpoint,
-            envVarHeaders: authHeaders
+            envVarHeaders: Self.authHeaders
         )
 
         let spanProcessor = BatchSpanProcessor(spanExporter: tracesExporter)
@@ -95,11 +144,11 @@ final class TelemetryService {
 
         tracerProvider = tracerProviderSdk
         OpenTelemetry.registerTracerProvider(tracerProvider: tracerProviderSdk)
-        tracer = tracerProviderSdk.get(instrumentationName: "synctray")
+        tracer = tracerProviderSdk.get(instrumentationName: Self.serviceName)
 
         // MARK: Build metric instruments from the stable meter
 
-        let meter = stableMeterProvider.get(name: "synctray")
+        let meter = stableMeterProvider.get(name: Self.serviceName)
 
         syncDurationHistogram = meter
             .histogramBuilder(name: "synctray.sync.duration")
@@ -191,15 +240,28 @@ final class TelemetryService {
         let version = appVersion()
         let osVersion = ProcessInfo.processInfo.operatingSystemVersionString
 
-        return Resource(attributes: [
-            ResourceAttributes.serviceName.rawValue: .string("synctray"),
+        // Parse additional resource attributes from OTEL_RESOURCE_ATTRIBUTES
+        var attrs: [String: AttributeValue] = [
+            ResourceAttributes.serviceName.rawValue: .string(Self.serviceName),
             ResourceAttributes.serviceNamespace.rawValue: .string("synctray"),
             ResourceAttributes.serviceVersion.rawValue: .string(version),
-            "deployment.environment.name": .string("production"),
             "service.instance.id": .string(SyncTraySettings.installationId),
             ResourceAttributes.osType.rawValue: .string("darwin"),
             ResourceAttributes.osVersion.rawValue: .string(osVersion),
-        ])
+        ]
+
+        // Apply OTEL_RESOURCE_ATTRIBUTES overrides (e.g., deployment.environment.name)
+        if let raw = Self.config["OTEL_RESOURCE_ATTRIBUTES"] {
+            for pair in raw.split(separator: ",") {
+                let parts = pair.split(separator: "=", maxSplits: 1)
+                guard parts.count == 2 else { continue }
+                let key = String(parts[0]).trimmingCharacters(in: .whitespaces)
+                let value = String(parts[1]).trimmingCharacters(in: .whitespaces)
+                attrs[key] = .string(value)
+            }
+        }
+
+        return Resource(attributes: attrs)
     }
 
     private func appVersion() -> String {
@@ -217,6 +279,31 @@ final class TelemetryService {
         span.setAttribute(key: "sync.result", value: .string(result))
         span.setAttribute(key: "sync.files_changed", value: .int(filesChanged))
         span.end()
+    }
+
+    /// Loads key=value pairs from ~/.config/synctray/.env (if it exists).
+    private static func loadDotEnv() -> [String: String] {
+        let envFile = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".config/synctray/.env")
+        guard let contents = try? String(contentsOf: envFile, encoding: .utf8) else {
+            return [:]
+        }
+        var result: [String: String] = [:]
+        for line in contents.components(separatedBy: .newlines) {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            if trimmed.isEmpty || trimmed.hasPrefix("#") { continue }
+            let parts = trimmed.split(separator: "=", maxSplits: 1)
+            guard parts.count == 2 else { continue }
+            let key = String(parts[0]).trimmingCharacters(in: .whitespaces)
+            var value = String(parts[1]).trimmingCharacters(in: .whitespaces)
+            // Strip surrounding quotes
+            if (value.hasPrefix("\"") && value.hasSuffix("\"")) ||
+               (value.hasPrefix("'") && value.hasSuffix("'")) {
+                value = String(value.dropFirst().dropLast())
+            }
+            result[key] = value
+        }
+        return result
     }
 
 }

@@ -18,5 +18,9 @@
 	<true/>
 	<key>NSUserNotificationAlertStyle</key>
 	<string>banner</string>
+	<key>Dash0AuthToken</key>
+	<string>$(DASH0_AUTH_TOKEN)</string>
+	<key>OTelExporterEndpoint</key>
+	<string>$(OTEL_EXPORTER_OTLP_ENDPOINT)</string>
 </dict>
 </plist>
