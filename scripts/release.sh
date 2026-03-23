@@ -24,6 +24,29 @@ XCODEPROJ="$PROJECT_DIR/SyncTray.xcodeproj"
 # Helper Functions
 # =============================================================================
 
+# Load environment variables from ~/.config/synctray/.env (if it exists)
+load_env() {
+    local env_file="$HOME/.config/synctray/.env"
+    if [ -f "$env_file" ]; then
+        while IFS= read -r line || [ -n "$line" ]; do
+            # Skip comments and empty lines
+            [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
+            # Only export if not already set in environment
+            local key="${line%%=*}"
+            key=$(echo "$key" | xargs)  # trim whitespace
+            if [ -z "${!key:-}" ]; then
+                export "$line"
+            fi
+        done < "$env_file"
+        log_info "Loaded env from $env_file"
+        if [ -n "${DASH0_AUTH_TOKEN:-}" ]; then
+            log_success "DASH0_AUTH_TOKEN is set (${#DASH0_AUTH_TOKEN} chars)"
+        else
+            log_warning "DASH0_AUTH_TOKEN is not set — telemetry token will not be embedded"
+        fi
+    fi
+}
+
 log_info() { echo -e "${BLUE}ℹ${NC} $1" >&2; }
 log_success() { echo -e "${GREEN}✓${NC} $1" >&2; }
 log_warning() { echo -e "${YELLOW}⚠${NC} $1" >&2; }
@@ -212,6 +235,7 @@ build_release() {
         -derivedDataPath "$BUILD_DIR/DerivedData" \
         clean build \
         ONLY_ACTIVE_ARCH=NO \
+        DASH0_AUTH_TOKEN="${DASH0_AUTH_TOKEN:-}" \
         2>&1 | tail -5
 
     log_success "Build completed"
@@ -320,6 +344,7 @@ create_github_release() {
 
 main() {
     cd "$PROJECT_DIR"
+    load_env
 
     echo ""
     echo "🚀 ${PROJECT_NAME} Release Script"

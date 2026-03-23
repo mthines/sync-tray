@@ -7,7 +7,7 @@
     "build": {
       "executor": "nx:run-commands",
       "options": {
-        "command": "xcodebuild -scheme SyncTray -configuration Debug -derivedDataPath build SYMROOT=build build 2>&1 | grep -E '(error:|warning:.*error|BUILD)' || true",
+        "command": "xcodebuild -scheme SyncTray -configuration Debug -derivedDataPath build DASH0_AUTH_TOKEN=\"${DASH0_AUTH_TOKEN:-}\" build 2>&1 | grep -E '(error:|warning:.*error|BUILD)' || true",
         "cwd": "{projectRoot}"
       },
       "inputs": ["swift-sources", "project-config"],
@@ -17,7 +17,7 @@
     "build:release": {
       "executor": "nx:run-commands",
       "options": {
-        "command": "xcodebuild -scheme SyncTray -configuration Release -derivedDataPath build/DerivedData clean build ONLY_ACTIVE_ARCH=NO 2>&1 | tail -5",
+        "command": "xcodebuild -scheme SyncTray -configuration Release -derivedDataPath build clean build ONLY_ACTIVE_ARCH=NO DASH0_AUTH_TOKEN=\"${DASH0_AUTH_TOKEN:-}\" 2>&1 | tail -5",
         "cwd": "{projectRoot}"
       },
       "inputs": ["swift-sources", "project-config"],
@@ -58,7 +58,7 @@
             "description": "Remove old installation"
           },
           {
-            "command": "cp -R build/Debug/SyncTray.app /Applications/SyncTray.app",
+            "command": "cp -R build/Build/Products/Debug/SyncTray.app /Applications/SyncTray.app",
             "description": "Install to Applications"
           }
         ],

@@ -20,7 +20,7 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 SCHEME="SyncTray"
-BUILD_DIR="$PROJECT_DIR/build/Debug"
+BUILD_DIR="$PROJECT_DIR/build/Build/Products/Debug"
 APP_NAME="SyncTray.app"
 APP_PATH="$BUILD_DIR/$APP_NAME"
 

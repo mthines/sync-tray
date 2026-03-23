@@ -6,24 +6,19 @@ cd "$(dirname "$0")/.."
 
 APP_NAME="SyncTray"
 BUILD_DIR="$(pwd)/build"
-BUILD_PATH="$BUILD_DIR/Debug/SyncTray.app"
+BUILD_PATH="$BUILD_DIR/Build/Products/Debug/SyncTray.app"
 INSTALL_PATH="/Applications/$APP_NAME.app"
 
 # Clean and build the app
 echo "Cleaning build artifacts..."
 rm -rf "$BUILD_DIR"
-DERIVED_DATA="$HOME/Library/Developer/Xcode/DerivedData"
-# Remove ALL SyncTray DerivedData to force full recompile
-rm -rf "$DERIVED_DATA"/SyncTray-* 2>/dev/null && echo "Removed DerivedData cache"
-# Also clean via xcodebuild
-xcodebuild -scheme SyncTray clean -quiet 2>/dev/null || true
 
 echo "Building $APP_NAME (full rebuild)..."
-# Build with explicit derived data path to ensure clean state
-xcodebuild -scheme SyncTray -configuration Debug build \
-    SYMROOT="$BUILD_DIR" \
-    -derivedDataPath "$BUILD_DIR/DerivedData" \
-    2>&1 | grep -E "(error:|warning:.*error|BUILD)" || true
+# DASH0_AUTH_TOKEN is embedded in Info.plist if set in environment
+xcodebuild -scheme SyncTray -configuration Debug \
+    -derivedDataPath "$BUILD_DIR" \
+    DASH0_AUTH_TOKEN="${DASH0_AUTH_TOKEN:-}" \
+    build 2>&1 | grep -E "(error:|warning:.*error|BUILD)" || true
 
 if [ ! -d "$BUILD_PATH" ]; then
     echo "ERROR: Build failed - no app bundle found"

@@ -44,34 +44,69 @@ Telemetry is **disabled by default**. When a user opts in via Settings, the app 
 
 Two things are required:
 
-1. **Set the `DASH0_AUTH_TOKEN` environment variable** with a valid Dash0 auth token:
+1. **Configure environment variables** — copy `.env.example` to `~/.config/synctray/.env` and fill in your auth token:
 
    ```bash
-   # In your shell profile (~/.zshrc, ~/.bashrc, etc.)
-   export DASH0_AUTH_TOKEN="your-dash0-auth-token-here"
+   cp .env.example ~/.config/synctray/.env
+   # Edit ~/.config/synctray/.env with your Dash0 auth token
    ```
 
-   Or in Xcode: **Scheme > Run > Arguments > Environment Variables** — add `DASH0_AUTH_TOKEN`.
+   The app reads this file at runtime, so it works regardless of how the app is launched (Nx, Xcode, `open`, Finder, etc.). Process environment variables take precedence over `.env` file values.
 
-   > Without a valid token, the telemetry service skips initialization entirely (no wasted network requests).
+   > Without valid auth headers, the telemetry service skips initialization entirely (no wasted network requests).
 
 2. **Toggle "Anonymous Usage Data" ON** in the app's Settings window.
+
+### Environment Variables
+
+All configuration uses [standard OTel environment variables](https://opentelemetry.io/docs/languages/sdk-configuration/general/):
+
+| Variable                      | Required | Default                                          | Description                                                                                                                                                              |
+| ----------------------------- | -------- | ------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | No       | `https://ingress.europe-west4.gcp.dash0-dev.com` | Base OTLP endpoint URL. `/v1/traces` and `/v1/metrics` are appended automatically.                                                                                       |
+| `OTEL_EXPORTER_OTLP_HEADERS`  | Yes\*    | —                                                | Auth headers as comma-separated `Key=Value` pairs. e.g., `Authorization=Bearer <token>`                                                                                  |
+| `OTEL_SERVICE_NAME`           | No       | `synctray`                                       | The `service.name` resource attribute.                                                                                                                                   |
+| `OTEL_RESOURCE_ATTRIBUTES`    | No       | —                                                | Additional resource attributes as comma-separated `key=value` pairs. e.g., `deployment.environment.name=development,service.namespace=synctray`                          |
+| `DASH0_AUTH_TOKEN`            | No       | —                                                | Convenience alternative to `OTEL_EXPORTER_OTLP_HEADERS`. If set (and `OTEL_EXPORTER_OTLP_HEADERS` is not), automatically creates `Authorization: Bearer <token>` header. |
+
+\*Either `OTEL_EXPORTER_OTLP_HEADERS` or `DASH0_AUTH_TOKEN` must be set for telemetry to initialize.
+
+**Example `.env`:**
+
+```bash
+OTEL_SERVICE_NAME=synctray
+OTEL_EXPORTER_OTLP_ENDPOINT=https://ingress.europe-west4.gcp.dash0-dev.com
+OTEL_EXPORTER_OTLP_HEADERS=Authorization=Bearer dt0-your-token-here
+OTEL_RESOURCE_ATTRIBUTES=service.namespace=synctray,deployment.environment.name=development
+```
+
+Create a Dash0 auth token at **Settings > Auth Tokens > Create Token** with `Ingesting` permission.
+
+### Token for Release Builds (Distributed App)
+
+For end users to have telemetry work out of the box (when they opt in), the auth token must be embedded at build time via Info.plist variable substitution.
+
+The `DASH0_AUTH_TOKEN` Xcode build setting is empty by default (never committed to source). CI/release builds inject it:
+
+```bash
+# CI sets DASH0_AUTH_TOKEN as a secret, then:
+xcodebuild -scheme SyncTray -configuration Release \
+    -derivedDataPath build \
+    DASH0_AUTH_TOKEN="$DASH0_AUTH_TOKEN" \
+    build
+```
+
+The token is embedded in the app bundle's Info.plist as `Dash0AuthToken`. This is an **ingestion-only** token — it can only write telemetry data, not read or delete it.
+
+Config resolution priority (first non-empty wins):
+1. Process environment variables
+2. `~/.config/synctray/.env` file
+3. Info.plist values embedded at build time
 
 ### Disabling Telemetry
 
 - **In the app:** Toggle "Anonymous Usage Data" OFF in Settings. All telemetry methods become no-ops.
-- **At build time:** Simply don't set `DASH0_AUTH_TOKEN`. The service detects the placeholder value and skips setup.
-
-### Endpoint Configuration
-
-| Setting | Value |
-|---------|-------|
-| OTLP Endpoint | `https://ingress.europe-west4.gcp.dash0-dev.com` |
-| Metrics path | `/v1/metrics` |
-| Traces path | `/v1/traces` |
-| Auth header | `Authorization: Bearer $DASH0_AUTH_TOKEN` |
-
-The endpoint is hardcoded in `TelemetryService.swift`. To point at a different collector (e.g., a local one for testing), modify `TelemetryService.endpoint`.
+- **No auth configured:** If neither `OTEL_EXPORTER_OTLP_HEADERS` nor `DASH0_AUTH_TOKEN` is set (in env, `.env` file, or Info.plist), the service skips setup entirely.
 
 ### Running a Local Collector (Optional)
 
@@ -101,7 +136,12 @@ service:
 EOF
 ```
 
-Then change the endpoint in `TelemetryService.swift` to `http://localhost:4318`.
+Then set in your `.env`:
+
+```bash
+OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318
+OTEL_EXPORTER_OTLP_HEADERS=Authorization=Bearer unused
+```
 
 ### What's Collected
 
@@ -109,35 +149,35 @@ Then change the endpoint in `TelemetryService.swift` to `http://localhost:4318`.
 
 #### Metrics (exported every 60 seconds)
 
-| Metric | Type | Description |
-|--------|------|-------------|
-| `synctray.sync.duration` | Histogram | Sync operation duration (seconds) |
-| `synctray.sync.completed` | Counter | Number of completed sync operations |
-| `synctray.sync.files_changed` | Counter | Number of files changed during sync |
-| `synctray.app.profiles.active` | UpDownCounter | Number of active sync profiles |
-| `synctray.app.launch` | Counter | Number of app launches |
+| Metric                         | Type          | Description                         |
+| ------------------------------ | ------------- | ----------------------------------- |
+| `synctray.sync.duration`       | Histogram     | Sync operation duration (seconds)   |
+| `synctray.sync.completed`      | Counter       | Number of completed sync operations |
+| `synctray.sync.files_changed`  | Counter       | Number of files changed during sync |
+| `synctray.app.profiles.active` | UpDownCounter | Number of active sync profiles      |
+| `synctray.app.launch`          | Counter       | Number of app launches              |
 
 All sync metrics include `sync.mode` (bisync/sync/mount) and `sync.result` (success/failure) attributes.
 
 #### Traces
 
-| Span | Kind | Attributes |
-|------|------|------------|
+| Span           | Kind     | Attributes                                       |
+| -------------- | -------- | ------------------------------------------------ |
 | `sync.execute` | INTERNAL | `sync.mode`, `sync.result`, `sync.files_changed` |
 
 #### Resource Attributes
 
-Every signal includes:
+Every signal includes these resource attributes (overridable via `OTEL_RESOURCE_ATTRIBUTES`):
 
-| Attribute | Value |
-|-----------|-------|
-| `service.name` | `synctray` |
-| `service.namespace` | `synctray` |
-| `service.version` | App bundle version |
-| `service.instance.id` | Anonymous UUID (generated on first opt-in) |
-| `deployment.environment.name` | `production` |
-| `os.type` | `darwin` |
-| `os.version` | macOS version string |
+| Attribute                     | Default              | Source                             |
+| ----------------------------- | -------------------- | ---------------------------------- |
+| `service.name`                | `synctray`           | `OTEL_SERVICE_NAME` env var        |
+| `service.namespace`           | `synctray`           | Hardcoded                          |
+| `service.version`             | App bundle version   | `CFBundleShortVersionString`       |
+| `service.instance.id`         | Anonymous UUID       | Generated on first opt-in          |
+| `deployment.environment.name` | —                    | `OTEL_RESOURCE_ATTRIBUTES` env var |
+| `os.type`                     | `darwin`             | Hardcoded                          |
+| `os.version`                  | macOS version string | `ProcessInfo`                      |
 
 ### Dependencies
 
@@ -149,13 +189,13 @@ The telemetry feature uses [opentelemetry-swift](https://github.com/open-telemet
 
 ### Key Files
 
-| File | Role |
-|------|------|
-| `Services/TelemetryService.swift` | Singleton that configures OTel SDK, creates instruments, and records signals |
-| `Models/Settings.swift` | `telemetryEnabled` and `installationId` in UserDefaults |
-| `SyncTrayApp.swift` | Calls `configure()` at launch, `shutdown()` at termination |
-| `Services/SyncManager.swift` | Records sync completions and profile counts |
-| `Views/Settings/ProfileDetailView.swift` | UI toggle for opting in/out |
+| File                                     | Role                                                                         |
+| ---------------------------------------- | ---------------------------------------------------------------------------- |
+| `Services/TelemetryService.swift`        | Singleton that configures OTel SDK, creates instruments, and records signals |
+| `Models/Settings.swift`                  | `telemetryEnabled` and `installationId` in UserDefaults                      |
+| `SyncTrayApp.swift`                      | Calls `configure()` at launch, `shutdown()` at termination                   |
+| `Services/SyncManager.swift`             | Records sync completions and profile counts                                  |
+| `Views/Settings/ProfileDetailView.swift` | UI toggle for opting in/out                                                  |
 
 ## Debugging
 

@@ -5,12 +5,14 @@
   "scripts": {
     "build": "nx run synctray:build",
     "build:release": "nx run synctray:build:release",
-    "app:install": "nx run synctray:install",
-    "app:install:launch": "nx run synctray:install:launch",
-    "release": "nx run synctray:release",
-    "dev": "nx run synctray:dev",
-    "clean": "nx run synctray:clean",
     "test": "nx run synctray:test",
+    "clean": "nx run synctray:clean",
+    "install": "nx run synctray:install",
+    "install:launch": "nx run synctray:install:launch",
+    "install:full": "nx run synctray:install:full",
+    "install:full:launch": "nx run synctray:install:full:launch",
+    "dev": "nx run synctray:dev",
+    "release": "nx run synctray:release",
     "reset": "nx reset"
   },
   "devDependencies": {

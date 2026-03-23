@@ -28,6 +28,11 @@ tasks
 *.swo
 *~
 
+# Secrets
+.env
+.env.local
+.env.*.local
+
 # Node / Nx
 node_modules/
 .nx/
