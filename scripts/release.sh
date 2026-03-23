@@ -229,16 +229,34 @@ build_release() {
 
     mkdir -p "$BUILD_DIR"
 
-    xcodebuild -project "$XCODEPROJ" \
+    local build_output
+    build_output=$(xcodebuild -project "$XCODEPROJ" \
         -scheme "$SCHEME" \
         -configuration Release \
         -derivedDataPath "$BUILD_DIR/DerivedData" \
         clean build \
         ONLY_ACTIVE_ARCH=NO \
         DASH0_AUTH_TOKEN="${DASH0_AUTH_TOKEN:-}" \
-        2>&1 | tail -5
+        2>&1)
 
-    log_success "Build completed"
+    if [ $? -ne 0 ]; then
+        echo "$build_output" | tail -30
+        log_error "Build failed"
+    fi
+
+    # Validate the built app bundle
+    local app_path="$BUILD_DIR/DerivedData/Build/Products/Release/${PROJECT_NAME}.app"
+    local binary="$app_path/Contents/MacOS/${PROJECT_NAME}"
+
+    if [ ! -f "$binary" ]; then
+        log_error "Binary not found at $binary — build produced an empty app bundle"
+    fi
+
+    if ! codesign -v "$app_path" 2>/dev/null; then
+        log_warning "App bundle has invalid code signature"
+    fi
+
+    log_success "Build completed ($(lipo -info "$binary" 2>/dev/null | sed 's/.*: //'))"
 }
 
 # Create release zip
@@ -253,6 +271,15 @@ create_zip() {
     fi
 
     ditto -c -k --sequesterRsrc --keepParent "$app_path" "$zip_path"
+
+    # Validate zip by extracting to temp dir and checking binary exists
+    local verify_dir=$(mktemp -d)
+    ditto -x -k "$zip_path" "$verify_dir"
+    if [ ! -f "$verify_dir/${PROJECT_NAME}.app/Contents/MacOS/${PROJECT_NAME}" ]; then
+        rm -rf "$verify_dir"
+        log_error "Zip verification failed — extracted app has no binary"
+    fi
+    rm -rf "$verify_dir"
 
     log_success "Created $zip_name ($(du -h "$zip_path" | cut -f1))"
     echo "$zip_path"

@@ -466,13 +466,13 @@ final class SyncSetupService {
                         # This preserves bisync cache since the remote name stays the same
                         UPPER_NAME=$(echo "$REMOTE_NAME" | tr '[:lower:]' '[:upper:]' | tr '-' '_')
                         eval "$($RCLONE_BIN config dump 2>/dev/null | python3 -c "
-import json, sys
-d = json.load(sys.stdin).get('${FALLBACK_REMOTE}', {})
-name = '${UPPER_NAME}'
-for k, v in d.items():
-    safe_k = k.upper().replace('-', '_')
-    print(f'export RCLONE_CONFIG_{name}_{safe_k}=\\\"' + str(v).replace('\\\"', '\\\\\\\"') + '\\\"')
-")"
+            import json, sys
+            d = json.load(sys.stdin).get('${FALLBACK_REMOTE}', {})
+            name = '${UPPER_NAME}'
+            for k, v in d.items():
+                safe_k = k.upper().replace('-', '_')
+                print(f'export RCLONE_CONFIG_{name}_{safe_k}=\\\"' + str(v).replace('\\\"', '\\\\\\\"') + '\\\"')
+            ")"
                     else
                         # Different path structure: swap entire REMOTE reference
                         REMOTE="${FALLBACK_REMOTE}:${FALLBACK_PATH}"
