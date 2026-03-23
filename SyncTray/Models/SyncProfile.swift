@@ -22,8 +22,10 @@ struct SyncProfile: Identifiable, Codable, Equatable {
     // Mount mode specific settings
     var vfsCacheMode: VFSCacheMode      // VFS cache mode for mount (default: full)
     var vfsCacheMaxSize: String         // Max cache size (e.g., "10G")
-    var vfsCachePath: String            // Cache directory path (default: ~/.cache/rclone/vfs)
+    var vfsCachePath: String            // Cache directory path (default: ~/.cache/rclone)
     var allowNonEmptyMount: Bool        // Allow mounting to non-empty folders (default: false)
+    var pinnedDirectories: [String]     // Directories to automatically cache offline (mount mode)
+    var rcPort: Int                     // Port for rclone RC (remote control) API (mount mode)
 
     /// Short ID for file naming (first 8 chars of UUID)
     var shortId: String {
@@ -129,7 +131,9 @@ struct SyncProfile: Identifiable, Codable, Equatable {
         vfsCacheMode: VFSCacheMode = .full,
         vfsCacheMaxSize: String = "10G",
         vfsCachePath: String = "",
-        allowNonEmptyMount: Bool = false
+        allowNonEmptyMount: Bool = false,
+        pinnedDirectories: [String] = [],
+        rcPort: Int = 0
     ) {
         self.id = id
         self.name = name
@@ -147,8 +151,21 @@ struct SyncProfile: Identifiable, Codable, Equatable {
         self.fallbackRemotePath = fallbackRemotePath
         self.vfsCacheMode = vfsCacheMode
         self.vfsCacheMaxSize = vfsCacheMaxSize
-        self.vfsCachePath = vfsCachePath.isEmpty ? "\(NSHomeDirectory())/.cache/rclone/vfs" : vfsCachePath
+        self.vfsCachePath = vfsCachePath.isEmpty ? "\(NSHomeDirectory())/.cache/rclone" : vfsCachePath
         self.allowNonEmptyMount = allowNonEmptyMount
+        self.pinnedDirectories = pinnedDirectories
+        self.rcPort = rcPort > 0 ? rcPort : SyncProfile.defaultRCPort(for: id)
+    }
+
+    /// Generate a deterministic RC port from the profile UUID (range: 5800-5899)
+    /// Uses djb2 hash for stability (Swift's hashValue is randomized per process)
+    static func defaultRCPort(for id: UUID) -> Int {
+        let bytes = Array(id.uuidString.utf8)
+        var hash: UInt32 = 5381
+        for byte in bytes {
+            hash = ((hash &<< 5) &+ hash) &+ UInt32(byte)
+        }
+        return 5800 + Int(hash % 100)
     }
 
     /// Create a new profile with default values
@@ -166,6 +183,7 @@ extension SyncProfile {
         case isEnabled, isMuted, syncMode, syncDirection
         case fallbackRemote, fallbackRemotePath
         case vfsCacheMode, vfsCacheMaxSize, vfsCachePath, allowNonEmptyMount
+        case pinnedDirectories, rcPort
     }
 
     init(from decoder: Decoder) throws {
@@ -192,9 +210,14 @@ extension SyncProfile {
         vfsCacheMode = try container.decodeIfPresent(VFSCacheMode.self, forKey: .vfsCacheMode) ?? .full
         vfsCacheMaxSize = try container.decodeIfPresent(String.self, forKey: .vfsCacheMaxSize) ?? "10G"
         let cachePath = try container.decodeIfPresent(String.self, forKey: .vfsCachePath) ?? ""
-        vfsCachePath = cachePath.isEmpty ? "\(NSHomeDirectory())/.cache/rclone/vfs" : cachePath
+        vfsCachePath = cachePath.isEmpty ? "\(NSHomeDirectory())/.cache/rclone" : cachePath
         // Backwards compatibility: default to false if not present
         allowNonEmptyMount = try container.decodeIfPresent(Bool.self, forKey: .allowNonEmptyMount) ?? false
+        // Backwards compatibility: default to empty array if not present
+        pinnedDirectories = try container.decodeIfPresent([String].self, forKey: .pinnedDirectories) ?? []
+        // Backwards compatibility: generate default RC port if not present
+        let decodedRCPort = try container.decodeIfPresent(Int.self, forKey: .rcPort) ?? 0
+        rcPort = decodedRCPort > 0 ? decodedRCPort : SyncProfile.defaultRCPort(for: id)
     }
 }
 
