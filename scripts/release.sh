@@ -252,8 +252,7 @@ create_zip() {
         log_error "App not found at $app_path"
     fi
 
-    cd "$BUILD_DIR/DerivedData/Build/Products/Release"
-    zip -rq "$zip_path" "${PROJECT_NAME}.app"
+    ditto -c -k --sequesterRsrc --keepParent "$app_path" "$zip_path"
 
     log_success "Created $zip_name ($(du -h "$zip_path" | cut -f1))"
     echo "$zip_path"
