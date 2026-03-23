@@ -59,7 +59,7 @@ kill_app() {
     pkill -x "SyncTray" 2>/dev/null || true
 }
 
-# Build the app
+# Build the app (incremental — only recompiles changed files)
 build_app() {
     log_info "Building $SCHEME..."
 
@@ -68,6 +68,8 @@ build_app() {
         -configuration Debug \
         -derivedDataPath "$PROJECT_DIR/build" \
         -destination "platform=macOS" \
+        ONLY_ACTIVE_ARCH=YES \
+        DASH0_AUTH_TOKEN="${DASH0_AUTH_TOKEN:-}" \
         build 2>&1 | grep -E "(error:|warning:|BUILD SUCCEEDED|BUILD FAILED)"; then
 
         if [ -d "$APP_PATH" ]; then
@@ -91,6 +93,10 @@ launch_app() {
     fi
 }
 
+# Debounce: track last build time to avoid rapid rebuilds
+LAST_BUILD_TIME=0
+DEBOUNCE_SECONDS=2
+
 # Handle file changes
 on_change() {
     local changed_file="$1"
@@ -103,6 +109,14 @@ on_change() {
             return
             ;;
     esac
+
+    # Debounce: skip if last build was less than DEBOUNCE_SECONDS ago
+    local now
+    now=$(date +%s)
+    if (( now - LAST_BUILD_TIME < DEBOUNCE_SECONDS )); then
+        return
+    fi
+    LAST_BUILD_TIME=$now
 
     echo ""
     log_info "File changed: $(basename "$changed_file")"
@@ -147,8 +161,9 @@ fi
 echo ""
 log_info "Watching for file changes in SyncTray/..."
 
-# Watch for changes
+# Watch for changes (--latency debounces at the fswatch level too)
 fswatch -0 -r \
+    --latency 1.5 \
     --include='\.swift$' \
     --include='\.xib$' \
     --include='\.storyboard$' \
