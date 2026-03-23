@@ -60,6 +60,14 @@ struct ProfileDetailView: View {
     // Setup wizard for reconfiguring the profile
     @State private var showingReconfigureWizard: Bool = false
 
+    // Add remote sheet — tracks which picker opened it
+    @State private var addRemoteTarget: AddRemoteTarget?
+
+    enum AddRemoteTarget: Identifiable {
+        case primary, fallback
+        var id: Self { self }
+    }
+
     private let setupService = SyncSetupService.shared
 
     // MARK: - Computed Properties
@@ -255,6 +263,18 @@ struct ProfileDetailView: View {
         .sheet(isPresented: $showingReconfigureWizard) {
             SetupWizardView(profileStore: profileStore, editing: profile)
         }
+        .sheet(item: $addRemoteTarget) { target in
+            AddRemoteSheet { newRemoteName in
+                loadRcloneRemotes()
+                let name = newRemoteName.hasSuffix(":") ? String(newRemoteName.dropLast()) : newRemoteName
+                switch target {
+                case .primary:
+                    rcloneRemote = name
+                case .fallback:
+                    fallbackRemote = name
+                }
+            }
+        }
     }
 
     // MARK: - Sections
@@ -414,6 +434,11 @@ struct ProfileDetailView: View {
                             .frame(maxWidth: 200)
                     }
 
+                    Button(action: { addRemoteTarget = .primary }) {
+                        Image(systemName: "plus")
+                    }
+                    .help("Setup a new remote")
+
                     Button(action: loadRcloneRemotes) {
                         Image(systemName: "arrow.clockwise")
                     }
@@ -426,7 +451,7 @@ struct ProfileDetailView: View {
                         .font(.caption)
                         .foregroundStyle(.orange)
                 } else if availableRemotes.isEmpty && !isLoadingRemotes {
-                    Text("Run `rclone listremotes` in Terminal to see configured remotes")
+                    Text("No remotes configured yet. Click + to create one.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -1191,19 +1216,33 @@ struct ProfileDetailView: View {
                     if isLoadingRemotes {
                         ProgressView()
                             .controlSize(.small)
-                    } else if availableRemotes.isEmpty {
-                        Text("No remotes found. Create one with the Setup Wizard first.")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
                     } else {
-                        Picker("", selection: $fallbackRemote) {
-                            Text("Select a remote...").tag("")
-                            ForEach(availableRemotes.filter { $0 != rcloneRemote }, id: \.self) { remote in
-                                Text(remote).tag(remote)
+                        HStack {
+                            if availableRemotes.filter({ $0 != rcloneRemote }).isEmpty {
+                                Text("No other remotes found")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            } else {
+                                Picker("", selection: $fallbackRemote) {
+                                    Text("Select a remote...").tag("")
+                                    ForEach(availableRemotes.filter { $0 != rcloneRemote }, id: \.self) { remote in
+                                        Text(remote).tag(remote)
+                                    }
+                                }
+                                .pickerStyle(.menu)
+                                .frame(maxWidth: 250, alignment: .leading)
                             }
+
+                            Button(action: { addRemoteTarget = .fallback }) {
+                                Image(systemName: "plus")
+                            }
+                            .help("Setup a new remote")
+
+                            Button(action: loadRcloneRemotes) {
+                                Image(systemName: "arrow.clockwise")
+                            }
+                            .help("Refresh remotes list")
                         }
-                        .pickerStyle(.menu)
-                        .frame(maxWidth: 250, alignment: .leading)
                     }
                 }
 

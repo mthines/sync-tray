@@ -7,6 +7,7 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		AB12CD34EF56789012340001 /* AddRemoteSheet.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB12CD34EF56789012340002 /* AddRemoteSheet.swift */; };
 		1D86AAFD8D8099734E2357A8 /* SyncMode.swift in Sources */ = {isa = PBXBuildFile; fileRef = 406416A46963E44FF701814B /* SyncMode.swift */; };
 		58578B4CF51E7600D4E39636 /* ProviderFieldsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 77CC26F6DC209C0F0B6626D7 /* ProviderFieldsView.swift */; };
 		7D9FBA7536F4EB2EDCAEE043 /* RcloneConfigService.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0DC6141FBB853681643F593 /* RcloneConfigService.swift */; };
@@ -45,6 +46,7 @@
 /* Begin PBXFileReference section */
 		406416A46963E44FF701814B /* SyncMode.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = SyncMode.swift; sourceTree = "<group>"; };
 		77CC26F6DC209C0F0B6626D7 /* ProviderFieldsView.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = ProviderFieldsView.swift; sourceTree = "<group>"; };
+		AB12CD34EF56789012340002 /* AddRemoteSheet.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = AddRemoteSheet.swift; sourceTree = "<group>"; };
 		8DF29F3BB633D9E3DD12136A /* SetupWizardView.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = SetupWizardView.swift; sourceTree = "<group>"; };
 		A10000000000000000000001 /* SyncTrayApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SyncTrayApp.swift; sourceTree = "<group>"; };
 		A10000000000000000000002 /* SyncState.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SyncState.swift; sourceTree = "<group>"; };
@@ -97,6 +99,7 @@
 			children = (
 				8DF29F3BB633D9E3DD12136A /* SetupWizardView.swift */,
 				77CC26F6DC209C0F0B6626D7 /* ProviderFieldsView.swift */,
+				AB12CD34EF56789012340002 /* AddRemoteSheet.swift */,
 			);
 			name = Wizard;
 			path = Wizard;
@@ -298,6 +301,7 @@
 				7D9FBA7536F4EB2EDCAEE043 /* RcloneConfigService.swift in Sources */,
 				D347B9A6D156102131579DED /* SetupWizardView.swift in Sources */,
 				58578B4CF51E7600D4E39636 /* ProviderFieldsView.swift in Sources */,
+				AB12CD34EF56789012340001 /* AddRemoteSheet.swift in Sources */,
 				E1A0B1C2D3E4F56789AB0001 /* VFSCacheService.swift in Sources */,
 				E1A0B1C2D3E4F56789AB0003 /* OfflineFilesSection.swift in Sources */,
 				F2B3C4D5E6F7089012AB0001 /* MigrationRunner.swift in Sources */,
