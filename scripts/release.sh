@@ -40,7 +40,7 @@ load_env() {
         done < "$env_file"
         log_info "Loaded env from $env_file"
         if [ -n "${DASH0_AUTH_TOKEN:-}" ]; then
-            log_success "DASH0_AUTH_TOKEN is set (${#DASH0_AUTH_TOKEN} chars)"
+            log_success "DASH0_AUTH_TOKEN is set"
         else
             log_warning "DASH0_AUTH_TOKEN is not set — telemetry token will not be embedded"
         fi
