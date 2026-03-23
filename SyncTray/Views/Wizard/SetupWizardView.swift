@@ -726,6 +726,7 @@ struct ProviderCard: View {
                 RoundedRectangle(cornerRadius: 8)
                     .stroke(isSelected ? Color.accentColor : Color.gray.opacity(0.3), lineWidth: isSelected ? 2 : 1)
             )
+            .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
     }
