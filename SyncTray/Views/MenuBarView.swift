@@ -286,26 +286,6 @@ struct MenuBarView: View {
             Divider()
                 .padding(.vertical, 4)
 
-            // Launch at Login toggle
-            HStack {
-                Toggle(isOn: Binding(
-                    get: { syncManager.isLoginItemEnabled },
-                    set: { enabled in
-                        if enabled {
-                            syncManager.enableLoginItem()
-                        } else {
-                            syncManager.disableLoginItem()
-                        }
-                    }
-                )) {
-                    Text("Launch at Login")
-                }
-                .toggleStyle(.checkbox)
-                Spacer()
-            }
-            .padding(.horizontal, 8)
-            .padding(.vertical, 4)
-
             // Settings button
             Button(action: { openSettingsWindow() }) {
                 HStack {

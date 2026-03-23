@@ -3,10 +3,16 @@ import SwiftUI
 struct ProfileListView: View {
     @ObservedObject var profileStore: ProfileStore
     @EnvironmentObject var syncManager: SyncManager
-    @Binding var selection: UUID?
+    @Binding var selection: SidebarSelection?
 
     @State private var showingDeleteConfirmation = false
     @State private var showingSetupWizard = false
+
+    /// The currently selected profile ID, if a profile is selected
+    private var selectedProfileId: UUID? {
+        if case .profile(let id) = selection { return id }
+        return nil
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -23,7 +29,7 @@ struct ProfileListView: View {
                         isPaused: syncManager.isPaused(for: profile.id),
                         progress: syncManager.profileProgress[profile.id]
                     )
-                    .tag(profile.id)
+                    .tag(SidebarSelection.profile(profile.id))
                     .contextMenu {
                         Button(syncManager.isPaused(for: profile.id) ? "Resume Syncing" : "Pause Syncing") {
                             syncManager.togglePause(for: profile.id)
@@ -40,28 +46,50 @@ struct ProfileListView: View {
 
             Divider()
 
+            // App Settings row
+            Button(action: { selection = .appSettings }) {
+                HStack(spacing: 8) {
+                    Image(systemName: "gearshape")
+                        .font(.system(size: 12))
+                        .foregroundStyle(selection == .appSettings ? .primary : .secondary)
+                    Text("App Settings")
+                        .font(.system(size: 13))
+                        .foregroundStyle(selection == .appSettings ? .primary : .secondary)
+                    Spacer()
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 8)
+                .background(selection == .appSettings ? Color.accentColor.opacity(0.15) : Color.clear)
+                .clipShape(.rect(cornerRadius: 6))
+            }
+            .buttonStyle(.plain)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 4)
+
+            Divider()
+
             // Action buttons bar at bottom
             HStack(spacing: 12) {
                 Button(action: addProfile) {
                     Image(systemName: "plus")
-                        .foregroundColor(.primary)
+                        .foregroundStyle(.primary)
                 }
                 .buttonStyle(.borderless)
                 .help("Add Profile")
 
                 Button(action: { showingSetupWizard = true }) {
                     Image(systemName: "wand.and.stars")
-                        .foregroundColor(.primary)
+                        .foregroundStyle(.primary)
                 }
                 .buttonStyle(.borderless)
                 .help("Setup Wizard")
 
                 Button(action: { showingDeleteConfirmation = true }) {
                     Image(systemName: "trash")
-                        .foregroundColor(selection == nil ? .secondary : .primary)
+                        .foregroundStyle(selectedProfileId == nil ? .secondary : .primary)
                 }
                 .buttonStyle(.borderless)
-                .disabled(selection == nil)
+                .disabled(selectedProfileId == nil)
                 .help("Delete Profile")
 
                 Spacer()
@@ -76,7 +104,7 @@ struct ProfileListView: View {
             Button("Cancel", role: .cancel) {}
             Button("Delete", role: .destructive) { deleteSelectedProfile() }
         } message: {
-            if let selectedId = selection,
+            if let selectedId = selectedProfileId,
                let profile = profileStore.profile(for: selectedId) {
                 Text("Are you sure you want to delete \"\(profile.name.isEmpty ? "Untitled Profile" : profile.name)\"? This will also uninstall its scheduled sync.")
             } else {
@@ -87,11 +115,11 @@ struct ProfileListView: View {
 
     private func addProfile() {
         let profile = profileStore.createNewProfile()
-        selection = profile.id
+        selection = .profile(profile.id)
     }
 
     private func deleteSelectedProfile() {
-        guard let selectedId = selection,
+        guard let selectedId = selectedProfileId,
               let profile = profileStore.profile(for: selectedId) else { return }
         deleteProfile(profile)
     }
@@ -125,7 +153,7 @@ struct ProfileRow: View {
             if isPaused {
                 Image(systemName: "pause.circle.fill")
                     .font(.system(size: 10))
-                    .foregroundColor(.gray)
+                    .foregroundStyle(.gray)
             } else {
                 Circle()
                     .fill(statusColor)
@@ -135,23 +163,23 @@ struct ProfileRow: View {
             VStack(alignment: .leading, spacing: 2) {
                 Text(profile.name.isEmpty ? "Untitled Profile" : profile.name)
                     .font(.system(size: 13, weight: .medium))
-                    .foregroundColor(isPaused ? .secondary : .primary)
+                    .foregroundStyle(isPaused ? .secondary : .primary)
                     .lineLimit(1)
 
                 if isPaused {
                     Text("Paused")
                         .font(.system(size: 11))
-                        .foregroundColor(.secondary)
+                        .foregroundStyle(.secondary)
                         .italic()
                 } else if isInstalled {
                     Text(profile.fullRemotePath)
                         .font(.system(size: 11))
-                        .foregroundColor(.secondary)
+                        .foregroundStyle(.secondary)
                         .lineLimit(1)
                 } else {
                     Text("Not configured")
                         .font(.system(size: 11))
-                        .foregroundColor(.secondary)
+                        .foregroundStyle(.secondary)
                         .italic()
                 }
             }
@@ -164,7 +192,7 @@ struct ProfileRow: View {
                     // Show progress percentage when available
                     Text("\(Int(progress.percentage))%")
                         .font(.system(size: 11, weight: .medium))
-                        .foregroundColor(.secondary)
+                        .foregroundStyle(.secondary)
                         .monospacedDigit()
                 } else {
                     // Show spinner when syncing but no progress yet

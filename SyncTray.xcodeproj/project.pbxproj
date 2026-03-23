@@ -41,6 +41,7 @@
 		OT00000000000000000000C1 /* OpenTelemetryApi in Frameworks */ = {isa = PBXBuildFile; productRef = OT00000000000000000000D1 /* OpenTelemetryApi */; };
 		OT00000000000000000000C2 /* OpenTelemetrySdk in Frameworks */ = {isa = PBXBuildFile; productRef = OT00000000000000000000D2 /* OpenTelemetrySdk */; };
 		OT00000000000000000000C3 /* OpenTelemetryProtocolExporterHTTP in Frameworks */ = {isa = PBXBuildFile; productRef = OT00000000000000000000D3 /* OpenTelemetryProtocolExporterHTTP */; };
+		A11111110000000000000019 /* AppSettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000019 /* AppSettingsView.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -78,6 +79,7 @@
 		E1A0B1C2D3E4F56789AB0004 /* OfflineFilesSection.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OfflineFilesSection.swift; sourceTree = "<group>"; };
 		F2B3C4D5E6F7089012AB0002 /* MigrationRunner.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MigrationRunner.swift; sourceTree = "<group>"; };
 		OT00000000000000000000A1 /* TelemetryService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TelemetryService.swift; sourceTree = "<group>"; };
+		A10000000000000000000019 /* AppSettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppSettingsView.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -166,6 +168,7 @@
 				A10000000000000000000009 /* StatusHeaderView.swift */,
 				A1000000000000000000000A /* RecentChangesView.swift */,
 				A1000000000000000000000F /* SettingsView.swift */,
+				A10000000000000000000019 /* AppSettingsView.swift */,
 				A10000000000000000000014 /* ProfileListView.swift */,
 				A10000000000000000000015 /* SyncProgressDetailView.swift */,
 				A13000000000000000000008 /* Settings */,
@@ -291,6 +294,7 @@
 				A11111110000000000000009 /* StatusHeaderView.swift in Sources */,
 				A1111111000000000000000A /* RecentChangesView.swift in Sources */,
 				A1111111000000000000000F /* SettingsView.swift in Sources */,
+				A11111110000000000000019 /* AppSettingsView.swift in Sources */,
 				A11111110000000000000014 /* ProfileListView.swift in Sources */,
 				A11111110000000000000015 /* SyncProgressDetailView.swift in Sources */,
 				A11111110000000000000016 /* DirectoryWatcher.swift in Sources */,

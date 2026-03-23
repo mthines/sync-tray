@@ -1367,51 +1367,6 @@ struct ProfileDetailView: View {
 
             Divider()
 
-            // Debug Logging
-            VStack(alignment: .leading, spacing: 4) {
-                Toggle(isOn: Binding(
-                    get: { SyncTraySettings.debugLoggingEnabled },
-                    set: { SyncTraySettings.debugLoggingEnabled = $0 }
-                )) {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("Debug Logging")
-                            .font(.subheadline.weight(.medium))
-                        Text("Log file watcher events and sync triggers to Console")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-                }
-                .toggleStyle(.switch)
-                .controlSize(.small)
-            }
-
-            Divider()
-
-            // Anonymous Telemetry
-            VStack(alignment: .leading, spacing: 4) {
-                Toggle(isOn: Binding(
-                    get: { SyncTraySettings.telemetryEnabled },
-                    set: { newValue in
-                        SyncTraySettings.telemetryEnabled = newValue
-                        if newValue {
-                            TelemetryService.shared.configure()
-                        }
-                    }
-                )) {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("Anonymous Usage Data")
-                            .font(.subheadline.weight(.medium))
-                        Text("Anonymous usage data helps find bugs and improve performance. No file paths, account names, or personal information is collected. This is completely optional and deeply appreciated.")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-                }
-                .toggleStyle(.switch)
-                .controlSize(.small)
-            }
-
-            Divider()
-
             // Reconfigure Remote
             VStack(alignment: .leading, spacing: 4) {
                 Text("Reconfigure Profile")
