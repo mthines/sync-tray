@@ -14,9 +14,6 @@ struct SyncTrayApp: App {
         // Initialize telemetry (no-op if disabled)
         TelemetryService.shared.configure()
 
-        // Initialize telemetry (no-op if disabled)
-        TelemetryService.shared.configure()
-
         // Create the sync manager
         let manager = SyncManager()
         _syncManager = StateObject(wrappedValue: manager)

@@ -123,7 +123,8 @@ final class TelemetryService {
     }
 
     private func setupOTel() {
-        // Skip setup if no auth headers are configured
+        // Skip if already configured or no auth headers
+        guard meterProvider == nil else { return }
         guard !Self.authHeaders.isEmpty else { return }
 
         let resource = buildResource()
@@ -143,6 +144,10 @@ final class TelemetryService {
 
         let stableMeterProvider = StableMeterProviderSdk.builder()
             .setResource(resource: resource)
+            .registerView(
+                selector: InstrumentSelector.builder().setInstrument(name: ".*").build(),
+                view: StableView.builder().build()
+            )
             .registerMetricReader(reader: metricReader)
             .build()
 
@@ -889,3 +894,4 @@ final class TelemetryService {
     }
 
 }
+
