@@ -754,6 +754,7 @@ final class TelemetryService {
             ResourceAttributes.serviceNamespace.rawValue: .string("synctray"),
             ResourceAttributes.serviceVersion.rawValue: .string(version),
             "service.instance.id": .string(SyncTraySettings.installationId),
+            "enduser.id": .string(SyncTraySettings.anonymousUserId),
             ResourceAttributes.osType.rawValue: .string("darwin"),
             ResourceAttributes.osVersion.rawValue: .string(osVersion),
         ]
