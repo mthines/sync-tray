@@ -23,7 +23,7 @@ struct TelemetryOptInBanner: View {
                 VStack(alignment: .leading, spacing: 2) {
                     Text("Help improve SyncTray")
                         .font(.subheadline.weight(.medium))
-                    Text("Share anonymous usage data to help development. No file names or sensitive data — just usage patterns. Completely optional.")
+                    Text("Share anonymous usage data to help development. No file names or sensitive data — just usage patterns. Completely optional. You can always change this in App Settings.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
