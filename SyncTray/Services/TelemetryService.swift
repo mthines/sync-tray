@@ -133,11 +133,12 @@ final class TelemetryService {
         let metricsEndpoint = URL(string: "\(Self.endpoint)/v1/metrics")!
         let metricsExporter = StableOtlpHTTPMetricExporter(
             endpoint: metricsEndpoint,
+            aggregationTemporalitySelector: AggregationTemporality.deltaPreferred(),
             envVarHeaders: Self.authHeaders
         )
 
         let metricReader = StablePeriodicMetricReaderBuilder(exporter: metricsExporter)
-            .setInterval(timeInterval: 60)
+            .setInterval(timeInterval: 30)
             .build()
 
         let stableMeterProvider = StableMeterProviderSdk.builder()
