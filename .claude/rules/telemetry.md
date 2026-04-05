@@ -168,6 +168,25 @@ All key lifecycle events are emitted as structured OTel logs:
 - Profile configuration snapshots (RUM — sync mode, interval, feature toggles)
 - Configuration summary (profile count breakdown by mode)
 
+## Swift SDK Gotcha: Wildcard View Required
+
+opentelemetry-swift 1.17.1's stable metrics API requires an explicit view registration
+with a `".*"` wildcard selector. Without it, instruments silently record to no-op storage
+and `collectAllMetrics()` returns empty. This differs from every other OTel SDK.
+
+```swift
+StableMeterProviderSdk.builder()
+    .setResource(resource: resource)
+    .registerView(
+        selector: InstrumentSelector.builder().setInstrument(name: ".*").build(),
+        view: StableView.builder().build()
+    )
+    .registerMetricReader(reader: metricReader)
+    .build()
+```
+
+Ref: https://github.com/open-telemetry/opentelemetry-swift/issues/500
+
 ## Configuration
 
 Priority (first non-empty wins):
