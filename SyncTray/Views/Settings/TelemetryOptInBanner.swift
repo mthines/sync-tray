@@ -2,6 +2,8 @@ import SwiftUI
 
 /// A dismissable banner encouraging users to opt in to anonymous telemetry.
 /// Shown at the top of the profile detail view until the user either opts in or dismisses it.
+/// Uses a consent version so the banner can be re-surfaced by bumping
+/// `SyncTraySettings.currentTelemetryConsentVersion`.
 struct TelemetryOptInBanner: View {
     @State private var telemetryEnabled = SyncTraySettings.telemetryEnabled
     @State private var dismissed = SyncTraySettings.telemetryBannerDismissed
@@ -31,6 +33,7 @@ struct TelemetryOptInBanner: View {
 
                 Button("Enable") {
                     SyncTraySettings.telemetryEnabled = true
+                    SyncTraySettings.telemetryBannerDismissedVersion = SyncTraySettings.currentTelemetryConsentVersion
                     TelemetryService.shared.configure()
                     withAnimation(.easeOut(duration: 0.2)) {
                         telemetryEnabled = true
@@ -40,7 +43,7 @@ struct TelemetryOptInBanner: View {
                 .controlSize(.small)
 
                 Button {
-                    SyncTraySettings.telemetryBannerDismissed = true
+                    SyncTraySettings.telemetryBannerDismissedVersion = SyncTraySettings.currentTelemetryConsentVersion
                     withAnimation(.easeOut(duration: 0.2)) {
                         dismissed = true
                     }

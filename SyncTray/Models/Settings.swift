@@ -29,7 +29,7 @@ struct SyncTraySettings {
         // Telemetry settings
         static let telemetryEnabled = "telemetryEnabled"
         static let installationId = "installationId"
-        static let telemetryBannerDismissed = "telemetryBannerDismissed"
+        static let telemetryBannerDismissedVersion = "telemetryBannerDismissedVersion"
     }
 
     // MARK: - Telemetry Settings
@@ -79,10 +79,20 @@ struct SyncTraySettings {
         return uuid
     }
 
-    /// Whether the telemetry opt-in banner has been dismissed.
+    /// The current consent banner version. Bump this to re-show the banner to all users,
+    /// even those who previously dismissed it. Independent of the app version.
+    static let currentTelemetryConsentVersion = 1
+
+    /// The consent banner version the user last dismissed (or opted in on).
+    /// Returns 0 if the user has never interacted with the banner.
+    static var telemetryBannerDismissedVersion: Int {
+        get { defaults.integer(forKey: Keys.telemetryBannerDismissedVersion) }
+        set { defaults.set(newValue, forKey: Keys.telemetryBannerDismissedVersion) }
+    }
+
+    /// Whether the banner should be shown — true if the user hasn't dismissed the current version.
     static var telemetryBannerDismissed: Bool {
-        get { defaults.bool(forKey: Keys.telemetryBannerDismissed) }
-        set { defaults.set(newValue, forKey: Keys.telemetryBannerDismissed) }
+        telemetryBannerDismissedVersion >= currentTelemetryConsentVersion
     }
 
     // MARK: - Debug Settings
