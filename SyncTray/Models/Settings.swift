@@ -29,6 +29,7 @@ struct SyncTraySettings {
         // Telemetry settings
         static let telemetryEnabled = "telemetryEnabled"
         static let installationId = "installationId"
+        static let telemetryBannerDismissed = "telemetryBannerDismissed"
     }
 
     // MARK: - Telemetry Settings
@@ -76,6 +77,12 @@ struct SyncTraySettings {
         guard let uuid = IORegistryEntryCreateCFProperty(service, key, kCFAllocatorDefault, 0)?
             .takeRetainedValue() as? String else { return nil }
         return uuid
+    }
+
+    /// Whether the telemetry opt-in banner has been dismissed.
+    static var telemetryBannerDismissed: Bool {
+        get { defaults.bool(forKey: Keys.telemetryBannerDismissed) }
+        set { defaults.set(newValue, forKey: Keys.telemetryBannerDismissed) }
     }
 
     // MARK: - Debug Settings

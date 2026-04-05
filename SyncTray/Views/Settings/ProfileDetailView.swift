@@ -170,6 +170,9 @@ struct ProfileDetailView: View {
         VStack(spacing: 0) {
             ScrollView {
                 VStack(alignment: .leading, spacing: 16) {
+                    // Telemetry opt-in banner
+                    TelemetryOptInBanner()
+
                     // Profile Name
                     profileNameSection
 
