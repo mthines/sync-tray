@@ -11,13 +11,20 @@ import OpenTelemetryProtocolExporterHttp
 ///
 /// ## Signal overview
 /// - **Traces**: Sync lifecycle spans with real duration (start→complete/fail)
-/// - **Metrics**: Sync duration histogram, operation counters, profile gauge
+/// - **Metrics**: Sync duration histogram, operation counters, profile gauge (delta temporality, 30s export)
 /// - **Logs**: Structured log records for key lifecycle events (sync, mount, errors)
 ///
-/// ## Per-installation differentiation
-/// Every signal carries `service.instance.id` (a persistent UUID per install) as a
-/// resource attribute. Combined with profile-level attributes on spans/logs, you can
-/// see exactly what each installation is doing across all its profiles.
+/// ## User correlation
+/// - `service.instance.id` — random UUID per install (changes on reinstall)
+/// - `enduser.id` — HMAC-SHA256 of hardware UUID (stable across reinstalls, not reversible)
+///
+/// Both are resource attributes, so every signal (trace, metric, log) is automatically
+/// correlated to the same physical machine.
+///
+/// ## Swift SDK note
+/// opentelemetry-swift 1.17.1 requires a wildcard `registerView(name: ".*")` for the
+/// stable metrics API. Without it, instruments silently record to no-op storage.
+/// See: https://github.com/open-telemetry/opentelemetry-swift/issues/500
 final class TelemetryService {
     static let shared = TelemetryService()
 

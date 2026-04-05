@@ -127,10 +127,14 @@ For operations with real duration (like syncs), use the `activeSyncSpans` patter
 
 ### Resource attributes (automatic on all signals)
 - `service.name` = synctray
-- `service.instance.id` = persistent UUID per installation (differentiates users)
+- `service.instance.id` = random UUID per installation (changes on reinstall)
+- `enduser.id` = HMAC-SHA256 of hardware UUID (stable across reinstalls, not reversible)
 - `service.version` = app version
 - `os.type` = darwin
 - `os.version` = macOS version
+
+`enduser.id` is the primary user correlation key — it survives app reinstalls because
+it's derived from the machine's hardware UUID via a one-way hash.
 
 ## Current Instrumentation
 

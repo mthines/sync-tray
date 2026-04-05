@@ -80,6 +80,7 @@ SyncTray/
 | `LogParser.swift` | Parses plain text and JSON log lines into typed `ParsedLogEvent` |
 | `DirectoryWatcher.swift` | FSEvents-based directory monitoring with debouncing |
 | `NotificationService.swift` | Batched macOS notifications with action support |
+| `TelemetryService.swift` | Opt-in OTel telemetry (traces, metrics, logs) via OTLP/HTTP |
 
 ### Views/
 
@@ -339,6 +340,27 @@ open ~/Library/Developer/Xcode/DerivedData/SyncTray-*/Build/Products/Debug/SyncT
 | `SettingsView.swift` | Main settings UI with profile editing |
 | `ProfileStore.swift` | Profile persistence (JSON files) |
 | `SyncLogPatterns` | Centralized log message pattern matching |
+| `TelemetryService.swift` | OTel singleton — traces, metrics, logs via OTLP/HTTP |
+| `Settings.swift` | Global settings including `installationId` and `anonymousUserId` |
+
+## Telemetry
+
+Anonymous, opt-in telemetry using OpenTelemetry (opentelemetry-swift 1.17.1). All methods are no-ops unless `SyncTraySettings.telemetryEnabled` is true. See `.claude/rules/telemetry.md` for the full instrumentation guide and how to add new telemetry.
+
+### Three signals
+- **Traces**: Sync lifecycle spans with real duration (start→complete/fail), mount/unmount spans
+- **Metrics**: 10 instruments — sync duration histogram, operation counters, file ops by extension, profile gauge (delta temporality, 30s export interval)
+- **Logs**: Structured log records for all key events (sync lifecycle, mount, transport changes, errors, config snapshots)
+
+### User correlation
+- `service.instance.id` — random UUID per install (changes on reinstall)
+- `enduser.id` — HMAC-SHA256 of hardware UUID (stable across reinstalls, not reversible)
+
+### Privacy
+No file paths, remote names, or credentials in telemetry. File operations tracked by normalized extension only. Error messages categorized into low-cardinality types. Profile names are user-chosen display names, not paths.
+
+### Configuration
+Priority: process env vars > `~/.config/synctray/.env` > Info.plist. Key vars: `OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_EXPORTER_OTLP_HEADERS`, `DASH0_AUTH_TOKEN`.
 
 ## Generated Files (per profile)
 
