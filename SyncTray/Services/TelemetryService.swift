@@ -303,17 +303,19 @@ final class TelemetryService {
             stale.end()
         }
 
-        let span = tracer.spanBuilder(spanName: "synctray sync")
-            .setSpanKind(spanKind: .internal)
-            .startSpan()
-
-        for (key, value) in profileAttributes(
+        let attrs = profileAttributes(
             profileId: profileId,
             profileName: profileName,
             syncMode: syncMode,
             syncDirection: syncDirection,
             hasFallback: hasFallback
-        ) {
+        )
+
+        let span = tracer.spanBuilder(spanName: "synctray sync")
+            .setSpanKind(spanKind: .internal)
+            .startSpan()
+
+        for (key, value) in attrs {
             span.setAttribute(key: key, value: value)
         }
 
@@ -322,13 +324,7 @@ final class TelemetryService {
         emitLog(
             severity: .info,
             body: "Sync started",
-            attributes: profileAttributes(
-                profileId: profileId,
-                profileName: profileName,
-                syncMode: syncMode,
-                syncDirection: syncDirection,
-                hasFallback: hasFallback
-            ),
+            attributes: attrs,
             spanContext: span.context
         )
     }
@@ -433,9 +429,7 @@ final class TelemetryService {
             span.setAttribute(key: "sync.files_changed", value: .int(filesChanged))
             span.setAttribute(key: "sync.duration_s", value: .double(duration))
             span.setAttribute(key: "sync.exit_code", value: .int(exitCode))
-            if errorMessage != nil {
-                span.setAttribute(key: "error.type", value: .string(errorType))
-            }
+            span.setAttribute(key: "error.type", value: .string(errorType))
             span.status = .error(description: errorMessage ?? "Exit code \(exitCode)")
             span.end()
 
@@ -530,8 +524,7 @@ final class TelemetryService {
     func recordTransportChange(
         profileId: UUID,
         profileName: String,
-        transport: String,          // "primary" or "fallback"
-        fallbackRemoteName: String? = nil
+        transport: String           // "primary" or "fallback"
     ) {
         guard SyncTraySettings.telemetryEnabled else { return }
         ensureSetup()

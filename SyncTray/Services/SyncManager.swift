@@ -1179,8 +1179,7 @@ final class SyncManager: ObservableObject {
             TelemetryService.shared.recordTransportChange(
                 profileId: profileId,
                 profileName: profileName,
-                transport: transport.isPrimary ? "primary" : "fallback",
-                fallbackRemoteName: transport.isFallback ? transport.label : nil
+                transport: transport.isPrimary ? "primary" : "fallback"
             )
 
         case .errorMessage(let message):
