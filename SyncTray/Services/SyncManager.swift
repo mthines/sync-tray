@@ -76,8 +76,9 @@ final class SyncManager: ObservableObject {
         checkInitialState()
         startWatchingAllProfiles()
         updateMountStates()  // Initialize mount states for mount mode profiles
-        // Report active profile count for telemetry
+        // Report active profile count and configuration snapshot for telemetry
         TelemetryService.shared.recordProfileCount(self.profileStore.enabledProfiles.count)
+        TelemetryService.shared.recordAllProfileConfigurations(self.profileStore.profiles)
     }
 
     deinit {
@@ -171,6 +172,12 @@ final class SyncManager: ObservableObject {
                         DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
                             if self?.setupService.isMounted(profile: profile) == true {
                                 self?.profileMountStates[profile.id] = .mounted
+                                TelemetryService.shared.recordMountOperation(
+                                    profileId: profile.id,
+                                    profileName: profile.name,
+                                    operation: "mount",
+                                    result: "success"
+                                )
                                 // Auto-refresh pinned directories after successful mount
                                 if !profile.pinnedDirectories.isEmpty {
                                     Task {
@@ -181,10 +188,22 @@ final class SyncManager: ObservableObject {
                                 }
                             } else {
                                 self?.profileMountStates[profile.id] = .failed("Mount did not establish")
+                                TelemetryService.shared.recordMountOperation(
+                                    profileId: profile.id,
+                                    profileName: profile.name,
+                                    operation: "mount",
+                                    result: "failure"
+                                )
                             }
                         }
                     } else {
                         profileMountStates[profile.id] = .failed("Failed to load launchd agent")
+                        TelemetryService.shared.recordMountOperation(
+                            profileId: profile.id,
+                            profileName: profile.name,
+                            operation: "mount",
+                            result: "failure"
+                        )
                     }
                 }
             }
@@ -200,10 +219,22 @@ final class SyncManager: ObservableObject {
                 try setupService.unmount(profile: profile)
                 await MainActor.run {
                     profileMountStates[profile.id] = .unmounted
+                    TelemetryService.shared.recordMountOperation(
+                        profileId: profile.id,
+                        profileName: profile.name,
+                        operation: "unmount",
+                        result: "success"
+                    )
                 }
             } catch {
                 await MainActor.run {
                     profileMountStates[profile.id] = .failed(error.localizedDescription)
+                    TelemetryService.shared.recordMountOperation(
+                        profileId: profile.id,
+                        profileName: profile.name,
+                        operation: "unmount",
+                        result: "failure"
+                    )
                 }
             }
         }
@@ -427,6 +458,11 @@ final class SyncManager: ObservableObject {
         updateAggregateState()
 
         SyncTraySettings.debugLog("Paused profile: \(profile.name)")
+        TelemetryService.shared.recordProfileStateChange(
+            profileId: profileId,
+            profileName: profile.name,
+            action: "paused"
+        )
     }
 
     /// Resume syncing for a specific profile (restarts directory watcher)
@@ -450,6 +486,11 @@ final class SyncManager: ObservableObject {
         updateAggregateState()
 
         SyncTraySettings.debugLog("Resumed profile: \(profile.name)")
+        TelemetryService.shared.recordProfileStateChange(
+            profileId: profileId,
+            profileName: profile.name,
+            action: "resumed"
+        )
     }
 
     /// Pause all enabled profiles
@@ -815,6 +856,11 @@ final class SyncManager: ObservableObject {
 
         SyncTraySettings.debugLog("DirectoryWatcher: Triggering sync for '\(profile.name)' (path: \(profile.localSyncPath))")
 
+        TelemetryService.shared.recordDirectoryWatchTrigger(
+            profileId: profileId,
+            profileName: profile.name
+        )
+
         // Trigger sync for this specific profile
         // Note: Lock file in sync script handles concurrent sync prevention
         Task {
@@ -1044,6 +1090,13 @@ final class SyncManager: ObservableObject {
             logWatchers[profileId]?.setActivelySyncing(true)  // Increase polling frequency
             // Don't send notification - the menu bar icon updates to show syncing state
             notificationService.clearPendingChanges(for: profileId)
+            TelemetryService.shared.recordSyncStarted(
+                profileId: profileId,
+                profileName: profileName,
+                syncMode: profile?.syncMode ?? .bisync,
+                syncDirection: profile?.syncDirection,
+                hasFallback: profile?.hasFallback ?? false
+            )
 
         case .syncCompleted:
             profileStates[profileId] = .idle
@@ -1057,8 +1110,9 @@ final class SyncManager: ObservableObject {
             let completedDuration = syncStartTimes[profileId].map { Date().timeIntervalSince($0) } ?? 0
             syncStartTimes[profileId] = nil
             TelemetryService.shared.recordSyncCompleted(
+                profileId: profileId,
+                profileName: profileName,
                 mode: profile?.syncMode ?? .bisync,
-                result: "success",
                 duration: completedDuration,
                 filesChanged: changesCount
             )
@@ -1097,11 +1151,14 @@ final class SyncManager: ObservableObject {
             // Report telemetry for failed sync
             let failedDuration = syncStartTimes[profileId].map { Date().timeIntervalSince($0) } ?? 0
             syncStartTimes[profileId] = nil
-            TelemetryService.shared.recordSyncCompleted(
+            TelemetryService.shared.recordSyncFailed(
+                profileId: profileId,
+                profileName: profileName,
                 mode: profile?.syncMode ?? .bisync,
-                result: "failure",
                 duration: failedDuration,
-                filesChanged: currentSyncChanges[profileId]?.count ?? 0
+                filesChanged: currentSyncChanges[profileId]?.count ?? 0,
+                exitCode: exitCode,
+                errorMessage: message ?? profileErrors[profileId]
             )
             // Only use the syncFailed message if we don't already have a more specific error
             if profileErrors[profileId] == nil, let msg = message {
@@ -1119,6 +1176,11 @@ final class SyncManager: ObservableObject {
 
         case .transportChanged(let transport):
             profileTransports[profileId] = transport
+            TelemetryService.shared.recordTransportChange(
+                profileId: profileId,
+                profileName: profileName,
+                transport: transport.isPrimary ? "primary" : "fallback"
+            )
 
         case .errorMessage(let message):
             // Track all error messages so we can correlate with syncFailed events
@@ -1128,6 +1190,12 @@ final class SyncManager: ObservableObject {
             if SyncLogPatterns.isTransientAllFilesChangedError(message) {
                 break
             }
+
+            TelemetryService.shared.recordSyncError(
+                profileId: profileId,
+                profileName: profileName,
+                errorMessage: message
+            )
 
             // Prefer critical/actionable errors over file-level errors
             // Critical errors tell us what to do (e.g., "out of sync", "resync")
@@ -1144,6 +1212,10 @@ final class SyncManager: ObservableObject {
 
         case .driveNotMounted:
             profileStates[profileId] = .driveNotMounted
+            TelemetryService.shared.recordDriveNotMounted(
+                profileId: profileId,
+                profileName: profileName
+            )
             if !isNotificationsMuted(for: profileId) {
                 notificationService.notifyDriveNotMounted(profileId: profileId, profileName: profileName)
             }
@@ -1158,6 +1230,11 @@ final class SyncManager: ObservableObject {
             }
             currentSyncChanges[profileId]?.append(change)
             addRecentChange(change)
+            TelemetryService.shared.recordFileOperation(
+                profileName: profileName,
+                operation: change.operation.rawValue,
+                filePath: change.path
+            )
             // Only send notification if not muted
             if !isNotificationsMuted(for: profileId) {
                 notificationService.notifyFileChange(change, profileId: profileId, syncDirectoryPath: syncDirectoryPath)

@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 import os.log
 
 /// Global app settings (not profile-specific)
@@ -47,6 +48,34 @@ struct SyncTraySettings {
         let newId = UUID().uuidString
         defaults.set(newId, forKey: Keys.installationId)
         return newId
+    }
+
+    /// A stable, anonymous user identifier derived from the hardware UUID.
+    /// HMAC-SHA256(hardwareUUID, key: "synctray-telemetry") — not reversible,
+    /// survives reinstalls, and correlates all telemetry to the same physical machine.
+    static var anonymousUserId: String {
+        let hardwareUUID = platformUUID() ?? installationId
+        let key = SymmetricKey(data: Data("synctray-telemetry".utf8))
+        let mac = HMAC<SHA256>.authenticationCode(
+            for: Data(hardwareUUID.utf8),
+            using: key
+        )
+        return mac.map { String(format: "%02x", $0) }.joined()
+    }
+
+    /// Read the hardware UUID from IOKit (stable across reinstalls).
+    private static func platformUUID() -> String? {
+        let service = IOServiceGetMatchingService(
+            kIOMainPortDefault,
+            IOServiceMatching("IOPlatformExpertDevice")
+        )
+        guard service != IO_OBJECT_NULL else { return nil }
+        defer { IOObjectRelease(service) }
+
+        let key = kIOPlatformUUIDKey as CFString
+        guard let uuid = IORegistryEntryCreateCFProperty(service, key, kCFAllocatorDefault, 0)?
+            .takeRetainedValue() as? String else { return nil }
+        return uuid
     }
 
     // MARK: - Debug Settings
