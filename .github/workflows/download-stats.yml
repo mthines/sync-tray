@@ -26,11 +26,26 @@ jobs:
             -H "Authorization: token $GITHUB_TOKEN" \
             "https://api.github.com/repos/${{ github.repository }}/releases?per_page=100")
 
+          # Date cutoffs for time-windowed stats
+          CUTOFF_7D=$(date -u -d '7 days ago' +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -v-7d +%Y-%m-%dT%H:%M:%SZ)
+          CUTOFF_30D=$(date -u -d '30 days ago' +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -v-30d +%Y-%m-%dT%H:%M:%SZ)
+
+          # All time
           TOTAL=$(echo "$RELEASES" | jq '[.[].assets[].download_count] | add // 0')
           STABLE=$(echo "$RELEASES" | jq '[.[] | select(.prerelease == false) | .assets[].download_count] | add // 0')
           BETA=$(echo "$RELEASES" | jq '[.[] | select(.prerelease == true) | .assets[].download_count] | add // 0')
           LATEST_TAG=$(echo "$RELEASES" | jq -r '[.[] | select(.prerelease == false)] | first | .tag_name // "none"')
           LATEST_DL=$(echo "$RELEASES" | jq '[.[] | select(.prerelease == false)] | first | [.assets[].download_count] | add // 0')
+
+          # Last 7 days (downloads from releases published in the last 7 days)
+          TOTAL_7D=$(echo "$RELEASES" | jq --arg cutoff "$CUTOFF_7D" '[.[] | select(.published_at >= $cutoff) | .assets[].download_count] | add // 0')
+          STABLE_7D=$(echo "$RELEASES" | jq --arg cutoff "$CUTOFF_7D" '[.[] | select(.published_at >= $cutoff and .prerelease == false) | .assets[].download_count] | add // 0')
+          BETA_7D=$(echo "$RELEASES" | jq --arg cutoff "$CUTOFF_7D" '[.[] | select(.published_at >= $cutoff and .prerelease == true) | .assets[].download_count] | add // 0')
+
+          # Last 30 days (downloads from releases published in the last 30 days)
+          TOTAL_30D=$(echo "$RELEASES" | jq --arg cutoff "$CUTOFF_30D" '[.[] | select(.published_at >= $cutoff) | .assets[].download_count] | add // 0')
+          STABLE_30D=$(echo "$RELEASES" | jq --arg cutoff "$CUTOFF_30D" '[.[] | select(.published_at >= $cutoff and .prerelease == false) | .assets[].download_count] | add // 0')
+          BETA_30D=$(echo "$RELEASES" | jq --arg cutoff "$CUTOFF_30D" '[.[] | select(.published_at >= $cutoff and .prerelease == true) | .assets[].download_count] | add // 0')
 
           # =================================================================
           # 2. Homebrew tap repo traffic (brew install/update activity)
@@ -79,6 +94,12 @@ jobs:
             --argjson total "$TOTAL" \
             --argjson stable "$STABLE" \
             --argjson beta "$BETA" \
+            --argjson total_7d "$TOTAL_7D" \
+            --argjson stable_7d "$STABLE_7D" \
+            --argjson beta_7d "$BETA_7D" \
+            --argjson total_30d "$TOTAL_30D" \
+            --argjson stable_30d "$STABLE_30D" \
+            --argjson beta_30d "$BETA_30D" \
             --arg latest_tag "$LATEST_TAG" \
             --argjson latest_dl "$LATEST_DL" \
             --argjson tap_clones_total "$TAP_CLONES_TOTAL" \
@@ -90,9 +111,9 @@ jobs:
             '{
               date: $date,
               github_releases: {
-                total_downloads: $total,
-                stable_downloads: $stable,
-                beta_downloads: $beta,
+                last_7_days: { total: $total_7d, stable: $stable_7d, beta: $beta_7d },
+                last_30_days: { total: $total_30d, stable: $stable_30d, beta: $beta_30d },
+                all_time: { total: $total, stable: $stable, beta: $beta },
                 latest_release: { tag: $latest_tag, downloads: $latest_dl }
               },
               homebrew_tap: {
@@ -126,14 +147,15 @@ jobs:
           | Tap page views (total) | $TAP_VIEWS_TOTAL |
           | Tap page views (unique) | $TAP_VIEWS_UNIQUE |
 
-          ### GitHub Release Downloads (all time)
+          ### GitHub Release Downloads
+          > Counts are cumulative downloads from releases published within each window.
 
-          | Metric | Count |
-          |--------|-------|
-          | **Total downloads** | **$TOTAL** |
-          | Stable releases | $STABLE |
-          | Beta releases | $BETA |
-          | Latest release ($LATEST_TAG) | $LATEST_DL |
+          | Metric | Last 7 days | Last 30 days | All time |
+          |--------|-------------|--------------|----------|
+          | **Total downloads** | **$TOTAL_7D** | **$TOTAL_30D** | **$TOTAL** |
+          | Stable releases | $STABLE_7D | $STABLE_30D | $STABLE |
+          | Beta releases | $BETA_7D | $BETA_30D | $BETA |
+          | Latest release ($LATEST_TAG) | — | — | $LATEST_DL |
           EOL
 
       - name: Upload stats artifact
