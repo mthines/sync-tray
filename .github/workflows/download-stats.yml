@@ -37,6 +37,9 @@ jobs:
           LATEST_TAG=$(echo "$RELEASES" | jq -r '[.[] | select(.prerelease == false)] | first | .tag_name // "none"')
           LATEST_DL=$(echo "$RELEASES" | jq '[.[] | select(.prerelease == false)] | first | [.assets[].download_count] | add // 0')
 
+          # Last 10 stable releases (tag + total downloads each)
+          TOP10_JSON=$(echo "$RELEASES" | jq '[.[] | select(.prerelease == false) | { tag: .tag_name, published: .published_at, downloads: ([.assets[].download_count] | add // 0) }] | .[0:10]')
+
           # Last 7 days (downloads from releases published in the last 7 days)
           TOTAL_7D=$(echo "$RELEASES" | jq --arg cutoff "$CUTOFF_7D" '[.[] | select(.published_at >= $cutoff) | .assets[].download_count] | add // 0')
           STABLE_7D=$(echo "$RELEASES" | jq --arg cutoff "$CUTOFF_7D" '[.[] | select(.published_at >= $cutoff and .prerelease == false) | .assets[].download_count] | add // 0')
@@ -102,6 +105,7 @@ jobs:
             --argjson beta_30d "$BETA_30D" \
             --arg latest_tag "$LATEST_TAG" \
             --argjson latest_dl "$LATEST_DL" \
+            --argjson top10 "$TOP10_JSON" \
             --argjson tap_clones_total "$TAP_CLONES_TOTAL" \
             --argjson tap_clones_unique "$TAP_CLONES_UNIQUE" \
             --argjson tap_views_total "$TAP_VIEWS_TOTAL" \
@@ -114,7 +118,8 @@ jobs:
                 last_7_days: { total: $total_7d, stable: $stable_7d, beta: $beta_7d },
                 last_30_days: { total: $total_30d, stable: $stable_30d, beta: $beta_30d },
                 all_time: { total: $total, stable: $stable, beta: $beta },
-                latest_release: { tag: $latest_tag, downloads: $latest_dl }
+                latest_release: { tag: $latest_tag, downloads: $latest_dl },
+                top_10_stable: $top10
               },
               homebrew_tap: {
                 clones_14d: { total: $tap_clones_total, unique: $tap_clones_unique },
@@ -155,7 +160,12 @@ jobs:
           | **Total downloads** | **$TOTAL_7D** | **$TOTAL_30D** | **$TOTAL** |
           | Stable releases | $STABLE_7D | $STABLE_30D | $STABLE |
           | Beta releases | $BETA_7D | $BETA_30D | $BETA |
-          | Latest release ($LATEST_TAG) | — | — | $LATEST_DL |
+
+          ### Downloads by Stable Release (last 10)
+
+          | Version | Published | Downloads |
+          |---------|-----------|-----------|
+          $(echo "$TOP10_JSON" | jq -r '.[] | "| \(.tag) | \(.published | split("T")[0]) | \(.downloads) |"')
           EOL
 
       - name: Upload stats artifact
