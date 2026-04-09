@@ -1211,13 +1211,17 @@ final class SyncManager: ObservableObject {
             }
 
         case .driveNotMounted:
+            let previousState = profileStates[profileId]
             profileStates[profileId] = .driveNotMounted
-            TelemetryService.shared.recordDriveNotMounted(
-                profileId: profileId,
-                profileName: profileName
-            )
-            if !isNotificationsMuted(for: profileId) {
-                notificationService.notifyDriveNotMounted(profileId: profileId, profileName: profileName)
+            // Only emit telemetry/notification on state transition, not every poll
+            if previousState != .driveNotMounted {
+                TelemetryService.shared.recordDriveNotMounted(
+                    profileId: profileId,
+                    profileName: profileName
+                )
+                if !isNotificationsMuted(for: profileId) {
+                    notificationService.notifyDriveNotMounted(profileId: profileId, profileName: profileName)
+                }
             }
 
         case .syncAlreadyRunning:

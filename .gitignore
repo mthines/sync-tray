@@ -14,7 +14,7 @@ build/
 
 tasks
 
-.gw
+.mcp.json
 
 # macOS
 .DS_Store
