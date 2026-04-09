@@ -1,0 +1,144 @@
+name: Download Stats
+
+on:
+  schedule:
+    # Run weekly on Monday at 9:00 UTC
+    - cron: '0 9 * * 1'
+  workflow_dispatch: # Allow manual trigger
+
+permissions:
+  contents: read
+
+jobs:
+  collect-stats:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Collect download statistics
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          # =================================================================
+          # 1. GitHub Release download counts
+          # =================================================================
+          RELEASES=$(curl -sf \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: token $GITHUB_TOKEN" \
+            "https://api.github.com/repos/${{ github.repository }}/releases?per_page=100")
+
+          TOTAL=$(echo "$RELEASES" | jq '[.[].assets[].download_count] | add // 0')
+          STABLE=$(echo "$RELEASES" | jq '[.[] | select(.prerelease == false) | .assets[].download_count] | add // 0')
+          BETA=$(echo "$RELEASES" | jq '[.[] | select(.prerelease == true) | .assets[].download_count] | add // 0')
+          LATEST_TAG=$(echo "$RELEASES" | jq -r '[.[] | select(.prerelease == false)] | first | .tag_name // "none"')
+          LATEST_DL=$(echo "$RELEASES" | jq '[.[] | select(.prerelease == false)] | first | [.assets[].download_count] | add // 0')
+
+          # =================================================================
+          # 2. Homebrew tap repo traffic (brew install/update activity)
+          #    Requires HOMEBREW_TAP_TOKEN with push access to the tap repo.
+          #    GitHub only retains 14 days of traffic data, so this weekly
+          #    collection preserves data that would otherwise be lost.
+          # =================================================================
+          TAP_CLONES_TOTAL=0
+          TAP_CLONES_UNIQUE=0
+          TAP_VIEWS_TOTAL=0
+          TAP_VIEWS_UNIQUE=0
+          TAP_CLONES_JSON="[]"
+          TAP_VIEWS_JSON="[]"
+
+          if [ -n "$HOMEBREW_TAP_TOKEN" ]; then
+            echo "Fetching Homebrew tap traffic data..."
+
+            # Clone traffic = brew install/update/tap activity
+            TAP_CLONES=$(curl -sf \
+              -H "Accept: application/vnd.github+json" \
+              -H "Authorization: token $HOMEBREW_TAP_TOKEN" \
+              "https://api.github.com/repos/mthines/homebrew-synctray/traffic/clones" 2>/dev/null || echo '{}')
+
+            TAP_CLONES_TOTAL=$(echo "$TAP_CLONES" | jq '.count // 0')
+            TAP_CLONES_UNIQUE=$(echo "$TAP_CLONES" | jq '.uniques // 0')
+            TAP_CLONES_JSON=$(echo "$TAP_CLONES" | jq '.clones // []')
+
+            # Page views on the tap repo
+            TAP_VIEWS=$(curl -sf \
+              -H "Accept: application/vnd.github+json" \
+              -H "Authorization: token $HOMEBREW_TAP_TOKEN" \
+              "https://api.github.com/repos/mthines/homebrew-synctray/traffic/views" 2>/dev/null || echo '{}')
+
+            TAP_VIEWS_TOTAL=$(echo "$TAP_VIEWS" | jq '.count // 0')
+            TAP_VIEWS_UNIQUE=$(echo "$TAP_VIEWS" | jq '.uniques // 0')
+            TAP_VIEWS_JSON=$(echo "$TAP_VIEWS" | jq '.views // []')
+          else
+            echo "::warning::HOMEBREW_TAP_TOKEN not set — skipping tap traffic data. Set this secret for brew install tracking."
+          fi
+
+          # =================================================================
+          # 3. Build combined JSON snapshot
+          # =================================================================
+          SNAPSHOT=$(jq -n \
+            --arg date "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --argjson total "$TOTAL" \
+            --argjson stable "$STABLE" \
+            --argjson beta "$BETA" \
+            --arg latest_tag "$LATEST_TAG" \
+            --argjson latest_dl "$LATEST_DL" \
+            --argjson tap_clones_total "$TAP_CLONES_TOTAL" \
+            --argjson tap_clones_unique "$TAP_CLONES_UNIQUE" \
+            --argjson tap_views_total "$TAP_VIEWS_TOTAL" \
+            --argjson tap_views_unique "$TAP_VIEWS_UNIQUE" \
+            --argjson tap_clones_daily "$TAP_CLONES_JSON" \
+            --argjson tap_views_daily "$TAP_VIEWS_JSON" \
+            '{
+              date: $date,
+              github_releases: {
+                total_downloads: $total,
+                stable_downloads: $stable,
+                beta_downloads: $beta,
+                latest_release: { tag: $latest_tag, downloads: $latest_dl }
+              },
+              homebrew_tap: {
+                clones_14d: { total: $tap_clones_total, unique: $tap_clones_unique },
+                views_14d: { total: $tap_views_total, unique: $tap_views_unique },
+                daily_clones: $tap_clones_daily,
+                daily_views: $tap_views_daily
+              }
+            }')
+
+          echo "$SNAPSHOT" | jq .
+
+          # Write to file for artifact upload
+          mkdir -p stats
+          echo "$SNAPSHOT" > stats/download-stats-$(date -u +%Y-%m-%d).json
+          echo "$SNAPSHOT" > stats/latest.json
+
+          # =================================================================
+          # 4. Write job summary
+          # =================================================================
+          cat >> "$GITHUB_STEP_SUMMARY" <<EOL
+          ## SyncTray Download Stats — $(date -u +%Y-%m-%d)
+
+          ### Homebrew Tap Traffic (last 14 days)
+          > Clones of [homebrew-synctray](https://github.com/mthines/homebrew-synctray) represent \`brew install\`/\`brew update\` activity.
+
+          | Metric | Count |
+          |--------|-------|
+          | **Tap clones (total)** | **$TAP_CLONES_TOTAL** |
+          | **Tap clones (unique users)** | **$TAP_CLONES_UNIQUE** |
+          | Tap page views (total) | $TAP_VIEWS_TOTAL |
+          | Tap page views (unique) | $TAP_VIEWS_UNIQUE |
+
+          ### GitHub Release Downloads (all time)
+
+          | Metric | Count |
+          |--------|-------|
+          | **Total downloads** | **$TOTAL** |
+          | Stable releases | $STABLE |
+          | Beta releases | $BETA |
+          | Latest release ($LATEST_TAG) | $LATEST_DL |
+          EOL
+
+      - name: Upload stats artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: download-stats-${{ github.run_id }}
+          path: stats/
+          retention-days: 365
