@@ -620,10 +620,21 @@ struct SetupWizardView: View {
             try configService.addRemote(remoteConfig)
             selectedRemote = "\(remoteConfig.name):"
             isLoading = false
+            TelemetryService.shared.recordRemoteConfigOperation(
+                operation: "create",
+                providerType: remoteConfig.provider.rcloneType,
+                result: "success"
+            )
             completion()
         } catch {
             isLoading = false
             errorMessage = error.localizedDescription
+            TelemetryService.shared.recordRemoteConfigOperation(
+                operation: "create",
+                providerType: remoteConfig.provider.rcloneType,
+                result: "failure",
+                errorMessage: error.localizedDescription
+            )
         }
     }
 

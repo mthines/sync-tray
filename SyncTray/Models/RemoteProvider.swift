@@ -6,6 +6,7 @@ enum RemoteProvider: String, Codable, CaseIterable, Identifiable {
     case dropbox = "dropbox"
     case oneDrive = "onedrive"
     case synology = "synology"  // Synology uses WebDAV but has distinct UI
+    case smb = "smb"
     case webdav = "webdav"
     case sftp = "sftp"
 
@@ -21,6 +22,8 @@ enum RemoteProvider: String, Codable, CaseIterable, Identifiable {
             return "OneDrive"
         case .synology:
             return "Synology NAS"
+        case .smb:
+            return "SMB / CIFS"
         case .webdav:
             return "WebDAV"
         case .sftp:
@@ -38,6 +41,8 @@ enum RemoteProvider: String, Codable, CaseIterable, Identifiable {
             return "cloud"
         case .synology:
             return "externaldrive.connected.to.line.below"
+        case .smb:
+            return "folder.badge.gearshape"
         case .webdav:
             return "server.rack"
         case .sftp:
@@ -56,6 +61,8 @@ enum RemoteProvider: String, Codable, CaseIterable, Identifiable {
             return "onedrive"
         case .synology, .webdav:
             return "webdav"
+        case .smb:
+            return "smb"
         case .sftp:
             return "sftp"
         }
@@ -66,7 +73,7 @@ enum RemoteProvider: String, Codable, CaseIterable, Identifiable {
         switch self {
         case .googleDrive, .dropbox, .oneDrive:
             return true
-        case .synology, .webdav, .sftp:
+        case .synology, .smb, .webdav, .sftp:
             return false
         }
     }
@@ -100,6 +107,16 @@ enum RemoteProvider: String, Codable, CaseIterable, Identifiable {
                 ProviderField(key: "user", label: "Username", type: .text),
                 ProviderField(key: "pass", label: "Password", type: .password),
                 ProviderField(key: "vendor", label: "Vendor", type: .hidden, defaultValue: "other")
+            ]
+        case .smb:
+            return [
+                ProviderField(key: "host", label: "Host", type: .text,
+                              placeholder: "192.168.1.100 or nas.local"),
+                ProviderField(key: "user", label: "Username", type: .text),
+                ProviderField(key: "pass", label: "Password", type: .password,
+                              isOptional: true),
+                ProviderField(key: "port", label: "Port", type: .number,
+                              placeholder: "445", defaultValue: "445")
             ]
         case .webdav:
             return [
@@ -145,6 +162,13 @@ enum RemoteProvider: String, Codable, CaseIterable, Identifiable {
             ]
         case .synology, .webdav:
             return []
+        case .smb:
+            return [
+                ProviderField(key: "domain", label: "Domain", type: .text,
+                              placeholder: "WORKGROUP",
+                              helpText: "Domain name for NTLM authentication",
+                              defaultValue: "WORKGROUP")
+            ]
         case .sftp:
             return [
                 ProviderField(key: "key_file", label: "SSH Key Path", type: .file,

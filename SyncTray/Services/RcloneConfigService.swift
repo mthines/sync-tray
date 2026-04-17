@@ -202,6 +202,8 @@ final class RcloneConfigService {
             return .webdav
         case "sftp":
             return .sftp
+        case "smb":
+            return .smb
         default:
             return .webdav
         }

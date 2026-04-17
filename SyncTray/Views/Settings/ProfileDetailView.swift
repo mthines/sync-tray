@@ -1582,13 +1582,18 @@ struct ProfileDetailView: View {
 
         DispatchQueue.global(qos: .userInitiated).async {
             do {
-                try RcloneConfigService.shared.deleteRemote(name)
-
                 let nameWithoutColon = name.hasSuffix(":") ? String(name.dropLast()) : name
+                let providerType = RcloneConfigService.shared.readRemoteConfig(name: nameWithoutColon)?.provider.rcloneType ?? "unknown"
+                try RcloneConfigService.shared.deleteRemote(name)
                 let clearRclone = capturedRcloneRemote == nameWithoutColon || capturedRcloneRemote == "\(nameWithoutColon):"
                 let clearFallback = capturedFallbackRemote == nameWithoutColon || capturedFallbackRemote == "\(nameWithoutColon):"
 
                 DispatchQueue.main.async {
+                    TelemetryService.shared.recordRemoteConfigOperation(
+                        operation: "delete",
+                        providerType: providerType,
+                        result: "success"
+                    )
                     // Clear selection if the deleted remote was selected
                     if clearRclone {
                         rcloneRemote = ""
@@ -1602,6 +1607,12 @@ struct ProfileDetailView: View {
             } catch {
                 DispatchQueue.main.async {
                     installError = "Failed to delete remote: \(error.localizedDescription)"
+                    TelemetryService.shared.recordRemoteConfigOperation(
+                        operation: "delete",
+                        providerType: "unknown",
+                        result: "failure",
+                        errorMessage: error.localizedDescription
+                    )
                 }
             }
         }

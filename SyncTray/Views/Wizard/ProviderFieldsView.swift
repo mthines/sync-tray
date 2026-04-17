@@ -291,18 +291,33 @@ struct RemotePathStepView: View {
         connectionTestSuccess = false
 
         let fullPath = remotePath.isEmpty ? remoteName : "\(remoteName.replacingOccurrences(of: ":", with: "")):\(remotePath)"
+        let remoteNameClean = remoteName.replacingOccurrences(of: ":", with: "")
 
         Task {
             let result = await configService.testConnection(fullPath)
+            // Resolve provider type for telemetry (low-cardinality, no PII)
+            let providerType = configService.readRemoteConfig(name: remoteNameClean)?.provider.rcloneType ?? "unknown"
+
             await MainActor.run {
                 isTestingConnection = false
                 switch result {
                 case .success:
                     connectionTestSuccess = true
                     errorMessage = nil
+                    TelemetryService.shared.recordRemoteConfigOperation(
+                        operation: "connection_test",
+                        providerType: providerType,
+                        result: "success"
+                    )
                 case .failure(let error):
                     connectionTestSuccess = false
                     errorMessage = "Connection failed: \(error.localizedDescription)"
+                    TelemetryService.shared.recordRemoteConfigOperation(
+                        operation: "connection_test",
+                        providerType: providerType,
+                        result: "failure",
+                        errorMessage: error.localizedDescription
+                    )
                 }
             }
         }

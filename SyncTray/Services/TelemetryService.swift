@@ -97,6 +97,7 @@ final class TelemetryService {
     private var directoryWatchTriggerCounter: LongCounterSdk?
     private var transportFallbackCounter: LongCounterSdk?
     private var fileOperationCounter: LongCounterSdk?
+    private var remoteConfigCounter: LongCounterSdk?
 
     // MARK: - Providers (kept alive for shutdown)
 
@@ -262,6 +263,12 @@ final class TelemetryService {
         fileOperationCounter = meter
             .counterBuilder(name: "synctray.sync.file_operations")
             .setDescription("Number of file operations by type and extension")
+            .setUnit("1")
+            .build()
+
+        remoteConfigCounter = meter
+            .counterBuilder(name: "synctray.remote.config_operations")
+            .setDescription("Number of remote configuration operations by type and result")
             .setUnit("1")
             .build()
     }
@@ -715,6 +722,83 @@ final class TelemetryService {
         for profile in profiles {
             recordProfileConfiguration(profile)
         }
+    }
+
+    // MARK: - Remote Configuration
+
+    /// Record a remote configuration operation (create, update, delete, connection_test).
+    /// Emits a counter tick and a structured log with outcome details.
+    /// Never includes URLs, passwords, or hostnames — only provider type and error category.
+    func recordRemoteConfigOperation(
+        operation: String,          // "create", "update", "delete", "connection_test"
+        providerType: String,       // rclone type: "sftp", "webdav", "smb", etc.
+        result: String,             // "success" or "failure"
+        errorMessage: String? = nil
+    ) {
+        guard SyncTraySettings.telemetryEnabled else { return }
+        ensureSetup()
+
+        let errorType = errorMessage.map { categorizeRemoteError($0) } ?? ""
+
+        var metricAttrs: [String: AttributeValue] = [
+            "remote.operation": .string(operation),
+            "remote.provider_type": .string(providerType),
+            "remote.result": .string(result),
+        ]
+        if !errorType.isEmpty {
+            metricAttrs["error.type"] = .string(errorType)
+        }
+
+        remoteConfigCounter?.add(value: 1, attribute: metricAttrs)
+
+        var logAttrs: [String: AttributeValue] = [
+            "remote.operation": .string(operation),
+            "remote.provider_type": .string(providerType),
+            "remote.result": .string(result),
+        ]
+        if let errMsg = errorMessage {
+            logAttrs["error.type"] = .string(errorType)
+            logAttrs["error.message"] = .string(String(errMsg.prefix(256)))
+        }
+
+        emitLog(
+            severity: result == "success" ? .info : .warn,
+            body: "Remote \(operation) \(result)",
+            attributes: logAttrs
+        )
+    }
+
+    /// Categorize remote config errors into low-cardinality types.
+    private func categorizeRemoteError(_ message: String) -> String {
+        let msg = message.lowercased()
+        if msg.contains("xml syntax") || msg.contains("html") {
+            return "invalid_endpoint"
+        }
+        if msg.contains("base64") || msg.contains("obscure") || msg.contains("decrypt") {
+            return "password_encoding"
+        }
+        if msg.contains("connection refused") || msg.contains("dial tcp") {
+            return "connection_refused"
+        }
+        if msg.contains("timeout") || msg.contains("timed out") || msg.contains("deadline") {
+            return "timeout"
+        }
+        if msg.contains("401") || msg.contains("403") || msg.contains("auth") || msg.contains("permission") {
+            return "authentication"
+        }
+        if msg.contains("404") || msg.contains("not found") {
+            return "not_found"
+        }
+        if msg.contains("certificate") || msg.contains("tls") || msg.contains("ssl") {
+            return "tls_error"
+        }
+        if msg.contains("dns") || msg.contains("no such host") || msg.contains("resolve") {
+            return "dns_error"
+        }
+        if msg.contains("already exists") {
+            return "duplicate"
+        }
+        return "other"
     }
 
     // MARK: - App Lifecycle

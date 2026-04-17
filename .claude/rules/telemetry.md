@@ -151,6 +151,7 @@ it's derived from the machine's hardware UUID via a one-way hash.
 | `synctray.directory_watch.triggers` | Counter | Directory change triggers |
 | `synctray.transport.fallback_activations` | Counter | Fallback remote activations |
 | `synctray.sync.file_operations` | Counter | File operations by type + extension |
+| `synctray.remote.config_operations` | Counter | Remote config operations (create/update/delete/connection_test) by provider type + result |
 
 ### Spans
 | Span | Kind | Description |
@@ -171,6 +172,7 @@ All key lifecycle events are emitted as structured OTel logs:
 - App launch
 - Profile configuration snapshots (RUM — sync mode, interval, feature toggles)
 - Configuration summary (profile count breakdown by mode)
+- Remote config operations: create/update/delete/connection_test (with provider type and categorized error type)
 
 ## Swift SDK Gotcha: Wildcard View Required
 
