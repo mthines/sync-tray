@@ -192,13 +192,12 @@ final class RcloneConfigService {
         case "onedrive":
             return .oneDrive
         case "webdav":
-            // Detect Synology by vendor or URL containing Synology ports
-            if let url = values["url"],
-               (url.contains(":5005") || url.contains(":5006") || url.contains(":5001")) {
+            // Detect Synology by vendor field or Synology DSM port in URL
+            if let vendor = values["vendor"], vendor == "synology" {
                 return .synology
             }
-            if let vendor = values["vendor"], vendor == "other" {
-                // Could be Synology — check URL
+            if let url = values["url"],
+               (url.contains(":5005") || url.contains(":5006") || url.contains(":5001")) {
                 return .synology
             }
             return .webdav
