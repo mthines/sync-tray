@@ -111,8 +111,12 @@ final class RcloneConfigService {
             throw ConfigError.remoteAlreadyExists(config.name)
         }
 
+        // Obscure password before writing
+        var configToWrite = config
+        obscurePasswordFields(&configToWrite)
+
         // Generate new section
-        let newSection = config.generateConfigSection()
+        let newSection = configToWrite.generateConfigSection()
 
         // Append to config
         let newConfig = existingConfig.isEmpty
@@ -192,12 +196,7 @@ final class RcloneConfigService {
         case "onedrive":
             return .oneDrive
         case "webdav":
-            // Detect Synology by vendor field or Synology DSM port in URL
-            if let vendor = values["vendor"], vendor == "synology" {
-                return .synology
-            }
-            if let url = values["url"],
-               (url.contains(":5005") || url.contains(":5006") || url.contains(":5001")) {
+            if isSynologyRemote(values: values) {
                 return .synology
             }
             return .webdav
@@ -206,6 +205,27 @@ final class RcloneConfigService {
         default:
             return .webdav
         }
+    }
+
+    /// Detect whether a WebDAV remote is a Synology NAS based on config values
+    private func isSynologyRemote(values: [String: String]) -> Bool {
+        if let vendor = values["vendor"], vendor == "synology" {
+            return true
+        }
+        guard let url = values["url"]?.lowercased() else { return false }
+        // Synology DSM ports
+        if url.contains(":5005") || url.contains(":5006") || url.contains(":5001") {
+            return true
+        }
+        // Synology QuickConnect
+        if url.contains("quickconnect.to") {
+            return true
+        }
+        // Synology DDNS domains
+        if url.contains(".synology.me") || url.contains(".dsm.") {
+            return true
+        }
+        return false
     }
 
     /// Update an existing remote (delete old config section, write new one)
@@ -226,8 +246,12 @@ final class RcloneConfigService {
             existingConfig = try String(contentsOfFile: configPath, encoding: .utf8)
         }
 
+        // Obscure password before writing
+        var configToWrite = config
+        obscurePasswordFields(&configToWrite)
+
         // Generate new section
-        let newSection = config.generateConfigSection()
+        let newSection = configToWrite.generateConfigSection()
 
         // Append to config
         let newConfig = existingConfig.isEmpty
@@ -261,7 +285,6 @@ final class RcloneConfigService {
             return .failure(.rcloneNotFound)
         }
 
-        // Use exact same pattern as listFolders which works
         return await withCheckedContinuation { continuation in
             DispatchQueue.global(qos: .userInitiated).async {
                 let process = Process()
@@ -269,8 +292,9 @@ final class RcloneConfigService {
 
                 process.executableURL = URL(fileURLWithPath: rclonePath)
                 let remote = remotePath.contains(":") ? remotePath : "\(remotePath):"
-                // Use rclone about - designed for connection testing, minimal output
-                process.arguments = ["about", remote, "--json"]
+                // Use rclone lsd — works reliably across all backends (SFTP, WebDAV, etc.)
+                // rclone about fails on some SFTP servers that don't support df
+                process.arguments = ["lsd", remote, "--contimeout", "10s"]
                 process.standardOutput = pipe
                 process.standardError = pipe
 
@@ -278,7 +302,6 @@ final class RcloneConfigService {
                     try process.run()
                     process.waitUntilExit()
 
-                    // Read after process exits (same pattern as working listFolders)
                     let data = pipe.fileHandleForReading.readDataToEndOfFile()
 
                     if process.terminationStatus == 0 {
@@ -401,6 +424,40 @@ final class RcloneConfigService {
     }
 
     // MARK: - Password Obscuring
+
+    /// Obscure password fields in a RemoteConfiguration before writing to config.
+    /// Skips values that are already obscured (read back from an existing config).
+    private func obscurePasswordFields(_ config: inout RemoteConfiguration) {
+        for field in config.provider.requiredFields where field.type == .password {
+            guard let value = config.values[field.key], !value.isEmpty else { continue }
+            // If the value can be revealed, it's already obscured — don't double-obscure
+            if isAlreadyObscured(value) { continue }
+            if let obscured = obscurePassword(value) {
+                config.values[field.key] = obscured
+            }
+        }
+    }
+
+    /// Check if a password string is already in rclone's obscured format
+    private func isAlreadyObscured(_ value: String) -> Bool {
+        guard let rclonePath = findRclonePath() else { return false }
+
+        let process = Process()
+        let pipe = Pipe()
+
+        process.executableURL = URL(fileURLWithPath: rclonePath)
+        process.arguments = ["reveal", value]
+        process.standardOutput = pipe
+        process.standardError = pipe
+
+        do {
+            try process.run()
+            process.waitUntilExit()
+            return process.terminationStatus == 0
+        } catch {
+            return false
+        }
+    }
 
     /// Obscure a password using rclone (for secure storage in config)
     func obscurePassword(_ password: String) -> String? {

@@ -1,7 +1,7 @@
 import SwiftUI
 
-/// A lightweight sheet for creating or editing a rclone remote.
-/// Reuses the provider grid and credential fields from the full setup wizard.
+/// A sheet for creating or editing a rclone remote with connection testing.
+/// Reuses the provider grid, credential fields, and connection test from the setup wizard.
 struct AddRemoteSheet: View {
     @Environment(\.dismiss) private var dismiss
 
@@ -20,6 +20,7 @@ struct AddRemoteSheet: View {
     // Wizard state
     @State private var step: Step = .provider
     @State private var remoteConfig = RemoteConfiguration(name: "", provider: .googleDrive)
+    @State private var remotePath: String = ""
     @State private var isLoading: Bool = false
     @State private var isOAuthInProgress: Bool = false
     @State private var errorMessage: String?
@@ -42,35 +43,60 @@ struct AddRemoteSheet: View {
         self.onRemoteCreated = { _ in }
     }
 
-    enum Step {
-        case provider
-        case credentials
+    enum Step: Int, CaseIterable {
+        case provider = 0
+        case credentials = 1
+        case connectionTest = 2
+
+        var title: String {
+            switch self {
+            case .provider: return "Provider"
+            case .credentials: return "Configure"
+            case .connectionTest: return "Test"
+            }
+        }
+    }
+
+    /// Steps shown in the progress indicator (edit mode skips provider)
+    private var visibleSteps: [Step] {
+        isEditMode ? [.credentials, .connectionTest] : Step.allCases
     }
 
     var body: some View {
         VStack(spacing: 0) {
+            // Progress indicator
+            HStack(spacing: 4) {
+                ForEach(visibleSteps, id: \.rawValue) { s in
+                    Circle()
+                        .fill(s.rawValue <= step.rawValue ? Color.accentColor : Color.gray.opacity(0.3))
+                        .frame(width: 8, height: 8)
+                }
+            }
+            .padding(.horizontal)
+            .padding(.top, 12)
+
             // Header
             HStack {
-                if isEditMode {
-                    Text("Edit Remote")
-                        .font(.headline)
-                } else {
-                    Text(step == .provider ? "Choose Provider" : "Configure \(remoteConfig.provider.displayName)")
-                        .font(.headline)
-                }
+                Text(headerTitle)
+                    .font(.headline)
                 Spacer()
             }
-            .padding()
+            .padding(.horizontal)
+            .padding(.top, 8)
+            .padding(.bottom, 4)
 
             Divider()
 
             // Content
             ScrollView {
                 VStack(alignment: .leading, spacing: 16) {
-                    if step == .provider {
+                    switch step {
+                    case .provider:
                         providerContent
-                    } else {
+                    case .credentials:
                         credentialsContent
+                    case .connectionTest:
+                        connectionTestContent
                     }
                 }
                 .padding()
@@ -80,34 +106,10 @@ struct AddRemoteSheet: View {
             Divider()
 
             // Buttons
-            HStack {
-                Button("Cancel") { dismiss() }
-                    .keyboardShortcut(.cancelAction)
-
-                Spacer()
-
-                // Show Back only in create mode (edit mode starts at credentials)
-                if step == .credentials && !isEditMode {
-                    Button("Back") {
-                        withAnimation { step = .provider }
-                    }
-                }
-
-                Button(actionButtonLabel) {
-                    if step == .provider {
-                        withAnimation { step = .credentials }
-                    } else if isEditMode {
-                        updateRemote()
-                    } else {
-                        createRemote()
-                    }
-                }
-                .buttonStyle(.borderedProminent)
-                .disabled(step == .credentials && !canSave)
-            }
-            .padding()
+            navigationButtons
+                .padding()
         }
-        .frame(width: 500, height: 420)
+        .frame(width: 550, height: 480)
         .onAppear {
             if isEditMode {
                 loadExistingRemote()
@@ -115,10 +117,83 @@ struct AddRemoteSheet: View {
         }
     }
 
+    private var headerTitle: String {
+        switch step {
+        case .provider:
+            return "Choose Provider"
+        case .credentials:
+            if isEditMode {
+                return "Edit Remote"
+            }
+            return "Configure \(remoteConfig.provider.displayName)"
+        case .connectionTest:
+            return "Test Connection"
+        }
+    }
+
+    // MARK: - Navigation Buttons
+
+    private var navigationButtons: some View {
+        HStack {
+            Button("Cancel") { dismiss() }
+                .keyboardShortcut(.cancelAction)
+
+            Spacer()
+
+            // Back button
+            if step == .credentials && !isEditMode {
+                Button("Back") {
+                    withAnimation { step = .provider }
+                }
+            } else if step == .connectionTest {
+                Button("Back") {
+                    withAnimation { step = .credentials }
+                }
+            }
+
+            // Forward button
+            Button(actionButtonLabel) {
+                handleActionButton()
+            }
+            .buttonStyle(.borderedProminent)
+            .disabled(actionButtonDisabled)
+        }
+    }
+
     private var actionButtonLabel: String {
-        if step == .provider { return "Next" }
-        if isEditMode { return "Save Changes" }
-        return "Create Remote"
+        switch step {
+        case .provider:
+            return "Next"
+        case .credentials:
+            return "Next"
+        case .connectionTest:
+            return "Done"
+        }
+    }
+
+    private var actionButtonDisabled: Bool {
+        if step == .credentials && !canSave { return true }
+        if isLoading { return true }
+        return false
+    }
+
+    private func handleActionButton() {
+        switch step {
+        case .provider:
+            withAnimation { step = .credentials }
+        case .credentials:
+            if isEditMode {
+                updateRemote {
+                    withAnimation { step = .connectionTest }
+                }
+            } else {
+                createRemote {
+                    withAnimation { step = .connectionTest }
+                }
+            }
+        case .connectionTest:
+            dismiss()
+        }
     }
 
     // MARK: - Provider Step
@@ -146,7 +221,6 @@ struct AddRemoteSheet: View {
                     .foregroundColor(.secondary)
 
                 if isEditMode {
-                    // Name is immutable in edit mode — rename requires delete + recreate
                     Text(remoteConfig.name)
                         .font(.body)
                         .padding(.vertical, 4)
@@ -202,14 +276,20 @@ struct AddRemoteSheet: View {
         }
     }
 
+    // MARK: - Connection Test Step
+
+    private var connectionTestContent: some View {
+        RemotePathStepView(
+            remoteName: "\(remoteConfig.name):",
+            remotePath: $remotePath,
+            configService: configService
+        )
+    }
+
     // MARK: - Validation
 
     private var canSave: Bool {
         if isEditMode {
-            // In edit mode the remote name is fixed and already populated, so we
-            // validate only the credential fields (not the name field). Any
-            // validation error that is solely about a missing/invalid name is
-            // irrelevant here because the name cannot be changed.
             guard !remoteConfig.name.isEmpty else { return false }
             return remoteConfig.validate().filter { !$0.localizedCaseInsensitiveContains("name") }.isEmpty
         }
@@ -219,7 +299,6 @@ struct AddRemoteSheet: View {
     // MARK: - Actions
 
     private func loadExistingRemote() {
-        // Always advance to credentials step so the error message is visible to the user.
         step = .credentials
         guard let remoteName = editingRemoteName,
               let existing = configService.readRemoteConfig(name: remoteName) else {
@@ -244,7 +323,7 @@ struct AddRemoteSheet: View {
         }
     }
 
-    private func createRemote() {
+    private func createRemote(onSuccess: @escaping () -> Void) {
         isLoading = true
         errorMessage = nil
 
@@ -256,7 +335,7 @@ struct AddRemoteSheet: View {
                 DispatchQueue.main.async {
                     isLoading = false
                     onRemoteCreated(remoteName)
-                    dismiss()
+                    onSuccess()
                 }
             } catch {
                 DispatchQueue.main.async {
@@ -267,7 +346,7 @@ struct AddRemoteSheet: View {
         }
     }
 
-    private func updateRemote() {
+    private func updateRemote(onSuccess: @escaping () -> Void) {
         isLoading = true
         errorMessage = nil
 
@@ -278,7 +357,7 @@ struct AddRemoteSheet: View {
                 DispatchQueue.main.async {
                     isLoading = false
                     onRemoteUpdated?(capturedConfig.name)
-                    dismiss()
+                    onSuccess()
                 }
             } catch {
                 DispatchQueue.main.async {

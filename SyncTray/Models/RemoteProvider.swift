@@ -122,7 +122,8 @@ enum RemoteProvider: String, Codable, CaseIterable, Identifiable {
                               placeholder: "22", defaultValue: "22"),
                 ProviderField(key: "user", label: "Username", type: .text),
                 ProviderField(key: "pass", label: "Password", type: .password,
-                              helpText: "Leave empty if using SSH key")
+                              helpText: "Leave empty if using SSH key",
+                              isOptional: true)
             ]
         }
     }
@@ -155,7 +156,7 @@ enum RemoteProvider: String, Codable, CaseIterable, Identifiable {
 
 /// A configuration field for a remote provider
 struct ProviderField: Identifiable {
-    let id = UUID()
+    var id: String { key }
     let key: String
     let label: String
     let type: FieldType
@@ -163,6 +164,8 @@ struct ProviderField: Identifiable {
     var helpText: String?
     var options: [FieldOption]?
     var defaultValue: String?
+    /// When true, validation skips this field even though it's in requiredFields
+    var isOptional: Bool = false
 
     enum FieldType {
         case text
@@ -176,7 +179,7 @@ struct ProviderField: Identifiable {
 
 /// An option for dropdown fields
 struct FieldOption: Identifiable {
-    let id = UUID()
+    var id: String { value }
     let value: String
     let label: String
 }
@@ -210,13 +213,7 @@ struct RemoteConfiguration {
         lines.append("type = \(provider.rcloneType)")
 
         for (key, value) in values where !value.isEmpty {
-            // Obscure password fields
-            if key == "pass" {
-                // Note: In production, use rclone obscure for passwords
-                lines.append("\(key) = \(value)")
-            } else {
-                lines.append("\(key) = \(value)")
-            }
+            lines.append("\(key) = \(value)")
         }
 
         if let token = oauthToken {
@@ -238,7 +235,7 @@ struct RemoteConfiguration {
             errors.append("Remote name cannot contain ':' or spaces")
         }
 
-        for field in provider.requiredFields where field.type != .hidden {
+        for field in provider.requiredFields where field.type != .hidden && !field.isOptional {
             if let value = values[field.key], !value.isEmpty {
                 continue
             }

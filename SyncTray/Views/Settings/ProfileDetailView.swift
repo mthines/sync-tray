@@ -498,7 +498,6 @@ struct ProfileDetailView: View {
                             Image(systemName: "pencil")
                         }
                         .help("Edit this remote's configuration")
-                        .controlSize(.small)
 
                         Button(action: {
                             let name = rcloneRemote.hasSuffix(":") ? String(rcloneRemote.dropLast()) : rcloneRemote
@@ -506,10 +505,8 @@ struct ProfileDetailView: View {
                             showingDeleteRemoteConfirm = true
                         }) {
                             Image(systemName: "trash")
-                                .foregroundStyle(.red)
                         }
                         .help("Delete this remote")
-                        .controlSize(.small)
                     }
 
                     Spacer()
@@ -1320,7 +1317,6 @@ struct ProfileDetailView: View {
                                     Image(systemName: "pencil")
                                 }
                                 .help("Edit fallback remote's configuration")
-                                .controlSize(.small)
 
                                 Button(action: {
                                     let name = fallbackRemote.hasSuffix(":") ? String(fallbackRemote.dropLast()) : fallbackRemote
@@ -1328,10 +1324,8 @@ struct ProfileDetailView: View {
                                     showingDeleteRemoteConfirm = true
                                 }) {
                                     Image(systemName: "trash")
-                                        .foregroundStyle(.red)
                                 }
                                 .help("Delete fallback remote")
-                                .controlSize(.small)
                             }
                         }
                     }
