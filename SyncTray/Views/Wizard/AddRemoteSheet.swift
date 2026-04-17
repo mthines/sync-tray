@@ -206,9 +206,12 @@ struct AddRemoteSheet: View {
 
     private var canSave: Bool {
         if isEditMode {
-            // In edit mode, name is already set — validate without name check
-            let errors = remoteConfig.validate().filter { !$0.contains("name") }
-            return errors.isEmpty
+            // In edit mode the remote name is fixed and already populated, so we
+            // validate only the credential fields (not the name field). Any
+            // validation error that is solely about a missing/invalid name is
+            // irrelevant here because the name cannot be changed.
+            guard !remoteConfig.name.isEmpty else { return false }
+            return remoteConfig.validate().filter { !$0.localizedCaseInsensitiveContains("name") }.isEmpty
         }
         return remoteConfig.validate().isEmpty
     }
@@ -216,13 +219,14 @@ struct AddRemoteSheet: View {
     // MARK: - Actions
 
     private func loadExistingRemote() {
+        // Always advance to credentials step so the error message is visible to the user.
+        step = .credentials
         guard let remoteName = editingRemoteName,
               let existing = configService.readRemoteConfig(name: remoteName) else {
-            errorMessage = "Could not load remote configuration"
+            errorMessage = "Could not load remote configuration for \"\(editingRemoteName ?? "unknown")\""
             return
         }
         remoteConfig = existing
-        step = .credentials
     }
 
     private func startOAuth() {
@@ -244,15 +248,22 @@ struct AddRemoteSheet: View {
         isLoading = true
         errorMessage = nil
 
-        do {
-            try configService.addRemote(remoteConfig)
-            let remoteName = "\(remoteConfig.name):"
-            isLoading = false
-            onRemoteCreated(remoteName)
-            dismiss()
-        } catch {
-            isLoading = false
-            errorMessage = error.localizedDescription
+        let capturedConfig = remoteConfig
+        DispatchQueue.global(qos: .userInitiated).async {
+            do {
+                try configService.addRemote(capturedConfig)
+                let remoteName = "\(capturedConfig.name):"
+                DispatchQueue.main.async {
+                    isLoading = false
+                    onRemoteCreated(remoteName)
+                    dismiss()
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    isLoading = false
+                    errorMessage = error.localizedDescription
+                }
+            }
         }
     }
 
@@ -260,14 +271,21 @@ struct AddRemoteSheet: View {
         isLoading = true
         errorMessage = nil
 
-        do {
-            try configService.updateRemote(remoteConfig)
-            isLoading = false
-            onRemoteUpdated?(remoteConfig.name)
-            dismiss()
-        } catch {
-            isLoading = false
-            errorMessage = error.localizedDescription
+        let capturedConfig = remoteConfig
+        DispatchQueue.global(qos: .userInitiated).async {
+            do {
+                try configService.updateRemote(capturedConfig)
+                DispatchQueue.main.async {
+                    isLoading = false
+                    onRemoteUpdated?(capturedConfig.name)
+                    dismiss()
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    isLoading = false
+                    errorMessage = error.localizedDescription
+                }
+            }
         }
     }
 }

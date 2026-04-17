@@ -82,8 +82,7 @@ struct ProfileDetailView: View {
         }
         var remoteName: String {
             switch self {
-            case .primary(let name): return name
-            case .fallback(let name): return name
+            case .primary(let name), .fallback(let name): return name
             }
         }
     }
@@ -1583,22 +1582,34 @@ struct ProfileDetailView: View {
     }
 
     private func performDeleteRemote(_ name: String) {
-        do {
-            try RcloneConfigService.shared.deleteRemote(name)
+        // Capture state values before dispatching to background
+        let capturedRcloneRemote = rcloneRemote
+        let capturedFallbackRemote = fallbackRemote
 
-            // Clear selection if the deleted remote was selected
-            let nameWithoutColon = name.hasSuffix(":") ? String(name.dropLast()) : name
-            if rcloneRemote == nameWithoutColon || rcloneRemote == "\(nameWithoutColon):" {
-                rcloneRemote = ""
-                availableFolders = []
-            }
-            if fallbackRemote == nameWithoutColon || fallbackRemote == "\(nameWithoutColon):" {
-                fallbackRemote = ""
-            }
+        DispatchQueue.global(qos: .userInitiated).async {
+            do {
+                try RcloneConfigService.shared.deleteRemote(name)
 
-            loadRcloneRemotes()
-        } catch {
-            installError = "Failed to delete remote: \(error.localizedDescription)"
+                let nameWithoutColon = name.hasSuffix(":") ? String(name.dropLast()) : name
+                let clearRclone = capturedRcloneRemote == nameWithoutColon || capturedRcloneRemote == "\(nameWithoutColon):"
+                let clearFallback = capturedFallbackRemote == nameWithoutColon || capturedFallbackRemote == "\(nameWithoutColon):"
+
+                DispatchQueue.main.async {
+                    // Clear selection if the deleted remote was selected
+                    if clearRclone {
+                        rcloneRemote = ""
+                        availableFolders = []
+                    }
+                    if clearFallback {
+                        fallbackRemote = ""
+                    }
+                    loadRcloneRemotes()
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    installError = "Failed to delete remote: \(error.localizedDescription)"
+                }
+            }
         }
     }
 
