@@ -112,6 +112,10 @@ struct RemotePathStepView: View {
     @Binding var remotePath: String
     let configService: RcloneConfigService
 
+    /// When true, start in custom text input mode instead of folder picker.
+    /// Use this in edit mode when the existing path may not match any folder from lsd.
+    var initialUseCustomPath: Bool = false
+
     @State private var availableFolders: [String] = []
     @State private var isLoading: Bool = false
     @State private var isTestingConnection: Bool = false
@@ -138,6 +142,9 @@ struct RemotePathStepView: View {
             statusMessageSection
         }
         .onAppear {
+            if initialUseCustomPath {
+                useTextInput = true
+            }
             loadFolders()
         }
     }

@@ -1,12 +1,21 @@
 import SwiftUI
 
-/// A lightweight sheet for creating a new rclone remote.
+/// A lightweight sheet for creating or editing a rclone remote.
 /// Reuses the provider grid and credential fields from the full setup wizard.
 struct AddRemoteSheet: View {
     @Environment(\.dismiss) private var dismiss
 
     /// Called with the new remote name (with trailing colon) after successful creation.
     var onRemoteCreated: (String) -> Void
+
+    /// When non-nil, the sheet is in edit mode for this remote name.
+    var editingRemoteName: String?
+
+    /// Called after a successful edit (passes the remote name).
+    var onRemoteUpdated: ((String) -> Void)?
+
+    /// Whether we are editing an existing remote.
+    private var isEditMode: Bool { editingRemoteName != nil }
 
     // Wizard state
     @State private var step: Step = .provider
@@ -17,6 +26,22 @@ struct AddRemoteSheet: View {
 
     private let configService = RcloneConfigService.shared
 
+    // MARK: - Initializers
+
+    /// Create sheet for adding a new remote.
+    init(onRemoteCreated: @escaping (String) -> Void) {
+        self.onRemoteCreated = onRemoteCreated
+        self.editingRemoteName = nil
+        self.onRemoteUpdated = nil
+    }
+
+    /// Create sheet for editing an existing remote.
+    init(editing remoteName: String, onRemoteUpdated: @escaping (String) -> Void) {
+        self.editingRemoteName = remoteName
+        self.onRemoteUpdated = onRemoteUpdated
+        self.onRemoteCreated = { _ in }
+    }
+
     enum Step {
         case provider
         case credentials
@@ -26,8 +51,13 @@ struct AddRemoteSheet: View {
         VStack(spacing: 0) {
             // Header
             HStack {
-                Text(step == .provider ? "Choose Provider" : "Configure \(remoteConfig.provider.displayName)")
-                    .font(.headline)
+                if isEditMode {
+                    Text("Edit Remote")
+                        .font(.headline)
+                } else {
+                    Text(step == .provider ? "Choose Provider" : "Configure \(remoteConfig.provider.displayName)")
+                        .font(.headline)
+                }
                 Spacer()
             }
             .padding()
@@ -56,25 +86,39 @@ struct AddRemoteSheet: View {
 
                 Spacer()
 
-                if step == .credentials {
+                // Show Back only in create mode (edit mode starts at credentials)
+                if step == .credentials && !isEditMode {
                     Button("Back") {
                         withAnimation { step = .provider }
                     }
                 }
 
-                Button(step == .provider ? "Next" : "Create Remote") {
+                Button(actionButtonLabel) {
                     if step == .provider {
                         withAnimation { step = .credentials }
+                    } else if isEditMode {
+                        updateRemote()
                     } else {
                         createRemote()
                     }
                 }
                 .buttonStyle(.borderedProminent)
-                .disabled(step == .credentials && !canCreate)
+                .disabled(step == .credentials && !canSave)
             }
             .padding()
         }
         .frame(width: 500, height: 420)
+        .onAppear {
+            if isEditMode {
+                loadExistingRemote()
+            }
+        }
+    }
+
+    private var actionButtonLabel: String {
+        if step == .provider { return "Next" }
+        if isEditMode { return "Save Changes" }
+        return "Create Remote"
     }
 
     // MARK: - Provider Step
@@ -100,11 +144,22 @@ struct AddRemoteSheet: View {
                 Text("Remote Name")
                     .font(.subheadline)
                     .foregroundColor(.secondary)
-                TextField("e.g., my-nas", text: $remoteConfig.name)
-                    .textFieldStyle(.roundedBorder)
-                Text("A unique name for this remote (no spaces or colons)")
-                    .font(.caption)
-                    .foregroundColor(.secondary)
+
+                if isEditMode {
+                    // Name is immutable in edit mode — rename requires delete + recreate
+                    Text(remoteConfig.name)
+                        .font(.body)
+                        .padding(.vertical, 4)
+                    Text("Remote name cannot be changed. Delete and re-create to rename.")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                } else {
+                    TextField("e.g., my-nas", text: $remoteConfig.name)
+                        .textFieldStyle(.roundedBorder)
+                    Text("A unique name for this remote (no spaces or colons)")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
             }
 
             Divider()
@@ -117,6 +172,10 @@ struct AddRemoteSheet: View {
                     if remoteConfig.oauthToken != nil {
                         Label("Authenticated", systemImage: "checkmark.circle.fill")
                             .foregroundColor(.green)
+                        Button("Re-authenticate") {
+                            remoteConfig.oauthToken = nil
+                        }
+                        .font(.caption)
                     } else {
                         Button(action: startOAuth) {
                             HStack {
@@ -145,11 +204,26 @@ struct AddRemoteSheet: View {
 
     // MARK: - Validation
 
-    private var canCreate: Bool {
-        remoteConfig.validate().isEmpty
+    private var canSave: Bool {
+        if isEditMode {
+            // In edit mode, name is already set — validate without name check
+            let errors = remoteConfig.validate().filter { !$0.contains("name") }
+            return errors.isEmpty
+        }
+        return remoteConfig.validate().isEmpty
     }
 
     // MARK: - Actions
+
+    private func loadExistingRemote() {
+        guard let remoteName = editingRemoteName,
+              let existing = configService.readRemoteConfig(name: remoteName) else {
+            errorMessage = "Could not load remote configuration"
+            return
+        }
+        remoteConfig = existing
+        step = .credentials
+    }
 
     private func startOAuth() {
         isOAuthInProgress = true
@@ -175,6 +249,21 @@ struct AddRemoteSheet: View {
             let remoteName = "\(remoteConfig.name):"
             isLoading = false
             onRemoteCreated(remoteName)
+            dismiss()
+        } catch {
+            isLoading = false
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    private func updateRemote() {
+        isLoading = true
+        errorMessage = nil
+
+        do {
+            try configService.updateRemote(remoteConfig)
+            isLoading = false
+            onRemoteUpdated?(remoteConfig.name)
             dismiss()
         } catch {
             isLoading = false

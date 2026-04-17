@@ -310,7 +310,8 @@ struct SetupWizardView: View {
         RemotePathStepView(
             remoteName: selectedRemote.isEmpty ? remoteConfig.name : selectedRemote,
             remotePath: $remotePath,
-            configService: configService
+            configService: configService,
+            initialUseCustomPath: isEditMode && !remotePath.isEmpty
         )
     }
 
@@ -495,6 +496,14 @@ struct SetupWizardView: View {
         }
     }
 
+    // MARK: - Edit Mode Start Step
+
+    /// The step where edit mode begins. Back navigation is blocked at this step
+    /// because the provider/credentials steps are uninitialized in edit mode.
+    private var editModeStartStep: WizardStep? {
+        isEditMode ? .remotePath : nil
+    }
+
     // MARK: - Navigation Buttons
 
     private var navigationButtons: some View {
@@ -506,7 +515,8 @@ struct SetupWizardView: View {
 
             Spacer()
 
-            if currentStep.previous != nil {
+            // Hide Back when at the starting step in edit mode (provider/credentials uninitialized)
+            if currentStep.previous != nil && currentStep != editModeStartStep {
                 Button("Back") {
                     withAnimation {
                         currentStep = currentStep.previous!

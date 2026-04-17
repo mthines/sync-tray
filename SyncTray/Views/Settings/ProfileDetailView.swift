@@ -68,6 +68,30 @@ struct ProfileDetailView: View {
         var id: Self { self }
     }
 
+    // Edit remote sheet — tracks which picker opened it and the remote name
+    @State private var editRemoteTarget: EditRemoteTarget?
+
+    enum EditRemoteTarget: Identifiable {
+        case primary(String)
+        case fallback(String)
+        var id: String {
+            switch self {
+            case .primary(let name): return "primary-\(name)"
+            case .fallback(let name): return "fallback-\(name)"
+            }
+        }
+        var remoteName: String {
+            switch self {
+            case .primary(let name): return name
+            case .fallback(let name): return name
+            }
+        }
+    }
+
+    // Delete remote confirmation
+    @State private var deleteRemoteConfirmName: String?
+    @State private var showingDeleteRemoteConfirm: Bool = false
+
     private let setupService = SyncSetupService.shared
 
     // MARK: - Computed Properties
@@ -278,6 +302,26 @@ struct ProfileDetailView: View {
                 }
             }
         }
+        .sheet(item: $editRemoteTarget) { target in
+            AddRemoteSheet(editing: target.remoteName) { _ in
+                loadRcloneRemotes()
+            }
+        }
+        .alert("Delete Remote?", isPresented: $showingDeleteRemoteConfirm) {
+            Button("Cancel", role: .cancel) {
+                deleteRemoteConfirmName = nil
+            }
+            Button("Delete", role: .destructive) {
+                if let name = deleteRemoteConfirmName {
+                    performDeleteRemote(name)
+                }
+                deleteRemoteConfirmName = nil
+            }
+        } message: {
+            if let name = deleteRemoteConfirmName {
+                Text("Delete remote \"\(name)\"? This cannot be undone. Any profiles using this remote will need to be reconfigured.")
+            }
+        }
     }
 
     // MARK: - Sections
@@ -446,6 +490,29 @@ struct ProfileDetailView: View {
                         Image(systemName: "arrow.clockwise")
                     }
                     .help("Refresh remotes list")
+
+                    if !rcloneRemote.isEmpty {
+                        Button(action: {
+                            let name = rcloneRemote.hasSuffix(":") ? String(rcloneRemote.dropLast()) : rcloneRemote
+                            editRemoteTarget = .primary(name)
+                        }) {
+                            Image(systemName: "pencil")
+                        }
+                        .help("Edit this remote's configuration")
+                        .controlSize(.small)
+
+                        Button(action: {
+                            let name = rcloneRemote.hasSuffix(":") ? String(rcloneRemote.dropLast()) : rcloneRemote
+                            deleteRemoteConfirmName = name
+                            showingDeleteRemoteConfirm = true
+                        }) {
+                            Image(systemName: "trash")
+                                .foregroundStyle(.red)
+                        }
+                        .help("Delete this remote")
+                        .controlSize(.small)
+                    }
+
                     Spacer()
                 }
 
@@ -1245,6 +1312,28 @@ struct ProfileDetailView: View {
                                 Image(systemName: "arrow.clockwise")
                             }
                             .help("Refresh remotes list")
+
+                            if !fallbackRemote.isEmpty {
+                                Button(action: {
+                                    let name = fallbackRemote.hasSuffix(":") ? String(fallbackRemote.dropLast()) : fallbackRemote
+                                    editRemoteTarget = .fallback(name)
+                                }) {
+                                    Image(systemName: "pencil")
+                                }
+                                .help("Edit fallback remote's configuration")
+                                .controlSize(.small)
+
+                                Button(action: {
+                                    let name = fallbackRemote.hasSuffix(":") ? String(fallbackRemote.dropLast()) : fallbackRemote
+                                    deleteRemoteConfirmName = name
+                                    showingDeleteRemoteConfirm = true
+                                }) {
+                                    Image(systemName: "trash")
+                                        .foregroundStyle(.red)
+                                }
+                                .help("Delete fallback remote")
+                                .controlSize(.small)
+                            }
                         }
                     }
                 }
@@ -1490,6 +1579,26 @@ struct ProfileDetailView: View {
         // Only reinstall if sync-related settings changed
         if needsReinstall {
             reinstallSync()
+        }
+    }
+
+    private func performDeleteRemote(_ name: String) {
+        do {
+            try RcloneConfigService.shared.deleteRemote(name)
+
+            // Clear selection if the deleted remote was selected
+            let nameWithoutColon = name.hasSuffix(":") ? String(name.dropLast()) : name
+            if rcloneRemote == nameWithoutColon || rcloneRemote == "\(nameWithoutColon):" {
+                rcloneRemote = ""
+                availableFolders = []
+            }
+            if fallbackRemote == nameWithoutColon || fallbackRemote == "\(nameWithoutColon):" {
+                fallbackRemote = ""
+            }
+
+            loadRcloneRemotes()
+        } catch {
+            installError = "Failed to delete remote: \(error.localizedDescription)"
         }
     }
 

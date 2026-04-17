@@ -122,6 +122,122 @@ final class RcloneConfigService {
         try newConfig.write(toFile: configPath, atomically: true, encoding: .utf8)
     }
 
+    /// Read configuration for an existing remote from rclone.conf
+    /// Returns a RemoteConfiguration pre-populated with the remote's current settings.
+    func readRemoteConfig(name: String) -> RemoteConfiguration? {
+        guard FileManager.default.fileExists(atPath: configPath),
+              let content = try? String(contentsOfFile: configPath, encoding: .utf8) else {
+            return nil
+        }
+
+        // Parse INI-style config file
+        let lines = content.components(separatedBy: "\n")
+        var inSection = false
+        var values: [String: String] = [:]
+        var rcloneType: String?
+
+        for line in lines {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+
+            if trimmed == "[\(name)]" {
+                inSection = true
+                continue
+            }
+
+            if inSection {
+                // Stop at next section
+                if trimmed.hasPrefix("[") && trimmed.hasSuffix("]") {
+                    break
+                }
+
+                // Parse key = value
+                if let eqRange = trimmed.range(of: " = ") {
+                    let key = String(trimmed[trimmed.startIndex..<eqRange.lowerBound])
+                    let value = String(trimmed[eqRange.upperBound...])
+                    if key == "type" {
+                        rcloneType = value
+                    } else {
+                        values[key] = value
+                    }
+                }
+            }
+        }
+
+        guard inSection, let type = rcloneType else { return nil }
+
+        let provider = providerFromRcloneType(type, values: values)
+        var config = RemoteConfiguration(name: name, provider: provider)
+
+        // Copy values (overriding defaults)
+        for (key, value) in values {
+            config.values[key] = value
+        }
+
+        // Extract OAuth token if present
+        if let token = values["token"] {
+            config.oauthToken = token
+            config.values.removeValue(forKey: "token")
+        }
+
+        return config
+    }
+
+    /// Map rclone type string to RemoteProvider
+    private func providerFromRcloneType(_ type: String, values: [String: String]) -> RemoteProvider {
+        switch type {
+        case "drive":
+            return .googleDrive
+        case "dropbox":
+            return .dropbox
+        case "onedrive":
+            return .oneDrive
+        case "webdav":
+            // Detect Synology by vendor or URL containing Synology ports
+            if let url = values["url"],
+               (url.contains(":5005") || url.contains(":5006") || url.contains(":5001")) {
+                return .synology
+            }
+            if let vendor = values["vendor"], vendor == "other" {
+                // Could be Synology — check URL
+                return .synology
+            }
+            return .webdav
+        case "sftp":
+            return .sftp
+        default:
+            return .webdav
+        }
+    }
+
+    /// Update an existing remote (delete old config section, write new one)
+    func updateRemote(_ config: RemoteConfiguration) throws {
+        // Delete the existing remote first
+        try deleteRemote(config.name)
+
+        // Ensure config directory exists
+        let configDir = (configPath as NSString).deletingLastPathComponent
+        try FileManager.default.createDirectory(
+            atPath: configDir,
+            withIntermediateDirectories: true
+        )
+
+        // Read existing config (after deletion)
+        var existingConfig = ""
+        if FileManager.default.fileExists(atPath: configPath) {
+            existingConfig = try String(contentsOfFile: configPath, encoding: .utf8)
+        }
+
+        // Generate new section
+        let newSection = config.generateConfigSection()
+
+        // Append to config
+        let newConfig = existingConfig.isEmpty
+            ? newSection
+            : "\(existingConfig)\n\n\(newSection)"
+
+        try newConfig.write(toFile: configPath, atomically: true, encoding: .utf8)
+    }
+
     /// Delete a remote from rclone config
     func deleteRemote(_ name: String) throws {
         guard let rclonePath = findRclonePath() else {
