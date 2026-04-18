@@ -152,6 +152,14 @@ it's derived from the machine's hardware UUID via a one-way hash.
 | `synctray.transport.fallback_activations` | Counter | Fallback remote activations |
 | `synctray.sync.file_operations` | Counter | File operations by type + extension |
 | `synctray.remote.config_operations` | Counter | Remote config operations (create/update/delete/connection_test) by provider type + result |
+| `synctray.sync.contention` | Counter | Syncs skipped because another was already running (lock file contention) |
+| `synctray.logwatcher.recovery` | Counter | LogWatcher recovery events (file_replaced, missed_bytes, polling_error) |
+| `synctray.startup.stale_locks_cleaned` | Counter | Stale lock files cleaned on startup (synctray or rclone_bisync) |
+| `synctray.sync.check_phase_duration` | Histogram | Duration of bisync listing/check phase (seconds) — main bottleneck for large repos |
+| `synctray.drive.events` | Counter | External drive mount/unmount events detected by NSWorkspace |
+| `synctray.directory_watch.filtered` | Counter | Directory watch events filtered out (out_of_scope, phantom, metadata) |
+| `synctray.sync.resumed_external` | Counter | Externally-started syncs detected and resumed at app startup |
+| `synctray.app.settings_opened` | Counter | Settings window opens |
 
 ### Spans
 | Span | Kind | Description |
@@ -173,6 +181,14 @@ All key lifecycle events are emitted as structured OTel logs:
 - Profile configuration snapshots (RUM — sync mode, interval, feature toggles)
 - Configuration summary (profile count breakdown by mode)
 - Remote config operations: create/update/delete/connection_test (with provider type and categorized error type)
+- Sync contention: sync skipped because another was already running (bottleneck detection)
+- LogWatcher recovery: file replaced, missed bytes, polling errors (monitoring health)
+- Stale lock cleanup: count and type of stale locks cleaned at startup (crash detection)
+- Check phase duration: bisync listing/comparison phase timing (bottleneck analysis)
+- Session heartbeat: periodic (5min) alive signal with profile state summary (availability)
+- Volume events: external drive mount/unmount with affected profile count (drive workflow RUM)
+- Sync precondition failures: script_not_found, config_not_found (setup issue detection)
+- Resumed external syncs: syncs detected running at startup (launchd overlap detection)
 
 ## Swift SDK Gotcha: Wildcard View Required
 
