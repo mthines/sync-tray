@@ -1183,6 +1183,10 @@ struct ProfileDetailView: View {
                         if FileManager.default.fileExists(atPath: lockPath) {
                             try? FileManager.default.removeItem(atPath: lockPath)
                         }
+                        TelemetryService.shared.recordProfileLifecycleOperation(
+                            profileId: profile.id, profileName: profile.name,
+                            operation: "sync_now", syncMode: profile.syncMode.rawValue, result: "started"
+                        )
                         syncManager.triggerManualSync(for: profile)
                     }) {
                         Label("Sync Now", systemImage: "arrow.triangle.2.circlepath")
@@ -1772,6 +1776,11 @@ struct ProfileDetailView: View {
         // Build profile from current form state (no need to save first)
         let currentProfile = buildProfileFromForm()
 
+        TelemetryService.shared.recordProfileLifecycleOperation(
+            profileId: currentProfile.id, profileName: currentProfile.name,
+            operation: "install", syncMode: currentProfile.syncMode.rawValue, result: "started"
+        )
+
         // Check if this needs initial sync before we start
         let needsResync = !setupService.hasExistingListings(for: currentProfile)
 
@@ -1786,6 +1795,11 @@ struct ProfileDetailView: View {
                     DispatchQueue.main.async {
                         isInstalling = false
                         installError = error
+                        TelemetryService.shared.recordProfileLifecycleOperation(
+                            profileId: currentProfile.id, profileName: currentProfile.name,
+                            operation: "install", syncMode: currentProfile.syncMode.rawValue,
+                            result: "failure", errorMessage: error
+                        )
                     }
                     return
                 }
@@ -1806,6 +1820,16 @@ struct ProfileDetailView: View {
                         // Load the agent now that LogWatcher is ready
                         if !setupService.loadAgent(for: currentProfile) {
                             installError = "Failed to start sync agent"
+                            TelemetryService.shared.recordProfileLifecycleOperation(
+                                profileId: currentProfile.id, profileName: currentProfile.name,
+                                operation: "install", syncMode: currentProfile.syncMode.rawValue,
+                                result: "failure", errorMessage: "Failed to start sync agent"
+                            )
+                        } else {
+                            TelemetryService.shared.recordProfileLifecycleOperation(
+                                profileId: currentProfile.id, profileName: currentProfile.name,
+                                operation: "install", syncMode: currentProfile.syncMode.rawValue, result: "success"
+                            )
                         }
                         isInstalling = false
                     }
@@ -1814,6 +1838,11 @@ struct ProfileDetailView: View {
                 DispatchQueue.main.async {
                     isInstalling = false
                     installError = error.localizedDescription
+                    TelemetryService.shared.recordProfileLifecycleOperation(
+                        profileId: currentProfile.id, profileName: currentProfile.name,
+                        operation: "install", syncMode: currentProfile.syncMode.rawValue,
+                        result: "failure", errorMessage: error.localizedDescription
+                    )
                 }
             }
         }
@@ -1830,13 +1859,27 @@ struct ProfileDetailView: View {
             disabledProfile.isEnabled = false
             profileStore.update(disabledProfile)
             syncManager.refreshSettings()
+            TelemetryService.shared.recordProfileLifecycleOperation(
+                profileId: currentProfile.id, profileName: currentProfile.name,
+                operation: "uninstall", syncMode: currentProfile.syncMode.rawValue, result: "success"
+            )
         } catch {
             installError = error.localizedDescription
+            TelemetryService.shared.recordProfileLifecycleOperation(
+                profileId: currentProfile.id, profileName: currentProfile.name,
+                operation: "uninstall", syncMode: currentProfile.syncMode.rawValue,
+                result: "failure", errorMessage: error.localizedDescription
+            )
         }
     }
 
     private func reinstallSync() {
         guard let currentProfile = profileStore.profile(for: profile.id) else { return }
+
+        TelemetryService.shared.recordProfileLifecycleOperation(
+            profileId: currentProfile.id, profileName: currentProfile.name,
+            operation: "reinstall", syncMode: currentProfile.syncMode.rawValue, result: "started"
+        )
 
         do {
             try setupService.uninstall(profile: currentProfile)
@@ -1979,6 +2022,11 @@ struct ProfileDetailView: View {
             // Add filter file if it exists (excludes ._* files, .DS_Store, etc.)
             if fileManager.fileExists(atPath: capturedFilterPath) {
                 arguments.append(contentsOf: ["--filter-from", capturedFilterPath])
+            }
+
+            // Add --no-check-certificate if configured for this remote
+            if RcloneConfigService.shared.readRemoteConfig(name: capturedRcloneRemote)?.values["no_check_certificate"] == "true" {
+                arguments.append("--no-check-certificate")
             }
 
             // Add any additional flags from profile
@@ -2556,6 +2604,11 @@ struct ProfileDetailView: View {
             // Add resilient recovery options
             arguments.append(contentsOf: ["--resilient", "--recover", "--conflict-resolve", "newer", "--conflict-loser", "num", "--conflict-suffix", "sync-conflict-{DateOnly}-"])
 
+            // Add --no-check-certificate if configured for this remote
+            if RcloneConfigService.shared.readRemoteConfig(name: capturedRcloneRemote)?.values["no_check_certificate"] == "true" {
+                arguments.append("--no-check-certificate")
+            }
+
             // Add any user-specified additional flags
             if !capturedAdditionalFlags.isEmpty {
                 arguments.append(contentsOf: capturedAdditionalFlags.split(separator: " ").map(String.init))
@@ -2764,8 +2817,11 @@ struct ProfileDetailView: View {
             let checkProcess = Process()
             let checkPipe = Pipe()
 
+            let skipCert = RcloneConfigService.shared.readRemoteConfig(name: remote)?.values["no_check_certificate"] == "true"
             checkProcess.executableURL = URL(fileURLWithPath: rclone)
-            checkProcess.arguments = ["ls", remoteCheckPath]
+            var checkArgs = ["ls", remoteCheckPath]
+            if skipCert { checkArgs.append("--no-check-certificate") }
+            checkProcess.arguments = checkArgs
             checkProcess.standardOutput = checkPipe
             checkProcess.standardError = checkPipe
 
@@ -2784,12 +2840,17 @@ struct ProfileDetailView: View {
                 let touchPipe = Pipe()
 
                 touchProcess.executableURL = URL(fileURLWithPath: rclone)
-                touchProcess.arguments = ["touch", remoteCheckPath]
+                var touchArgs = ["rcat", remoteCheckPath]
+                if skipCert { touchArgs.append("--no-check-certificate") }
+                touchProcess.arguments = touchArgs
+                let touchStdin = Pipe()
+                touchProcess.standardInput = touchStdin
                 touchProcess.standardOutput = touchPipe
                 touchProcess.standardError = touchPipe
 
                 do {
                     try touchProcess.run()
+                    touchStdin.fileHandleForWriting.closeFile()
                     touchProcess.waitUntilExit()
 
                     if touchProcess.terminationStatus == 0 {
@@ -2928,16 +2989,22 @@ struct ProfileDetailView: View {
             let pipe = Pipe()
 
             process.executableURL = URL(fileURLWithPath: path)
-            process.arguments = ["touch", remoteDest]
+            var touchArgs = ["rcat", remoteDest]
+            let skipCertForTouch = RcloneConfigService.shared.readRemoteConfig(name: remote)?.values["no_check_certificate"] == "true"
+            if skipCertForTouch { touchArgs.append("--no-check-certificate") }
+            process.arguments = touchArgs
+            let rcatStdin = Pipe()
+            process.standardInput = rcatStdin
             process.standardOutput = pipe
             process.standardError = pipe
 
             DispatchQueue.main.async {
-                self.appendOutputLine("Running: rclone touch \"\(remoteDest)\"")
+                self.appendOutputLine("Running: rclone rcat \"\(remoteDest)\"")
             }
 
             do {
                 try process.run()
+                rcatStdin.fileHandleForWriting.closeFile()
                 process.waitUntilExit()
 
                 let data = pipe.fileHandleForReading.readDataToEndOfFile()

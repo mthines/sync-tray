@@ -724,6 +724,41 @@ final class TelemetryService {
         }
     }
 
+    // MARK: - Profile Lifecycle Operations
+
+    /// Record a profile lifecycle operation (install, reinstall, uninstall, sync_now, resync, force_sync).
+    /// Captures the operation type, sync mode, and result for debugging setup issues.
+    func recordProfileLifecycleOperation(
+        profileId: UUID,
+        profileName: String,
+        operation: String,          // "install", "reinstall", "uninstall", "sync_now", "resync", "force_sync"
+        syncMode: String,           // bisync, sync, mount
+        result: String,             // "success", "failure", "started"
+        errorMessage: String? = nil
+    ) {
+        guard SyncTraySettings.telemetryEnabled else { return }
+        ensureSetup()
+
+        var logAttrs: [String: AttributeValue] = [
+            "synctray.profile.id": .string(profileId.uuidString),
+            "synctray.profile.name": .string(profileName),
+            "profile.operation": .string(operation),
+            "sync.mode": .string(syncMode),
+            "profile.operation.result": .string(result),
+        ]
+        if let errMsg = errorMessage {
+            let errorType = categorizeError(errMsg)
+            logAttrs["error.type"] = .string(errorType)
+            logAttrs["error.message"] = .string(String(errMsg.prefix(256)))
+        }
+
+        emitLog(
+            severity: result == "failure" ? .error : .info,
+            body: "Profile \(operation) \(result)",
+            attributes: logAttrs
+        )
+    }
+
     // MARK: - Remote Configuration
 
     /// Record a remote configuration operation (create, update, delete, connection_test).

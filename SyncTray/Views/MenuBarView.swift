@@ -11,7 +11,7 @@ struct MenuBarView: View {
                 .padding(.bottom, 8)
 
             // Profile status section
-            if syncManager.profileStore.enabledProfiles.count >= 1 {
+            if syncManager.profileStore.profiles.count >= 1 {
                 Divider()
                     .padding(.horizontal, 8)
 
@@ -42,7 +42,7 @@ struct MenuBarView: View {
                 .font(.caption)
                 .foregroundColor(.secondary)
 
-            ForEach(syncManager.profileStore.enabledProfiles) { profile in
+            ForEach(syncManager.profileStore.profiles) { profile in
                 HStack(spacing: 8) {
                     // Status indicator - show pause icon when paused
                     if syncManager.isPaused(for: profile.id) {

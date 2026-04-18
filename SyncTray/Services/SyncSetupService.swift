@@ -303,11 +303,14 @@ final class SyncSetupService {
             rcatArgs.append("--no-check-certificate")
         }
         process.arguments = rcatArgs
-        // rcat reads from stdin — provide empty input to create an empty file
-        process.standardInput = Pipe()
+        // rcat reads from stdin — provide empty input and close immediately for EOF
+        let stdinPipe = Pipe()
+        process.standardInput = stdinPipe
 
         do {
             try process.run()
+            // Close stdin so rcat gets EOF and finishes
+            stdinPipe.fileHandleForWriting.closeFile()
             process.waitUntilExit()
             if process.terminationStatus != 0 {
                 return "Failed to create remote check file (exit code \(process.terminationStatus))"
