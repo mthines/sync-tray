@@ -6,6 +6,8 @@ protocol LogWatcherDelegate: AnyObject {
 
 final class LogWatcher {
     private var logPath: String
+    /// Profile name for telemetry attribution (set by SyncManager)
+    var profileName: String = ""
     private var fileHandle: FileHandle?
     private var source: DispatchSourceFileSystemObject?
     private var lastReadPosition: UInt64 = 0
@@ -148,6 +150,7 @@ final class LogWatcher {
         newSource.resume()
 
         SyncTraySettings.debugLog("LogWatcher: Successfully reopened file with new inode \(lastKnownInode)")
+        TelemetryService.shared.recordLogWatcherRecovery(reason: "file_replaced", profileName: profileName)
     }
 
     /// Adjust polling frequency based on sync activity
@@ -197,15 +200,19 @@ final class LogWatcher {
                 // Missed content - read it
                 let missedBytes = currentSize - lastReadPosition
                 SyncTraySettings.debugLog("LogWatcher: Polling detected \(missedBytes) missed bytes")
+                let name = self.profileName
                 DispatchQueue.main.async { [weak self] in
                     self?.handleFileChange()
+                    TelemetryService.shared.recordLogWatcherRecovery(reason: "missed_bytes", profileName: name)
                 }
             }
         } catch {
             // File may have been deleted - trigger recovery
             SyncTraySettings.debugLog("LogWatcher: Polling error - \(error.localizedDescription)")
+            let name = self.profileName
             DispatchQueue.main.async { [weak self] in
                 self?.stopWatching()
+                TelemetryService.shared.recordLogWatcherRecovery(reason: "polling_error", profileName: name)
                 DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
                     self?.startWatching()
                 }

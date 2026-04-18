@@ -11,6 +11,9 @@ final class DirectoryWatcher {
     private let debounceInterval: TimeInterval
     private let debugLabel: String
 
+    /// Profile name for telemetry attribution (set by SyncManager)
+    var profileName: String = ""
+
     private var debounceTimer: DispatchSourceTimer?
     private let debounceQueue = DispatchQueue(label: "com.synctray.directory-watcher.debounce")
 
@@ -148,6 +151,14 @@ final class DirectoryWatcher {
 
         if pathsInScope.isEmpty {
             SyncTraySettings.debugLog("[\(label)] No paths in scope after filtering")
+            let outOfScopeCount = eventPaths.count - pathsInScope.count
+            if outOfScopeCount > 0 {
+                TelemetryService.shared.recordDirectoryWatchFiltered(
+                    profileName: profileName,
+                    reason: "out_of_scope",
+                    filteredCount: outOfScopeCount
+                )
+            }
             return
         }
 
@@ -183,6 +194,14 @@ final class DirectoryWatcher {
 
         if relevantChanges.isEmpty {
             SyncTraySettings.debugLog("[\(label)] All events filtered out (metadata/temp files)")
+            let metadataFilteredCount = pathsInScope.count - relevantChanges.count
+            if metadataFilteredCount > 0 {
+                TelemetryService.shared.recordDirectoryWatchFiltered(
+                    profileName: profileName,
+                    reason: "metadata",
+                    filteredCount: metadataFilteredCount
+                )
+            }
             return
         }
 

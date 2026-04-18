@@ -98,6 +98,14 @@ final class TelemetryService {
     private var transportFallbackCounter: LongCounterSdk?
     private var fileOperationCounter: LongCounterSdk?
     private var remoteConfigCounter: LongCounterSdk?
+    private var syncContentionCounter: LongCounterSdk?
+    private var logWatcherRecoveryCounter: LongCounterSdk?
+    private var staleLockCleanupCounter: LongCounterSdk?
+    private var syncCheckPhaseHistogram: DoubleHistogramMeterSdk?
+    private var volumeEventCounter: LongCounterSdk?
+    private var directoryWatchFilterCounter: LongCounterSdk?
+    private var resumedExternalSyncCounter: LongCounterSdk?
+    private var settingsOpenedCounter: LongCounterSdk?
 
     // MARK: - Providers (kept alive for shutdown)
 
@@ -269,6 +277,54 @@ final class TelemetryService {
         remoteConfigCounter = meter
             .counterBuilder(name: "synctray.remote.config_operations")
             .setDescription("Number of remote configuration operations by type and result")
+            .setUnit("1")
+            .build()
+
+        syncContentionCounter = meter
+            .counterBuilder(name: "synctray.sync.contention")
+            .setDescription("Number of times a sync was skipped because another was already running")
+            .setUnit("1")
+            .build()
+
+        logWatcherRecoveryCounter = meter
+            .counterBuilder(name: "synctray.logwatcher.recovery")
+            .setDescription("Number of LogWatcher recovery events (file reopen, missed bytes, polling fallback)")
+            .setUnit("1")
+            .build()
+
+        staleLockCleanupCounter = meter
+            .counterBuilder(name: "synctray.startup.stale_locks_cleaned")
+            .setDescription("Number of stale lock files cleaned on startup")
+            .setUnit("1")
+            .build()
+
+        syncCheckPhaseHistogram = meter
+            .histogramBuilder(name: "synctray.sync.check_phase_duration")
+            .setDescription("Duration of the bisync listing/check phase in seconds")
+            .setUnit("s")
+            .build()
+
+        volumeEventCounter = meter
+            .counterBuilder(name: "synctray.drive.events")
+            .setDescription("Number of external drive mount/unmount events")
+            .setUnit("1")
+            .build()
+
+        directoryWatchFilterCounter = meter
+            .counterBuilder(name: "synctray.directory_watch.filtered")
+            .setDescription("Number of directory watch events filtered out (phantom, metadata, out-of-scope)")
+            .setUnit("1")
+            .build()
+
+        resumedExternalSyncCounter = meter
+            .counterBuilder(name: "synctray.sync.resumed_external")
+            .setDescription("Number of externally-started syncs detected and resumed at app startup")
+            .setUnit("1")
+            .build()
+
+        settingsOpenedCounter = meter
+            .counterBuilder(name: "synctray.app.settings_opened")
+            .setDescription("Number of times the Settings window was opened")
             .setUnit("1")
             .build()
     }
@@ -834,6 +890,233 @@ final class TelemetryService {
             return "duplicate"
         }
         return "other"
+    }
+
+    // MARK: - Sync Contention
+
+    /// Record when a sync is skipped because another is already running (lock file contention).
+    /// High rates indicate the sync interval is too short for the data volume.
+    func recordSyncContention(
+        profileId: UUID,
+        profileName: String
+    ) {
+        guard SyncTraySettings.telemetryEnabled else { return }
+        ensureSetup()
+
+        syncContentionCounter?.add(value: 1, attribute: [
+            "synctray.profile.name": .string(profileName),
+        ])
+
+        emitLog(
+            severity: .info,
+            body: "Sync skipped - already running",
+            attributes: [
+                "synctray.profile.id": .string(profileId.uuidString),
+                "synctray.profile.name": .string(profileName),
+            ]
+        )
+    }
+
+    // MARK: - LogWatcher Recovery
+
+    /// Record LogWatcher recovery events (file reopen, missed bytes, polling fallback).
+    /// Frequent recoveries may indicate file system reliability issues.
+    func recordLogWatcherRecovery(
+        reason: String,     // "file_replaced", "missed_bytes", "polling_error"
+        profileName: String
+    ) {
+        guard SyncTraySettings.telemetryEnabled else { return }
+        ensureSetup()
+
+        logWatcherRecoveryCounter?.add(value: 1, attribute: [
+            "logwatcher.recovery_reason": .string(reason),
+        ])
+
+        emitLog(
+            severity: .warn,
+            body: "LogWatcher recovery: \(reason)",
+            attributes: [
+                "synctray.profile.name": .string(profileName),
+                "logwatcher.recovery_reason": .string(reason),
+            ]
+        )
+    }
+
+    // MARK: - Stale Lock Cleanup
+
+    /// Record stale lock files cleaned during startup.
+    /// High counts indicate frequent ungraceful shutdowns or sync interruptions.
+    func recordStaleLockCleanup(
+        count: Int,
+        lockType: String    // "synctray" or "rclone_bisync"
+    ) {
+        guard SyncTraySettings.telemetryEnabled, count > 0 else { return }
+        ensureSetup()
+
+        staleLockCleanupCounter?.add(value: count, attribute: [
+            "lock.type": .string(lockType),
+        ])
+
+        emitLog(
+            severity: .warn,
+            body: "Cleaned \(count) stale \(lockType) lock files",
+            attributes: [
+                "lock.type": .string(lockType),
+                "lock.count": .int(count),
+            ]
+        )
+    }
+
+    // MARK: - Check Phase Duration
+
+    /// Record the duration of the bisync listing/check phase.
+    /// This phase scans all files on both sides and is the main bottleneck for large repos.
+    func recordCheckPhaseDuration(
+        profileName: String,
+        syncMode: String,
+        durationSeconds: Double,
+        checksCompleted: Int,
+        totalChecks: Int
+    ) {
+        guard SyncTraySettings.telemetryEnabled else { return }
+        ensureSetup()
+
+        syncCheckPhaseHistogram?.record(value: durationSeconds, attributes: [
+            "sync.mode": .string(syncMode),
+            "synctray.profile.name": .string(profileName),
+        ])
+
+        emitLog(
+            severity: .info,
+            body: "Check phase completed",
+            attributes: [
+                "synctray.profile.name": .string(profileName),
+                "sync.mode": .string(syncMode),
+                "sync.check_phase_duration_s": .double(durationSeconds),
+                "sync.checks_completed": .int(checksCompleted),
+                "sync.total_checks": .int(totalChecks),
+            ]
+        )
+    }
+
+    // MARK: - Session Heartbeat
+
+    /// Emit a periodic session heartbeat log. Call every ~5 minutes from a timer.
+    /// Allows detecting app availability vs. crashes (orphaned sessions with no heartbeat).
+    func recordSessionHeartbeat(
+        enabledProfiles: Int,
+        syncingProfiles: Int,
+        pausedProfiles: Int,
+        errorProfiles: Int
+    ) {
+        guard SyncTraySettings.telemetryEnabled else { return }
+        ensureSetup()
+
+        emitLog(
+            severity: .info,
+            body: "Session heartbeat",
+            attributes: [
+                "session.enabled_profiles": .int(enabledProfiles),
+                "session.syncing_profiles": .int(syncingProfiles),
+                "session.paused_profiles": .int(pausedProfiles),
+                "session.error_profiles": .int(errorProfiles),
+            ]
+        )
+    }
+
+    // MARK: - Volume Events
+
+    /// Record external drive mount/unmount events detected by NSWorkspace.
+    func recordVolumeEvent(
+        event: String,      // "mounted" or "unmounted"
+        affectedProfiles: Int
+    ) {
+        guard SyncTraySettings.telemetryEnabled else { return }
+        ensureSetup()
+
+        volumeEventCounter?.add(value: 1, attribute: [
+            "drive.event": .string(event),
+        ])
+
+        emitLog(
+            severity: .info,
+            body: "Volume \(event)",
+            attributes: [
+                "drive.event": .string(event),
+                "drive.affected_profiles": .int(affectedProfiles),
+            ]
+        )
+    }
+
+    // MARK: - DirectoryWatcher Filter Stats
+
+    /// Record directory watch events that were filtered out.
+    /// High phantom rates may indicate FSEvents reliability issues on external drives.
+    func recordDirectoryWatchFiltered(
+        profileName: String,
+        reason: String,     // "out_of_scope", "phantom", "metadata", "no_relevant_changes"
+        filteredCount: Int
+    ) {
+        guard SyncTraySettings.telemetryEnabled, filteredCount > 0 else { return }
+        ensureSetup()
+
+        directoryWatchFilterCounter?.add(value: filteredCount, attribute: [
+            "directory_watch.filter_reason": .string(reason),
+        ])
+    }
+
+    // MARK: - Sync Precondition Failures
+
+    /// Record when a sync cannot start due to missing preconditions.
+    func recordSyncPreconditionFailure(
+        profileId: UUID,
+        profileName: String,
+        reason: String      // "script_not_found", "config_not_found", "drive_not_mounted"
+    ) {
+        guard SyncTraySettings.telemetryEnabled else { return }
+        ensureSetup()
+
+        emitLog(
+            severity: .warn,
+            body: "Sync precondition failed: \(reason)",
+            attributes: [
+                "synctray.profile.id": .string(profileId.uuidString),
+                "synctray.profile.name": .string(profileName),
+                "sync.precondition_failure": .string(reason),
+            ]
+        )
+    }
+
+    // MARK: - Resumed External Syncs
+
+    /// Record syncs that were detected already running at app startup.
+    func recordResumedExternalSync(
+        profileId: UUID,
+        profileName: String,
+        count: Int
+    ) {
+        guard SyncTraySettings.telemetryEnabled, count > 0 else { return }
+        ensureSetup()
+
+        resumedExternalSyncCounter?.add(value: count, attribute: [:])
+
+        emitLog(
+            severity: .info,
+            body: "Resumed monitoring \(count) external sync(s)",
+            attributes: [
+                "sync.resumed_count": .int(count),
+            ]
+        )
+    }
+
+    // MARK: - Settings Window
+
+    /// Record when the user opens the Settings window.
+    func recordSettingsOpened() {
+        guard SyncTraySettings.telemetryEnabled else { return }
+        ensureSetup()
+
+        settingsOpenedCounter?.add(value: 1, attribute: [:])
     }
 
     // MARK: - App Lifecycle

@@ -163,6 +163,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
     func openSettingsWindow() {
         print("[SyncTray] openSettingsWindow called, shared=\(AppDelegate.shared != nil), manager=\(AppDelegate.sharedSyncManager != nil)")
 
+        TelemetryService.shared.recordSettingsOpened()
+
         // Activate app first
         if #available(macOS 14.0, *) {
             NSApp.activate()

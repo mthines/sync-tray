@@ -48,6 +48,7 @@ final class SyncManager: ObservableObject {
     private let setupService = SyncSetupService.shared
     private let cacheService = VFSCacheService.shared
 
+    private var heartbeatTimer: DispatchSourceTimer?
     private var workspaceObserver: NSObjectProtocol?
     private var currentSyncChanges: [UUID: [FileChange]] = [:]
     private var cancellables = Set<AnyCancellable>()
@@ -57,6 +58,10 @@ final class SyncManager: ObservableObject {
 
     /// Track sync start times per profile for duration measurement
     private var syncStartTimes: [UUID: Date] = [:]
+
+    /// Track check phase: once totalChecks > 0 and checksDone < totalChecks, phase is active
+    private var checkPhaseStartTimes: [UUID: Date] = [:]
+    private var checkPhaseReported: Set<UUID> = []
 
     /// Profiles where we're monitoring an externally-started sync
     private var monitoringExternalSyncs: Set<UUID> = []
@@ -79,9 +84,14 @@ final class SyncManager: ObservableObject {
         // Report active profile count and configuration snapshot for telemetry
         TelemetryService.shared.recordProfileCount(self.profileStore.enabledProfiles.count)
         TelemetryService.shared.recordAllProfileConfigurations(self.profileStore.profiles)
+        startSessionHeartbeat()
     }
 
     deinit {
+        // Cancel heartbeat timer
+        heartbeatTimer?.cancel()
+        heartbeatTimer = nil
+
         // Cancel all sync completion pollers
         for timer in syncCompletionPollers.values {
             timer.cancel()
@@ -627,12 +637,21 @@ final class SyncManager: ObservableObject {
 
     /// Detect running syncs at startup and start monitoring them
     private func detectAndResumeRunningSyncs() {
+        var resumedCount = 0
         for profile in profileStore.enabledProfiles {
             if let pid = detectRunningSyncPID(for: profile) {
                 profileStates[profile.id] = .syncing
                 monitoringExternalSyncs.insert(profile.id)
                 startPollingForSyncCompletion(profile: profile, pid: pid)
+                resumedCount += 1
             }
+        }
+        if resumedCount > 0 {
+            TelemetryService.shared.recordResumedExternalSync(
+                profileId: UUID(), // aggregate event
+                profileName: "all",
+                count: resumedCount
+            )
         }
         updateAggregateState()
     }
@@ -683,6 +702,7 @@ final class SyncManager: ObservableObject {
     /// Also removes rclone bisync .lck files if no rclone process is running
     private func cleanupStaleLockFiles() {
         let fm = FileManager.default
+        var staleLockCount = 0
 
         // Clean up SyncTray's /tmp lock files
         for profile in profileStore.profiles {
@@ -697,11 +717,17 @@ final class SyncManager: ObservableObject {
                 if kill(pid, 0) != 0 {
                     // Process not running - remove stale lock
                     try? fm.removeItem(atPath: lockPath)
+                    staleLockCount += 1
                 }
             } else {
                 // Could not read/parse PID - remove the lock file
                 try? fm.removeItem(atPath: lockPath)
+                staleLockCount += 1
             }
+        }
+
+        if staleLockCount > 0 {
+            TelemetryService.shared.recordStaleLockCleanup(count: staleLockCount, lockType: "synctray")
         }
 
         // Clean up rclone bisync lock files if no rclone process is running
@@ -725,10 +751,16 @@ final class SyncManager: ObservableObject {
         // No rclone running - remove all stale .lck files
         guard let files = try? fm.contentsOfDirectory(atPath: bisyncDir) else { return }
 
+        var bisyncLockCount = 0
         for file in files where file.hasSuffix(".lck") {
             let fullPath = "\(bisyncDir)/\(file)"
             try? fm.removeItem(atPath: fullPath)
+            bisyncLockCount += 1
             SyncTraySettings.debugLog("Removed stale rclone bisync lock: \(file)")
+        }
+
+        if bisyncLockCount > 0 {
+            TelemetryService.shared.recordStaleLockCleanup(count: bisyncLockCount, lockType: "rclone_bisync")
         }
     }
 
@@ -788,6 +820,7 @@ final class SyncManager: ObservableObject {
 
     private func startWatching(profile: SyncProfile) {
         let watcher = LogWatcher(logPath: profile.logPath)
+        watcher.profileName = profile.name
         watcher.delegate = self
         watcher.startWatching()
         logWatchers[profile.id] = watcher
@@ -823,6 +856,7 @@ final class SyncManager: ObservableObject {
                 self?.handleDirectoryChange(for: profileId)
             }
         }
+        watcher.profileName = profileName
         watcher.start()
         directoryWatchers[profile.id] = watcher
     }
@@ -978,11 +1012,13 @@ final class SyncManager: ObservableObject {
             return
         }
 
+        var affectedCount = 0
         for profile in profileStore.enabledProfiles {
             let drivePath = profile.drivePathToMonitor
             guard !drivePath.isEmpty else { continue }
 
             if drivePath.hasPrefix(volumePath) || volumePath == drivePath {
+                affectedCount += 1
                 notificationService.resetDriveNotMountedState(for: profile.id)
                 if profileStates[profile.id] == .driveNotMounted {
                     profileStates[profile.id] = .idle
@@ -995,6 +1031,10 @@ final class SyncManager: ObservableObject {
             }
         }
 
+        if affectedCount > 0 {
+            TelemetryService.shared.recordVolumeEvent(event: "mounted", affectedProfiles: affectedCount)
+        }
+
         updateAggregateState()
     }
 
@@ -1003,16 +1043,22 @@ final class SyncManager: ObservableObject {
             return
         }
 
+        var affectedCount = 0
         for profile in profileStore.enabledProfiles {
             let drivePath = profile.drivePathToMonitor
             guard !drivePath.isEmpty else { continue }
 
             if drivePath.hasPrefix(volumePath) || volumePath == drivePath {
+                affectedCount += 1
                 profileStates[profile.id] = .driveNotMounted
                 if !isNotificationsMuted(for: profile.id) {
                     notificationService.notifyDriveNotMounted(profileId: profile.id, profileName: profile.name)
                 }
             }
+        }
+
+        if affectedCount > 0 {
+            TelemetryService.shared.recordVolumeEvent(event: "unmounted", affectedProfiles: affectedCount)
         }
 
         updateAggregateState()
@@ -1041,6 +1087,11 @@ final class SyncManager: ObservableObject {
         guard FileManager.default.fileExists(atPath: SyncProfile.sharedScriptPath) else {
             await MainActor.run {
                 profileStates[profile.id] = .error("Script not found")
+                TelemetryService.shared.recordSyncPreconditionFailure(
+                    profileId: profile.id,
+                    profileName: profile.name,
+                    reason: "script_not_found"
+                )
                 updateAggregateState()
             }
             return
@@ -1049,6 +1100,11 @@ final class SyncManager: ObservableObject {
         guard FileManager.default.fileExists(atPath: profile.configPath) else {
             await MainActor.run {
                 profileStates[profile.id] = .error("Config not found")
+                TelemetryService.shared.recordSyncPreconditionFailure(
+                    profileId: profile.id,
+                    profileName: profile.name,
+                    reason: "config_not_found"
+                )
                 updateAggregateState()
             }
             return
@@ -1087,6 +1143,8 @@ final class SyncManager: ObservableObject {
             profileProgress[profileId] = nil  // Reset progress for new sync
             currentSyncChanges[profileId] = []
             syncStartTimes[profileId] = Date()  // Record start time for duration tracking
+            checkPhaseStartTimes.removeValue(forKey: profileId)  // Reset check phase tracking
+            checkPhaseReported.remove(profileId)
             logWatchers[profileId]?.setActivelySyncing(true)  // Increase polling frequency
             // Don't send notification - the menu bar icon updates to show syncing state
             notificationService.clearPendingChanges(for: profileId)
@@ -1225,7 +1283,10 @@ final class SyncManager: ObservableObject {
             }
 
         case .syncAlreadyRunning:
-            break
+            TelemetryService.shared.recordSyncContention(
+                profileId: profileId,
+                profileName: profileName
+            )
 
         case .fileChange(var change):
             change.profileName = profileName
@@ -1246,6 +1307,28 @@ final class SyncManager: ObservableObject {
 
         case .stats(let stats):
             if let bytes = stats.bytes, let totalBytes = stats.totalBytes, totalBytes > 0 {
+                let checksDone = stats.checks ?? 0
+                let totalChecks = stats.totalChecks ?? 0
+
+                // Track check phase duration (listing/comparison phase in bisync)
+                if totalChecks > 0 && checksDone < totalChecks && checkPhaseStartTimes[profileId] == nil {
+                    checkPhaseStartTimes[profileId] = Date()
+                    checkPhaseReported.remove(profileId)
+                }
+                if totalChecks > 0 && checksDone >= totalChecks && !checkPhaseReported.contains(profileId),
+                   let checkStart = checkPhaseStartTimes[profileId] {
+                    let checkDuration = Date().timeIntervalSince(checkStart)
+                    TelemetryService.shared.recordCheckPhaseDuration(
+                        profileName: profileName,
+                        syncMode: profile?.syncMode.rawValue ?? "unknown",
+                        durationSeconds: checkDuration,
+                        checksCompleted: checksDone,
+                        totalChecks: totalChecks
+                    )
+                    checkPhaseReported.insert(profileId)
+                    checkPhaseStartTimes.removeValue(forKey: profileId)
+                }
+
                 profileProgress[profileId] = SyncProgress(
                     bytesTransferred: Int64(bytes),
                     totalBytes: Int64(totalBytes),
@@ -1253,8 +1336,8 @@ final class SyncManager: ObservableObject {
                     speed: stats.speed,
                     transfersDone: stats.transfers ?? 0,
                     totalTransfers: stats.totalTransfers ?? 0,
-                    checksDone: stats.checks ?? 0,
-                    totalChecks: stats.totalChecks ?? 0,
+                    checksDone: checksDone,
+                    totalChecks: totalChecks,
                     elapsedTime: stats.elapsedTime,
                     errors: stats.errors ?? 0,
                     transferringFiles: stats.transferring ?? [],
@@ -1274,6 +1357,32 @@ final class SyncManager: ObservableObject {
         if recentChanges.count > maxRecentChanges {
             recentChanges = Array(recentChanges.prefix(maxRecentChanges))
         }
+    }
+
+    /// Start a 5-minute session heartbeat for availability monitoring
+    private func startSessionHeartbeat() {
+        heartbeatTimer?.cancel()
+        let timer = DispatchSource.makeTimerSource(queue: .global(qos: .utility))
+        timer.schedule(deadline: .now() + 300, repeating: 300)  // every 5 minutes
+        timer.setEventHandler { [weak self] in
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                let enabled = self.profileStore.enabledProfiles.count
+                let syncing = self.profileStates.values.filter { $0 == .syncing }.count
+                let paused = self.pausedProfiles.count
+                let errors = self.profileStates.values.filter {
+                    if case .error = $0 { return true }; return false
+                }.count
+                TelemetryService.shared.recordSessionHeartbeat(
+                    enabledProfiles: enabled,
+                    syncingProfiles: syncing,
+                    pausedProfiles: paused,
+                    errorProfiles: errors
+                )
+            }
+        }
+        heartbeatTimer = timer
+        timer.resume()
     }
 
     /// Find which profile a log watcher belongs to
