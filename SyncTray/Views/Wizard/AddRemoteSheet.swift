@@ -24,6 +24,8 @@ struct AddRemoteSheet: View {
     @State private var isLoading: Bool = false
     @State private var isOAuthInProgress: Bool = false
     @State private var errorMessage: String?
+    @State private var isTestingConnection: Bool = false
+    @State private var connectionTestSuccess: Bool = false
 
     private let configService = RcloneConfigService.shared
 
@@ -151,6 +153,22 @@ struct AddRemoteSheet: View {
                 }
             }
 
+            // Test Connection button on credentials step
+            if step == .credentials {
+                Button(action: testConnectionFromCredentials) {
+                    HStack {
+                        if isTestingConnection {
+                            ProgressView()
+                                .controlSize(.small)
+                        } else {
+                            Image(systemName: "checkmark.circle")
+                        }
+                        Text("Test Connection")
+                    }
+                }
+                .disabled(isTestingConnection || !canSave)
+            }
+
             // Forward button
             Button(actionButtonLabel) {
                 handleActionButton()
@@ -215,6 +233,28 @@ struct AddRemoteSheet: View {
 
     private var credentialsContent: some View {
         VStack(alignment: .leading, spacing: 16) {
+            // Status messages at the top for immediate visibility
+            if connectionTestSuccess {
+                HStack(spacing: 6) {
+                    Image(systemName: "checkmark.circle.fill")
+                        .foregroundColor(.green)
+                    Text("Connection successful")
+                        .font(.caption)
+                        .foregroundColor(.green)
+                }
+            }
+
+            if let error = errorMessage {
+                HStack(alignment: .top, spacing: 6) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .foregroundColor(.orange)
+                    Text(error)
+                        .foregroundColor(.orange)
+                        .font(.caption)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+
             VStack(alignment: .leading, spacing: 4) {
                 Text("Remote Name")
                     .font(.subheadline)
@@ -266,12 +306,6 @@ struct AddRemoteSheet: View {
                         .disabled(isOAuthInProgress)
                     }
                 }
-            }
-
-            if let error = errorMessage {
-                Text(error)
-                    .foregroundColor(.red)
-                    .font(.caption)
             }
         }
     }
@@ -385,6 +419,55 @@ struct AddRemoteSheet: View {
                         result: "failure",
                         errorMessage: error.localizedDescription
                     )
+                }
+            }
+        }
+    }
+
+    private func testConnectionFromCredentials() {
+        isTestingConnection = true
+        errorMessage = nil
+        connectionTestSuccess = false
+
+        // Save the remote first, then test
+        let capturedConfig = remoteConfig
+        DispatchQueue.global(qos: .userInitiated).async {
+            do {
+                if isEditMode {
+                    try configService.updateRemote(capturedConfig)
+                } else {
+                    try configService.addRemote(capturedConfig)
+                }
+
+                // Test connection
+                let remoteName = "\(capturedConfig.name):"
+                Task {
+                    let result = await configService.testConnection(remoteName)
+                    await MainActor.run {
+                        isTestingConnection = false
+                        switch result {
+                        case .success:
+                            connectionTestSuccess = true
+                            TelemetryService.shared.recordRemoteConfigOperation(
+                                operation: "connection_test",
+                                providerType: capturedConfig.provider.rcloneType,
+                                result: "success"
+                            )
+                        case .failure(let error):
+                            errorMessage = error.localizedDescription
+                            TelemetryService.shared.recordRemoteConfigOperation(
+                                operation: "connection_test",
+                                providerType: capturedConfig.provider.rcloneType,
+                                result: "failure",
+                                errorMessage: error.localizedDescription
+                            )
+                        }
+                    }
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    isTestingConnection = false
+                    errorMessage = error.localizedDescription
                 }
             }
         }

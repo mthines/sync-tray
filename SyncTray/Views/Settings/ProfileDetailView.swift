@@ -1708,13 +1708,29 @@ struct ProfileDetailView: View {
             }
 
             process.executableURL = URL(fileURLWithPath: path)
-            process.arguments = ["lsd", "\(rcloneRemote):"]
+            let remoteName = rcloneRemote.replacingOccurrences(of: ":", with: "")
+            let skipCert = RcloneConfigService.shared.readRemoteConfig(name: remoteName)?.values["no_check_certificate"] == "true"
+            var args = ["lsd", "\(rcloneRemote):"]
+            if skipCert {
+                args.append("--no-check-certificate")
+            }
+            process.arguments = args
             process.standardOutput = pipe
             process.standardError = pipe
 
             do {
                 try process.run()
                 process.waitUntilExit()
+
+                guard process.terminationStatus == 0 else {
+                    let data = pipe.fileHandleForReading.readDataToEndOfFile()
+                    let errorOutput = String(data: data, encoding: .utf8) ?? "Unknown error"
+                    DispatchQueue.main.async {
+                        isLoadingFolders = false
+                        foldersError = "Failed to list folders: \(errorOutput)"
+                    }
+                    return
+                }
 
                 let data = pipe.fileHandleForReading.readDataToEndOfFile()
                 let output = String(data: data, encoding: .utf8) ?? ""

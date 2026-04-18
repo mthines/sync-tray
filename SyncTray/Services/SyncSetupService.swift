@@ -292,12 +292,19 @@ final class SyncSetupService {
             fileManager.createFile(atPath: localCheckFile, contents: nil)
         }
 
-        // 3. Create remote check file using rclone touch
+        // 3. Create remote check file using rclone rcat (touch fails on some WebDAV remotes)
         let remoteCheckFile = "\(profile.rcloneRemote):\(profile.remotePath)/\(Self.checkFileName)"
+        let skipCert = RcloneConfigService.shared.readRemoteConfig(name: profile.rcloneRemote)?.values["no_check_certificate"] == "true"
 
         let process = Process()
         process.executableURL = URL(fileURLWithPath: rclonePath)
-        process.arguments = ["touch", remoteCheckFile]
+        var rcatArgs = ["rcat", remoteCheckFile]
+        if skipCert {
+            rcatArgs.append("--no-check-certificate")
+        }
+        process.arguments = rcatArgs
+        // rcat reads from stdin — provide empty input to create an empty file
+        process.standardInput = Pipe()
 
         do {
             try process.run()
@@ -306,7 +313,7 @@ final class SyncSetupService {
                 return "Failed to create remote check file (exit code \(process.terminationStatus))"
             }
         } catch {
-            return "Failed to run rclone touch: \(error.localizedDescription)"
+            return "Failed to create remote check file: \(error.localizedDescription)"
         }
 
         return nil  // Success
@@ -432,6 +439,28 @@ final class SyncSetupService {
                 exit 1
             fi
 
+            # Helper: check if a remote has no_check_certificate set in rclone config
+            check_no_cert() {
+                local remote_name="$1"
+                local rclone_conf="$HOME/.config/rclone/rclone.conf"
+                if [[ -f "$rclone_conf" ]]; then
+                    local in_section=false
+                    while IFS= read -r line; do
+                        if [[ "$line" == "[$remote_name]" ]]; then
+                            in_section=true
+                        elif [[ "$line" =~ ^\\[.+\\]$ ]] && $in_section; then
+                            break
+                        elif $in_section && [[ "$line" == *"no_check_certificate"*"="*"true"* ]]; then
+                            echo "--no-check-certificate"
+                            return
+                        fi
+                    done < "$rclone_conf"
+                fi
+            }
+
+            REMOTE_NAME="${REMOTE%%:*}"
+            NO_CHECK_CERT=$(check_no_cert "$REMOTE_NAME")
+
             # Check if drive is mounted (if configured)
             if [[ -n "$DRIVE_PATH" && ! -d "$DRIVE_PATH" ]]; then
                 echo "$(date '+%Y-%m-%d %H:%M:%S') - Drive not mounted, skipping sync" >> "$LOG_FILE"
@@ -458,8 +487,10 @@ final class SyncSetupService {
             if [[ -n "$FALLBACK_REMOTE" ]]; then
                 REMOTE_NAME="${REMOTE%%:*}"
                 # Quick reachability check on primary remote (3s connect timeout)
-                if ! $RCLONE_BIN lsd "${REMOTE_NAME}:" --contimeout 3s --timeout 8s --max-depth 0 &>/dev/null; then
+                if ! $RCLONE_BIN lsd "${REMOTE_NAME}:" --contimeout 3s --timeout 8s --max-depth 0 $NO_CHECK_CERT &>/dev/null; then
                     echo "$(date '+%Y-%m-%d %H:%M:%S') - Primary remote unreachable, using fallback: $FALLBACK_REMOTE" >> "$LOG_FILE"
+                    # Re-check cert setting for the fallback remote
+                    NO_CHECK_CERT=$(check_no_cert "$FALLBACK_REMOTE")
 
                     if [[ -z "$FALLBACK_PATH" ]]; then
                         # Same path structure: use env var overrides to swap transport
@@ -524,6 +555,10 @@ final class SyncSetupService {
                     echo "$(date '+%Y-%m-%d %H:%M:%S') - Starting sync (remote → local)" >> "$LOG_FILE"
                     RCLONE_CMD="$RCLONE_BIN sync \\"$REMOTE\\" \\"$LOCAL_PATH\\" --verbose --use-json-log --stats 2s --filter-from \\"$FILTER_FILE\\""
                 fi
+            fi
+
+            if [[ -n "$NO_CHECK_CERT" ]]; then
+                RCLONE_CMD="$RCLONE_CMD $NO_CHECK_CERT"
             fi
 
             if [[ -n "$ADDITIONAL_FLAGS" ]]; then

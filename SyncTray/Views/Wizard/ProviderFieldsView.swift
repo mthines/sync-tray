@@ -3,6 +3,7 @@ import SwiftUI
 /// Dynamic form fields for provider-specific configuration
 struct ProviderFieldsView: View {
     @Binding var config: RemoteConfiguration
+    @State private var advancedExpanded: Bool = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
@@ -15,13 +16,18 @@ struct ProviderFieldsView: View {
 
             // Optional fields (collapsible)
             if !config.provider.optionalFields.isEmpty {
-                DisclosureGroup("Advanced Options") {
+                DisclosureGroup(isExpanded: $advancedExpanded) {
                     VStack(alignment: .leading, spacing: 16) {
                         ForEach(config.provider.optionalFields) { field in
                             fieldView(for: field)
                         }
                     }
                     .padding(.top, 8)
+                } label: {
+                    Text("Advanced Options")
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .contentShape(Rectangle())
+                        .onTapGesture { advancedExpanded.toggle() }
                 }
             }
         }
@@ -29,53 +35,66 @@ struct ProviderFieldsView: View {
 
     @ViewBuilder
     private func fieldView(for field: ProviderField) -> some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Text(field.label)
-                .font(.subheadline)
-                .foregroundColor(.secondary)
+        if field.type == .boolean {
+            VStack(alignment: .leading, spacing: 4) {
+                Toggle(field.label, isOn: boolBinding(for: field.key))
+                    .toggleStyle(.checkbox)
 
-            switch field.type {
-            case .text:
-                TextField(field.placeholder ?? "", text: binding(for: field.key))
-                    .textFieldStyle(.roundedBorder)
-
-            case .password:
-                SecureField(field.placeholder ?? "", text: binding(for: field.key))
-                    .textFieldStyle(.roundedBorder)
-
-            case .number:
-                TextField(field.placeholder ?? "", text: binding(for: field.key))
-                    .textFieldStyle(.roundedBorder)
-
-            case .dropdown:
-                if let options = field.options {
-                    Picker(field.label, selection: binding(for: field.key)) {
-                        ForEach(options) { option in
-                            Text(option.label).tag(option.value)
-                        }
-                    }
-                    .labelsHidden()
-                    .pickerStyle(.menu)
+                if let helpText = field.helpText {
+                    Text(helpText)
+                        .font(.caption)
+                        .foregroundColor(.secondary)
                 }
+            }
+        } else {
+            VStack(alignment: .leading, spacing: 4) {
+                Text(field.label)
+                    .font(.subheadline)
+                    .foregroundColor(.secondary)
 
-            case .file:
-                HStack {
+                switch field.type {
+                case .text:
                     TextField(field.placeholder ?? "", text: binding(for: field.key))
                         .textFieldStyle(.roundedBorder)
 
-                    Button("Browse...") {
-                        browseForFile(field: field)
+                case .password:
+                    SecureField(field.placeholder ?? "", text: binding(for: field.key))
+                        .textFieldStyle(.roundedBorder)
+
+                case .number:
+                    TextField(field.placeholder ?? "", text: binding(for: field.key))
+                        .textFieldStyle(.roundedBorder)
+
+                case .dropdown:
+                    if let options = field.options {
+                        Picker(field.label, selection: binding(for: field.key)) {
+                            ForEach(options) { option in
+                                Text(option.label).tag(option.value)
+                            }
+                        }
+                        .labelsHidden()
+                        .pickerStyle(.menu)
                     }
+
+                case .file:
+                    HStack {
+                        TextField(field.placeholder ?? "", text: binding(for: field.key))
+                            .textFieldStyle(.roundedBorder)
+
+                        Button("Browse...") {
+                            browseForFile(field: field)
+                        }
+                    }
+
+                case .hidden, .boolean:
+                    EmptyView()
                 }
 
-            case .hidden:
-                EmptyView()
-            }
-
-            if let helpText = field.helpText {
-                Text(helpText)
-                    .font(.caption)
-                    .foregroundColor(.secondary)
+                if let helpText = field.helpText {
+                    Text(helpText)
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
             }
         }
     }
@@ -84,6 +103,13 @@ struct ProviderFieldsView: View {
         Binding(
             get: { config.values[key] ?? "" },
             set: { config.values[key] = $0 }
+        )
+    }
+
+    private func boolBinding(for key: String) -> Binding<Bool> {
+        Binding(
+            get: { config.values[key] == "true" },
+            set: { config.values[key] = $0 ? "true" : "" }
         )
     }
 

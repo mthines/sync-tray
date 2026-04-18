@@ -287,6 +287,10 @@ final class RcloneConfigService {
             return .failure(.rcloneNotFound)
         }
 
+        // Check if remote has no_check_certificate set
+        let remoteName = remotePath.replacingOccurrences(of: ":", with: "").split(separator: "/").first.map(String.init) ?? remotePath.replacingOccurrences(of: ":", with: "")
+        let skipCert = readRemoteConfig(name: remoteName)?.values["no_check_certificate"] == "true"
+
         return await withCheckedContinuation { continuation in
             DispatchQueue.global(qos: .userInitiated).async {
                 let process = Process()
@@ -294,9 +298,11 @@ final class RcloneConfigService {
 
                 process.executableURL = URL(fileURLWithPath: rclonePath)
                 let remote = remotePath.contains(":") ? remotePath : "\(remotePath):"
-                // Use rclone lsd — works reliably across all backends (SFTP, WebDAV, etc.)
-                // rclone about fails on some SFTP servers that don't support df
-                process.arguments = ["lsd", remote, "--contimeout", "10s"]
+                var args = ["lsd", remote, "--contimeout", "10s"]
+                if skipCert {
+                    args.append("--no-check-certificate")
+                }
+                process.arguments = args
                 process.standardOutput = pipe
                 process.standardError = pipe
 
@@ -499,7 +505,13 @@ final class RcloneConfigService {
 
                 process.executableURL = URL(fileURLWithPath: rclonePath)
                 let remotePath = remote.hasSuffix(":") ? remote : "\(remote):"
-                process.arguments = ["lsd", remotePath]
+                let remoteName = remote.replacingOccurrences(of: ":", with: "")
+                let skipCert = self.readRemoteConfig(name: remoteName)?.values["no_check_certificate"] == "true"
+                var args = ["lsd", remotePath]
+                if skipCert {
+                    args.append("--no-check-certificate")
+                }
+                process.arguments = args
                 process.standardOutput = pipe
                 process.standardError = pipe
 

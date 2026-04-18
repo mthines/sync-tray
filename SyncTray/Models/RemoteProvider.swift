@@ -161,7 +161,11 @@ enum RemoteProvider: String, Codable, CaseIterable, Identifiable {
                               helpText: "Optional: Specific drive to access")
             ]
         case .synology, .webdav:
-            return []
+            return [
+                ProviderField(key: "no_check_certificate", label: "Skip certificate verification",
+                              type: .boolean,
+                              helpText: "Allow self-signed or mismatched SSL certificates (insecure)")
+            ]
         case .smb:
             return [
                 ProviderField(key: "domain", label: "Domain", type: .text,
@@ -197,6 +201,7 @@ struct ProviderField: Identifiable {
         case number
         case dropdown
         case file
+        case boolean
         case hidden
     }
 }
