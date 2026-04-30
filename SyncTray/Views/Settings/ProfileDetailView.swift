@@ -2195,7 +2195,6 @@ struct ProfileDetailView: View {
                 let target = "\(bareName):\(path)"
 
                 let proc = Process()
-                let outPipe = Pipe()
                 let errPipe = Pipe()
                 proc.executableURL = URL(fileURLWithPath: rclone)
                 var args = ["lsd", target, "--contimeout", "3s", "--timeout", "5s", "--retries", "1", "--low-level-retries", "1", "--max-depth", "0"]
@@ -2203,7 +2202,7 @@ struct ProfileDetailView: View {
                     args.append("--no-check-certificate")
                 }
                 proc.arguments = args
-                proc.standardOutput = outPipe
+                proc.standardOutput = Pipe()
                 proc.standardError = errPipe
 
                 do {
@@ -3080,8 +3079,9 @@ struct ProfileDetailView: View {
         syncManager.clearError(for: profile.id)
         syncManager.setSyncing(for: profile.id, isSyncing: true)
 
-        // Capture values from main thread before going to background
+        // Capture values from main thread before going to background (CLAUDE.md rule 1)
         let localPath = profile.localSyncPath
+        let lockFilePath = profile.lockFilePath
         let checkFileName = SyncSetupService.checkFileName
         let bisyncDir = "\(NSHomeDirectory())/Library/Caches/rclone/bisync"
 
@@ -3099,7 +3099,7 @@ struct ProfileDetailView: View {
             var locksRemoved = 0
 
             // First, remove /tmp script lock file
-            let tmpLockPath = self.profile.lockFilePath
+            let tmpLockPath = lockFilePath
             if fileManager.fileExists(atPath: tmpLockPath) {
                 if (try? fileManager.removeItem(atPath: tmpLockPath)) != nil {
                     locksRemoved += 1
