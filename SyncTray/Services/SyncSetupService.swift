@@ -343,12 +343,10 @@ final class SyncSetupService {
         let stdinPipe = Pipe()
         process.standardInput = stdinPipe
 
-        let rcatExitCode: Int32
         do {
             try process.run()
             stdinPipe.fileHandleForWriting.closeFile()
             process.waitUntilExit()
-            rcatExitCode = process.terminationStatus
         } catch {
             return "Failed to create remote check file: \(error.localizedDescription)"
         }
