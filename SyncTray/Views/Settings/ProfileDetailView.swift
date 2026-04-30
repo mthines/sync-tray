@@ -1,6 +1,18 @@
 import SwiftUI
 import AppKit
 
+// MARK: - Fallback Path Validation
+
+/// Validation state for the fallback remote path. Drives inline UI feedback so
+/// users don't have to know SMB/SFTP path-mapping quirks (e.g., Synology `home`).
+enum FallbackPathStatus: Equatable {
+    case unknown        // No path entered or remote not selected
+    case validating     // rclone lsd in flight
+    case valid          // Path resolves on the fallback remote
+    case invalid        // rclone lsd failed; suggestion may be available
+    case unreachable    // Couldn't reach the fallback remote at all
+}
+
 // MARK: - Profile Detail View
 
 struct ProfileDetailView: View {
@@ -25,6 +37,12 @@ struct ProfileDetailView: View {
     @State private var fallbackRemotePath: String = ""
     @State private var fallbackUseDifferentPath: Bool = false
 
+    // Fallback path validation state
+    @State private var fallbackPathStatus: FallbackPathStatus = .unknown
+    @State private var fallbackPathSuggestion: String?
+    @State private var fallbackPathSuggestionReason: String?
+    @State private var fallbackPathValidationTask: Task<Void, Never>?
+
     // Mount mode specific settings
     @State private var vfsCacheMode: VFSCacheMode = .full
     @State private var vfsCacheMaxSize: String = "10G"
@@ -36,6 +54,7 @@ struct ProfileDetailView: View {
     @State private var isInstalling: Bool = false
     @State private var installError: String?
     @State private var showingUninstallConfirm: Bool = false
+    @State private var showingReinstallConfirm: Bool = false
     @State private var availableRemotes: [String] = []
     @State private var isLoadingRemotes: Bool = false
     @State private var isRunningResync: Bool = false
@@ -280,6 +299,12 @@ struct ProfileDetailView: View {
             Button("Uninstall", role: .destructive) { uninstallSync() }
         } message: {
             Text("This will remove the sync script and stop automatic syncing for \"\(profile.name)\".")
+        }
+        .alert("Reinstall Scheduled Sync?", isPresented: $showingReinstallConfirm) {
+            Button("Cancel", role: .cancel) {}
+            Button("Reinstall", role: .destructive) { reinstallSync() }
+        } message: {
+            Text(reinstallConfirmMessage)
         }
         .alert("Sync Already Running", isPresented: $showingSyncInProgressAlert) {
             Button("OK", role: .cancel) {}
@@ -1210,7 +1235,7 @@ struct ProfileDetailView: View {
                     }
                     .disabled(isSyncRunningForProfile)
 
-                    Button(action: reinstallSync) {
+                    Button(action: { showingReinstallConfirm = true }) {
                         Label("Reinstall", systemImage: "arrow.clockwise")
                     }
                     .disabled(!canInstall || isInstalling || isSyncRunningForProfile)
@@ -1301,6 +1326,9 @@ struct ProfileDetailView: View {
                                 }
                                 .pickerStyle(.menu)
                                 .frame(maxWidth: 250, alignment: .leading)
+                                .onChange(of: fallbackRemote) { _ in
+                                    applyFallbackAutoConfig()
+                                }
                             }
 
                             Button(action: { addRemoteTarget = .fallback }) {
@@ -1335,6 +1363,42 @@ struct ProfileDetailView: View {
                     }
                 }
 
+                // Proactive suggestion banner — shown when protocols differ and the toggle is OFF,
+                // so users discover they likely need to enable a different path without surprise mutations.
+                if let proactiveSuggestion = proactiveFallbackSuggestion {
+                    HStack(alignment: .top, spacing: 8) {
+                        Image(systemName: "lightbulb.fill")
+                            .foregroundStyle(.yellow)
+                            .font(.caption)
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("Different path likely needed")
+                                .font(.caption.weight(.semibold))
+                            Text("\(rcloneType(for: rcloneRemote) ?? "primary") and \(rcloneType(for: fallbackRemote) ?? "fallback") use different path conventions. Suggested fallback path:")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                            HStack(spacing: 6) {
+                                Text(proactiveSuggestion.path)
+                                    .font(.caption.monospaced())
+                                Button("Apply") {
+                                    fallbackUseDifferentPath = true
+                                    fallbackRemotePath = proactiveSuggestion.path
+                                }
+                                .controlSize(.mini)
+                            }
+                            Text(proactiveSuggestion.reason)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                        Spacer()
+                    }
+                    .padding(8)
+                    .background(Color.yellow.opacity(0.08), in: .rect(cornerRadius: 6))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 6)
+                            .strokeBorder(Color.yellow.opacity(0.3), lineWidth: 1)
+                    )
+                }
+
                 // Different path toggle
                 Toggle(isOn: $fallbackUseDifferentPath) {
                     VStack(alignment: .leading, spacing: 2) {
@@ -1350,6 +1414,11 @@ struct ProfileDetailView: View {
                 .onChange(of: fallbackUseDifferentPath) { useDifferent in
                     if !useDifferent {
                         fallbackRemotePath = ""
+                        fallbackPathStatus = .unknown
+                        fallbackPathSuggestion = nil
+                        fallbackPathSuggestionReason = nil
+                    } else {
+                        scheduleFallbackPathValidation()
                     }
                 }
 
@@ -1362,6 +1431,12 @@ struct ProfileDetailView: View {
                             .foregroundStyle(.secondary)
                         TextField("/volume1/MyShare/Folder", text: $fallbackRemotePath)
                             .textFieldStyle(.roundedBorder)
+                            .onChange(of: fallbackRemotePath) { _ in
+                                scheduleFallbackPathValidation()
+                            }
+
+                        // Inline validation feedback
+                        fallbackPathValidationView
                     }
                 }
 
@@ -1525,6 +1600,11 @@ struct ProfileDetailView: View {
         // Show text input if the path contains "/" (nested path) or is a custom path
         // that won't be in the folder picker dropdown
         useTextInputForFolder = profile.remotePath.contains("/")
+
+        // Validate the existing fallback path so users see status without changing anything
+        if fallbackEnabled && fallbackUseDifferentPath {
+            scheduleFallbackPathValidation()
+        }
     }
 
     /// Build a profile from the current form state
@@ -1871,6 +1951,292 @@ struct ProfileDetailView: View {
                 result: "failure", errorMessage: error.localizedDescription
             )
         }
+    }
+
+    /// Inline view rendered under the fallback path field showing live validation state.
+    @ViewBuilder
+    private var fallbackPathValidationView: some View {
+        switch fallbackPathStatus {
+        case .unknown:
+            EmptyView()
+        case .validating:
+            HStack(spacing: 6) {
+                ProgressView().controlSize(.mini)
+                Text("Verifying fallback path…")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        case .valid:
+            HStack(spacing: 6) {
+                Image(systemName: "checkmark.circle.fill")
+                    .foregroundStyle(.green)
+                    .font(.caption)
+                Text("Path verified on fallback remote")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        case .invalid:
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(spacing: 6) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .foregroundStyle(.orange)
+                        .font(.caption)
+                    Text("Path doesn't exist on the fallback remote")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                }
+                if let suggestion = fallbackPathSuggestion {
+                    HStack(spacing: 6) {
+                        Text("Try: ")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        Text(suggestion)
+                            .font(.caption.monospaced())
+                        Button("Apply") {
+                            fallbackRemotePath = suggestion
+                        }
+                        .controlSize(.mini)
+                    }
+                    if let reason = fallbackPathSuggestionReason {
+                        Text(reason)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            }
+        case .unreachable:
+            HStack(spacing: 6) {
+                Image(systemName: "wifi.exclamationmark")
+                    .foregroundStyle(.secondary)
+                    .font(.caption)
+                Text("Couldn't reach fallback remote to verify path")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    /// Proactive suggestion shown above the "different path" toggle for existing profiles
+    /// where protocols differ but the toggle is still OFF. Only computed (no state mutation)
+    /// so opening a profile doesn't trigger spurious "unsaved changes."
+    private var proactiveFallbackSuggestion: (path: String, reason: String)? {
+        guard fallbackEnabled,
+              !fallbackRemote.isEmpty,
+              !rcloneRemote.isEmpty,
+              !remotePath.isEmpty,
+              !fallbackUseDifferentPath else {
+            return nil
+        }
+        let primary = rcloneType(for: rcloneRemote)
+        let fallback = rcloneType(for: fallbackRemote)
+        guard primary != fallback else { return nil }
+        return suggestFallbackPath(primaryPath: remotePath, primaryType: primary, fallbackType: fallback)
+    }
+
+    // MARK: - Fallback Path Smart Configuration
+
+    /// Look up the rclone backend type ("smb", "sftp", "webdav", etc.) for a remote name.
+    private func rcloneType(for remoteName: String) -> String? {
+        let bare = remoteName.hasSuffix(":") ? String(remoteName.dropLast()) : remoteName
+        guard !bare.isEmpty else { return nil }
+        return RcloneConfigService.shared.readRemoteConfig(name: bare)?.provider.rcloneType
+    }
+
+    /// Heuristic: given a primary path under a primary protocol, suggest a fallback path
+    /// for a different protocol. Handles the most common Synology cases (SMB↔SFTP).
+    /// Returns nil when no transformation is needed (paths likely match).
+    private func suggestFallbackPath(primaryPath: String, primaryType: String?, fallbackType: String?) -> (path: String, reason: String)? {
+        guard let primary = primaryType, let fallback = fallbackType else { return nil }
+        guard primary != fallback else { return nil }  // Same protocol: paths typically match
+
+        let trimmed = primaryPath.trimmingCharacters(in: .whitespaces)
+        guard !trimmed.isEmpty else { return nil }
+
+        // SMB → SFTP on Synology
+        if primary == "smb" && fallback == "sftp" {
+            // The `home` SMB share maps to the SFTP user's home dir → drop `home/`.
+            if trimmed.hasPrefix("home/") {
+                return (
+                    path: String(trimmed.dropFirst("home/".count)),
+                    reason: "On SFTP, your home directory is the default — drop the `home/` prefix."
+                )
+            }
+            // Other SMB shares: SFTP exposes them at root via bind mounts → prepend `/`.
+            if !trimmed.hasPrefix("/") {
+                return (
+                    path: "/\(trimmed)",
+                    reason: "On SFTP, share names need a leading `/` so the path resolves from the filesystem root."
+                )
+            }
+        }
+
+        // SFTP → SMB on Synology
+        if primary == "sftp" && fallback == "smb" {
+            // Absolute paths starting with `/<share>/...` → drop the leading slash.
+            if trimmed.hasPrefix("/") {
+                return (
+                    path: String(trimmed.dropFirst()),
+                    reason: "On SMB, paths are share-relative — drop the leading `/`."
+                )
+            }
+            // Bare paths: assume they live under the user's home share.
+            return (
+                path: "home/\(trimmed)",
+                reason: "On SMB, your home directory is the `home` share — add the `home/` prefix."
+            )
+        }
+
+        return nil
+    }
+
+    /// Apply auto-configuration for the fallback when a remote is selected:
+    /// - If protocols differ, enable "different path" toggle
+    /// - Pre-fill suggested path when one applies
+    private func applyFallbackAutoConfig() {
+        guard !fallbackRemote.isEmpty, !rcloneRemote.isEmpty else { return }
+        let primaryType = rcloneType(for: rcloneRemote)
+        let fallbackType = rcloneType(for: fallbackRemote)
+
+        guard let primary = primaryType, let fallback = fallbackType else { return }
+
+        if primary != fallback {
+            // Protocols differ — enable the toggle by default
+            if !fallbackUseDifferentPath {
+                fallbackUseDifferentPath = true
+            }
+            // If user hasn't set a fallback path yet, pre-fill the suggestion (or fall back to primary path)
+            if fallbackRemotePath.isEmpty {
+                if let suggestion = suggestFallbackPath(primaryPath: remotePath, primaryType: primary, fallbackType: fallback) {
+                    fallbackRemotePath = suggestion.path
+                } else {
+                    fallbackRemotePath = remotePath
+                }
+            }
+        }
+
+        // Trigger validation against the (possibly newly set) path
+        scheduleFallbackPathValidation()
+    }
+
+    /// Debounced validation of the fallback remote path via `rclone lsd`.
+    /// Cancels any in-flight validation and schedules a new one with a small delay,
+    /// so rapid typing doesn't fire a request per keystroke.
+    private func scheduleFallbackPathValidation() {
+        fallbackPathValidationTask?.cancel()
+        guard fallbackEnabled, !fallbackRemote.isEmpty, fallbackUseDifferentPath, !fallbackRemotePath.isEmpty else {
+            fallbackPathStatus = .unknown
+            fallbackPathSuggestion = nil
+            fallbackPathSuggestionReason = nil
+            return
+        }
+
+        let pathToTest = fallbackRemotePath
+        let remoteToTest = fallbackRemote
+        fallbackPathStatus = .validating
+
+        fallbackPathValidationTask = Task { @MainActor in
+            // Debounce: wait briefly so rapid typing doesn't spam rclone
+            try? await Task.sleep(nanoseconds: 600_000_000)
+            if Task.isCancelled { return }
+            // Only run if state hasn't changed since we scheduled
+            guard pathToTest == self.fallbackRemotePath, remoteToTest == self.fallbackRemote else { return }
+
+            let result = await self.runRcloneLsd(remote: remoteToTest, path: pathToTest)
+            if Task.isCancelled { return }
+            // Re-check state hasn't moved on
+            guard pathToTest == self.fallbackRemotePath, remoteToTest == self.fallbackRemote else { return }
+
+            switch result {
+            case .success:
+                self.fallbackPathStatus = .valid
+                self.fallbackPathSuggestion = nil
+                self.fallbackPathSuggestionReason = nil
+            case .pathNotFound:
+                self.fallbackPathStatus = .invalid
+                // Compute a suggestion to show next to the error
+                let primaryType = self.rcloneType(for: self.rcloneRemote)
+                let fallbackType = self.rcloneType(for: self.fallbackRemote)
+                if let s = self.suggestFallbackPath(primaryPath: self.remotePath, primaryType: primaryType, fallbackType: fallbackType),
+                   s.path != self.fallbackRemotePath {
+                    self.fallbackPathSuggestion = s.path
+                    self.fallbackPathSuggestionReason = s.reason
+                } else {
+                    self.fallbackPathSuggestion = nil
+                    self.fallbackPathSuggestionReason = nil
+                }
+            case .unreachable:
+                self.fallbackPathStatus = .unreachable
+                self.fallbackPathSuggestion = nil
+                self.fallbackPathSuggestionReason = nil
+            }
+        }
+    }
+
+    /// Outcome of an `rclone lsd` probe.
+    private enum LsdResult {
+        case success
+        case pathNotFound
+        case unreachable
+    }
+
+    /// Run `rclone lsd remote:path` with a 5s timeout. Distinguishes between
+    /// "remote unreachable" (network failure) and "path doesn't exist" (lsd error
+    /// after auth succeeded) so the UI can show different copy.
+    private func runRcloneLsd(remote: String, path: String) async -> LsdResult {
+        await withCheckedContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async {
+                let rclonePaths = ["/opt/homebrew/bin/rclone", "/usr/local/bin/rclone", "/usr/bin/rclone"]
+                guard let rclone = rclonePaths.first(where: { FileManager.default.fileExists(atPath: $0) }) else {
+                    continuation.resume(returning: .unreachable)
+                    return
+                }
+
+                let bareName = remote.hasSuffix(":") ? String(remote.dropLast()) : remote
+                let target = "\(bareName):\(path)"
+
+                let proc = Process()
+                let outPipe = Pipe()
+                let errPipe = Pipe()
+                proc.executableURL = URL(fileURLWithPath: rclone)
+                var args = ["lsd", target, "--contimeout", "3s", "--timeout", "5s", "--retries", "1", "--low-level-retries", "1", "--max-depth", "0"]
+                if RcloneConfigService.shared.readRemoteConfig(name: bareName)?.values["no_check_certificate"] == "true" {
+                    args.append("--no-check-certificate")
+                }
+                proc.arguments = args
+                proc.standardOutput = outPipe
+                proc.standardError = errPipe
+
+                do {
+                    try proc.run()
+                    proc.waitUntilExit()
+                    if proc.terminationStatus == 0 {
+                        continuation.resume(returning: .success)
+                        return
+                    }
+                    // Inspect stderr to distinguish "no such file" from network failure
+                    let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
+                    let errOutput = (String(data: errData, encoding: .utf8) ?? "").lowercased()
+                    if errOutput.contains("connection") || errOutput.contains("dial") || errOutput.contains("timeout") || errOutput.contains("no such host") || errOutput.contains("network is unreachable") {
+                        continuation.resume(returning: .unreachable)
+                    } else {
+                        continuation.resume(returning: .pathNotFound)
+                    }
+                } catch {
+                    continuation.resume(returning: .unreachable)
+                }
+            }
+        }
+    }
+
+    /// Confirmation alert message for Reinstall — adapts to active transport so the user
+    /// is warned when their primary remote is likely unreachable (e.g., on mobile hotspot).
+    private var reinstallConfirmMessage: String {
+        let base = "This removes the current schedule and recreates it. If verification fails, the schedule won't run until you fix the configuration."
+        let transport = syncManager.activeTransport(for: profile.id)
+        if case .fallback(let remoteName) = transport {
+            return "\(base)\n\nNote: You're currently using the fallback remote (\(remoteName)). Reinstall verifies the primary remote, which may not be reachable from your current network."
+        }
+        return base
     }
 
     private func reinstallSync() {
@@ -2716,8 +3082,6 @@ struct ProfileDetailView: View {
 
         // Capture values from main thread before going to background
         let localPath = profile.localSyncPath
-        let remote = profile.rcloneRemote
-        let remoteFolder = profile.remotePath
         let checkFileName = SyncSetupService.checkFileName
         let bisyncDir = "\(NSHomeDirectory())/Library/Caches/rclone/bisync"
 
@@ -2792,84 +3156,16 @@ struct ProfileDetailView: View {
                 }
             }
 
-            // Find rclone
-            let rclonePaths = ["/opt/homebrew/bin/rclone", "/usr/local/bin/rclone", "/usr/bin/rclone"]
-            var rclonePath: String?
-
-            for path in rclonePaths {
-                if fileManager.fileExists(atPath: path) {
-                    rclonePath = path
-                    break
-                }
-            }
-
-            guard let rclone = rclonePath else {
+            // Ensure remote check file (centralized; verifies by read-back, robust to SFTP/WebDAV exit-code quirks)
+            let captureProfile = self.profile
+            let checkFileError = setupService.ensureRemoteCheckFile(for: captureProfile)
+            if checkFileError == nil {
                 DispatchQueue.main.async {
-                    self.appendOutputLine("  ✗ rclone not found. Install with: brew install rclone")
-                    self.isRunningResync = false
-                    self.syncManager.setSyncing(for: self.profile.id, isSyncing: false)
-                }
-                return
-            }
-
-            // Check if remote check file exists using rclone ls
-            let remoteCheckPath = "\(remote):\(remoteFolder)/\(checkFileName)"
-            let checkProcess = Process()
-            let checkPipe = Pipe()
-
-            let skipCert = RcloneConfigService.shared.readRemoteConfig(name: remote)?.values["no_check_certificate"] == "true"
-            checkProcess.executableURL = URL(fileURLWithPath: rclone)
-            var checkArgs = ["ls", remoteCheckPath]
-            if skipCert { checkArgs.append("--no-check-certificate") }
-            checkProcess.arguments = checkArgs
-            checkProcess.standardOutput = checkPipe
-            checkProcess.standardError = checkPipe
-
-            var remoteCheckExists = false
-            do {
-                try checkProcess.run()
-                checkProcess.waitUntilExit()
-                remoteCheckExists = checkProcess.terminationStatus == 0
-            } catch {
-                // Assume it doesn't exist
-            }
-
-            if !remoteCheckExists {
-                // Create remote check file
-                let touchProcess = Process()
-                let touchPipe = Pipe()
-
-                touchProcess.executableURL = URL(fileURLWithPath: rclone)
-                var touchArgs = ["rcat", remoteCheckPath]
-                if skipCert { touchArgs.append("--no-check-certificate") }
-                touchProcess.arguments = touchArgs
-                let touchStdin = Pipe()
-                touchProcess.standardInput = touchStdin
-                touchProcess.standardOutput = touchPipe
-                touchProcess.standardError = touchPipe
-
-                do {
-                    try touchProcess.run()
-                    touchStdin.fileHandleForWriting.closeFile()
-                    touchProcess.waitUntilExit()
-
-                    if touchProcess.terminationStatus == 0 {
-                        DispatchQueue.main.async {
-                            self.appendOutputLine("  ✓ Created remote .synctray-check file")
-                        }
-                    } else {
-                        DispatchQueue.main.async {
-                            self.appendOutputLine("  ⚠ Could not create remote .synctray-check file")
-                        }
-                    }
-                } catch {
-                    DispatchQueue.main.async {
-                        self.appendOutputLine("  ⚠ Error creating remote check file: \(error.localizedDescription)")
-                    }
+                    self.appendOutputLine("  ✓ Remote .synctray-check file ready")
                 }
             } else {
                 DispatchQueue.main.async {
-                    self.appendOutputLine("  ✓ Remote .synctray-check file exists")
+                    self.appendOutputLine("  ⚠ Could not ensure remote check file: \(checkFileError ?? "unknown error")")
                 }
             }
 
@@ -2933,8 +3229,6 @@ struct ProfileDetailView: View {
 
         // Capture values from main thread before going to background
         let localPath = profile.localSyncPath
-        let remote = profile.rcloneRemote
-        let remoteFolder = profile.remotePath
         let checkFileName = SyncSetupService.checkFileName
 
         DispatchQueue.global(qos: .userInitiated).async {
@@ -2963,74 +3257,23 @@ struct ProfileDetailView: View {
                 self.appendOutputLine("✓ Created local .synctray-check file")
             }
 
-            // Create remote check file using rclone
-            let rclonePaths = ["/opt/homebrew/bin/rclone", "/usr/local/bin/rclone", "/usr/bin/rclone"]
-            var rclonePath: String?
-
-            for path in rclonePaths {
-                if FileManager.default.fileExists(atPath: path) {
-                    rclonePath = path
-                    break
-                }
+            // Ensure remote check file (centralized; verifies by read-back, robust to SFTP/WebDAV exit-code quirks)
+            let captureProfile = self.profile
+            DispatchQueue.main.async {
+                self.appendOutputLine("Ensuring remote .synctray-check file...")
             }
-
-            guard let path = rclonePath else {
-                DispatchQueue.main.async {
-                    self.appendOutputLine("✗ rclone not found")
-                    self.isRunningResync = false
-                    self.syncManager.setSyncing(for: self.profile.id, isSyncing: false)
-                }
-                return
-            }
-
-            // Create remote check file using rclone touch
-            let remoteDest = "\(remote):\(remoteFolder)/\(checkFileName)"
-            let process = Process()
-            let pipe = Pipe()
-
-            process.executableURL = URL(fileURLWithPath: path)
-            var touchArgs = ["rcat", remoteDest]
-            let skipCertForTouch = RcloneConfigService.shared.readRemoteConfig(name: remote)?.values["no_check_certificate"] == "true"
-            if skipCertForTouch { touchArgs.append("--no-check-certificate") }
-            process.arguments = touchArgs
-            let rcatStdin = Pipe()
-            process.standardInput = rcatStdin
-            process.standardOutput = pipe
-            process.standardError = pipe
+            let checkFileError = setupService.ensureRemoteCheckFile(for: captureProfile)
 
             DispatchQueue.main.async {
-                self.appendOutputLine("Running: rclone rcat \"\(remoteDest)\"")
-            }
+                if checkFileError == nil {
+                    self.appendOutputLine("✓ Remote .synctray-check file ready")
+                    self.appendOutputLine("")
+                    self.appendOutputLine("Now running initial sync (--resync)...")
 
-            do {
-                try process.run()
-                rcatStdin.fileHandleForWriting.closeFile()
-                process.waitUntilExit()
-
-                let data = pipe.fileHandleForReading.readDataToEndOfFile()
-                let output = String(data: data, encoding: .utf8) ?? ""
-
-                DispatchQueue.main.async {
-                    if !output.isEmpty {
-                        self.appendOutputLine(output)
-                    }
-
-                    if process.terminationStatus == 0 {
-                        self.appendOutputLine("✓ Created remote .synctray-check file")
-                        self.appendOutputLine("")
-                        self.appendOutputLine("Now running initial sync (--resync)...")
-
-                        // Run resync after creating files (needed because check-access failure corrupts listing files)
-                        self.runResync()
-                    } else {
-                        self.appendOutputLine("✗ Failed to create remote file (exit code \(process.terminationStatus))")
-                        self.isRunningResync = false
-                        self.syncManager.setSyncing(for: self.profile.id, isSyncing: false)
-                    }
-                }
-            } catch {
-                DispatchQueue.main.async {
-                    self.appendOutputLine("✗ Error: \(error.localizedDescription)")
+                    // Run resync after creating files (needed because check-access failure corrupts listing files)
+                    self.runResync()
+                } else {
+                    self.appendOutputLine("✗ \(checkFileError ?? "Failed to ensure remote check file")")
                     self.isRunningResync = false
                     self.syncManager.setSyncing(for: self.profile.id, isSyncing: false)
                 }

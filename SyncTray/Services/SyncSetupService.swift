@@ -292,34 +292,118 @@ final class SyncSetupService {
             fileManager.createFile(atPath: localCheckFile, contents: nil)
         }
 
-        // 3. Create remote check file using rclone rcat (touch fails on some WebDAV remotes)
+        // 3. Create remote check file
+        if let error = ensureRemoteCheckFile(for: profile, rclonePath: rclonePath) {
+            return error
+        }
+
+        return nil  // Success
+    }
+
+    /// Ensure the remote `.synctray-check` file exists at the profile's remote path.
+    /// Idempotent — returns nil (success) when the file ends up existing, regardless of how it got there.
+    ///
+    /// **Why this is non-trivial:** `rclone rcat` over SFTP (notably Synology) often returns a
+    /// non-zero exit code due to post-upload metadata operations (SetModTime, perms) failing,
+    /// even though the file was successfully written. The same applies to some WebDAV servers.
+    /// Trusting only the exit code produces false-failure UX.
+    ///
+    /// **Strategy:** Try cheap operations first, then verify the actual state via `lsf`.
+    /// 1. If the file already exists → done.
+    /// 2. Try `rclone touch` (cleanest, no upload payload).
+    /// 3. Fall back to `rclone rcat` with empty stdin (some WebDAV servers reject touch).
+    /// 4. **Read-back verify** — if the file exists now, success regardless of prior exit codes.
+    func ensureRemoteCheckFile(for profile: SyncProfile, rclonePath: String? = nil) -> String? {
+        guard let rclonePath = rclonePath ?? findRclonePath() else {
+            return "rclone not found"
+        }
+
         let remoteCheckFile = "\(profile.rcloneRemote):\(profile.remotePath)/\(Self.checkFileName)"
         let skipCert = RcloneConfigService.shared.readRemoteConfig(name: profile.rcloneRemote)?.values["no_check_certificate"] == "true"
 
+        // Step A: Already exists?
+        if remoteFileExists(rclonePath: rclonePath, remotePath: remoteCheckFile, skipCert: skipCert) {
+            return nil
+        }
+
+        // Step B: Try `rclone touch`
+        _ = runRcloneSimple(rclonePath: rclonePath, args: ["touch", remoteCheckFile], skipCert: skipCert)
+        if remoteFileExists(rclonePath: rclonePath, remotePath: remoteCheckFile, skipCert: skipCert) {
+            return nil
+        }
+
+        // Step C: Fall back to `rcat` with empty stdin (time-bounded)
         let process = Process()
         process.executableURL = URL(fileURLWithPath: rclonePath)
-        var rcatArgs = ["rcat", remoteCheckFile]
-        if skipCert {
-            rcatArgs.append("--no-check-certificate")
-        }
+        var rcatArgs = ["rcat", remoteCheckFile, "--contimeout", "5s", "--timeout", "15s", "--retries", "1", "--low-level-retries", "1"]
+        if skipCert { rcatArgs.append("--no-check-certificate") }
         process.arguments = rcatArgs
-        // rcat reads from stdin — provide empty input and close immediately for EOF
+        process.standardOutput = Pipe()
+        process.standardError = Pipe()
         let stdinPipe = Pipe()
         process.standardInput = stdinPipe
 
+        let rcatExitCode: Int32
         do {
             try process.run()
-            // Close stdin so rcat gets EOF and finishes
             stdinPipe.fileHandleForWriting.closeFile()
             process.waitUntilExit()
-            if process.terminationStatus != 0 {
-                return "Failed to create remote check file (exit code \(process.terminationStatus))"
-            }
+            rcatExitCode = process.terminationStatus
         } catch {
             return "Failed to create remote check file: \(error.localizedDescription)"
         }
 
-        return nil  // Success
+        // Step D: Read-back verify — trust actual state over exit codes
+        if remoteFileExists(rclonePath: rclonePath, remotePath: remoteCheckFile, skipCert: skipCert) {
+            return nil
+        }
+
+        // All attempts failed — likely network/reachability issue since we have generous timeouts
+        return "Could not reach the remote to verify check file. Check your network connection and that the remote is online."
+    }
+
+    /// Check if a remote file exists via `rclone lsf`. Returns true on exit code 0 with non-empty output.
+    /// Time-bounded so an unreachable remote fails within ~10s instead of hanging on rclone defaults.
+    private func remoteFileExists(rclonePath: String, remotePath: String, skipCert: Bool) -> Bool {
+        let process = Process()
+        let pipe = Pipe()
+        process.executableURL = URL(fileURLWithPath: rclonePath)
+        var args = ["lsf", remotePath, "--contimeout", "5s", "--timeout", "10s", "--retries", "1", "--low-level-retries", "1"]
+        if skipCert { args.append("--no-check-certificate") }
+        process.arguments = args
+        process.standardOutput = pipe
+        process.standardError = Pipe()
+
+        do {
+            try process.run()
+            process.waitUntilExit()
+            guard process.terminationStatus == 0 else { return false }
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            let output = String(data: data, encoding: .utf8) ?? ""
+            return !output.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        } catch {
+            return false
+        }
+    }
+
+    /// Run rclone with given args, return exit code (or -1 on launch failure).
+    /// Adds connection/operation timeouts so unreachable remotes fail within ~15s.
+    private func runRcloneSimple(rclonePath: String, args: [String], skipCert: Bool) -> Int32 {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: rclonePath)
+        var fullArgs = args + ["--contimeout", "5s", "--timeout", "15s", "--retries", "1", "--low-level-retries", "1"]
+        if skipCert { fullArgs.append("--no-check-certificate") }
+        process.arguments = fullArgs
+        process.standardOutput = Pipe()
+        process.standardError = Pipe()
+
+        do {
+            try process.run()
+            process.waitUntilExit()
+            return process.terminationStatus
+        } catch {
+            return -1
+        }
     }
 
     /// Checks if listing files exist for this profile's path combination
