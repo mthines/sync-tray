@@ -106,6 +106,7 @@ final class TelemetryService {
     private var directoryWatchFilterCounter: LongCounterSdk?
     private var resumedExternalSyncCounter: LongCounterSdk?
     private var settingsOpenedCounter: LongCounterSdk?
+    private var profileShareCounter: LongCounterSdk?
 
     // MARK: - Providers (kept alive for shutdown)
 
@@ -325,6 +326,12 @@ final class TelemetryService {
         settingsOpenedCounter = meter
             .counterBuilder(name: "synctray.app.settings_opened")
             .setDescription("Number of times the Settings window was opened")
+            .setUnit("1")
+            .build()
+
+        profileShareCounter = meter
+            .counterBuilder(name: "synctray.profile.share_operations")
+            .setDescription("Profile share operations (export/import) by provider type and result")
             .setUnit("1")
             .build()
     }
@@ -1117,6 +1124,70 @@ final class TelemetryService {
         ensureSetup()
 
         settingsOpenedCounter?.add(value: 1, attribute: [:])
+    }
+
+    // MARK: - Profile Sharing
+
+    /// Record an export of a profile share file. Never includes paths, names, or remote URLs.
+    func recordProfileExport(
+        providerType: String,
+        includedFallback: Bool,
+        includedFilter: Bool,
+        result: String,
+        errorMessage: String? = nil
+    ) {
+        guard SyncTraySettings.telemetryEnabled else { return }
+        ensureSetup()
+
+        var attrs: [String: AttributeValue] = [
+            "share.operation": .string("export"),
+            "remote.provider_type": .string(providerType),
+            "share.included_fallback": .bool(includedFallback),
+            "share.included_filter": .bool(includedFilter),
+            "share.result": .string(result),
+        ]
+        if let errMsg = errorMessage {
+            attrs["error.type"] = .string(categorizeRemoteError(errMsg))
+        }
+        profileShareCounter?.add(value: 1, attribute: attrs)
+
+        emitLog(
+            severity: result == "success" ? .info : .warn,
+            body: "Profile exported (\(result))",
+            attributes: attrs
+        )
+    }
+
+    /// Record an import of a profile share file. Never includes paths, names, or remote URLs.
+    func recordProfileImport(
+        providerType: String,
+        reusedRemote: Bool,
+        hadFallback: Bool,
+        hadFilter: Bool,
+        result: String,
+        errorMessage: String? = nil
+    ) {
+        guard SyncTraySettings.telemetryEnabled else { return }
+        ensureSetup()
+
+        var attrs: [String: AttributeValue] = [
+            "share.operation": .string("import"),
+            "remote.provider_type": .string(providerType),
+            "share.reused_remote": .bool(reusedRemote),
+            "share.had_fallback": .bool(hadFallback),
+            "share.had_filter": .bool(hadFilter),
+            "share.result": .string(result),
+        ]
+        if let errMsg = errorMessage {
+            attrs["error.type"] = .string(categorizeRemoteError(errMsg))
+        }
+        profileShareCounter?.add(value: 1, attribute: attrs)
+
+        emitLog(
+            severity: result == "success" ? .info : .warn,
+            body: "Profile imported (\(result))",
+            attributes: attrs
+        )
     }
 
     // MARK: - App Lifecycle

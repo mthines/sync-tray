@@ -28,6 +28,11 @@ struct SetupWizardView: View {
     @State private var errorMessage: String?
     @State private var isOAuthInProgress: Bool = false
 
+    // Sharing — import flow launched from the welcome step.
+    @State private var importingShared: SharedProfile?
+    @State private var importErrorMessage: String?
+    @State private var showingImportError: Bool = false
+
     // Services
     private let configService = RcloneConfigService.shared
 
@@ -104,6 +109,23 @@ struct SetupWizardView: View {
         .onAppear {
             checkRcloneInstallation()
             loadEditingProfile()
+        }
+        .sheet(item: $importingShared) { shared in
+            ImportProfileSheet(profileStore: profileStore, onImported: { newId in
+                // Tell SettingsView to select the freshly imported profile.
+                NotificationCenter.default.post(
+                    name: .selectProfile,
+                    object: nil,
+                    userInfo: ["profileId": newId]
+                )
+                // Dismiss the wizard so the user lands on their new profile.
+                dismiss()
+            }, shared: shared)
+        }
+        .alert("Import Failed", isPresented: $showingImportError) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text(importErrorMessage ?? "Could not read the shared profile.")
         }
     }
 
@@ -216,6 +238,34 @@ struct SetupWizardView: View {
                 }
                 .pickerStyle(.menu)
             }
+
+            Divider()
+                .padding(.vertical, 8)
+
+            HStack(spacing: 8) {
+                Image(systemName: "square.and.arrow.down")
+                    .foregroundColor(.secondary)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Have a shared configuration?")
+                        .font(.subheadline)
+                    Text("Import a `.synctrayprofile` file from another SyncTray user.")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+                Spacer()
+                Button("Import…") { launchImport() }
+            }
+        }
+    }
+
+    private func launchImport() {
+        guard let result = ProfileImportLauncher.pickFile() else { return }
+        switch result {
+        case .success(let shared):
+            importingShared = shared
+        case .failure(let error):
+            importErrorMessage = error.localizedDescription
+            showingImportError = true
         }
     }
 

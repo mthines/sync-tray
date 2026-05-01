@@ -8,10 +8,22 @@ struct ProfileListView: View {
     @State private var showingDeleteConfirmation = false
     @State private var showingSetupWizard = false
 
+    // Sharing state
+    @State private var exportingProfile: SyncProfile?
+    @State private var importingShared: SharedProfile?
+    @State private var importErrorMessage: String?
+    @State private var showingImportError: Bool = false
+
     /// The currently selected profile ID, if a profile is selected
     private var selectedProfileId: UUID? {
         if case .profile(let id) = selection { return id }
         return nil
+    }
+
+    /// The currently selected profile, if any
+    private var selectedProfile: SyncProfile? {
+        guard let id = selectedProfileId else { return nil }
+        return profileStore.profile(for: id)
     }
 
     var body: some View {
@@ -33,6 +45,10 @@ struct ProfileListView: View {
                     .contextMenu {
                         Button(syncManager.isPaused(for: profile.id) ? "Resume Syncing" : "Pause Syncing") {
                             syncManager.togglePause(for: profile.id)
+                        }
+                        Divider()
+                        Button("Share Configuration…") {
+                            exportingProfile = profile
                         }
                         Divider()
                         Button("Delete", role: .destructive) {
@@ -93,12 +109,40 @@ struct ProfileListView: View {
                 .help("Delete Profile")
 
                 Spacer()
+
+                Button(action: shareSelectedProfile) {
+                    Image(systemName: "square.and.arrow.up")
+                        .foregroundStyle(selectedProfileId == nil ? .secondary : .primary)
+                }
+                .buttonStyle(.borderless)
+                .disabled(selectedProfileId == nil)
+                .help("Share Configuration")
+
+                Button(action: importSharedProfile) {
+                    Image(systemName: "square.and.arrow.down")
+                        .foregroundStyle(.primary)
+                }
+                .buttonStyle(.borderless)
+                .help("Import Configuration")
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 8)
         }
         .sheet(isPresented: $showingSetupWizard) {
             SetupWizardView(profileStore: profileStore)
+        }
+        .sheet(item: $exportingProfile) { profile in
+            ExportProfileSheet(profile: profile)
+        }
+        .sheet(item: $importingShared) { shared in
+            ImportProfileSheet(profileStore: profileStore, onImported: { newId in
+                selection = .profile(newId)
+            }, shared: shared)
+        }
+        .alert("Import Failed", isPresented: $showingImportError) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text(importErrorMessage ?? "Could not read the shared profile.")
         }
         .alert("Delete Profile?", isPresented: $showingDeleteConfirmation) {
             Button("Cancel", role: .cancel) {}
@@ -116,6 +160,22 @@ struct ProfileListView: View {
     private func addProfile() {
         let profile = profileStore.createNewProfile()
         selection = .profile(profile.id)
+    }
+
+    private func shareSelectedProfile() {
+        guard let profile = selectedProfile else { return }
+        exportingProfile = profile
+    }
+
+    private func importSharedProfile() {
+        guard let result = ProfileImportLauncher.pickFile() else { return }
+        switch result {
+        case .success(let shared):
+            importingShared = shared
+        case .failure(let error):
+            importErrorMessage = error.localizedDescription
+            showingImportError = true
+        }
     }
 
     private func deleteSelectedProfile() {
