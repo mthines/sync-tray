@@ -16,7 +16,6 @@ final class ProfileShareService {
         case missingProfile
         case missingRemote
         case remoteCreationFailed(String)
-        case profileSaveFailed(String)
 
         var errorDescription: String? {
             switch self {
@@ -32,8 +31,6 @@ final class ProfileShareService {
                 return "The shared file does not contain a remote configuration."
             case .remoteCreationFailed(let msg):
                 return "Failed to create remote: \(msg)"
-            case .profileSaveFailed(let msg):
-                return "Failed to save profile: \(msg)"
             }
         }
     }
@@ -129,11 +126,13 @@ final class ProfileShareService {
     /// Apply the redaction allowlist to a `RemoteConfiguration`, returning a `SharedRemote`
     /// safe to write to disk.
     private func redact(_ config: RemoteConfiguration) -> SharedRemote {
-        let strip = Self.sensitiveFields(for: config.provider)
         var safe = config.values
-        for key in strip {
+        for key in Self.sensitiveFields(for: config.provider) {
             safe.removeValue(forKey: key)
         }
+        // OAuth `token` lives on `RemoteConfiguration.oauthToken`, but defend against it
+        // ever appearing in `values` directly.
+        safe.removeValue(forKey: "token")
         // Drop empty values to keep the file tidy.
         safe = safe.filter { !$0.value.isEmpty }
         return SharedRemote(name: config.name, provider: config.provider, values: safe)
@@ -217,14 +216,18 @@ final class ProfileShareService {
     ) throws -> ImportResult {
         guard let body = shared.profile else { throw ShareError.missingProfile }
 
+        // Track newly-created remotes so we can roll them back if a later step fails.
+        var rollbackRemoteNames: [String] = []
+
         let primaryName: String
         if shared.remote != nil {
             primaryName = try resolveRemote(
-                sharedRemote: shared.remote,
                 override: primaryRemoteOverride,
-                action: primaryRemoteAction,
-                isPrimary: true
+                action: primaryRemoteAction
             )
+            if case .create = primaryRemoteAction {
+                rollbackRemoteNames.append(primaryName)
+            }
         } else if !body.rcloneRemote.isEmpty,
                   RcloneConfigService.shared.remoteExists(body.rcloneRemote) {
             // No remote in the file — recipient already has one with the right name.
@@ -235,17 +238,27 @@ final class ProfileShareService {
 
         var fallbackName: String?
         if !body.fallbackRemote.isEmpty {
-            if shared.fallbackRemote != nil {
-                fallbackName = try resolveRemote(
-                    sharedRemote: shared.fallbackRemote,
-                    override: fallbackRemoteOverride,
-                    action: fallbackRemoteAction,
-                    isPrimary: false
-                )
-            } else if RcloneConfigService.shared.remoteExists(body.fallbackRemote) {
-                fallbackName = body.fallbackRemote
+            do {
+                if shared.fallbackRemote != nil {
+                    let resolved = try resolveRemote(
+                        override: fallbackRemoteOverride,
+                        action: fallbackRemoteAction
+                    )
+                    fallbackName = resolved
+                    if case .create = fallbackRemoteAction {
+                        rollbackRemoteNames.append(resolved)
+                    }
+                } else if RcloneConfigService.shared.remoteExists(body.fallbackRemote) {
+                    fallbackName = body.fallbackRemote
+                }
+                // If fallback isn't resolvable, silently drop it — the profile still works without it.
+            } catch {
+                // Roll back any remotes we created in this transaction.
+                for name in rollbackRemoteNames {
+                    try? RcloneConfigService.shared.deleteRemote(name)
+                }
+                throw error
             }
-            // If fallback isn't resolvable, silently drop it — the profile still works without it.
         }
 
         // Build the new profile.
@@ -300,19 +313,14 @@ final class ProfileShareService {
     }
 
     private func resolveRemote(
-        sharedRemote: SharedRemote?,
         override: RemoteConfiguration?,
-        action: RemoteAction,
-        isPrimary: Bool
+        action: RemoteAction
     ) throws -> String {
         switch action {
         case .reuse(let name):
             return name
         case .create:
-            guard let cfg = override else {
-                if isPrimary { throw ShareError.missingRemote }
-                throw ShareError.missingRemote
-            }
+            guard let cfg = override else { throw ShareError.missingRemote }
             do {
                 try RcloneConfigService.shared.addRemote(cfg)
                 return cfg.name

@@ -19,22 +19,16 @@ struct ExportProfileSheet: View {
     @State private var didCopy: Bool = false
     @State private var errorMessage: String?
 
+    /// Cached on appear so we don't re-stat the filter file on every redraw.
+    @State private var profileHasFallback: Bool = false
+    @State private var profileHasExcludeFilter: Bool = false
+
+    /// Cached preview JSON. Recomputed when toggles change while the preview is open.
+    @State private var previewJSON: String = ""
+
     private let shareService = ProfileShareService.shared
 
     // MARK: - Derived state
-
-    /// Whether the source profile actually has a fallback remote (controls toggle visibility).
-    private var profileHasFallback: Bool {
-        !profile.fallbackRemote.isEmpty
-    }
-
-    /// Whether the source profile has a non-empty exclude filter file.
-    private var profileHasExcludeFilter: Bool {
-        guard FileManager.default.fileExists(atPath: profile.filterFilePath),
-              let contents = try? String(contentsOfFile: profile.filterFilePath, encoding: .utf8)
-        else { return false }
-        return !contents.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-    }
 
     private var currentOptions: ProfileShareService.ExportOptions {
         ProfileShareService.ExportOptions(
@@ -45,7 +39,7 @@ struct ExportProfileSheet: View {
         )
     }
 
-    private var sharedProfile: SharedProfile {
+    private func buildSharedProfile() -> SharedProfile {
         shareService.makeSharedProfile(from: profile, options: currentOptions)
     }
 
@@ -82,6 +76,34 @@ struct ExportProfileSheet: View {
                 .padding()
         }
         .frame(width: 560, height: 540)
+        .onAppear(perform: cacheProfileFlags)
+        .onChange(of: includeProfile) { _ in refreshPreviewIfVisible() }
+        .onChange(of: includePrimaryRemote) { _ in refreshPreviewIfVisible() }
+        .onChange(of: includeFallbackRemote) { _ in refreshPreviewIfVisible() }
+        .onChange(of: includeExcludeFilter) { _ in refreshPreviewIfVisible() }
+        .onChange(of: showPreview) { newValue in
+            if newValue { refreshPreview() }
+        }
+    }
+
+    private func cacheProfileFlags() {
+        profileHasFallback = !profile.fallbackRemote.isEmpty
+        profileHasExcludeFilter = {
+            guard FileManager.default.fileExists(atPath: profile.filterFilePath),
+                  let contents = try? String(contentsOfFile: profile.filterFilePath, encoding: .utf8)
+            else { return false }
+            return !contents.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }()
+    }
+
+    private func refreshPreviewIfVisible() {
+        guard showPreview else { return }
+        refreshPreview()
+    }
+
+    private func refreshPreview() {
+        previewJSON = (try? shareService.encodeAsString(buildSharedProfile()))
+            ?? "Could not generate preview."
     }
 
     // MARK: - Header
@@ -199,11 +221,9 @@ struct ExportProfileSheet: View {
         }
     }
 
-    @ViewBuilder
     private var previewContent: some View {
-        let preview = (try? shareService.encodeAsString(sharedProfile)) ?? "Could not generate preview."
         ScrollView {
-            Text(preview)
+            Text(previewJSON)
                 .font(.system(.caption, design: .monospaced))
                 .textSelection(.enabled)
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -244,22 +264,22 @@ struct ExportProfileSheet: View {
 
     private func copyToClipboard() {
         do {
-            let json = try shareService.encodeAsString(sharedProfile)
+            let json = try shareService.encodeAsString(buildSharedProfile())
             let pb = NSPasteboard.general
             pb.clearContents()
             pb.setString(json, forType: .string)
             didCopy = true
-            recordExport(result: "success", method: "clipboard")
+            recordExport(result: "success")
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { didCopy = false }
         } catch {
             errorMessage = error.localizedDescription
-            recordExport(result: "failure", method: "clipboard", error: error)
+            recordExport(result: "failure", error: error)
         }
     }
 
     private func saveToFile() {
         do {
-            let data = try shareService.encode(sharedProfile)
+            let data = try shareService.encode(buildSharedProfile())
             let panel = NSSavePanel()
             panel.title = "Save Profile Configuration"
             panel.nameFieldStringValue = "\(safeFilename(profile.name)).\(SharedProfile.fileExtension)"
@@ -276,21 +296,21 @@ struct ExportProfileSheet: View {
             }
 
             try data.write(to: url, options: .atomic)
-            recordExport(result: "success", method: "file")
+            recordExport(result: "success")
             dismiss()
         } catch {
             errorMessage = error.localizedDescription
-            recordExport(result: "failure", method: "file", error: error)
+            recordExport(result: "failure", error: error)
         }
     }
 
-    private func recordExport(result: String, method: String, error: Error? = nil) {
-        let providerType: String = {
-            let name = profile.rcloneRemote.hasSuffix(":")
-                ? String(profile.rcloneRemote.dropLast())
-                : profile.rcloneRemote
-            return RcloneConfigService.shared.readRemoteConfig(name: name)?.provider.rcloneType ?? "unknown"
-        }()
+    private func recordExport(result: String, error: Error? = nil) {
+        let name = profile.rcloneRemote.hasSuffix(":")
+            ? String(profile.rcloneRemote.dropLast())
+            : profile.rcloneRemote
+        let providerType = RcloneConfigService.shared.readRemoteConfig(name: name)?
+            .provider.rcloneType ?? "unknown"
+
         TelemetryService.shared.recordProfileExport(
             providerType: providerType,
             includedFallback: profileHasFallback && includeFallbackRemote,
@@ -298,7 +318,6 @@ struct ExportProfileSheet: View {
             result: result,
             errorMessage: error?.localizedDescription
         )
-        _ = method  // currently informational; kept here for future per-method telemetry
     }
 
     /// Sanitize profile name for use as a filename.

@@ -62,6 +62,9 @@ struct ImportProfileSheet: View {
 
             ScrollView {
                 VStack(alignment: .leading, spacing: 18) {
+                    if shared.profile == nil {
+                        invalidFileBanner
+                    }
                     summarySection
                     if shared.profile != nil {
                         Divider()
@@ -128,6 +131,33 @@ struct ImportProfileSheet: View {
         }
         .padding(.horizontal, 20)
         .padding(.vertical, 14)
+    }
+
+    // MARK: - Invalid file banner
+
+    private var invalidFileBanner: some View {
+        HStack(alignment: .top, spacing: 8) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .foregroundStyle(.orange)
+            VStack(alignment: .leading, spacing: 2) {
+                Text("This file doesn't contain a profile")
+                    .font(.subheadline.weight(.semibold))
+                Text("It may have been exported with profile settings disabled. Ask the sender to re-export with \"Profile settings\" included.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .padding(10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            RoundedRectangle(cornerRadius: 8)
+                .fill(Color.orange.opacity(0.08))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 8)
+                .strokeBorder(Color.orange.opacity(0.3), lineWidth: 1)
+        )
     }
 
     // MARK: - Summary
@@ -253,7 +283,7 @@ struct ImportProfileSheet: View {
                 // Provider field editor (required + optional). Reuses the wizard's logic.
                 ProviderFieldsView(config: configBinding(config))
 
-                if cfgValue.provider.usesOAuth, isPrimary {
+                if cfgValue.provider.usesOAuth {
                     HStack {
                         if cfgValue.oauthToken != nil {
                             Label("Authenticated", systemImage: "checkmark.circle.fill")
@@ -312,7 +342,15 @@ struct ImportProfileSheet: View {
 
     private var canTestPrimary: Bool {
         guard let cfg = primaryRemote else { return false }
-        return cfg.validate().isEmpty
+        guard cfg.validate().isEmpty else { return false }
+        // In .createNew mode, testing would write the typed credentials to rclone.conf.
+        // If the name clashes with an existing remote, that would overwrite the user's
+        // existing remote — block until they choose a unique name.
+        if primaryRemoteAction == .createNew,
+           existingRemoteNames.contains(cfg.name) {
+            return false
+        }
+        return true
     }
 
     /// Binding that unwraps the optional remote name for editing.
@@ -464,13 +502,18 @@ struct ImportProfileSheet: View {
         primaryTestPassed = false
         errorMessage = nil
 
-        // Save first under a temporary unique name? No — easier and safer to write the
-        // remote, test, and let the import flow handle dedup. If the name clashes the user
-        // already chose a non-clashing name above.
+        // We need the remote written to rclone.conf before rclone can test it. Use
+        // updateRemote so retries (different password each attempt) don't trip on
+        // "already exists" — it deletes-then-adds atomically.
         let captured = cfg
+        let preexisted = existingRemoteNames.contains(captured.name)
         DispatchQueue.global(qos: .userInitiated).async {
             do {
-                try configService.addRemote(captured)
+                if configService.remoteExists(captured.name) {
+                    try configService.updateRemote(captured)
+                } else {
+                    try configService.addRemote(captured)
+                }
                 Task {
                     let result = await configService.testConnection("\(captured.name):")
                     await MainActor.run {
@@ -486,8 +529,11 @@ struct ImportProfileSheet: View {
                             }
                         case .failure(let error):
                             errorMessage = error.localizedDescription
-                            // Roll back — we don't want to leave a half-broken remote behind.
-                            try? configService.deleteRemote(captured.name)
+                            // Only roll back if we created the remote in this session;
+                            // never delete a pre-existing one the user owns.
+                            if !preexisted {
+                                try? configService.deleteRemote(captured.name)
+                            }
                         }
                     }
                 }
@@ -532,6 +578,14 @@ struct ImportProfileSheet: View {
             return parts.count >= 2 ? "/Volumes/\(parts[1])" : ""
         }()
 
+        let providerType = shared.remote?.provider.rcloneType ?? "unknown"
+        let reusedRemote = primaryRemoteAction == .reuseExisting
+        let hadFallback = shared.fallbackRemote != nil
+        let hadFilter = shared.excludeFilter != nil
+
+        // installImport may spawn rclone subprocesses (addRemote → Process). It's brief
+        // (~100ms) and the spinner is shown via isImporting, so we stay on main here for
+        // simplicity. If profile creation grows expensive, refactor installImport to async.
         do {
             let result = try shareService.installImport(
                 shared: sharedCopy,
@@ -543,26 +597,24 @@ struct ImportProfileSheet: View {
                 fallbackRemoteAction: fallbackAction,
                 profileStore: profileStore
             )
-
+            isImporting = false
             recordImport(
-                providerType: shared.remote?.provider.rcloneType ?? "unknown",
-                reusedRemote: primaryRemoteAction == .reuseExisting,
-                hadFallback: shared.fallbackRemote != nil,
-                hadFilter: shared.excludeFilter != nil,
+                providerType: providerType,
+                reusedRemote: reusedRemote,
+                hadFallback: hadFallback,
+                hadFilter: hadFilter,
                 result: "success"
             )
-
-            isImporting = false
             onImported?(result.profile.id)
             dismiss()
         } catch {
             isImporting = false
             errorMessage = error.localizedDescription
             recordImport(
-                providerType: shared.remote?.provider.rcloneType ?? "unknown",
-                reusedRemote: primaryRemoteAction == .reuseExisting,
-                hadFallback: shared.fallbackRemote != nil,
-                hadFilter: shared.excludeFilter != nil,
+                providerType: providerType,
+                reusedRemote: reusedRemote,
+                hadFallback: hadFallback,
+                hadFilter: hadFilter,
                 result: "failure",
                 error: error
             )
