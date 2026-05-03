@@ -68,6 +68,7 @@ SyncTray/
 | `SyncState.swift` | Sync state enum, progress struct, file change model, `ActiveTransport`, `SyncLogPatterns` for log parsing |
 | `RcloneLogEntry.swift` | JSON models for parsing rclone `--use-json-log` output |
 | `Settings.swift` | Global app settings (debug logging toggle) |
+| `SharedProfile.swift` | Versioned `.synctrayprofile` share file format (profile + redacted remote + exclude filter) |
 
 ### Services/
 
@@ -81,6 +82,7 @@ SyncTray/
 | `DirectoryWatcher.swift` | FSEvents-based directory monitoring with debouncing |
 | `NotificationService.swift` | Batched macOS notifications with action support |
 | `TelemetryService.swift` | Opt-in OTel telemetry (traces, metrics, logs) via OTLP/HTTP |
+| `ProfileShareService.swift` | Owns the per-provider redaction allowlist; encodes/decodes share files; installs imported profiles |
 
 ### Views/
 
@@ -88,10 +90,12 @@ SyncTray/
 |------|---------|
 | `MenuBarView.swift` | Menu bar dropdown with profile status, recent changes, quick actions |
 | `SettingsView.swift` | Settings window with profile list and detail editor |
-| `ProfileListView.swift` | Sidebar list of profiles with add/delete controls |
+| `ProfileListView.swift` | Sidebar list of profiles with add/delete/share/import controls |
 | `StatusHeaderView.swift` | Header showing current sync state and progress |
 | `SyncProgressDetailView.swift` | Detailed per-file transfer progress during sync |
 | `RecentChangesView.swift` | List of recently synced files |
+| `Settings/ExportProfileSheet.swift` | Export sheet — section toggles, redaction preview, save-as / copy |
+| `Settings/ImportProfileSheet.swift` | Import sheet — summary, conflict resolution, credential entry, test-connection |
 
 ## Data Flow
 
@@ -146,6 +150,40 @@ MenuBarView shows transport icon (wifi=primary, antenna=fallback)
 ```
 
 **Bisync cache preservation:** When the fallback remote has the same directory structure as the primary (e.g., WebDAV LAN → WebDAV QuickConnect), the sync script uses `RCLONE_CONFIG_*` environment variable overrides to change the transport while keeping the rclone remote name unchanged. This means bisync's listing cache (keyed by remote name + path) remains valid. When paths differ (e.g., SMB → SFTP), the full remote reference is swapped and bisync will rebuild listings on first switch (~12s for 85K files, no data re-download).
+
+### Profile Sharing Pipeline
+```
+Right-click profile → "Share Configuration…" (or toolbar share icon)
+        ↓
+ExportProfileSheet — section toggles, redaction preview
+        ↓
+ProfileShareService.makeSharedProfile(...)
+    ├─ Read remote config from rclone.conf (RcloneConfigService)
+    ├─ Apply per-provider redaction allowlist (sensitiveFields(for:))
+    └─ Pack profile body + redacted remotes + exclude filter into SharedProfile
+        ↓
+JSONEncoder (snake_case + ISO8601 dates) → .synctrayprofile file or clipboard
+        ↓
+============ recipient ============
+        ↓
+ProfileImportLauncher.pickFile() → NSOpenPanel → JSONDecoder
+        ↓
+ImportProfileSheet — summary, name conflict resolution, credential entry
+        ↓
+ProfileShareService.installImport(...)
+    ├─ Resolve primary remote (create / reuse existing)
+    ├─ Resolve fallback remote (create / reuse existing) — rolls back primary on failure
+    ├─ Build SyncProfile (with recipient's localSyncPath; isEnabled=false — never auto-arms)
+    ├─ Disambiguate name via ProfileStore.uniqueName(basedOn:)
+    ├─ profileStore.add(newProfile)
+    └─ Write exclude filter to {shortId}-exclude.txt
+        ↓
+.selectProfile notification fires → SettingsView opens the new profile
+```
+
+**Redaction:** `ProfileShareService.sensitiveFields(for:)` is the single source of truth for what's stripped per provider. Always strips `user`/`pass`/`key_file` for non-OAuth providers, and OAuth `token`s + user-specific `drive_id`/`root_folder_id`. Empty-valued keys are also dropped to keep the file tidy. Defensively strips any `token` key from the values dict even though OAuth tokens normally live on `RemoteConfiguration.oauthToken`.
+
+**Schema versioning:** `SharedProfile.synctrayVersion` is a hard gate — files exported by a newer version of SyncTray fail to decode with a clear error. Bump `currentVersion` when introducing breaking format changes; add new fields as optional to preserve forward compatibility for the same major version.
 
 ## Key Design Patterns
 
@@ -342,6 +380,7 @@ open ~/Library/Developer/Xcode/DerivedData/SyncTray-*/Build/Products/Debug/SyncT
 | `SyncLogPatterns` | Centralized log message pattern matching |
 | `TelemetryService.swift` | OTel singleton — traces, metrics, logs via OTLP/HTTP |
 | `Settings.swift` | Global settings including `installationId` and `anonymousUserId` |
+| `SharedProfile.swift` / `ProfileShareService.swift` | `.synctrayprofile` import/export, per-provider redaction allowlist |
 
 ## Telemetry
 

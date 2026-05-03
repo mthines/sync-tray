@@ -145,6 +145,16 @@ Configure an alternative remote that activates automatically when the primary is
 - **Bisync cache preservation**: When the fallback uses the same directory structure, env var overrides swap the transport without invalidating rclone's bisync cache
 - **Flexible path mapping**: Supports fallback remotes with different path structures (e.g., SMB share root vs SFTP filesystem path)
 
+### Profile Sharing
+
+Share a sync profile with collaborators (band members, family, teammates) without sharing credentials. Right-click any profile in the sidebar → **"Share Configuration…"** to export a `.synctrayprofile` file. The recipient imports it with the toolbar button (or directly from the Setup Wizard) and only needs to fill in their own credentials and pick a local folder.
+
+- **Credentials are never exported**: Passwords, OAuth tokens, and usernames are stripped before sharing
+- **Configurable contents**: Choose which parts to include — profile settings, primary remote, fallback remote, exclude filter
+- **JSON preview**: See exactly what will be exported before saving
+- **Smart conflict resolution**: If a remote with the same name already exists locally, choose to reuse it or import as a new name
+- **Test-before-commit**: Verify the connection works with your filled-in credentials before the profile is created
+
 ### One-Click Actions
 
 - **Sync Now**: Trigger immediate sync for all enabled profiles

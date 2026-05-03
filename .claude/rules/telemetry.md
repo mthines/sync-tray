@@ -160,6 +160,7 @@ it's derived from the machine's hardware UUID via a one-way hash.
 | `synctray.directory_watch.filtered` | Counter | Directory watch events filtered out (out_of_scope, phantom, metadata) |
 | `synctray.sync.resumed_external` | Counter | Externally-started syncs detected and resumed at app startup |
 | `synctray.app.settings_opened` | Counter | Settings window opens |
+| `synctray.profile.share_operations` | Counter | Profile share export/import (by `share.operation`, provider type, included flags, result, error type) |
 
 ### Spans
 | Span | Kind | Description |
@@ -189,6 +190,7 @@ All key lifecycle events are emitted as structured OTel logs:
 - Volume events: external drive mount/unmount with affected profile count (drive workflow RUM)
 - Sync precondition failures: script_not_found, config_not_found (setup issue detection)
 - Resumed external syncs: syncs detected running at startup (launchd overlap detection)
+- Profile share operations: export/import lifecycle with provider type, included sections (`share.included_fallback`, `share.included_filter`), and `share.reused_remote` for imports
 
 ## Swift SDK Gotcha: Wildcard View Required
 
