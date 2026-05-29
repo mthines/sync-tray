@@ -37,6 +37,7 @@
 		E1A0B1C2D3E4F56789AB0001 /* VFSCacheService.swift in Sources */ = {isa = PBXBuildFile; fileRef = E1A0B1C2D3E4F56789AB0002 /* VFSCacheService.swift */; };
 		E1A0B1C2D3E4F56789AB0003 /* OfflineFilesSection.swift in Sources */ = {isa = PBXBuildFile; fileRef = E1A0B1C2D3E4F56789AB0004 /* OfflineFilesSection.swift */; };
 		E1A0B1C2D3E4F56789AB0005 /* TelemetryOptInBanner.swift in Sources */ = {isa = PBXBuildFile; fileRef = E1A0B1C2D3E4F56789AB0006 /* TelemetryOptInBanner.swift */; };
+		E1A0B1C2D3E4F56789AB0007 /* TelemetryDetailsSheet.swift in Sources */ = {isa = PBXBuildFile; fileRef = E1A0B1C2D3E4F56789AB0008 /* TelemetryDetailsSheet.swift */; };
 		F2B3C4D5E6F7089012AB0001 /* MigrationRunner.swift in Sources */ = {isa = PBXBuildFile; fileRef = F2B3C4D5E6F7089012AB0002 /* MigrationRunner.swift */; };
 		OT00000000000000000000B1 /* TelemetryService.swift in Sources */ = {isa = PBXBuildFile; fileRef = OT00000000000000000000A1 /* TelemetryService.swift */; };
 		OT00000000000000000000C1 /* OpenTelemetryApi in Frameworks */ = {isa = PBXBuildFile; productRef = OT00000000000000000000D1 /* OpenTelemetryApi */; };
@@ -79,6 +80,7 @@
 		E1A0B1C2D3E4F56789AB0002 /* VFSCacheService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VFSCacheService.swift; sourceTree = "<group>"; };
 		E1A0B1C2D3E4F56789AB0004 /* OfflineFilesSection.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OfflineFilesSection.swift; sourceTree = "<group>"; };
 		E1A0B1C2D3E4F56789AB0006 /* TelemetryOptInBanner.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TelemetryOptInBanner.swift; sourceTree = "<group>"; };
+		E1A0B1C2D3E4F56789AB0008 /* TelemetryDetailsSheet.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TelemetryDetailsSheet.swift; sourceTree = "<group>"; };
 		F2B3C4D5E6F7089012AB0002 /* MigrationRunner.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MigrationRunner.swift; sourceTree = "<group>"; };
 		OT00000000000000000000A1 /* TelemetryService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TelemetryService.swift; sourceTree = "<group>"; };
 		A10000000000000000000019 /* AppSettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppSettingsView.swift; sourceTree = "<group>"; };
@@ -201,6 +203,7 @@
 				A10000000000000000000018 /* ProfileDetailView.swift */,
 				E1A0B1C2D3E4F56789AB0004 /* OfflineFilesSection.swift */,
 				E1A0B1C2D3E4F56789AB0006 /* TelemetryOptInBanner.swift */,
+				E1A0B1C2D3E4F56789AB0008 /* TelemetryDetailsSheet.swift */,
 			);
 			path = Settings;
 			sourceTree = "<group>";
@@ -312,6 +315,7 @@
 				E1A0B1C2D3E4F56789AB0001 /* VFSCacheService.swift in Sources */,
 				E1A0B1C2D3E4F56789AB0003 /* OfflineFilesSection.swift in Sources */,
 				E1A0B1C2D3E4F56789AB0005 /* TelemetryOptInBanner.swift in Sources */,
+				E1A0B1C2D3E4F56789AB0007 /* TelemetryDetailsSheet.swift in Sources */,
 				F2B3C4D5E6F7089012AB0001 /* MigrationRunner.swift in Sources */,
 				OT00000000000000000000B1 /* TelemetryService.swift in Sources */,
 			);

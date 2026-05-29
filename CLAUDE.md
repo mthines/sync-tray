@@ -88,10 +88,14 @@ SyncTray/
 |------|---------|
 | `MenuBarView.swift` | Menu bar dropdown with profile status, recent changes, quick actions |
 | `SettingsView.swift` | Settings window with profile list and detail editor |
+| `AppSettingsView.swift` | Global app settings — launch at login, telemetry toggle, debug logging |
 | `ProfileListView.swift` | Sidebar list of profiles with add/delete controls |
 | `StatusHeaderView.swift` | Header showing current sync state and progress |
 | `SyncProgressDetailView.swift` | Detailed per-file transfer progress during sync |
 | `RecentChangesView.swift` | List of recently synced files |
+| `TelemetryOptInBanner.swift` | Dismissable banner prompting telemetry opt-in (consent-versioned) |
+| `TelemetryDetailsSheet.swift` | Full privacy disclosure sheet — reachable from wizard, banner, and settings |
+| `SetupWizardView.swift` | New-profile creation wizard, including optional `.helpImprove` epilogue step |
 
 ## Data Flow
 
@@ -341,6 +345,7 @@ open ~/Library/Developer/Xcode/DerivedData/SyncTray-*/Build/Products/Debug/SyncT
 | `ProfileStore.swift` | Profile persistence (JSON files) |
 | `SyncLogPatterns` | Centralized log message pattern matching |
 | `TelemetryService.swift` | OTel singleton — traces, metrics, logs via OTLP/HTTP |
+| `TelemetryDetailsSheet.swift` | Shared privacy disclosure sheet for wizard, banner, and settings |
 | `Settings.swift` | Global settings including `installationId` and `anonymousUserId` |
 
 ## Telemetry

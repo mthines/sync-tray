@@ -7,6 +7,7 @@ import SwiftUI
 struct TelemetryOptInBanner: View {
     @State private var telemetryEnabled = SyncTraySettings.telemetryEnabled
     @State private var dismissed = SyncTraySettings.telemetryBannerDismissed
+    @State private var showingTelemetryDetails: Bool = false
 
     /// Whether the banner should be visible
     var isVisible: Bool {
@@ -21,12 +22,17 @@ struct TelemetryOptInBanner: View {
                     .foregroundStyle(.blue)
 
                 VStack(alignment: .leading, spacing: 2) {
-                    Text("Help improve SyncTray")
+                    Text("Help shape SyncTray")
                         .font(.subheadline.weight(.medium))
-                    Text("Share anonymous usage data to help development. No file names or sensitive data — just usage patterns. Completely optional. You can always change this in App Settings.")
+                    Text("Anonymous usage data — sync results, error types, feature usage. No file names or credentials.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
+                    Button("Learn more") {
+                        showingTelemetryDetails = true
+                    }
+                    .buttonStyle(.link)
+                    .font(.caption)
                 }
 
                 Spacer()
@@ -42,17 +48,14 @@ struct TelemetryOptInBanner: View {
                 .buttonStyle(.borderedProminent)
                 .controlSize(.small)
 
-                Button {
+                Button("Not now") {
                     SyncTraySettings.telemetryBannerDismissedVersion = SyncTraySettings.currentTelemetryConsentVersion
                     withAnimation(.easeOut(duration: 0.2)) {
                         dismissed = true
                     }
-                } label: {
-                    Image(systemName: "xmark")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
                 }
-                .buttonStyle(.plain)
+                .buttonStyle(.bordered)
+                .controlSize(.small)
             }
             .padding(12)
             .background(
@@ -64,6 +67,9 @@ struct TelemetryOptInBanner: View {
                     )
             )
             .transition(.opacity.combined(with: .move(edge: .top)))
+            .sheet(isPresented: $showingTelemetryDetails) {
+                TelemetryDetailsSheet()
+            }
         }
     }
 }

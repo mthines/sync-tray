@@ -27,6 +27,8 @@ struct SetupWizardView: View {
     @State private var isLoading: Bool = false
     @State private var errorMessage: String?
     @State private var isOAuthInProgress: Bool = false
+    @State private var wasFirstProfile: Bool = false
+    @State private var showingTelemetryDetails: Bool = false
 
     // Services
     private let configService = RcloneConfigService.shared
@@ -53,6 +55,7 @@ struct SetupWizardView: View {
         case localPath = 4
         case syncSettings = 5
         case confirmation = 6
+        case helpImprove = 7
 
         var title: String {
             switch self {
@@ -63,6 +66,7 @@ struct SetupWizardView: View {
             case .localPath: return "Local Path"
             case .syncSettings: return "Sync Settings"
             case .confirmation: return "Confirm"
+            case .helpImprove: return "Help shape SyncTray"
             }
         }
 
@@ -129,7 +133,7 @@ struct SetupWizardView: View {
 
     private var progressIndicator: some View {
         HStack(spacing: 4) {
-            ForEach(WizardStep.allCases, id: \.rawValue) { step in
+            ForEach(WizardStep.allCases.filter { $0 != .helpImprove }, id: \.rawValue) { step in
                 Circle()
                     .fill(step.rawValue <= currentStep.rawValue ? Color.accentColor : Color.gray.opacity(0.3))
                     .frame(width: 8, height: 8)
@@ -156,6 +160,8 @@ struct SetupWizardView: View {
             syncSettingsStep
         case .confirmation:
             confirmationStep
+        case .helpImprove:
+            helpImproveStep
         }
     }
 
@@ -504,11 +510,113 @@ struct SetupWizardView: View {
         isEditMode ? .remotePath : nil
     }
 
+    // MARK: - Help Improve Step
+
+    private var helpImproveStep: some View {
+        VStack(alignment: .leading, spacing: 20) {
+            Text("Help shape SyncTray")
+                .font(.title2)
+                .fontWeight(.semibold)
+
+            Text("SyncTray is built by one person in his spare time. Anonymous usage data tells me which sync modes people actually use, when syncs fail, and where the app gets stuck — so I can fix real problems instead of guessing.")
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            HStack(alignment: .top, spacing: 12) {
+                // What's sent
+                GroupBox {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("What's sent")
+                            .font(.subheadline.weight(.medium))
+                            .padding(.bottom, 2)
+                        Label("Sync mode, success/failure, and duration", systemImage: "checkmark.circle.fill")
+                            .foregroundStyle(.primary)
+                            .labelStyle(ColoredIconLabelStyle(iconColor: .green))
+                        Label("Error categories (e.g. \"timeout\", \"network\")", systemImage: "checkmark.circle.fill")
+                            .foregroundStyle(.primary)
+                            .labelStyle(ColoredIconLabelStyle(iconColor: .green))
+                        Label("Anonymous machine ID — not reversible to you", systemImage: "checkmark.circle.fill")
+                            .foregroundStyle(.primary)
+                            .labelStyle(ColoredIconLabelStyle(iconColor: .green))
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .frame(maxWidth: .infinity)
+
+                // What's never sent
+                GroupBox {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("What's never sent")
+                            .font(.subheadline.weight(.medium))
+                            .padding(.bottom, 2)
+                        Label("File names, folder names, or file contents", systemImage: "xmark.circle.fill")
+                            .foregroundStyle(.primary)
+                            .labelStyle(ColoredIconLabelStyle(iconColor: .red))
+                        Label("Remote names, hostnames, or credentials", systemImage: "xmark.circle.fill")
+                            .foregroundStyle(.primary)
+                            .labelStyle(ColoredIconLabelStyle(iconColor: .red))
+                        Label("Your IP address or personal identifiers", systemImage: "xmark.circle.fill")
+                            .foregroundStyle(.primary)
+                            .labelStyle(ColoredIconLabelStyle(iconColor: .red))
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .frame(maxWidth: .infinity)
+            }
+
+            HStack {
+                Button("Learn more") {
+                    showingTelemetryDetails = true
+                }
+                .buttonStyle(.link)
+
+                Spacer()
+
+                Text("— Mads, SyncTray maintainer")
+                    .font(.caption)
+                    .italic()
+                    .foregroundStyle(.secondary)
+            }
+
+            Text("You can change this any time in App Settings.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            // Action buttons — two equal-weight buttons, only tint differs
+            HStack(spacing: 12) {
+                Button("Share anonymous data") {
+                    SyncTraySettings.telemetryEnabled = true
+                    SyncTraySettings.telemetryBannerDismissedVersion = SyncTraySettings.currentTelemetryConsentVersion
+                    TelemetryService.shared.configure()
+                    dismiss()
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.large)
+                .frame(maxWidth: .infinity)
+
+                Button("Not now") {
+                    SyncTraySettings.telemetryBannerDismissedVersion = SyncTraySettings.currentTelemetryConsentVersion
+                    dismiss()
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(.secondary)
+                .controlSize(.large)
+                .frame(maxWidth: .infinity)
+            }
+        }
+        .sheet(isPresented: $showingTelemetryDetails) {
+            TelemetryDetailsSheet()
+        }
+    }
+
     // MARK: - Navigation Buttons
 
     private var navigationButtons: some View {
         HStack {
             Button("Cancel") {
+                if currentStep == .helpImprove {
+                    SyncTraySettings.telemetryBannerDismissedVersion = SyncTraySettings.currentTelemetryConsentVersion
+                }
                 dismiss()
             }
             .keyboardShortcut(.cancelAction)
@@ -516,7 +624,8 @@ struct SetupWizardView: View {
             Spacer()
 
             // Hide Back when at the starting step in edit mode (provider/credentials uninitialized)
-            if currentStep.previous != nil && currentStep != editModeStartStep {
+            // Also hide Back on the .helpImprove epilogue step
+            if currentStep.previous != nil && currentStep != editModeStartStep && currentStep != .helpImprove {
                 Button("Back") {
                     withAnimation {
                         currentStep = currentStep.previous!
@@ -524,18 +633,20 @@ struct SetupWizardView: View {
                 }
             }
 
-            if currentStep == .confirmation {
-                Button(isEditMode ? "Save Changes" : "Create Profile") {
-                    saveProfile()
+            if currentStep != .helpImprove {
+                if currentStep == .confirmation {
+                    Button(isEditMode ? "Save Changes" : "Create Profile") {
+                        saveProfile()
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(isLoading)
+                } else if let nextStep = currentStep.next {
+                    Button("Next") {
+                        advanceToNextStep(nextStep)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(!canAdvance)
                 }
-                .buttonStyle(.borderedProminent)
-                .disabled(isLoading)
-            } else if let nextStep = currentStep.next {
-                Button("Next") {
-                    advanceToNextStep(nextStep)
-                }
-                .buttonStyle(.borderedProminent)
-                .disabled(!canAdvance)
             }
         }
     }
@@ -561,6 +672,8 @@ struct SetupWizardView: View {
         case .syncSettings:
             return true
         case .confirmation:
+            return true
+        case .helpImprove:
             return true
         }
     }
@@ -659,7 +772,18 @@ struct SetupWizardView: View {
         }
     }
 
+    /// Gate: wasFirstProfile must be set as the FIRST statement, before profileStore.add() changes the count.
+    private var shouldShowHelpImproveStep: Bool {
+        wasFirstProfile
+            && !isEditMode
+            && !SyncTraySettings.telemetryEnabled
+            && !SyncTraySettings.telemetryBannerDismissed
+    }
+
     private func saveProfile() {
+        // Capture BEFORE profileStore.add() changes the count
+        wasFirstProfile = profileStore.profiles.isEmpty
+
         isLoading = true
         errorMessage = nil
 
@@ -716,7 +840,28 @@ struct SetupWizardView: View {
         }
 
         isLoading = false
-        dismiss()
+        if shouldShowHelpImproveStep {
+            withAnimation {
+                currentStep = .helpImprove
+            }
+        } else {
+            dismiss()
+        }
+    }
+}
+
+// MARK: - Colored Icon Label Style
+
+private struct ColoredIconLabelStyle: LabelStyle {
+    let iconColor: Color
+
+    func makeBody(configuration: Configuration) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 6) {
+            configuration.icon
+                .foregroundStyle(iconColor)
+            configuration.title
+                .font(.caption)
+        }
     }
 }
 
