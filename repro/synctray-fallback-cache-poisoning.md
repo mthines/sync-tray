@@ -120,7 +120,7 @@ types differ. The bash script then branches on this field in addition to
 `FALLBACK_PATH`:
 
 ```bash
-if [[ -z "$FALLBACK_PATH" && "$FALLBACK_REQUIRES_CACHE_REBUILD" != "true" ]]; then
+if [[ -z "$FALLBACK_PATH" && "$FALLBACK_REQUIRES_CACHE_REBUILD" != "true" && "$FALLBACK_REQUIRES_CACHE_REBUILD" != "True" ]]; then
     # env-var override: same wire type, no path change, preserve bisync cache
 else
     # REMOTE swap: different wire type OR explicit path change
@@ -157,7 +157,7 @@ fi
    ```bash
    FALLBACK_REQUIRES_CACHE_REBUILD=$(parse_json "fallbackRequiresCacheRebuild" "false")
    REMOTE_PATH=$(parse_json "remotePath" "")
-   if [[ -z "$FALLBACK_PATH" && "$FALLBACK_REQUIRES_CACHE_REBUILD" != "true" ]]; then
+   if [[ -z "$FALLBACK_PATH" && "$FALLBACK_REQUIRES_CACHE_REBUILD" != "true" && "$FALLBACK_REQUIRES_CACHE_REBUILD" != "True" ]]; then
    ```
 
 4. Block the SMB service and trigger a sync. The script now executes the REMOTE
@@ -176,3 +176,10 @@ Profiles created before this fix have no `fallbackRequiresCacheRebuild` field.
 The `parse_json` call defaults to `"false"`, preserving the env-var-override
 behaviour until the user next saves the profile (which triggers re-evaluation of
 the wire types).
+
+**Python capitalisation note:** `parse_json` uses `python3 -c "… print(d.get(…))"`.
+Python's `json` module deserialises JSON `true` as a Python `bool`, which prints
+as `"True"` (capital T) — not `"true"`. The bash condition therefore guards against
+both: `!= "true" && != "True"`. The default value (`"false"`) is a Python string
+literal returned as-is (lowercase), so old profiles without the field correctly
+evaluate as `False` (not triggering the swap).

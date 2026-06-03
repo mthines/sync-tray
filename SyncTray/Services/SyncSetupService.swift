@@ -579,7 +579,7 @@ final class SyncSetupService {
                     # Re-check cert setting for the fallback remote
                     NO_CHECK_CERT=$(check_no_cert "$FALLBACK_REMOTE")
 
-                    if [[ -z "$FALLBACK_PATH" && "$FALLBACK_REQUIRES_CACHE_REBUILD" != "true" ]]; then
+                    if [[ -z "$FALLBACK_PATH" && "$FALLBACK_REQUIRES_CACHE_REBUILD" != "true" && "$FALLBACK_REQUIRES_CACHE_REBUILD" != "True" ]]; then
                         # Same wire type, same path: use env var overrides to swap transport.
                         # This preserves bisync cache since the remote name stays the same.
                         UPPER_NAME=$(echo "$REMOTE_NAME" | tr '[:lower:]' '[:upper:]' | tr '-' '_')
@@ -680,6 +680,13 @@ final class SyncSetupService {
     /// meaning the bisync cache must be rebuilt on fallback activation.
     /// Uses rcloneType (e.g. "webdav", "smb", "sftp") so that .synology and .webdav
     /// (both wire type "webdav") are treated as compatible.
+    ///
+    /// Limitation: RcloneConfigService.providerFromRcloneType maps unrecognised rclone
+    /// types (s3, azureblob, b2, ftp, etc.) to .webdav as a fallback, so two different
+    /// unrecognised types both resolve to rcloneType "webdav" and are incorrectly treated
+    /// as cache-compatible. This is safe for the wizard-supported type set; users with
+    /// manually-added exotic remotes should set fallbackRemotePath explicitly to force a
+    /// REMOTE swap via the existing path-based branch.
     private func computeFallbackRequiresCacheRebuild(profile: SyncProfile) -> Bool {
         guard profile.hasFallback else { return false }
         let configService = RcloneConfigService.shared
