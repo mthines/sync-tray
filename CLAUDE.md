@@ -134,9 +134,10 @@ Check if FALLBACK_REMOTE is configured (from profile JSON)
 If set: rclone lsd primary remote (3s connect timeout)
         ↓
 Unreachable? → Log "using fallback: X"
-    ├─ Same paths (FALLBACK_PATH empty): env var overrides swap transport
-    │   (preserves bisync cache — remote name stays the same)
-    └─ Different paths: swap entire REMOTE reference
+    ├─ Same wire type + no path change (fallbackRequiresCacheRebuild=false):
+    │   env var overrides swap transport (preserves bisync cache)
+    └─ Different wire type OR explicit path (fallbackRequiresCacheRebuild=true):
+        swap entire REMOTE reference (bisync rebuilds listings, ~12s)
         ↓
 Reachable? → Log "Using primary remote: X"
         ↓
@@ -145,7 +146,27 @@ LogParser detects transport message → SyncManager.profileTransports updated
 MenuBarView shows transport icon (wifi=primary, antenna=fallback)
 ```
 
-**Bisync cache preservation:** When the fallback remote has the same directory structure as the primary (e.g., WebDAV LAN → WebDAV QuickConnect), the sync script uses `RCLONE_CONFIG_*` environment variable overrides to change the transport while keeping the rclone remote name unchanged. This means bisync's listing cache (keyed by remote name + path) remains valid. When paths differ (e.g., SMB → SFTP), the full remote reference is swapped and bisync will rebuild listings on first switch (~12s for 85K files, no data re-download).
+**Bisync cache preservation:** When primary and fallback remotes share the same
+rclone wire type (e.g., WebDAV LAN → WebDAV QuickConnect, both `type = webdav`)
+and `fallbackRemotePath` is empty, the sync script uses `RCLONE_CONFIG_*`
+environment variable overrides to change the transport while keeping the rclone
+remote name unchanged. This means bisync's listing cache (keyed by remote name +
+path) remains valid across failover events.
+
+When primary and fallback have **different** wire types (e.g., SMB → SFTP), the
+script swaps the full remote reference to `<fallbackRemote>:<path>` regardless of
+whether `fallbackRemotePath` is set. This forces bisync to rebuild listings on
+the first switch (~12s for 85K files, no data re-download) but avoids cache
+poisoning from byte-level filename encoding differences (macOS SMB normalises to
+NFD; SFTP passes NFC verbatim — same human-readable name, different byte
+sequence).
+
+The branching condition is determined at profile install/save time by comparing
+`provider.rcloneType` for the primary and fallback remotes (read via
+`RcloneConfigService.readRemoteConfig`), stored as `fallbackRequiresCacheRebuild`
+in the profile JSON. Profiles created before this field was added default to
+`false` (legacy env-var-override behaviour). The field re-evaluates on every
+profile save, so users can correct it by re-saving the profile.
 
 ## Key Design Patterns
 
