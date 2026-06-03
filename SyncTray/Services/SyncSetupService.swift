@@ -499,6 +499,8 @@ final class SyncSetupService {
             SYNC_DIRECTION=$(parse_json "syncDirection" "localToRemote")
             FALLBACK_REMOTE=$(parse_json "fallbackRemote" "")
             FALLBACK_PATH=$(parse_json "fallbackRemotePath" "")
+            FALLBACK_REQUIRES_CACHE_REBUILD=$(parse_json "fallbackRequiresCacheRebuild" "false")
+            REMOTE_PATH=$(parse_json "remotePath" "")
             VFS_CACHE_MODE=$(parse_json "vfsCacheMode" "full")
             VFS_CACHE_MAX_SIZE=$(parse_json "vfsCacheMaxSize" "10G")
             VFS_CACHE_PATH=$(parse_json "vfsCachePath" "$HOME/.cache/rclone")
@@ -577,9 +579,9 @@ final class SyncSetupService {
                     # Re-check cert setting for the fallback remote
                     NO_CHECK_CERT=$(check_no_cert "$FALLBACK_REMOTE")
 
-                    if [[ -z "$FALLBACK_PATH" ]]; then
-                        # Same path structure: use env var overrides to swap transport
-                        # This preserves bisync cache since the remote name stays the same
+                    if [[ -z "$FALLBACK_PATH" && "$FALLBACK_REQUIRES_CACHE_REBUILD" != "true" ]]; then
+                        # Same wire type, same path: use env var overrides to swap transport.
+                        # This preserves bisync cache since the remote name stays the same.
                         UPPER_NAME=$(echo "$REMOTE_NAME" | tr '[:lower:]' '[:upper:]' | tr '-' '_')
                         eval "$($RCLONE_BIN config dump 2>/dev/null | python3 -c "
             import json, sys
@@ -590,8 +592,9 @@ final class SyncSetupService {
                 print(f'export RCLONE_CONFIG_{name}_{safe_k}=\\\"' + str(v).replace('\\\"', '\\\\\\\"') + '\\\"')
             ")"
                     else
-                        # Different path structure: swap entire REMOTE reference
-                        REMOTE="${FALLBACK_REMOTE}:${FALLBACK_PATH}"
+                        # Different wire type OR explicit path change: swap entire REMOTE reference.
+                        # bisync will rebuild listings on first switch (~12s for 85K files).
+                        REMOTE="${FALLBACK_REMOTE}:${FALLBACK_PATH:-$REMOTE_PATH}"
                     fi
                 else
                     echo "$(date '+%Y-%m-%d %H:%M:%S') - Using primary remote: $REMOTE_NAME" >> "$LOG_FILE"
@@ -673,6 +676,27 @@ final class SyncSetupService {
             """
     }
 
+    /// Returns true when primary and fallback remotes have different rclone wire types,
+    /// meaning the bisync cache must be rebuilt on fallback activation.
+    /// Uses rcloneType (e.g. "webdav", "smb", "sftp") so that .synology and .webdav
+    /// (both wire type "webdav") are treated as compatible.
+    private func computeFallbackRequiresCacheRebuild(profile: SyncProfile) -> Bool {
+        guard profile.hasFallback else { return false }
+        let configService = RcloneConfigService.shared
+        let primaryName = profile.rcloneRemote.hasSuffix(":")
+            ? String(profile.rcloneRemote.dropLast())
+            : profile.rcloneRemote
+        let fallbackName = profile.fallbackRemote.hasSuffix(":")
+            ? String(profile.fallbackRemote.dropLast())
+            : profile.fallbackRemote
+        guard let primaryConfig = configService.readRemoteConfig(name: primaryName),
+              let fallbackConfig = configService.readRemoteConfig(name: fallbackName) else {
+            // Cannot read config — default to safe behaviour (force REMOTE swap, no cache poisoning)
+            return true
+        }
+        return primaryConfig.provider.rcloneType != fallbackConfig.provider.rcloneType
+    }
+
     /// Generate profile-specific JSON config
     private func generateProfileConfig(for profile: SyncProfile) -> String {
         let config: [String: Any] = [
@@ -690,6 +714,8 @@ final class SyncSetupService {
             "syncDirection": profile.syncDirection.rawValue,
             "fallbackRemote": profile.fallbackRemote,
             "fallbackRemotePath": profile.fallbackRemotePath,
+            "fallbackRequiresCacheRebuild": computeFallbackRequiresCacheRebuild(profile: profile),
+            "remotePath": profile.remotePath,
             "vfsCacheMode": profile.vfsCacheMode.rawValue,
             "vfsCacheMaxSize": profile.vfsCacheMaxSize,
             "vfsCachePath": profile.vfsCachePath,

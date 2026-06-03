@@ -18,6 +18,11 @@ struct SyncProfile: Identifiable, Codable, Equatable {
     // Fallback remote (used when primary remote is unreachable)
     var fallbackRemote: String          // e.g., "synology-sftp" (empty = no fallback)
     var fallbackRemotePath: String      // e.g., "/volume1/Kaiju" (empty = same as primary remotePath)
+    /// True when primary and fallback remotes use different rclone wire types (e.g. smb vs sftp).
+    /// When true, the sync script swaps the full REMOTE reference on fallback activation instead of
+    /// using env-var overrides — bisync cache is intentionally rebuilt to avoid NFD/NFC divergence.
+    /// Populated at install/save time. Defaults to false for profiles created before this field existed.
+    var fallbackRequiresCacheRebuild: Bool
 
     // Mount mode specific settings
     var vfsCacheMode: VFSCacheMode      // VFS cache mode for mount (default: full)
@@ -128,6 +133,7 @@ struct SyncProfile: Identifiable, Codable, Equatable {
         syncDirection: SyncDirection = .localToRemote,
         fallbackRemote: String = "",
         fallbackRemotePath: String = "",
+        fallbackRequiresCacheRebuild: Bool = false,
         vfsCacheMode: VFSCacheMode = .full,
         vfsCacheMaxSize: String = "10G",
         vfsCachePath: String = "",
@@ -149,6 +155,7 @@ struct SyncProfile: Identifiable, Codable, Equatable {
         self.syncDirection = syncDirection
         self.fallbackRemote = fallbackRemote
         self.fallbackRemotePath = fallbackRemotePath
+        self.fallbackRequiresCacheRebuild = fallbackRequiresCacheRebuild
         self.vfsCacheMode = vfsCacheMode
         self.vfsCacheMaxSize = vfsCacheMaxSize
         self.vfsCachePath = vfsCachePath.isEmpty ? "\(NSHomeDirectory())/.cache/rclone" : vfsCachePath
@@ -181,7 +188,7 @@ extension SyncProfile {
         case id, name, rcloneRemote, remotePath, localSyncPath
         case drivePathToMonitor, syncIntervalMinutes, additionalRcloneFlags
         case isEnabled, isMuted, syncMode, syncDirection
-        case fallbackRemote, fallbackRemotePath
+        case fallbackRemote, fallbackRemotePath, fallbackRequiresCacheRebuild
         case vfsCacheMode, vfsCacheMaxSize, vfsCachePath, allowNonEmptyMount
         case pinnedDirectories, rcPort
     }
@@ -206,6 +213,9 @@ extension SyncProfile {
         // Backwards compatibility: fallback remote defaults to empty (disabled)
         fallbackRemote = try container.decodeIfPresent(String.self, forKey: .fallbackRemote) ?? ""
         fallbackRemotePath = try container.decodeIfPresent(String.self, forKey: .fallbackRemotePath) ?? ""
+        // Backwards compatibility: defaults to false (preserves env-var-override behaviour for old profiles)
+        fallbackRequiresCacheRebuild = try container.decodeIfPresent(
+            Bool.self, forKey: .fallbackRequiresCacheRebuild) ?? false
         // Backwards compatibility: mount mode settings with defaults
         vfsCacheMode = try container.decodeIfPresent(VFSCacheMode.self, forKey: .vfsCacheMode) ?? .full
         vfsCacheMaxSize = try container.decodeIfPresent(String.self, forKey: .vfsCacheMaxSize) ?? "10G"
