@@ -127,14 +127,35 @@ For operations with real duration (like syncs), use the `activeSyncSpans` patter
 
 ### Resource attributes (automatic on all signals)
 - `service.name` = synctray
+- `service.namespace` = synctray
 - `service.instance.id` = random UUID per installation (changes on reinstall)
 - `enduser.id` = HMAC-SHA256 of hardware UUID (stable across reinstalls, not reversible)
-- `service.version` = app version
+- `service.version` = deployment-precise version (see below)
+- `deployment.environment.name` = `development` for DEBUG builds, `production` for Release
+  (overridable via `OTEL_RESOURCE_ATTRIBUTES`)
 - `os.type` = darwin
 - `os.version` = macOS version
 
 `enduser.id` is the primary user correlation key — it survives app reinstalls because
 it's derived from the machine's hardware UUID via a one-way hash.
+
+### Deployment correlation
+`service.version` is the primary key Dash0 uses to correlate telemetry to a specific
+release. `TelemetryService.appVersion()` builds it from
+`CFBundleShortVersionString` + `CFBundleVersion` + the git short SHA, e.g.
+`0.34.0+1.gabc1234`, so every shipped commit is a distinct deployment for
+version-aware comparison and regression detection.
+
+The SHA is injected into `Info.plist` (`GitCommitSHA` key) by the `Embed Git Commit
+SHA` Xcode build phase (`PlistBuddy` on the built plist; `alwaysOutOfDate` so it
+re-runs every build). When unavailable (non-git source tree), `service.version`
+gracefully falls back to `<marketing>+<build>`.
+
+On launch, `recordDeploymentIfChanged()` compares the current `service.version`
+against `SyncTraySettings.lastLaunchedVersion` and, on a change, emits an
+`App upgraded` log (`deployment.from_version` / `deployment.to_version`). Dash0
+overlays these as dashboard annotations so metric/trace changes can be tied to a
+rollout. No event is emitted on a fresh install.
 
 ## Current Instrumentation
 
@@ -189,6 +210,7 @@ All key lifecycle events are emitted as structured OTel logs:
 - Volume events: external drive mount/unmount with affected profile count (drive workflow RUM)
 - Sync precondition failures: script_not_found, config_not_found (setup issue detection)
 - Resumed external syncs: syncs detected running at startup (launchd overlap detection)
+- App upgraded: `service.version` changed since the previous launch (deployment markers)
 
 ## Swift SDK Gotcha: Wildcard View Required
 
