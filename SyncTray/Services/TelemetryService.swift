@@ -1249,6 +1249,10 @@ final class TelemetryService {
     /// Git short SHA injected into Info.plist by the `Embed Git Commit SHA`
     /// build phase. Returns nil when absent or left as the unsubstituted
     /// build-setting placeholder (e.g. building from a non-git source tree).
+    ///
+    /// The `GitCommitSHA` key name is shared across three files and must stay in
+    /// sync: this reader, `SyncTray/Info.plist`, and the `Embed Git Commit SHA`
+    /// build phase in the Xcode project (the writer).
     private func gitCommitSHA() -> String? {
         guard let raw = Bundle.main.infoDictionary?["GitCommitSHA"] as? String else { return nil }
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
