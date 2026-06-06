@@ -1128,6 +1128,33 @@ final class TelemetryService {
         appLaunchCounter?.add(value: 1, attribute: [:])
 
         emitLog(severity: .info, body: "App launched", attributes: [:])
+
+        recordDeploymentIfChanged()
+    }
+
+    /// Detect that this install is now running a different `service.version`
+    /// than it was on the previous launch, and emit a discrete "App upgraded"
+    /// log. Dash0 overlays these as dashboard annotations so metric/trace
+    /// changes can be correlated with the rollout of a new version.
+    ///
+    /// No event is emitted on a fresh install (no prior version recorded) — we
+    /// only mark genuine version transitions.
+    private func recordDeploymentIfChanged() {
+        let current = appVersion()
+        let previous = SyncTraySettings.lastLaunchedVersion
+
+        defer { SyncTraySettings.lastLaunchedVersion = current }
+
+        guard let previous, previous != current else { return }
+
+        emitLog(
+            severity: .info,
+            body: "App upgraded",
+            attributes: [
+                "deployment.from_version": .string(previous),
+                "deployment.to_version": .string(current),
+            ]
+        )
     }
 
     /// Update the active profile count gauge.
@@ -1174,6 +1201,16 @@ final class TelemetryService {
             ResourceAttributes.osVersion.rawValue: .string(osVersion),
         ]
 
+        // Distinguish development builds from real user installs so dev/test
+        // telemetry lands in its own Dash0 environment. A DEBUG build is, by
+        // definition, a development build; a Release build ships to users.
+        // Overridable via OTEL_RESOURCE_ATTRIBUTES below.
+        #if DEBUG
+        attrs["deployment.environment.name"] = .string("development")
+        #else
+        attrs["deployment.environment.name"] = .string("production")
+        #endif
+
         // Apply OTEL_RESOURCE_ATTRIBUTES overrides (e.g., deployment.environment.name)
         if let raw = Self.config["OTEL_RESOURCE_ATTRIBUTES"] {
             for pair in raw.split(separator: ",") {
@@ -1188,8 +1225,35 @@ final class TelemetryService {
         return Resource(attributes: attrs)
     }
 
+    /// Deployment-precise version string for Dash0 correlation.
+    ///
+    /// Combines marketing version + build number + git commit (when injected at
+    /// build time), e.g. `0.34.0+1.gabc1234`. Each commit produces a distinct
+    /// `service.version`, so Dash0 treats every shipped build as its own
+    /// deployment for version-aware comparison and regression detection.
     private func appVersion() -> String {
-        Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "unknown"
+        let info = Bundle.main.infoDictionary
+        let short = info?["CFBundleShortVersionString"] as? String ?? "unknown"
+
+        var version = short
+        if let build = info?["CFBundleVersion"] as? String,
+           !build.isEmpty, build != "0" {
+            version += "+\(build)"
+        }
+        if let sha = gitCommitSHA() {
+            version += ".g\(sha)"
+        }
+        return version
+    }
+
+    /// Git short SHA injected into Info.plist by the `Embed Git Commit SHA`
+    /// build phase. Returns nil when absent or left as the unsubstituted
+    /// build-setting placeholder (e.g. building from a non-git source tree).
+    private func gitCommitSHA() -> String? {
+        guard let raw = Bundle.main.infoDictionary?["GitCommitSHA"] as? String else { return nil }
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, !trimmed.hasPrefix("$(") else { return nil }
+        return trimmed
     }
 
     /// Emit a structured OTel log record, optionally correlated to a span.

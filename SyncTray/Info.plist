@@ -14,6 +14,8 @@
 	<string>1</string>
 	<key>Dash0AuthToken</key>
 	<string>$(DASH0_AUTH_TOKEN)</string>
+	<key>GitCommitSHA</key>
+	<string>$(GIT_COMMIT_SHA)</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>13.0</string>
 	<key>LSUIElement</key>
