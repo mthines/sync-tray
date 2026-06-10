@@ -110,6 +110,11 @@ struct ProfileDetailView: View {
     @State private var deleteRemoteConfirmName: String?
     @State private var showingDeleteRemoteConfirm: Bool = false
 
+    // Non-empty local folder confirmation (warns about local/remote merge on first sync)
+    @State private var showingNonEmptyDirConfirm: Bool = false
+    @State private var pendingLocalSyncPath: String = ""
+    @State private var pendingLocalSyncItemCount: Int = 0
+
     private let setupService = SyncSetupService.shared
 
     // MARK: - Computed Properties
@@ -188,17 +193,7 @@ struct ProfileDetailView: View {
 
     /// Returns the number of items in the local directory (excluding hidden .synctray folder)
     private var localDirectoryItemCount: Int {
-        guard !localSyncPath.isEmpty else { return 0 }
-        let fm = FileManager.default
-        guard fm.fileExists(atPath: localSyncPath) else { return 0 }
-
-        do {
-            let contents = try fm.contentsOfDirectory(atPath: localSyncPath)
-            // Exclude .synctray directory from count
-            return contents.filter { !$0.hasPrefix(".synctray") }.count
-        } catch {
-            return 0
-        }
+        SyncProfile.meaningfulItemCount(at: localSyncPath)
     }
 
     /// Returns true if local directory exists and has files that will be uploaded
@@ -345,6 +340,19 @@ struct ProfileDetailView: View {
             if let name = deleteRemoteConfirmName {
                 Text("Delete remote \"\(name)\"? This cannot be undone. Any profiles using this remote will need to be reconfigured.")
             }
+        }
+        .alert("This Folder Is Not Empty", isPresented: $showingNonEmptyDirConfirm) {
+            Button("Cancel", role: .cancel) {
+                pendingLocalSyncPath = ""
+                pendingLocalSyncItemCount = 0
+            }
+            Button("Use This Folder", role: .destructive) {
+                localSyncPath = pendingLocalSyncPath
+                pendingLocalSyncPath = ""
+                pendingLocalSyncItemCount = 0
+            }
+        } message: {
+            Text(nonEmptyDirWarningMessage)
         }
     }
 
@@ -610,7 +618,7 @@ struct ProfileDetailView: View {
                         .textFieldStyle(.roundedBorder)
                     Button("Browse...") {
                         browseForFolder(title: "Select Local Sync Directory") { path in
-                            localSyncPath = path
+                            confirmLocalPathSelection(path)
                         }
                     }
                 }
@@ -2589,6 +2597,36 @@ struct ProfileDetailView: View {
     }
 
     // MARK: - File Dialogs
+
+    /// Applies a newly chosen local sync path, first warning the user if the folder
+    /// already contains files. On the first sync SyncTray merges the folder with the
+    /// remote, so pointing at a non-empty folder can cause unexpected merges.
+    private func confirmLocalPathSelection(_ path: String) {
+        let count = SyncProfile.meaningfulItemCount(at: path)
+        // Re-selecting the folder that's already configured is expected to hold synced
+        // files — only warn when pointing at a *different* non-empty folder.
+        if count > 0 && path != profile.localSyncPath {
+            pendingLocalSyncPath = path
+            pendingLocalSyncItemCount = count
+            showingNonEmptyDirConfirm = true
+        } else {
+            localSyncPath = path
+        }
+    }
+
+    /// Detailed warning shown when a user points the sync at a folder that already
+    /// contains files. Spells out the merge behaviour so the choice is informed.
+    private var nonEmptyDirWarningMessage: String {
+        let count = pendingLocalSyncItemCount
+        let itemWord = count == 1 ? "item" : "items"
+        return """
+        This folder already contains \(count) \(itemWord).
+
+        On the first sync, SyncTray combines the contents of this folder with the remote — files from both sides are merged together. If the remote holds different versions of these files, this can lead to duplicates, unexpected overwrites, or deletions that are hard to undo.
+
+        Only continue if you intend to merge this folder with the remote.
+        """
+    }
 
     private func browseForFolder(title: String, completion: @escaping (String) -> Void) {
         let panel = NSOpenPanel()
