@@ -884,12 +884,12 @@ struct ProfileDetailView: View {
 
                     if localDirectoryHasContent {
                         HStack(spacing: 8) {
-                            Image(systemName: "arrow.up.circle.fill")
+                            Image(systemName: firstSyncEffect.icon)
                                 .foregroundStyle(.blue)
                             VStack(alignment: .leading, spacing: 2) {
                                 Text("Local folder contains \(localDirectoryItemCount) item\(localDirectoryItemCount == 1 ? "" : "s")")
                                     .font(.subheadline.weight(.medium))
-                                Text("These files will be uploaded to the remote during initial sync.")
+                                Text("On the first sync, \(firstSyncEffect.headline).")
                                     .font(.caption)
                                     .foregroundStyle(.secondary)
                             }
@@ -2599,8 +2599,8 @@ struct ProfileDetailView: View {
     // MARK: - File Dialogs
 
     /// Applies a newly chosen local sync path, first warning the user if the folder
-    /// already contains files. On the first sync SyncTray merges the folder with the
-    /// remote, so pointing at a non-empty folder can cause unexpected merges.
+    /// already contains files — on the first sync those files are reconciled with the
+    /// remote (merged, overwritten, or deleted depending on mode), which can surprise.
     private func confirmLocalPathSelection(_ path: String) {
         let count = SyncProfile.meaningfulItemCount(at: path)
         // Re-selecting the folder that's already configured is expected to hold synced
@@ -2614,17 +2614,54 @@ struct ProfileDetailView: View {
         }
     }
 
+    /// Describes what the first sync will do to a non-empty local folder, tailored to
+    /// the current mode/direction so warnings match actual behaviour — bisync merges,
+    /// one-way overwrites/deletes, mount overlays. Drives both the picker confirmation
+    /// dialog and the inline "folder not empty" banner so they tell one consistent story.
+    private var firstSyncEffect: (icon: String, headline: String, detail: String) {
+        switch syncMode {
+        case .mount:
+            return (
+                "eye.slash",
+                "files already here will be hidden while the remote is mounted",
+                "Mount mode overlays the remote onto this folder. Your existing files stay on disk but become inaccessible until you unmount, and mounting can fail unless \"Mount even if the local folder already contains files\" is enabled."
+            )
+        case .sync:
+            switch syncDirection {
+            case .localToRemote:
+                return (
+                    "arrow.up.circle.fill",
+                    "files here will be uploaded, and remote files missing here may be deleted",
+                    "One-way upload makes the remote match this folder. Files that exist only on the remote can be deleted to mirror your local copy."
+                )
+            case .remoteToLocal:
+                return (
+                    "exclamationmark.triangle.fill",
+                    "files here may be overwritten or deleted to match the remote",
+                    "One-way download makes this folder match the remote. Files here that aren't on the remote can be deleted, and any that differ will be overwritten — this can be hard to undo."
+                )
+            }
+        case .bisync:
+            return (
+                "arrow.left.arrow.right.circle.fill",
+                "the contents of this folder will be merged with the remote",
+                "Two-way sync combines files from both sides. If the remote holds different versions of these files, this can lead to duplicates, unexpected overwrites, or deletions that are hard to undo."
+            )
+        }
+    }
+
     /// Detailed warning shown when a user points the sync at a folder that already
-    /// contains files. Spells out the merge behaviour so the choice is informed.
+    /// contains files. Names the folder and describes the mode-specific first-sync effect.
     private var nonEmptyDirWarningMessage: String {
         let count = pendingLocalSyncItemCount
         let itemWord = count == 1 ? "item" : "items"
+        let folderName = URL(fileURLWithPath: pendingLocalSyncPath).lastPathComponent
         return """
-        This folder already contains \(count) \(itemWord).
+        \"\(folderName)\" already contains \(count) \(itemWord).
 
-        On the first sync, SyncTray combines the contents of this folder with the remote — files from both sides are merged together. If the remote holds different versions of these files, this can lead to duplicates, unexpected overwrites, or deletions that are hard to undo.
+        \(firstSyncEffect.detail)
 
-        Only continue if you intend to merge this folder with the remote.
+        Only continue if that's what you intend.
         """
     }
 

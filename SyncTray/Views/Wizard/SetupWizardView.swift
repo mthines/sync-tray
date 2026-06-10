@@ -694,16 +694,18 @@ struct SetupWizardView: View {
     }
 
     /// Detailed warning shown when a user points the sync at a folder that already
-    /// contains files. Spells out the merge behaviour so the choice is informed.
+    /// contains files. The sync mode/direction is chosen on a later step, so the copy
+    /// stays mode-agnostic and names the folder rather than assuming a specific behaviour.
     private var nonEmptyDirWarningMessage: String {
         let count = pendingLocalItemCount
         let itemWord = count == 1 ? "item" : "items"
+        let folderName = URL(fileURLWithPath: pendingLocalPath).lastPathComponent
         return """
-        This folder already contains \(count) \(itemWord).
+        \"\(folderName)\" already contains \(count) \(itemWord).
 
-        On the first sync, SyncTray combines the contents of this folder with the remote — files from both sides are merged together. If the remote holds different versions of these files, this can lead to duplicates, unexpected overwrites, or deletions that are hard to undo.
+        On the first sync, these files are combined with the remote. Depending on the sync mode and direction you choose next, files can be uploaded, overwritten, or deleted on either side — which can be hard to undo.
 
-        Only continue if you intend to merge this folder with the remote.
+        Only continue if that's what you intend.
         """
     }
 
