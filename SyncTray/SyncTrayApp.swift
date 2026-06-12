@@ -106,7 +106,7 @@ struct CircularProgressIcon: View {
     }
 }
 
-class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDelegate {
+class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUserNotificationCenterDelegate {
     /// Shared instance for easy access
     static var shared: AppDelegate?
 
@@ -161,9 +161,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
     }
 
     func openSettingsWindow() {
-        print("[SyncTray] openSettingsWindow called, shared=\(AppDelegate.shared != nil), manager=\(AppDelegate.sharedSyncManager != nil)")
+        SyncTraySettings.debugLog("[SyncTray] openSettingsWindow called, shared=\(AppDelegate.shared != nil), manager=\(AppDelegate.sharedSyncManager != nil)")
 
         TelemetryService.shared.recordSettingsOpened()
+
+        // Switch to regular activation policy so the window appears in cmd+tab and the Dock.
+        // This is reverted to .accessory when the settings window closes (see windowWillClose).
+        NSApp.setActivationPolicy(.regular)
 
         // Activate app first
         if #available(macOS 14.0, *) {
@@ -174,14 +178,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
 
         // If window already exists, just show it
         if let window = settingsWindow {
-            print("[SyncTray] Showing existing window")
+            SyncTraySettings.debugLog("[SyncTray] Showing existing window")
             window.makeKeyAndOrderFront(nil)
-            // Ensure app is frontmost
-            if #available(macOS 14.0, *) {
-                NSApp.activate()
-            } else {
-                NSApp.activate(ignoringOtherApps: true)
-            }
             return
         }
 
@@ -190,7 +188,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
             print("[SyncTray] ERROR: sharedSyncManager is nil!")
             return
         }
-        print("[SyncTray] Creating new settings window")
+        SyncTraySettings.debugLog("[SyncTray] Creating new settings window")
 
         let settingsView = SettingsView()
             .environmentObject(syncManager)
@@ -203,17 +201,41 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
         window.setContentSize(NSSize(width: 700, height: 650))
         window.minSize = NSSize(width: 600, height: 500)
         window.center()
+        // isReleasedWhenClosed = false keeps the NSWindow object alive after the user
+        // closes it so we can re-show it via makeKeyAndOrderFront without recreating it.
+        // The delegate is set once here and remains valid for the lifetime of the window
+        // because the same NSWindow instance is reused on every subsequent open.
         window.isReleasedWhenClosed = false
+        window.delegate = self
 
         self.settingsWindow = window
         window.makeKeyAndOrderFront(nil)
-        // Ensure app is frontmost
-        if #available(macOS 14.0, *) {
-            NSApp.activate()
-        } else {
-            NSApp.activate(ignoringOtherApps: true)
+        SyncTraySettings.debugLog("[SyncTray] Window created and shown")
+    }
+
+    // MARK: - NSWindowDelegate
+
+    func windowWillClose(_ notification: Notification) {
+        // Guard: only react to the settings window closing. If AppDelegate is ever set
+        // as the delegate for a second window (e.g. an About panel), that window closing
+        // must not revert the activation policy while Settings is still open.
+        guard notification.object as? NSWindow === settingsWindow else { return }
+
+        // Revert to accessory (menu-bar-only) policy once the settings window closes,
+        // so the app disappears from cmd+tab and the Dock when there is no window open.
+        //
+        // We dispatch asynchronously to let the window finish closing first — calling
+        // setActivationPolicy synchronously inside windowWillClose can confuse AppKit
+        // and leave a phantom Dock tile behind on some macOS versions.
+        //
+        // Race guard: if openSettingsWindow() is called before this async block runs
+        // (rapid close-then-reopen), the window will already be visible again. In that
+        // case we must NOT revert to .accessory or the app disappears from cmd+tab while
+        // its window is on screen. We check isVisible as a proxy for "was reopened".
+        DispatchQueue.main.async { [weak self] in
+            guard let window = self?.settingsWindow, !window.isVisible else { return }
+            NSApp.setActivationPolicy(.accessory)
         }
-        print("[SyncTray] Window created and shown")
     }
 
     private func requestNotificationPermissions() {
