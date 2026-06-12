@@ -365,6 +365,15 @@ enum SyncLogPatterns {
         message.lowercased().contains("already running")
     }
 
+    /// Error pattern that triggers automatic recovery via --resync.
+    /// Matches the canonical bisync "out of sync" message that requires --resync.
+    static func isOutOfSyncError(_ message: String) -> Bool {
+        message.contains("out of sync") ||
+        message.contains("resync to recover") ||
+        message.contains("--resync") ||
+        message.contains("cannot find prior")
+    }
+
     // MARK: - Error Categorization
 
     /// Transient "all files changed" error that should be ignored.

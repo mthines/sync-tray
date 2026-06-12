@@ -153,6 +153,16 @@ final class NotificationService {
         )
     }
 
+    /// Notify the user that an automatic --resync recovery has been triggered.
+    func notifyAutoFix(profileId: UUID, profileName: String) {
+        sendNotification(
+            title: "SyncTray: \(profileName)",
+            body: "Auto-resyncing \(profileName) after sync conflict",
+            sound: nil,
+            profileId: profileId
+        )
+    }
+
     /// Reset the "drive not mounted" notification state for a specific profile or all profiles
     func resetDriveNotMountedState(for profileId: UUID? = nil) {
         if let profileId = profileId {

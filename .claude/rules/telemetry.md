@@ -181,6 +181,7 @@ rollout. No event is emitted on a fresh install.
 | `synctray.directory_watch.filtered` | Counter | Directory watch events filtered out (out_of_scope, phantom, metadata) |
 | `synctray.sync.resumed_external` | Counter | Externally-started syncs detected and resumed at app startup |
 | `synctray.app.settings_opened` | Counter | Settings window opens |
+| `synctray.sync.auto_fix_triggered` | Counter | Automatic --resync recovery attempts (`result`: `triggered` or `gave_up_backoff`) |
 
 ### Spans
 | Span | Kind | Description |
@@ -211,6 +212,7 @@ All key lifecycle events are emitted as structured OTel logs:
 - Sync precondition failures: script_not_found, config_not_found (setup issue detection)
 - Resumed external syncs: syncs detected running at startup (launchd overlap detection)
 - App upgraded: `service.version` changed since the previous launch (deployment markers)
+- Auto-fix: automatic --resync triggered (`triggered`) or suppressed by backoff (`gave_up_backoff`)
 
 ## Swift SDK Gotcha: Wildcard View Required
 

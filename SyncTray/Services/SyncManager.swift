@@ -69,6 +69,19 @@ final class SyncManager: ObservableObject {
     /// Timers polling for sync completion
     private var syncCompletionPollers: [UUID: DispatchSourceTimer] = [:]
 
+    // MARK: - Auto-Fix Backoff State
+
+    /// Timestamps of the last consecutive auto-fix attempts per profile (in-memory only, not persisted).
+    /// Used to implement backoff: if 2+ attempts within autoFixBackoffWindow seconds both fail, stop auto-fixing.
+    private var autoFixAttempts: [UUID: [Date]] = [:]
+
+    /// Profiles where auto-fix has been suppressed due to repeated failures.
+    /// Reset when the profile completes a successful sync.
+    private var autoFixSuppressed: Set<UUID> = []
+
+    /// The time window (seconds) within which consecutive auto-fix failures trigger backoff suppression.
+    private let autoFixBackoffWindow: TimeInterval = 5 * 60  // 5 minutes
+
     private let maxRecentChanges = 20
 
     init(profileStore: ProfileStore? = nil) {
@@ -415,6 +428,174 @@ final class SyncManager: ObservableObject {
     /// Returns true if we're monitoring an externally-started sync for this profile
     func isMonitoringExternalSync(for profileId: UUID) -> Bool {
         monitoringExternalSyncs.contains(profileId)
+    }
+
+    // MARK: - Auto-Fix
+
+    /// Attempt an automatic --resync recovery for the given profile.
+    ///
+    /// Called from `processLogEvent` when the auto-fix setting is enabled and the
+    /// profile enters an out-of-sync error state. Implements a backoff guard:
+    /// if the same profile triggers auto-fix **twice within 5 minutes** and both
+    /// attempts end in failure, auto-fix is suppressed for that profile until a
+    /// successful sync clears the suppression.
+    ///
+    /// Reuses the same rclone bisync --resync process that `ProfileDetailView.runResync()`
+    /// runs, but without UI state (the progress bar / output panel in the settings
+    /// view is driven by the profile state change visible via `@Published profileStates`).
+    func triggerAutoFix(for profile: SyncProfile) {
+        let profileId = profile.id
+
+        // Respect the global setting
+        guard SyncTraySettings.autoFixSyncIssues else { return }
+
+        // Respect per-profile suppression (backoff guard)
+        guard !autoFixSuppressed.contains(profileId) else {
+            TelemetryService.shared.recordAutoFixTriggered(
+                profileId: profileId,
+                profileName: profile.name,
+                result: "gave_up_backoff"
+            )
+            SyncTraySettings.debugLog("Auto-fix suppressed (backoff) for '\(profile.name)'")
+            return
+        }
+
+        // Record the attempt and check backoff threshold
+        let now = Date()
+        var attempts = autoFixAttempts[profileId] ?? []
+        // Prune attempts outside the backoff window
+        attempts = attempts.filter { now.timeIntervalSince($0) < autoFixBackoffWindow }
+        attempts.append(now)
+        autoFixAttempts[profileId] = attempts
+
+        if attempts.count >= 2 {
+            // Two failures within the window — suppress further auto-fix for this profile
+            autoFixSuppressed.insert(profileId)
+            TelemetryService.shared.recordAutoFixTriggered(
+                profileId: profileId,
+                profileName: profile.name,
+                result: "gave_up_backoff"
+            )
+            SyncTraySettings.debugLog("Auto-fix giving up (backoff) for '\(profile.name)' after \(attempts.count) attempts")
+            return
+        }
+
+        // Good to go — notify user and start the resync
+        SyncTraySettings.debugLog("Auto-fix triggering resync for '\(profile.name)'")
+        TelemetryService.shared.recordAutoFixTriggered(
+            profileId: profileId,
+            profileName: profile.name,
+            result: "triggered"
+        )
+
+        // Post a macOS notification so the user can see what's happening
+        notificationService.notifyAutoFix(profileId: profileId, profileName: profile.name)
+
+        // Clear current error and mark syncing so the UI updates
+        clearError(for: profileId)
+        setSyncing(for: profileId, isSyncing: true)
+
+        Task {
+            await performResync(for: profile)
+        }
+    }
+
+    /// Run `rclone bisync --resync` for a profile directly (no UI output panel).
+    /// Called by `triggerAutoFix`. On completion, state is updated via the existing
+    /// log-watcher pipeline (same as scheduled syncs).
+    private func performResync(for profile: SyncProfile) async {
+        let profileId = profile.id
+
+        // Capture values on the main actor before going to the background
+        let rcloneRemote = profile.rcloneRemote
+        let remotePath = profile.remotePath
+        let localSyncPath = profile.localSyncPath
+        let filterPath = profile.filterFilePath
+        let lockPath = profile.lockFilePath
+        let syncMode = profile.syncMode
+        let syncDirection = profile.syncDirection
+        let additionalFlags = profile.additionalRcloneFlags
+        let bisyncDir = "\(NSHomeDirectory())/Library/Caches/rclone/bisync"
+
+        do {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                DispatchQueue.global(qos: .userInitiated).async {
+                    let fileManager = FileManager.default
+
+                    // Remove stale bisync .lck files before resync (same as runResync in the view)
+                    if let files = try? fileManager.contentsOfDirectory(atPath: bisyncDir) {
+                        for file in files where file.hasSuffix(".lck") {
+                            try? fileManager.removeItem(atPath: "\(bisyncDir)/\(file)")
+                        }
+                    }
+
+                    // Locate rclone binary
+                    let rclonePaths = ["/opt/homebrew/bin/rclone", "/usr/local/bin/rclone", "/usr/bin/rclone"]
+                    guard let rclonePath = rclonePaths.first(where: { fileManager.fileExists(atPath: $0) }) else {
+                        continuation.resume(throwing: NSError(
+                            domain: "SyncManager",
+                            code: 1,
+                            userInfo: [NSLocalizedDescriptionKey: "rclone not found"]
+                        ))
+                        return
+                    }
+
+                    let fullRemotePath = "\(rcloneRemote):\(remotePath)"
+                    var arguments: [String]
+
+                    if syncMode == .bisync {
+                        arguments = ["bisync", fullRemotePath, localSyncPath,
+                                     "--resync", "--verbose", "--use-json-log", "--stats", "2s"]
+                    } else if syncDirection == .localToRemote {
+                        arguments = ["sync", localSyncPath, fullRemotePath,
+                                     "--verbose", "--use-json-log", "--stats", "2s"]
+                    } else {
+                        arguments = ["sync", fullRemotePath, localSyncPath,
+                                     "--verbose", "--use-json-log", "--stats", "2s"]
+                    }
+
+                    if fileManager.fileExists(atPath: filterPath) {
+                        arguments.append(contentsOf: ["--filter-from", filterPath])
+                    }
+
+                    if RcloneConfigService.shared.readRemoteConfig(name: rcloneRemote)?.values["no_check_certificate"] == "true" {
+                        arguments.append("--no-check-certificate")
+                    }
+
+                    if !additionalFlags.isEmpty {
+                        let extra = additionalFlags.components(separatedBy: .whitespaces).filter { !$0.isEmpty }
+                        arguments.append(contentsOf: extra)
+                    }
+
+                    let process = Process()
+                    process.executableURL = URL(fileURLWithPath: rclonePath)
+                    process.arguments = arguments
+                    process.standardOutput = Pipe()
+                    process.standardError = Pipe()
+
+                    process.terminationHandler = { _ in
+                        // Remove lock file we created
+                        try? fileManager.removeItem(atPath: lockPath)
+                        continuation.resume()
+                    }
+
+                    do {
+                        try process.run()
+                        // Write a lock file so the scheduled sync script sees us as running
+                        try? "\(process.processIdentifier)".write(
+                            toFile: lockPath, atomically: true, encoding: .utf8)
+                    } catch {
+                        continuation.resume(throwing: error)
+                    }
+                }
+            }
+        } catch {
+            await MainActor.run {
+                SyncTraySettings.debugLog("Auto-fix process error for '\(profile.name)': \(error)")
+                self.setSyncing(for: profileId, isSyncing: false)
+            }
+        }
+        // State after completion is set by the log-watcher pipeline (same as regular syncs).
     }
 
     // MARK: - Notification Muting
@@ -1163,6 +1344,9 @@ final class SyncManager: ObservableObject {
             profileProgress[profileId] = nil  // Clear progress when sync completes
             logWatchers[profileId]?.setActivelySyncing(false)  // Reduce polling frequency
             lastSyncTime = event.timestamp
+            // Successful sync clears backoff suppression for this profile
+            autoFixSuppressed.remove(profileId)
+            autoFixAttempts[profileId] = nil
             let changesCount = currentSyncChanges[profileId]?.count ?? 0
             // Report telemetry for successful sync
             let completedDuration = syncStartTimes[profileId].map { Date().timeIntervalSince($0) } ?? 0
@@ -1231,6 +1415,14 @@ final class SyncManager: ObservableObject {
                 )
             }
             currentSyncChanges[profileId] = nil
+
+            // Auto-fix: if the stored error is an out-of-sync error and the setting is on,
+            // trigger an automatic --resync recovery.
+            if let storedError = profileErrors[profileId],
+               SyncLogPatterns.isOutOfSyncError(storedError),
+               let currentProfile = profile {
+                triggerAutoFix(for: currentProfile)
+            }
 
         case .transportChanged(let transport):
             profileTransports[profileId] = transport
