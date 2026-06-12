@@ -341,13 +341,13 @@ jobs:
             brew tap mthines/synctray
 
             # Latest beta from this PR
-            brew install --cask mthines/synctray/synctray-beta
+            brew install --cask --force mthines/synctray/synctray-beta
 
             # This exact version (pinned)
-            brew install --cask mthines/synctray/synctray-beta@${version}
+            brew install --cask --force mthines/synctray/synctray-beta@${version}
             \`\`\`
 
-            > Beta and stable share the same \`/Applications/SyncTray.app\` path, so installing one replaces the other. Reinstall stable with \`brew install --cask mthines/synctray/synctray\` when done testing.
+            > Beta and stable share \`/Applications/SyncTray.app\`. \`--force\` is required so Homebrew will overwrite the app installed by the other cask. To roll back: \`brew install --cask --force mthines/synctray/synctray\`.
 
             [View release](https://github.com/${context.repo.owner}/${context.repo.repo}/releases/tag/v${version})`;
 

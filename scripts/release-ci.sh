@@ -165,9 +165,11 @@ if [ "$IS_BETA" = "true" ]; then
   CHANGELOG+='**Via Homebrew (beta tap):**'$'\n'
   CHANGELOG+='```bash'$'\n'
   CHANGELOG+='brew tap mthines/synctray'$'\n'
-  CHANGELOG+='brew install --cask mthines/synctray/synctray-beta              # latest beta'$'\n'
-  CHANGELOG+="brew install --cask mthines/synctray/synctray-beta@${VERSION}    # this exact version"$'\n'
+  CHANGELOG+='brew install --cask --force mthines/synctray/synctray-beta              # latest beta'$'\n'
+  CHANGELOG+="brew install --cask --force mthines/synctray/synctray-beta@${VERSION}    # this exact version"$'\n'
   CHANGELOG+='```'$'\n'
+  CHANGELOG+=$'\n'
+  CHANGELOG+='> `--force` lets Homebrew overwrite a stable SyncTray.app already installed by the `synctray` cask.'$'\n'
 else
   CHANGELOG+='**Via Homebrew (recommended):**'$'\n'
   CHANGELOG+='```bash'$'\n'
@@ -219,6 +221,11 @@ fi
 
 log_info "Updating mthines/homebrew-synctray..."
 
+# The source-of-truth cask lives in the app repo. We copy it wholesale to the
+# tap on every release so any change (depends_on, desc, zap, caveats) propagates
+# automatically — sed only patches version + sha256 on top.
+SOURCE_CASK="$PROJECT_DIR/Casks/synctray.rb"
+
 TAP_DIR="/tmp/homebrew-synctray-ci"
 rm -rf "$TAP_DIR"
 git clone "https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/mthines/homebrew-synctray.git" "$TAP_DIR"
@@ -226,20 +233,16 @@ git clone "https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/mthines/homeb
 cd "$TAP_DIR"
 git config user.name "github-actions[bot]"
 git config user.email "github-actions[bot]@users.noreply.github.com"
+mkdir -p Casks
 
 if [ "$IS_BETA" = "true" ]; then
-  # synctray-beta.rb — always points to the latest beta
   BETA_CASK="Casks/synctray-beta.rb"
-  if [ ! -f "$BETA_CASK" ]; then
-    log_info "Creating $BETA_CASK from stable cask template"
-    mkdir -p Casks
-    cp "Casks/synctray.rb" "$BETA_CASK"
-    sed -i '' 's/cask "synctray"/cask "synctray-beta"/' "$BETA_CASK"
-  fi
+  cp "$SOURCE_CASK" "$BETA_CASK"
+  sed -i '' 's/cask "synctray"/cask "synctray-beta"/' "$BETA_CASK"
   sed -i '' "s/version \"[^\"]*\"/version \"${VERSION}\"/" "$BETA_CASK"
   sed -i '' "s/sha256 \"[^\"]*\"/sha256 \"${ZIP_SHA}\"/" "$BETA_CASK"
 
-  # synctray-beta@VERSION.rb — pinned beta for reproducible installs
+  # Pinned beta for reproducible installs
   VERSIONED_CASK="Casks/synctray-beta@${VERSION}.rb"
   cp "$BETA_CASK" "$VERSIONED_CASK"
   sed -i '' "s/cask \"synctray-beta\"/cask \"synctray-beta@${VERSION}\"/" "$VERSIONED_CASK"
@@ -248,8 +251,8 @@ if [ "$IS_BETA" = "true" ]; then
   git commit -m "synctray-beta: update to ${TAG}"
   log_success "Updated synctray-beta.rb + synctray-beta@${VERSION}.rb"
 else
-  # synctray.rb — stable
   STABLE_CASK="Casks/synctray.rb"
+  cp "$SOURCE_CASK" "$STABLE_CASK"
   sed -i '' "s/version \"[^\"]*\"/version \"${VERSION}\"/" "$STABLE_CASK"
   sed -i '' "s/sha256 \"[^\"]*\"/sha256 \"${ZIP_SHA}\"/" "$STABLE_CASK"
 
