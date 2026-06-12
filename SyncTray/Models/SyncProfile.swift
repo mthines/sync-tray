@@ -116,6 +116,27 @@ struct SyncProfile: Identifiable, Codable, Equatable {
         !name.isEmpty && !rcloneRemote.isEmpty && !remotePath.isEmpty && !localSyncPath.isEmpty
     }
 
+    // MARK: - Local Directory Inspection
+
+    /// Counts items in a local directory that a user would recognise as "their files",
+    /// ignoring SyncTray's own state folder and pure macOS metadata noise.
+    ///
+    /// Used to warn before pointing a sync at a folder that already has content: on the
+    /// first sync SyncTray merges the local folder with the remote, which can produce
+    /// duplicates, unexpected overwrites, or hard-to-undo deletions.
+    static func meaningfulItemCount(at path: String) -> Int {
+        guard !path.isEmpty else { return 0 }
+        let fm = FileManager.default
+        var isDir: ObjCBool = false
+        guard fm.fileExists(atPath: path, isDirectory: &isDir), isDir.boolValue else { return 0 }
+        guard let contents = try? fm.contentsOfDirectory(atPath: path) else { return 0 }
+
+        let ignored: Set<String> = [".DS_Store", ".localized"]
+        return contents.filter { name in
+            !name.hasPrefix(".synctray") && !ignored.contains(name)
+        }.count
+    }
+
     // MARK: - Initializers
 
     init(
