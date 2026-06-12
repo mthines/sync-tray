@@ -106,7 +106,7 @@ struct CircularProgressIcon: View {
     }
 }
 
-class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDelegate {
+class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUserNotificationCenterDelegate {
     /// Shared instance for easy access
     static var shared: AppDelegate?
 
@@ -165,6 +165,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
 
         TelemetryService.shared.recordSettingsOpened()
 
+        // Switch to regular activation policy so the window appears in cmd+tab and the Dock.
+        // This is reverted to .accessory when the settings window closes.
+        NSApp.setActivationPolicy(.regular)
+
         // Activate app first
         if #available(macOS 14.0, *) {
             NSApp.activate()
@@ -204,6 +208,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
         window.minSize = NSSize(width: 600, height: 500)
         window.center()
         window.isReleasedWhenClosed = false
+        window.delegate = self
 
         self.settingsWindow = window
         window.makeKeyAndOrderFront(nil)
@@ -214,6 +219,20 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
             NSApp.activate(ignoringOtherApps: true)
         }
         print("[SyncTray] Window created and shown")
+    }
+
+    // MARK: - NSWindowDelegate
+
+    func windowWillClose(_ notification: Notification) {
+        // Revert to accessory (menu-bar-only) policy once the settings window closes,
+        // so the app disappears from cmd+tab and the Dock when there is no window open.
+        //
+        // We dispatch asynchronously to let the window finish closing first — calling
+        // setActivationPolicy synchronously inside windowWillClose can confuse AppKit
+        // and leave a phantom Dock tile behind on some macOS versions.
+        DispatchQueue.main.async {
+            NSApp.setActivationPolicy(.accessory)
+        }
     }
 
     private func requestNotificationPermissions() {
