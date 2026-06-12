@@ -7,7 +7,7 @@ cask "synctray" do
   desc "Menu bar app for automatic two-way folder sync with 70+ cloud providers via rclone"
   homepage "https://github.com/mthines/sync-tray"
 
-  depends_on macos: ">= :ventura"
+  depends_on macos: :ventura
 
   # Remove quarantine attribute (app is not notarized yet)
   preflight do
