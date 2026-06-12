@@ -5,6 +5,7 @@ struct AppSettingsView: View {
 
     @State private var debugLogging = SyncTraySettings.debugLoggingEnabled
     @State private var telemetryEnabled = SyncTraySettings.telemetryEnabled
+    @State private var showingTelemetryDetails: Bool = false
     @State private var rcloneVersion: String?
 
     var body: some View {
@@ -88,19 +89,31 @@ struct AppSettingsView: View {
     // MARK: - Privacy
 
     private var telemetryToggle: some View {
-        Toggle(isOn: $telemetryEnabled) {
-            VStack(alignment: .leading, spacing: 2) {
-                Text("Anonymous Usage Data")
-                Text("Help improve SyncTray by sharing anonymous crash and usage statistics")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+        VStack(alignment: .leading, spacing: 4) {
+            Toggle(isOn: $telemetryEnabled) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Share anonymous usage data")
+                    Text("Sync results, error types, and feature usage. No file names, paths, or credentials.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
             }
+            .onChange(of: telemetryEnabled) { newValue in
+                SyncTraySettings.telemetryEnabled = newValue
+                if newValue {
+                    TelemetryService.shared.configure()
+                }
+            }
+
+            Button("Learn more") {
+                showingTelemetryDetails = true
+            }
+            .buttonStyle(.link)
+            .font(.caption)
+            .padding(.leading, 20) // Align with toggle label
         }
-        .onChange(of: telemetryEnabled) { newValue in
-            SyncTraySettings.telemetryEnabled = newValue
-            if newValue {
-                TelemetryService.shared.configure()
-            }
+        .sheet(isPresented: $showingTelemetryDetails) {
+            TelemetryDetailsSheet()
         }
     }
 
