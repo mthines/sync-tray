@@ -106,6 +106,7 @@ final class TelemetryService {
     private var directoryWatchFilterCounter: LongCounterSdk?
     private var resumedExternalSyncCounter: LongCounterSdk?
     private var settingsOpenedCounter: LongCounterSdk?
+    private var autoFixTriggeredCounter: LongCounterSdk?
 
     // MARK: - Providers (kept alive for shutdown)
 
@@ -325,6 +326,12 @@ final class TelemetryService {
         settingsOpenedCounter = meter
             .counterBuilder(name: "synctray.app.settings_opened")
             .setDescription("Number of times the Settings window was opened")
+            .setUnit("1")
+            .build()
+
+        autoFixTriggeredCounter = meter
+            .counterBuilder(name: "synctray.sync.auto_fix_triggered")
+            .setDescription("Number of automatic --resync recoveries triggered (by result: triggered, gave_up_backoff)")
             .setUnit("1")
             .build()
     }
@@ -913,6 +920,49 @@ final class TelemetryService {
             attributes: [
                 "synctray.profile.id": .string(profileId.uuidString),
                 "synctray.profile.name": .string(profileName),
+            ]
+        )
+    }
+
+    // MARK: - Auto-Fix
+
+    /// Record an automatic --resync recovery attempt.
+    /// - Parameters:
+    ///   - profileId:   UUID of the affected profile.
+    ///   - profileName: Display name of the affected profile.
+    ///   - result:      `"triggered"` when the resync starts; `"gave_up_backoff"` when
+    ///                  backoff suppresses the retry after repeated triggers;
+    ///                  `"skipped_drive_not_mounted"` when the external drive is absent.
+    func recordAutoFixTriggered(
+        profileId: UUID,
+        profileName: String,
+        result: String     // "triggered" | "gave_up_backoff" | "skipped_drive_not_mounted"
+    ) {
+        guard SyncTraySettings.telemetryEnabled else { return }
+        ensureSetup()
+
+        autoFixTriggeredCounter?.add(value: 1, attribute: [
+            "synctray.profile.name": .string(profileName),
+            "result": .string(result),
+        ])
+
+        let severity: Severity = result == "gave_up_backoff" ? .warn : .info
+        let body: String
+        switch result {
+        case "gave_up_backoff":
+            body = "Auto-fix suppressed by backoff for \(profileName)"
+        case "skipped_drive_not_mounted":
+            body = "Auto-fix skipped: external drive not mounted for \(profileName)"
+        default:
+            body = "Auto-resyncing \(profileName) after sync conflict"
+        }
+        emitLog(
+            severity: severity,
+            body: body,
+            attributes: [
+                "synctray.profile.id": .string(profileId.uuidString),
+                "synctray.profile.name": .string(profileName),
+                "result": .string(result),
             ]
         )
     }

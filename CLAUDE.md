@@ -13,6 +13,7 @@ SyncTray is a macOS menu bar application that provides Google Drive-style backgr
 - **Live progress tracking**: Parses rclone JSON logs for real-time transfer progress
 - **macOS notifications**: Batch notifications for file changes with "Open Directory" action
 - **Fallback remote**: Automatic failover to an alternative remote when the primary is unreachable
+- **Auto-fix sync issues**: Automatically runs `--resync` recovery when bisync detects an out-of-sync state (app-wide setting, default ON). Skipped when the profile's external drive is unmounted — a `--resync` against a missing/empty local path can't safely fix anything, so the profile is left in `.driveNotMounted` and resumes normally once the drive reconnects.
 
 ### Sync Modes
 
@@ -67,7 +68,7 @@ SyncTray/
 | `SyncProfile.swift` | Profile model with sync paths, remote config, fallback remote config, computed file paths |
 | `SyncState.swift` | Sync state enum, progress struct, file change model, `ActiveTransport`, `SyncLogPatterns` for log parsing |
 | `RcloneLogEntry.swift` | JSON models for parsing rclone `--use-json-log` output |
-| `Settings.swift` | Global app settings (debug logging toggle) |
+| `Settings.swift` | Global app settings (debug logging toggle, auto-fix sync issues toggle) |
 
 ### Services/
 
@@ -185,6 +186,9 @@ SyncManager maintains parallel dictionaries keyed by profile UUID:
 @Published private(set) var profileTransports: [UUID: ActiveTransport] = [:]
 private var logWatchers: [UUID: LogWatcher] = [:]
 private var directoryWatchers: [UUID: DirectoryWatcher] = [:]
+// Auto-fix backoff (in-memory, not persisted):
+private var autoFixAttempts: [UUID: [Date]] = [:]     // timestamps of recent fix attempts
+private var autoFixSuppressed: Set<UUID> = []          // profiles where auto-fix is paused
 ```
 
 This allows independent state tracking per profile while maintaining a single source of truth.
@@ -364,10 +368,10 @@ open ~/Library/Developer/Xcode/DerivedData/SyncTray-*/Build/Products/Debug/SyncT
 | `SyncManager.swift` | Central state manager, LogWatcher/DirectoryWatcher coordination |
 | `SettingsView.swift` | Main settings UI with profile editing |
 | `ProfileStore.swift` | Profile persistence (JSON files) |
-| `SyncLogPatterns` | Centralized log message pattern matching |
+| `SyncLogPatterns` | Centralized log message pattern matching (includes `isOutOfSyncError`) |
 | `TelemetryService.swift` | OTel singleton — traces, metrics, logs via OTLP/HTTP |
 | `TelemetryDetailsSheet.swift` | Shared privacy disclosure sheet for wizard, banner, and settings |
-| `Settings.swift` | Global settings including `installationId` and `anonymousUserId` |
+| `Settings.swift` | Global settings including `installationId`, `anonymousUserId`, and `autoFixSyncIssues` |
 
 ## Telemetry
 

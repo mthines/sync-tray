@@ -26,6 +26,9 @@ struct SyncTraySettings {
         // Debug settings
         static let debugLoggingEnabled = "debugLoggingEnabled"
 
+        // Auto-fix settings
+        static let autoFixSyncIssues = "autoFixSyncIssues"
+
         // Telemetry settings
         static let telemetryEnabled = "telemetryEnabled"
         static let installationId = "installationId"
@@ -102,6 +105,21 @@ struct SyncTraySettings {
     static var lastLaunchedVersion: String? {
         get { defaults.string(forKey: Keys.lastLaunchedVersion) }
         set { defaults.set(newValue, forKey: Keys.lastLaunchedVersion) }
+    }
+
+    // MARK: - Auto-Fix Settings
+
+    /// Automatically run --resync when bisync detects an out-of-sync state. On by default.
+    static var autoFixSyncIssues: Bool {
+        get {
+            // UserDefaults.bool returns false when key is absent — default ON requires
+            // registering a default or using object(forKey:) and treating nil as true.
+            if defaults.object(forKey: Keys.autoFixSyncIssues) == nil {
+                return true  // default ON
+            }
+            return defaults.bool(forKey: Keys.autoFixSyncIssues)
+        }
+        set { defaults.set(newValue, forKey: Keys.autoFixSyncIssues) }
     }
 
     // MARK: - Debug Settings

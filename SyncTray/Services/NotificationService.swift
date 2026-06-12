@@ -153,6 +153,27 @@ final class NotificationService {
         )
     }
 
+    /// Notify the user that an automatic --resync recovery has been triggered.
+    func notifyAutoFix(profileId: UUID, profileName: String) {
+        sendNotification(
+            title: "SyncTray: \(profileName)",
+            body: "Auto-resyncing \(profileName) to recover from out-of-sync state",
+            sound: nil,
+            profileId: profileId
+        )
+    }
+
+    /// Notify the user that auto-fix has been suppressed after repeated failures.
+    /// Only called once, at the transition from active → suppressed.
+    func notifyAutoFixSuppressed(profileId: UUID, profileName: String) {
+        sendNotification(
+            title: "Auto-fix paused for \(profileName)",
+            body: "Repeated recovery failures. Run \"Fix Sync Issues\" manually.",
+            sound: nil,
+            profileId: profileId
+        )
+    }
+
     /// Reset the "drive not mounted" notification state for a specific profile or all profiles
     func resetDriveNotMountedState(for profileId: UUID? = nil) {
         if let profileId = profileId {
