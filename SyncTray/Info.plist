@@ -9,15 +9,11 @@
 	<key>CFBundleName</key>
 	<string>SyncTray</string>
 	<key>CFBundleShortVersionString</key>
-	<string>0.34.0</string>
+	<string>0.35.0</string>
 	<key>CFBundleVersion</key>
 	<string>1</string>
 	<key>Dash0AuthToken</key>
 	<string>$(DASH0_AUTH_TOKEN)</string>
-	<!-- Seed value only; the real short SHA is written by the "Embed Git Commit
-	     SHA" Xcode build phase. GIT_COMMIT_SHA is an undefined build setting, so
-	     this resolves to an empty string at build time (TelemetryService then
-	     falls back to <marketing>+<build>). -->
 	<key>GitCommitSHA</key>
 	<string>$(GIT_COMMIT_SHA)</string>
 	<key>LSMinimumSystemVersion</key>
