@@ -792,6 +792,14 @@ struct SetupWizardView: View {
         }
     }
 
+    /// Gate: wasFirstProfile must be set as the FIRST statement, before profileStore.add() changes the count.
+    private var shouldShowHelpImproveStep: Bool {
+        wasFirstProfile
+            && !isEditMode
+            && !SyncTraySettings.telemetryEnabled
+            && !SyncTraySettings.telemetryBannerDismissed
+    }
+
     /// Applies a chosen local folder path along with its derived side effects
     /// (external-drive detection, default profile name).
     private func applyLocalPath(_ path: String) {
