@@ -79,6 +79,10 @@ final class SyncManager: ObservableObject {
     /// Reset when the profile completes a successful sync.
     private var autoFixSuppressed: Set<UUID> = []
 
+    /// Profiles where an auto-fix resync is currently in-flight.
+    /// Prevents a second Task from being dispatched before the first completes.
+    private var autoFixInFlight: Set<UUID> = []
+
     /// The time window (seconds) within which consecutive auto-fix failures trigger backoff suppression.
     private let autoFixBackoffWindow: TimeInterval = 5 * 60  // 5 minutes
 
@@ -449,13 +453,25 @@ final class SyncManager: ObservableObject {
         // Respect the global setting
         guard SyncTraySettings.autoFixSyncIssues else { return }
 
-        // Respect per-profile suppression (backoff guard)
+        // Skip paused profiles — auto-fix should never fire while the user has sync paused
+        guard !isPaused(for: profileId) else {
+            SyncTraySettings.debugLog("Auto-fix skipped: profile '\(profile.name)' is paused")
+            return
+        }
+
+        // Auto-fix only applies to bisync mode — one-way sync and mount profiles do not
+        // produce "out of sync" errors and have no --resync concept.
+        guard profile.syncMode == .bisync else { return }
+
+        // Skip if a resync is already in-flight for this profile
+        guard !autoFixInFlight.contains(profileId) else {
+            SyncTraySettings.debugLog("Auto-fix skipped: resync already in-flight for '\(profile.name)'")
+            return
+        }
+
+        // Respect per-profile suppression (backoff guard) — return silently after the first
+        // transition notification so the user is not spammed on every subsequent syncFailed event.
         guard !autoFixSuppressed.contains(profileId) else {
-            TelemetryService.shared.recordAutoFixTriggered(
-                profileId: profileId,
-                profileName: profile.name,
-                result: "gave_up_backoff"
-            )
             SyncTraySettings.debugLog("Auto-fix suppressed (backoff) for '\(profile.name)'")
             return
         }
@@ -469,7 +485,8 @@ final class SyncManager: ObservableObject {
         autoFixAttempts[profileId] = attempts
 
         if attempts.count >= 2 {
-            // Two failures within the window — suppress further auto-fix for this profile
+            // Two failures within the window — suppress further auto-fix for this profile.
+            // Only notify once (on the transition into suppressed state).
             autoFixSuppressed.insert(profileId)
             TelemetryService.shared.recordAutoFixTriggered(
                 profileId: profileId,
@@ -477,6 +494,7 @@ final class SyncManager: ObservableObject {
                 result: "gave_up_backoff"
             )
             SyncTraySettings.debugLog("Auto-fix giving up (backoff) for '\(profile.name)' after \(attempts.count) attempts")
+            notificationService.notifyAutoFixSuppressed(profileId: profileId, profileName: profile.name)
             return
         }
 
@@ -495,6 +513,9 @@ final class SyncManager: ObservableObject {
         clearError(for: profileId)
         setSyncing(for: profileId, isSyncing: true)
 
+        // Mark in-flight before dispatching
+        autoFixInFlight.insert(profileId)
+
         Task {
             await performResync(for: profile)
         }
@@ -506,7 +527,7 @@ final class SyncManager: ObservableObject {
     private func performResync(for profile: SyncProfile) async {
         let profileId = profile.id
 
-        // Capture values on the main actor before going to the background
+        // Capture all values from the main actor before going to the background
         let rcloneRemote = profile.rcloneRemote
         let remotePath = profile.remotePath
         let localSyncPath = profile.localSyncPath
@@ -515,7 +536,38 @@ final class SyncManager: ObservableObject {
         let syncMode = profile.syncMode
         let syncDirection = profile.syncDirection
         let additionalFlags = profile.additionalRcloneFlags
+        let fallbackTransport = profileTransports[profileId] ?? .unknown
+        let fallbackRemote = profile.fallbackRemote
+        let fallbackRemotePath = profile.fallbackRemotePath
+        let fallbackRequiresCacheRebuild = profile.fallbackRequiresCacheRebuild
         let bisyncDir = "\(NSHomeDirectory())/Library/Caches/rclone/bisync"
+
+        // Pre-flight: if a live lock already exists for a running process, skip.
+        if let existingPidStr = try? String(contentsOfFile: lockPath, encoding: .utf8)
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+           let existingPid = Int32(existingPidStr),
+           kill(existingPid, 0) == 0 {
+            SyncTraySettings.debugLog("Resync already in progress for '\(profile.name)', skipping auto-fix")
+            await MainActor.run {
+                self.autoFixInFlight.remove(profileId)
+                self.setSyncing(for: profileId, isSyncing: false)
+            }
+            return
+        }
+
+        // Write a sentinel lock file NOW — before process.run() — so launchd cannot
+        // spawn a concurrent rclone bisync against the same remote/path in the gap
+        // between process creation and PID availability.
+        let lockURL = URL(fileURLWithPath: lockPath)
+        let sentinelWritten = (try? Data("pending".utf8).write(to: lockURL)) != nil
+        if !sentinelWritten {
+            SyncTraySettings.debugLog("Could not write sentinel lock for '\(profile.name)' — aborting auto-fix")
+            await MainActor.run {
+                self.autoFixInFlight.remove(profileId)
+                self.setSyncing(for: profileId, isSyncing: false)
+            }
+            return
+        }
 
         do {
             try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
@@ -532,6 +584,7 @@ final class SyncManager: ObservableObject {
                     // Locate rclone binary
                     let rclonePaths = ["/opt/homebrew/bin/rclone", "/usr/local/bin/rclone", "/usr/bin/rclone"]
                     guard let rclonePath = rclonePaths.first(where: { fileManager.fileExists(atPath: $0) }) else {
+                        try? fileManager.removeItem(atPath: lockPath)
                         continuation.resume(throwing: NSError(
                             domain: "SyncManager",
                             code: 1,
@@ -540,17 +593,44 @@ final class SyncManager: ObservableObject {
                         return
                     }
 
-                    let fullRemotePath = "\(rcloneRemote):\(remotePath)"
+                    // Determine effective remote path — apply fallback transport if active.
+                    // This mirrors the fallback logic in the launchd-generated shell script.
+                    var effectiveRemotePath = "\(rcloneRemote):\(remotePath)"
+                    var extraEnv: [String: String] = [:]
+
+                    let isFallbackActive: Bool
+                    if case .fallback = fallbackTransport { isFallbackActive = true } else { isFallbackActive = false }
+
+                    if isFallbackActive && !fallbackRemote.isEmpty {
+                        if fallbackRequiresCacheRebuild || !fallbackRemotePath.isEmpty {
+                            // Different wire type OR explicit path: swap full remote reference.
+                            // bisync rebuilds listings on first switch — consistent with the script.
+                            let effectiveFallbackPath = fallbackRemotePath.isEmpty ? remotePath : fallbackRemotePath
+                            effectiveRemotePath = "\(fallbackRemote):\(effectiveFallbackPath)"
+                        } else {
+                            // Same wire type, same path: use env-var overrides to preserve bisync cache.
+                            let primaryRemoteName = rcloneRemote.hasSuffix(":")
+                                ? String(rcloneRemote.dropLast()) : rcloneRemote
+                            let upperName = primaryRemoteName.uppercased().replacingOccurrences(of: "-", with: "_")
+                            if let fallbackConfig = RcloneConfigService.shared.readRemoteConfig(name: fallbackRemote) {
+                                for (key, value) in fallbackConfig.values {
+                                    let envKey = "RCLONE_CONFIG_\(upperName)_\(key.uppercased().replacingOccurrences(of: "-", with: "_"))"
+                                    extraEnv[envKey] = value
+                                }
+                            }
+                        }
+                    }
+
                     var arguments: [String]
 
                     if syncMode == .bisync {
-                        arguments = ["bisync", fullRemotePath, localSyncPath,
+                        arguments = ["bisync", effectiveRemotePath, localSyncPath,
                                      "--resync", "--verbose", "--use-json-log", "--stats", "2s"]
                     } else if syncDirection == .localToRemote {
-                        arguments = ["sync", localSyncPath, fullRemotePath,
+                        arguments = ["sync", localSyncPath, effectiveRemotePath,
                                      "--verbose", "--use-json-log", "--stats", "2s"]
                     } else {
-                        arguments = ["sync", fullRemotePath, localSyncPath,
+                        arguments = ["sync", effectiveRemotePath, localSyncPath,
                                      "--verbose", "--use-json-log", "--stats", "2s"]
                     }
 
@@ -558,7 +638,10 @@ final class SyncManager: ObservableObject {
                         arguments.append(contentsOf: ["--filter-from", filterPath])
                     }
 
-                    if RcloneConfigService.shared.readRemoteConfig(name: rcloneRemote)?.values["no_check_certificate"] == "true" {
+                    // Resolve which remote name to check for no_check_certificate
+                    let certCheckRemote = (isFallbackActive && !fallbackRemote.isEmpty)
+                        ? fallbackRemote : rcloneRemote
+                    if RcloneConfigService.shared.readRemoteConfig(name: certCheckRemote)?.values["no_check_certificate"] == "true" {
                         arguments.append("--no-check-certificate")
                     }
 
@@ -570,21 +653,32 @@ final class SyncManager: ObservableObject {
                     let process = Process()
                     process.executableURL = URL(fileURLWithPath: rclonePath)
                     process.arguments = arguments
+
+                    // Merge fallback env-var overrides into the process environment
+                    if !extraEnv.isEmpty {
+                        var env = ProcessInfo.processInfo.environment
+                        for (key, value) in extraEnv {
+                            env[key] = value
+                        }
+                        process.environment = env
+                    }
+
                     process.standardOutput = Pipe()
                     process.standardError = Pipe()
 
                     process.terminationHandler = { _ in
-                        // Remove lock file we created
+                        // Remove lock file on exit (whether success or failure)
                         try? fileManager.removeItem(atPath: lockPath)
                         continuation.resume()
                     }
 
                     do {
                         try process.run()
-                        // Write a lock file so the scheduled sync script sees us as running
+                        // Overwrite sentinel with the real PID now that we have it
                         try? "\(process.processIdentifier)".write(
                             toFile: lockPath, atomically: true, encoding: .utf8)
                     } catch {
+                        try? fileManager.removeItem(atPath: lockPath)
                         continuation.resume(throwing: error)
                     }
                 }
@@ -592,9 +686,14 @@ final class SyncManager: ObservableObject {
         } catch {
             await MainActor.run {
                 SyncTraySettings.debugLog("Auto-fix process error for '\(profile.name)': \(error)")
+                self.autoFixInFlight.remove(profileId)
                 self.setSyncing(for: profileId, isSyncing: false)
             }
+            return
         }
+
+        // Clear in-flight on clean exit (log-watcher pipeline handles state via syncCompleted/syncFailed)
+        autoFixInFlight.remove(profileId)
         // State after completion is set by the log-watcher pipeline (same as regular syncs).
     }
 
@@ -1344,9 +1443,10 @@ final class SyncManager: ObservableObject {
             profileProgress[profileId] = nil  // Clear progress when sync completes
             logWatchers[profileId]?.setActivelySyncing(false)  // Reduce polling frequency
             lastSyncTime = event.timestamp
-            // Successful sync clears backoff suppression for this profile
+            // Successful sync clears backoff suppression and in-flight state for this profile
             autoFixSuppressed.remove(profileId)
             autoFixAttempts[profileId] = nil
+            autoFixInFlight.remove(profileId)
             let changesCount = currentSyncChanges[profileId]?.count ?? 0
             // Report telemetry for successful sync
             let completedDuration = syncStartTimes[profileId].map { Date().timeIntervalSince($0) } ?? 0
@@ -1415,6 +1515,11 @@ final class SyncManager: ObservableObject {
                 )
             }
             currentSyncChanges[profileId] = nil
+
+            // Clear in-flight sentinel so the backoff state can accept the next attempt.
+            // The backoff counter (autoFixAttempts) and suppression (autoFixSuppressed) still
+            // apply — this only unblocks the in-flight guard.
+            autoFixInFlight.remove(profileId)
 
             // Auto-fix: if the stored error is an out-of-sync error and the setting is on,
             // trigger an automatic --resync recovery.
