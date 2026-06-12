@@ -463,6 +463,19 @@ final class SyncManager: ObservableObject {
         // produce "out of sync" errors and have no --resync concept.
         guard profile.syncMode == .bisync else { return }
 
+        // Never auto-resync against an unmounted external drive. The local path is missing
+        // or replaced by an empty mount point, so a --resync would run against an empty/partial
+        // local tree — exactly the case that cannot be safely auto-fixed. Reflect reality in the
+        // UI and return WITHOUT recording an attempt, so the backoff budget is not consumed by a
+        // condition the user can only resolve by reconnecting the drive.
+        if !profile.drivePathToMonitor.isEmpty,
+           !FileManager.default.fileExists(atPath: profile.drivePathToMonitor) {
+            SyncTraySettings.debugLog("Auto-fix skipped: external drive not mounted for '\(profile.name)'")
+            profileStates[profileId] = .driveNotMounted
+            updateAggregateState()
+            return
+        }
+
         // Skip if a resync is already in-flight for this profile
         guard !autoFixInFlight.contains(profileId) else {
             SyncTraySettings.debugLog("Auto-fix skipped: resync already in-flight for '\(profile.name)'")
@@ -531,6 +544,7 @@ final class SyncManager: ObservableObject {
         let rcloneRemote = profile.rcloneRemote
         let remotePath = profile.remotePath
         let localSyncPath = profile.localSyncPath
+        let drivePathToMonitor = profile.drivePathToMonitor
         let filterPath = profile.filterFilePath
         let lockPath = profile.lockFilePath
         let syncMode = profile.syncMode
@@ -551,6 +565,21 @@ final class SyncManager: ObservableObject {
             await MainActor.run {
                 self.autoFixInFlight.remove(profileId)
                 self.setSyncing(for: profileId, isSyncing: false)
+            }
+            return
+        }
+
+        // Re-check the external drive right before launching — it may have been unplugged in
+        // the window between triggerAutoFix's guard and now (a resync can be queued behind an
+        // in-flight sync, and large repos take ~12s). Running --resync against a vanished mount
+        // point is the unsafe case we must never reach.
+        if !drivePathToMonitor.isEmpty,
+           !FileManager.default.fileExists(atPath: drivePathToMonitor) {
+            SyncTraySettings.debugLog("Auto-fix aborted: external drive unmounted before resync for '\(profile.name)'")
+            await MainActor.run {
+                self.autoFixInFlight.remove(profileId)
+                self.profileStates[profileId] = .driveNotMounted
+                self.updateAggregateState()
             }
             return
         }

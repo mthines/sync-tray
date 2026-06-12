@@ -13,7 +13,7 @@ SyncTray is a macOS menu bar application that provides Google Drive-style backgr
 - **Live progress tracking**: Parses rclone JSON logs for real-time transfer progress
 - **macOS notifications**: Batch notifications for file changes with "Open Directory" action
 - **Fallback remote**: Automatic failover to an alternative remote when the primary is unreachable
-- **Auto-fix sync issues**: Automatically runs `--resync` recovery when bisync detects an out-of-sync state (app-wide setting, default ON)
+- **Auto-fix sync issues**: Automatically runs `--resync` recovery when bisync detects an out-of-sync state (app-wide setting, default ON). Skipped when the profile's external drive is unmounted — a `--resync` against a missing/empty local path can't safely fix anything, so the profile is left in `.driveNotMounted` and resumes normally once the drive reconnects.
 
 ### Sync Modes
 
