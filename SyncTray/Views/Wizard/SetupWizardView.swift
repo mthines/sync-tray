@@ -30,6 +30,11 @@ struct SetupWizardView: View {
     @State private var wasFirstProfile: Bool = false
     @State private var showingTelemetryDetails: Bool = false
 
+    // Non-empty local folder confirmation (warns about local/remote merge on first sync)
+    @State private var showingNonEmptyDirConfirm: Bool = false
+    @State private var pendingLocalPath: String = ""
+    @State private var pendingLocalItemCount: Int = 0
+
     // Services
     private let configService = RcloneConfigService.shared
 
@@ -108,6 +113,19 @@ struct SetupWizardView: View {
         .onAppear {
             checkRcloneInstallation()
             loadEditingProfile()
+        }
+        .alert("This Folder Is Not Empty", isPresented: $showingNonEmptyDirConfirm) {
+            Button("Cancel", role: .cancel) {
+                pendingLocalPath = ""
+                pendingLocalItemCount = 0
+            }
+            Button("Use This Folder", role: .destructive) {
+                applyLocalPath(pendingLocalPath)
+                pendingLocalPath = ""
+                pendingLocalItemCount = 0
+            }
+        } message: {
+            Text(nonEmptyDirWarningMessage)
         }
     }
 
@@ -760,14 +778,16 @@ struct SetupWizardView: View {
         panel.prompt = "Select Folder"
 
         if panel.runModal() == .OK, let url = panel.url {
-            localPath = url.path
-            // Auto-detect external drive
-            if localPath.hasPrefix("/Volumes/") {
-                isExternalDrive = true
-            }
-            // Auto-generate profile name from folder
-            if profileName.isEmpty {
-                profileName = url.lastPathComponent
+            let path = url.path
+            let count = SyncProfile.meaningfulItemCount(at: path)
+            // Re-selecting the folder that's already configured (edit mode) is expected to
+            // hold synced files — only warn when pointing at a *different* non-empty folder.
+            if count > 0 && path != editingProfile?.localSyncPath {
+                pendingLocalPath = path
+                pendingLocalItemCount = count
+                showingNonEmptyDirConfirm = true
+            } else {
+                applyLocalPath(path)
             }
         }
     }
@@ -778,6 +798,36 @@ struct SetupWizardView: View {
             && !isEditMode
             && !SyncTraySettings.telemetryEnabled
             && !SyncTraySettings.telemetryBannerDismissed
+    }
+
+    /// Applies a chosen local folder path along with its derived side effects
+    /// (external-drive detection, default profile name).
+    private func applyLocalPath(_ path: String) {
+        localPath = path
+        // Auto-detect external drive
+        if path.hasPrefix("/Volumes/") {
+            isExternalDrive = true
+        }
+        // Auto-generate profile name from folder
+        if profileName.isEmpty {
+            profileName = URL(fileURLWithPath: path).lastPathComponent
+        }
+    }
+
+    /// Detailed warning shown when a user points the sync at a folder that already
+    /// contains files. The sync mode/direction is chosen on a later step, so the copy
+    /// stays mode-agnostic and names the folder rather than assuming a specific behaviour.
+    private var nonEmptyDirWarningMessage: String {
+        let count = pendingLocalItemCount
+        let itemWord = count == 1 ? "item" : "items"
+        let folderName = URL(fileURLWithPath: pendingLocalPath).lastPathComponent
+        return """
+        \"\(folderName)\" already contains \(count) \(itemWord).
+
+        On the first sync, these files are combined with the remote. Depending on the sync mode and direction you choose next, files can be uploaded, overwritten, or deleted on either side — which can be hard to undo.
+
+        Only continue if that's what you intend.
+        """
     }
 
     private func saveProfile() {

@@ -30,6 +30,7 @@ struct SyncTraySettings {
         static let telemetryEnabled = "telemetryEnabled"
         static let installationId = "installationId"
         static let telemetryBannerDismissedVersion = "telemetryBannerDismissedVersion"
+        static let lastLaunchedVersion = "lastLaunchedVersion"
     }
 
     // MARK: - Telemetry Settings
@@ -93,6 +94,14 @@ struct SyncTraySettings {
     /// Whether the banner should be shown — true if the user hasn't dismissed the current version.
     static var telemetryBannerDismissed: Bool {
         telemetryBannerDismissedVersion >= currentTelemetryConsentVersion
+    }
+
+    /// The `service.version` recorded the last time the app launched.
+    /// Used to detect upgrades (deployment markers) across launches.
+    /// nil on a fresh install (no upgrade event should be emitted then).
+    static var lastLaunchedVersion: String? {
+        get { defaults.string(forKey: Keys.lastLaunchedVersion) }
+        set { defaults.set(newValue, forKey: Keys.lastLaunchedVersion) }
     }
 
     // MARK: - Debug Settings
