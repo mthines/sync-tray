@@ -830,14 +830,6 @@ struct SetupWizardView: View {
         """
     }
 
-    /// Gate: wasFirstProfile must be set as the FIRST statement, before profileStore.add() changes the count.
-    private var shouldShowHelpImproveStep: Bool {
-        wasFirstProfile
-            && !isEditMode
-            && !SyncTraySettings.telemetryEnabled
-            && !SyncTraySettings.telemetryBannerDismissed
-    }
-
     private func saveProfile() {
         // Capture BEFORE profileStore.add() changes the count
         wasFirstProfile = profileStore.profiles.isEmpty
