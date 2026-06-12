@@ -212,7 +212,7 @@ All key lifecycle events are emitted as structured OTel logs:
 - Sync precondition failures: script_not_found, config_not_found (setup issue detection)
 - Resumed external syncs: syncs detected running at startup (launchd overlap detection)
 - App upgraded: `service.version` changed since the previous launch (deployment markers)
-- Auto-fix: automatic --resync triggered (`triggered`) or suppressed by backoff (`gave_up_backoff`)
+- Auto-fix: automatic --resync triggered (`triggered`), suppressed by backoff (`gave_up_backoff`), or skipped because the external drive is not mounted (`skipped_drive_not_mounted`)
 
 ## Swift SDK Gotcha: Wildcard View Required
 

@@ -366,14 +366,16 @@ enum SyncLogPatterns {
     }
 
     /// Error pattern that triggers automatic recovery via --resync.
-    /// Matches the canonical bisync "out of sync" message that requires --resync.
+    /// Matches the canonical bisync "out of sync" messages that require --resync.
     /// NOTE: Do NOT match bare "--resync" as a substring — rclone error output from a
     /// *failed* resync can itself contain "--resync" at critical level, which would
     /// re-trigger auto-fix and create a feedback loop.
+    /// NOTE: "cannot find prior listing" is the full rclone phrase; matching only the
+    /// "cannot find prior" prefix would also catch unrelated rclone warnings.
     static func isOutOfSyncError(_ message: String) -> Bool {
         message.contains("out of sync") ||
         message.contains("resync to recover") ||
-        message.contains("cannot find prior")
+        message.contains("cannot find prior listing")
     }
 
     // MARK: - Error Categorization

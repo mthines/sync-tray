@@ -440,9 +440,10 @@ final class SyncManager: ObservableObject {
     ///
     /// Called from `processLogEvent` when the auto-fix setting is enabled and the
     /// profile enters an out-of-sync error state. Implements a backoff guard:
-    /// if the same profile triggers auto-fix **twice within 5 minutes** and both
-    /// attempts end in failure, auto-fix is suppressed for that profile until a
-    /// successful sync clears the suppression.
+    /// if the same profile triggers auto-fix **twice within 5 minutes**, auto-fix
+    /// is suppressed for that profile until a successful sync clears the suppression.
+    /// Note: suppression fires on the 2nd trigger (not the 2nd confirmed failure),
+    /// because confirming failure requires the log-watcher round-trip.
     ///
     /// Reuses the same rclone bisync --resync process that `ProfileDetailView.runResync()`
     /// runs, but without UI state (the progress bar / output panel in the settings
@@ -471,6 +472,11 @@ final class SyncManager: ObservableObject {
         if !profile.drivePathToMonitor.isEmpty,
            !FileManager.default.fileExists(atPath: profile.drivePathToMonitor) {
             SyncTraySettings.debugLog("Auto-fix skipped: external drive not mounted for '\(profile.name)'")
+            TelemetryService.shared.recordAutoFixTriggered(
+                profileId: profileId,
+                profileName: profile.name,
+                result: "skipped_drive_not_mounted"
+            )
             profileStates[profileId] = .driveNotMounted
             updateAggregateState()
             return
@@ -525,6 +531,9 @@ final class SyncManager: ObservableObject {
         // Clear current error and mark syncing so the UI updates
         clearError(for: profileId)
         setSyncing(for: profileId, isSyncing: true)
+        // Ensure the log-watcher uses its faster polling cadence so it sees the
+        // upcoming "Starting bisync" / "Bisync completed" markers promptly.
+        logWatchers[profileId]?.setActivelySyncing(true)
 
         // Mark in-flight before dispatching
         autoFixInFlight.insert(profileId)
@@ -547,6 +556,7 @@ final class SyncManager: ObservableObject {
         let drivePathToMonitor = profile.drivePathToMonitor
         let filterPath = profile.filterFilePath
         let lockPath = profile.lockFilePath
+        let logPath = profile.logPath
         let syncMode = profile.syncMode
         let syncDirection = profile.syncDirection
         let additionalFlags = profile.additionalRcloneFlags
@@ -562,10 +572,8 @@ final class SyncManager: ObservableObject {
            let existingPid = Int32(existingPidStr),
            kill(existingPid, 0) == 0 {
             SyncTraySettings.debugLog("Resync already in progress for '\(profile.name)', skipping auto-fix")
-            await MainActor.run {
-                self.autoFixInFlight.remove(profileId)
-                self.setSyncing(for: profileId, isSyncing: false)
-            }
+            autoFixInFlight.remove(profileId)
+            setSyncing(for: profileId, isSyncing: false)
             return
         }
 
@@ -576,11 +584,9 @@ final class SyncManager: ObservableObject {
         if !drivePathToMonitor.isEmpty,
            !FileManager.default.fileExists(atPath: drivePathToMonitor) {
             SyncTraySettings.debugLog("Auto-fix aborted: external drive unmounted before resync for '\(profile.name)'")
-            await MainActor.run {
-                self.autoFixInFlight.remove(profileId)
-                self.profileStates[profileId] = .driveNotMounted
-                self.updateAggregateState()
-            }
+            autoFixInFlight.remove(profileId)
+            profileStates[profileId] = .driveNotMounted
+            updateAggregateState()
             return
         }
 
@@ -591,10 +597,8 @@ final class SyncManager: ObservableObject {
         let sentinelWritten = (try? Data("pending".utf8).write(to: lockURL)) != nil
         if !sentinelWritten {
             SyncTraySettings.debugLog("Could not write sentinel lock for '\(profile.name)' — aborting auto-fix")
-            await MainActor.run {
-                self.autoFixInFlight.remove(profileId)
-                self.setSyncing(for: profileId, isSyncing: false)
-            }
+            autoFixInFlight.remove(profileId)
+            setSyncing(for: profileId, isSyncing: false)
             return
         }
 
@@ -626,9 +630,7 @@ final class SyncManager: ObservableObject {
                     // This mirrors the fallback logic in the launchd-generated shell script.
                     var effectiveRemotePath = "\(rcloneRemote):\(remotePath)"
                     var extraEnv: [String: String] = [:]
-
-                    let isFallbackActive: Bool
-                    if case .fallback = fallbackTransport { isFallbackActive = true } else { isFallbackActive = false }
+                    let isFallbackActive = fallbackTransport.isFallback
 
                     if isFallbackActive && !fallbackRemote.isEmpty {
                         if fallbackRequiresCacheRebuild || !fallbackRemotePath.isEmpty {
@@ -692,11 +694,47 @@ final class SyncManager: ObservableObject {
                         process.environment = env
                     }
 
-                    process.standardOutput = Pipe()
-                    process.standardError = Pipe()
+                    // Route rclone output into the profile log file so the LogWatcher
+                    // pipeline fires `.syncStarted` / `.syncCompleted` / `.syncFailed`.
+                    // Without this, the profile would stay in `.syncing` indefinitely —
+                    // the watcher would never see process termination. The bracket
+                    // markers below mirror what `synctray-sync.sh` writes via `tee`.
+                    if !fileManager.fileExists(atPath: logPath) {
+                        fileManager.createFile(atPath: logPath, contents: nil)
+                    }
+                    let timestampFormatter = DateFormatter()
+                    timestampFormatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
+                    timestampFormatter.locale = Locale(identifier: "en_US_POSIX")
+                    let appendLog: (String) -> Void = { message in
+                        let line = "\(timestampFormatter.string(from: Date())) - \(message)\n"
+                        guard let data = line.data(using: .utf8),
+                              let handle = FileHandle(forWritingAtPath: logPath) else { return }
+                        handle.seekToEndOfFile()
+                        handle.write(data)
+                        try? handle.close()
+                    }
 
-                    process.terminationHandler = { _ in
-                        // Remove lock file on exit (whether success or failure)
+                    guard let processLog = FileHandle(forWritingAtPath: logPath) else {
+                        try? fileManager.removeItem(atPath: lockPath)
+                        continuation.resume(throwing: NSError(
+                            domain: "SyncManager",
+                            code: 2,
+                            userInfo: [NSLocalizedDescriptionKey: "could not open log file"]
+                        ))
+                        return
+                    }
+                    processLog.seekToEndOfFile()
+                    process.standardOutput = processLog
+                    process.standardError = processLog
+
+                    appendLog("Starting bisync (auto-fix --resync)")
+
+                    process.terminationHandler = { proc in
+                        try? processLog.close()
+                        let exit = proc.terminationStatus
+                        appendLog(exit == 0
+                            ? "Bisync completed successfully"
+                            : "Bisync failed with exit code \(exit)")
                         try? fileManager.removeItem(atPath: lockPath)
                         continuation.resume()
                     }
@@ -707,23 +745,23 @@ final class SyncManager: ObservableObject {
                         try? "\(process.processIdentifier)".write(
                             toFile: lockPath, atomically: true, encoding: .utf8)
                     } catch {
+                        try? processLog.close()
+                        appendLog("Auto-fix failed to launch rclone: \(error.localizedDescription)")
                         try? fileManager.removeItem(atPath: lockPath)
                         continuation.resume(throwing: error)
                     }
                 }
             }
         } catch {
-            await MainActor.run {
-                SyncTraySettings.debugLog("Auto-fix process error for '\(profile.name)': \(error)")
-                self.autoFixInFlight.remove(profileId)
-                self.setSyncing(for: profileId, isSyncing: false)
-            }
+            SyncTraySettings.debugLog("Auto-fix process error for '\(profile.name)': \(error)")
+            autoFixInFlight.remove(profileId)
+            setSyncing(for: profileId, isSyncing: false)
             return
         }
 
-        // Clear in-flight on clean exit (log-watcher pipeline handles state via syncCompleted/syncFailed)
+        // Clear in-flight on clean exit. State after completion (idle / error) is set by
+        // the log-watcher pipeline via .syncCompleted / .syncFailed.
         autoFixInFlight.remove(profileId)
-        // State after completion is set by the log-watcher pipeline (same as regular syncs).
     }
 
     // MARK: - Notification Muting

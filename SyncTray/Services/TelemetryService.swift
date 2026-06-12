@@ -931,11 +931,12 @@ final class TelemetryService {
     ///   - profileId:   UUID of the affected profile.
     ///   - profileName: Display name of the affected profile.
     ///   - result:      `"triggered"` when the resync starts; `"gave_up_backoff"` when
-    ///                  backoff suppresses the retry after repeated failures.
+    ///                  backoff suppresses the retry after repeated triggers;
+    ///                  `"skipped_drive_not_mounted"` when the external drive is absent.
     func recordAutoFixTriggered(
         profileId: UUID,
         profileName: String,
-        result: String     // "triggered" | "gave_up_backoff"
+        result: String     // "triggered" | "gave_up_backoff" | "skipped_drive_not_mounted"
     ) {
         guard SyncTraySettings.telemetryEnabled else { return }
         ensureSetup()
@@ -945,11 +946,19 @@ final class TelemetryService {
             "result": .string(result),
         ])
 
+        let severity: Severity = result == "gave_up_backoff" ? .warn : .info
+        let body: String
+        switch result {
+        case "gave_up_backoff":
+            body = "Auto-fix suppressed by backoff for \(profileName)"
+        case "skipped_drive_not_mounted":
+            body = "Auto-fix skipped: external drive not mounted for \(profileName)"
+        default:
+            body = "Auto-resyncing \(profileName) after sync conflict"
+        }
         emitLog(
-            severity: result == "gave_up_backoff" ? .warn : .info,
-            body: result == "gave_up_backoff"
-                ? "Auto-fix suppressed by backoff for \(profileName)"
-                : "Auto-resyncing \(profileName) after sync conflict",
+            severity: severity,
+            body: body,
             attributes: [
                 "synctray.profile.id": .string(profileId.uuidString),
                 "synctray.profile.name": .string(profileName),
