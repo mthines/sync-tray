@@ -1,0 +1,359 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  workflow_dispatch:
+    inputs:
+      force_release:
+        description: 'Force release even if no changes detected'
+        type: boolean
+        default: false
+      dry_run:
+        description: 'Dry run (no publishing)'
+        type: boolean
+        default: false
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  # ===========================================================================
+  # detect-changes — determine event context (push vs PR vs dispatch),
+  # whether this run should publish a beta or stable, and skip release-loop
+  # commits to avoid retriggering ourselves.
+  # ===========================================================================
+  detect-changes:
+    runs-on: ubuntu-latest
+    outputs:
+      should_release: ${{ steps.detect.outputs.should_release }}
+      is_beta: ${{ steps.detect.outputs.is_beta }}
+      pr_number: ${{ steps.detect.outputs.pr_number }}
+      base_ref: ${{ steps.detect.outputs.base_ref }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fetch all tags
+        run: git fetch --tags --force
+
+      - name: Detect context
+        id: detect
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FORCE_RELEASE: ${{ inputs.force_release }}
+        run: |
+          IS_BETA="false"
+          PR_NUMBER=""
+          BASE_REF="main"
+          SHOULD_RELEASE="true"
+
+          if [ "${{ github.event_name }}" = "push" ]; then
+            LAST_STABLE_TAG=$(git tag -l "v*" --sort=-version:refname | grep -E "^v[0-9]" | grep -v "beta" | head -n 1 || echo "")
+            if [ -n "$LAST_STABLE_TAG" ]; then
+              BASE_REF="$LAST_STABLE_TAG"
+            else
+              BASE_REF="HEAD~1"
+            fi
+            echo "::notice::Push to main — comparing against $BASE_REF"
+
+          elif [ "${{ github.event_name }}" = "pull_request" ]; then
+            BASE_REF="origin/${{ github.base_ref }}"
+            PR_NUMBER="${{ github.event.pull_request.number }}"
+            if [ "${{ github.event.pull_request.draft }}" = "false" ]; then
+              IS_BETA="true"
+            else
+              SHOULD_RELEASE="false"
+            fi
+            echo "::notice::PR #$PR_NUMBER — base=$BASE_REF draft=${{ github.event.pull_request.draft }}"
+
+          elif [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            if [ "${{ github.ref }}" = "refs/heads/main" ]; then
+              LAST_STABLE_TAG=$(git tag -l "v*" --sort=-version:refname | grep -E "^v[0-9]" | grep -v "beta" | head -n 1 || echo "")
+              if [ -n "$LAST_STABLE_TAG" ]; then
+                BASE_REF="$LAST_STABLE_TAG"
+              else
+                BASE_REF="HEAD~1"
+              fi
+            else
+              PR_INFO=$(gh pr view --json number,baseRefName,state 2>/dev/null || echo "")
+              if [ -n "$PR_INFO" ]; then
+                PR_STATE=$(echo "$PR_INFO" | jq -r '.state')
+                if [ "$PR_STATE" = "OPEN" ]; then
+                  PR_NUMBER=$(echo "$PR_INFO" | jq -r '.number')
+                  BASE_REF="origin/$(echo "$PR_INFO" | jq -r '.baseRefName')"
+                  IS_BETA="true"
+                fi
+              fi
+              if [ -z "$PR_NUMBER" ]; then
+                BASE_REF="HEAD~1"
+              fi
+            fi
+            echo "::notice::workflow_dispatch — base=$BASE_REF"
+          fi
+
+          # Skip release-loop commits on push events (their tag was already pushed in a prior run)
+          COMMIT_MSG=$(git log -1 --pretty=%s)
+          if [ "${{ github.event_name }}" = "push" ] && [ "$FORCE_RELEASE" != "true" ]; then
+            if [[ "$COMMIT_MSG" =~ ^chore\(release\): ]] || [[ "$COMMIT_MSG" =~ ^feat\(cask\): ]]; then
+              echo "::notice::Skipping release for commit: $COMMIT_MSG"
+              SHOULD_RELEASE="false"
+            fi
+          fi
+
+          echo "should_release=$SHOULD_RELEASE" >> "$GITHUB_OUTPUT"
+          echo "is_beta=$IS_BETA" >> "$GITHUB_OUTPUT"
+          echo "pr_number=$PR_NUMBER" >> "$GITHUB_OUTPUT"
+          echo "base_ref=$BASE_REF" >> "$GITHUB_OUTPUT"
+
+  # ===========================================================================
+  # test — compile the Debug build as a smoke test. SyncTray has no XCTest
+  # target in its scheme (see project.json `test` target), so the build itself
+  # is the gate.
+  # ===========================================================================
+  test:
+    needs: detect-changes
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.ref }}
+
+      - name: Build (Debug)
+        run: |
+          set -o pipefail
+          xcodebuild -project SyncTray.xcodeproj \
+            -scheme SyncTray \
+            -destination 'platform=macOS' \
+            -configuration Debug \
+            build \
+            ONLY_ACTIVE_ARCH=NO \
+            | tail -30
+
+  # ===========================================================================
+  # version — calculate the next version from conventional commits and create
+  # the git tag. Stable bumps Info.plist + commits chore(release) to main.
+  # Beta only creates the annotated tag.
+  # ===========================================================================
+  version:
+    needs: [detect-changes, test]
+    if: |
+      always() &&
+      needs.test.result == 'success' &&
+      needs.detect-changes.outputs.should_release == 'true' &&
+      !inputs.dry_run &&
+      (
+        (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+        (github.event_name == 'pull_request' && github.event.pull_request.draft == false) ||
+        (github.event_name == 'workflow_dispatch')
+      )
+    runs-on: macos-latest
+    permissions:
+      contents: write
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+      created: ${{ steps.tag.outputs.created }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha || github.ref }}
+          token: ${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}
+
+      - name: Fetch all tags
+        run: git fetch --tags --force
+
+      - name: Calculate version
+        id: version
+        env:
+          IS_BETA: ${{ needs.detect-changes.outputs.is_beta }}
+          PR_NUMBER: ${{ needs.detect-changes.outputs.pr_number }}
+          BASE_REF: ${{ needs.detect-changes.outputs.base_ref }}
+          FORCE_RELEASE: ${{ inputs.force_release }}
+        run: |
+          # Version source of truth: latest non-beta git tag, falling back to Info.plist
+          LAST_STABLE_TAG=$(git tag -l "v*" --sort=-version:refname | grep -E "^v[0-9]" | grep -v "beta" | head -n 1 || echo "")
+          if [ -n "$LAST_STABLE_TAG" ]; then
+            CURRENT="${LAST_STABLE_TAG#v}"
+            echo "::notice::Version source: tag $LAST_STABLE_TAG"
+          else
+            CURRENT=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" SyncTray/Info.plist 2>/dev/null || echo "0.0.0")
+            echo "::notice::Version source: Info.plist ($CURRENT) — no tags found"
+          fi
+          IFS='.' read -ra V <<< "$CURRENT"
+
+          # Determine bump type from conventional commits since base ref
+          COMMITS=$(git log "${BASE_REF}..HEAD" --pretty=format:"%s" --no-merges 2>/dev/null || git log HEAD~10..HEAD --pretty=format:"%s" --no-merges)
+          BUMP="patch"
+          if echo "$COMMITS" | grep -qE "(BREAKING CHANGE|^[a-z]+(\(.+\))?!:)"; then
+            BUMP="major"
+          elif echo "$COMMITS" | grep -qE "^feat(\(.+\))?:"; then
+            BUMP="minor"
+          fi
+          echo "::notice::Bump type: $BUMP"
+
+          case "$BUMP" in
+            major) V[0]=$((V[0] + 1)); V[1]=0; V[2]=0 ;;
+            minor) V[1]=$((V[1] + 1)); V[2]=0 ;;
+            patch) V[2]=$((V[2] + 1)) ;;
+          esac
+
+          BASE_VERSION="${V[0]}.${V[1]}.${V[2]}"
+
+          if [ "$IS_BETA" = "true" ] && [ -n "$PR_NUMBER" ]; then
+            # v{X.Y.Z}-beta.{PR#}.{n}
+            EXISTING=$(git tag -l "v${BASE_VERSION}-beta.${PR_NUMBER}.*" | wc -l | tr -d ' ')
+            BETA_NUM=$((EXISTING + 1))
+            NEW_VERSION="${BASE_VERSION}-beta.${PR_NUMBER}.${BETA_NUM}"
+            echo "::notice::Beta version: $NEW_VERSION"
+          else
+            NEW_VERSION="$BASE_VERSION"
+            # Force mode: increment past any collisions
+            if [ "$FORCE_RELEASE" = "true" ]; then
+              ATTEMPTS=0
+              while git rev-parse "v$NEW_VERSION" >/dev/null 2>&1; do
+                ATTEMPTS=$((ATTEMPTS + 1))
+                if [ $ATTEMPTS -ge 100 ]; then
+                  echo "::error::Could not find available version after 100 attempts"
+                  exit 1
+                fi
+                V[2]=$((V[2] + 1))
+                NEW_VERSION="${V[0]}.${V[1]}.${V[2]}"
+              done
+            fi
+            echo "::notice::Stable version: $NEW_VERSION"
+          fi
+
+          echo "version=$NEW_VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=v$NEW_VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Create tag
+        id: tag
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          TAG: ${{ steps.version.outputs.tag }}
+          IS_BETA: ${{ needs.detect-changes.outputs.is_beta }}
+        run: |
+          # Race-safe: bail out if the tag already exists (parallel/retried run)
+          if git rev-parse "$TAG" >/dev/null 2>&1; then
+            echo "::warning::Tag $TAG already exists — skipping version job"
+            echo "created=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          if [ "$IS_BETA" = "true" ]; then
+            # Beta: just annotate the PR head SHA — no Info.plist change, no commit
+            git tag -a "$TAG" -m "Beta release $TAG"
+            git push origin "$TAG"
+            echo "::notice::Created beta tag $TAG"
+          else
+            # Stable: bump Info.plist, commit, tag, push both
+            /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $VERSION" SyncTray/Info.plist
+            git add SyncTray/Info.plist
+            git commit -m "chore(release): bump version to $TAG"
+            git tag -a "$TAG" -m "Release $TAG"
+            git push origin main
+            git push origin "$TAG"
+            echo "::notice::Created stable release $TAG"
+          fi
+
+          echo "created=true" >> "$GITHUB_OUTPUT"
+
+  # ===========================================================================
+  # release-macos — build the Release .app, zip it, create the GitHub release,
+  # update the homebrew tap, and (stable only) sync Casks/synctray.rb back to
+  # the source repo so it stays in lockstep with the tap.
+  # ===========================================================================
+  release-macos:
+    needs: [detect-changes, version]
+    if: always() && needs.version.outputs.created == 'true'
+    runs-on: macos-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ needs.version.outputs.tag }}
+          token: ${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}
+
+      - name: Run release script
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          DASH0_AUTH_TOKEN: ${{ secrets.DASH0_AUTH_TOKEN }}
+          RELEASE_VERSION: ${{ needs.version.outputs.tag }}
+          PR_NUMBER: ${{ needs.detect-changes.outputs.pr_number }}
+          IS_BETA: ${{ needs.detect-changes.outputs.is_beta }}
+        run: bash scripts/release-ci.sh
+
+      - name: Sync in-repo cask (stable only)
+        if: needs.detect-changes.outputs.is_beta == 'false'
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+          ZIP_SHA: ${{ env.ZIP_SHA }}
+        run: |
+          # Move back to main, apply the cask change, push.
+          # We arrived here on a detached HEAD at the tag.
+          git fetch origin main
+          git switch main
+          git pull --ff-only origin main
+
+          sed -i '' "s/version \"[^\"]*\"/version \"${VERSION}\"/" Casks/synctray.rb
+          sed -i '' "s/sha256 \"[^\"]*\"/sha256 \"${ZIP_SHA}\"/" Casks/synctray.rb
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Casks/synctray.rb
+          if git diff --cached --quiet; then
+            echo "::notice::Casks/synctray.rb already up to date"
+          else
+            git commit -m "feat(cask): update SyncTray to version ${VERSION} with new SHA256 checksum"
+            git push origin main
+          fi
+
+      - name: Comment on PR (beta)
+        if: needs.detect-changes.outputs.is_beta == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const version = '${{ needs.version.outputs.version }}';
+            const prNumber = '${{ needs.detect-changes.outputs.pr_number }}';
+            const body = `## 🧪 Beta Release Published
+
+            **Version:** \`${version}\`
+
+            ### Install
+            \`\`\`bash
+            brew tap mthines/synctray
+
+            # Latest beta from this PR
+            brew install --cask mthines/synctray/synctray-beta
+
+            # This exact version (pinned)
+            brew install --cask mthines/synctray/synctray-beta@${version}
+            \`\`\`
+
+            > Beta and stable share the same \`/Applications/SyncTray.app\` path, so installing one replaces the other. Reinstall stable with \`brew install --cask mthines/synctray/synctray\` when done testing.
+
+            [View release](https://github.com/${context.repo.owner}/${context.repo.repo}/releases/tag/v${version})`;
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: parseInt(prNumber),
+              body: body.split('\n').map(line => line.trim()).join('\n')
+            });
