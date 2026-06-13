@@ -46,6 +46,8 @@ struct AppSettingsView: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
                 }
 
+                helpFeedbackSection
+
                 aboutSection
             }
             .padding(24)
@@ -155,6 +157,34 @@ struct AppSettingsView: View {
         }
         .onChange(of: debugLogging) { newValue in
             SyncTraySettings.debugLoggingEnabled = newValue
+        }
+    }
+
+    // MARK: - Help & Feedback
+
+    private var helpFeedbackSection: some View {
+        GroupBox("Help & Feedback") {
+            VStack(alignment: .leading, spacing: 12) {
+                HStack(alignment: .top, spacing: 12) {
+                    Image(systemName: "bubble.left.and.bubble.right.fill")
+                        .font(.title3)
+                        .foregroundStyle(.tint)
+                        .accessibilityHidden(true)
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Join the SyncTray community on Discord")
+                            .font(.body)
+                        Text("Ask for help, share feedback, or suggest features.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        Link("Open Discord", destination: URL(string: "https://discord.gg/KBp8kb3EwP")!)
+                            .font(.caption)
+                            .padding(.top, 2)
+                    }
+                    Spacer(minLength: 0)
+                }
+            }
+            .padding(4)
+            .frame(maxWidth: .infinity, alignment: .leading)
         }
     }
 

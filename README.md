@@ -487,6 +487,13 @@ Uses [Conventional Commits](https://www.conventionalcommits.org/):
 
 ---
 
+## Community & Support
+
+Need help, want to share feedback, or have a feature idea?
+Join the SyncTray community on Discord: <https://discord.gg/KBp8kb3EwP>
+
+You can also reach the same link from inside the app via **Settings → Help & Feedback** or the menu bar dropdown.
+
 ## Contributing
 
 Contributions are welcome! Please feel free to submit a Pull Request.
