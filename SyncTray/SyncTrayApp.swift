@@ -160,6 +160,20 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUserNoti
         TelemetryService.shared.shutdown()
     }
 
+    /// Called when the user clicks the Dock icon. While Settings is open the app is in
+    /// `.regular` activation policy and shows in the Dock; clicking that icon should
+    /// reopen / unminimize the Settings window, not be a no-op.
+    ///
+    /// - `flag` is `false` when there are no visible windows (closed or miniaturized).
+    ///   `makeKeyAndOrderFront` inside `openSettingsWindow` deminiaturizes if needed.
+    /// - When `flag` is `true` we return `true` and let AppKit bring the app forward.
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        if !flag {
+            openSettingsWindow()
+        }
+        return true
+    }
+
     func openSettingsWindow() {
         SyncTraySettings.debugLog("[SyncTray] openSettingsWindow called, shared=\(AppDelegate.shared != nil), manager=\(AppDelegate.sharedSyncManager != nil)")
 
