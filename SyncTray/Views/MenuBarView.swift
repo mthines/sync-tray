@@ -300,6 +300,21 @@ struct MenuBarView: View {
             .padding(.horizontal, 8)
             .padding(.vertical, 6)
 
+            // Help & Feedback button — opens Discord community
+            Button(action: { openDiscordCommunity() }) {
+                HStack {
+                    Image(systemName: "bubble.left.and.bubble.right")
+                    Text("Help & Feedback")
+                    Spacer()
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 6)
+            .help("Ask for help, share feedback, or suggest features on Discord")
+
             Divider()
                 .padding(.vertical, 4)
 
@@ -321,6 +336,12 @@ struct MenuBarView: View {
 
     private func openSettingsWindow() {
         AppDelegate.shared?.openSettingsWindow()
+    }
+
+    private func openDiscordCommunity() {
+        if let url = URL(string: "https://discord.gg/KBp8kb3EwP") {
+            NSWorkspace.shared.open(url)
+        }
     }
 }
 
