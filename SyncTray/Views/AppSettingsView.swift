@@ -167,29 +167,18 @@ struct AppSettingsView: View {
     }
 
     private func detectRcloneVersion() async -> String {
-        await withCheckedContinuation { continuation in
-            DispatchQueue.global(qos: .utility).async {
-                let process = Process()
-                let pipe = Pipe()
-                process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-                process.arguments = ["rclone", "version", "--check"]
-                process.standardOutput = pipe
-                process.standardError = pipe
-
-                do {
-                    try process.run()
-                    process.waitUntilExit()
-                    let data = pipe.fileHandleForReading.readDataToEndOfFile()
-                    let output = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-                    // Extract version from first line like "rclone v1.65.0"
-                    let firstLine = output.components(separatedBy: "\n").first ?? output
-                    let version = firstLine.replacingOccurrences(of: "rclone ", with: "")
-                    continuation.resume(returning: version.isEmpty ? "Not found" : version)
-                } catch {
-                    continuation.resume(returning: "Not found")
-                }
+        // RcloneConfigService.getRcloneVersion() resolves rclone via a list of
+        // candidate absolute paths (/opt/homebrew/bin, /usr/local/bin, /usr/bin)
+        // so it works correctly in macOS GUI apps that inherit a minimal PATH.
+        await Task.detached(priority: .utility) {
+            guard let raw = RcloneConfigService.shared.getRcloneVersion() else {
+                return "Not found"
             }
-        }
+            // raw is the first line from `rclone version`, e.g. "rclone v1.65.0"
+            let version = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+                .replacingOccurrences(of: "rclone ", with: "")
+            return version.isEmpty ? "Not found" : version
+        }.value
     }
 }
 
