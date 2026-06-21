@@ -2704,7 +2704,6 @@ struct ProfileDetailView: View {
         case unlockAndRetry // Just remove locks and retry normal sync (no resync)
         case unlock
         case retrySync
-        case createCheckFiles
         case forceSync      // Override "too many deletes" safety check
         case mountAnyway    // Enable non-empty mount and retry
 
@@ -2722,8 +2721,6 @@ struct ProfileDetailView: View {
                 return "Remove Lock File"
             case .retrySync:
                 return "Retry Sync"
-            case .createCheckFiles:
-                return "Create Check Files & Sync"
             case .forceSync:
                 return "Force Sync (Override Safety)"
             case .mountAnyway:
@@ -2745,8 +2742,6 @@ struct ProfileDetailView: View {
                 return "Removing lock..."
             case .retrySync:
                 return "Syncing..."
-            case .createCheckFiles:
-                return "Creating check files..."
             case .forceSync:
                 return "Force syncing..."
             case .mountAnyway:
@@ -2768,8 +2763,6 @@ struct ProfileDetailView: View {
                 return "lock.slash"
             case .retrySync:
                 return "arrow.clockwise"
-            case .createCheckFiles:
-                return "checkmark.circle"
             case .forceSync:
                 return "exclamationmark.triangle"
             case .mountAnyway:
@@ -2791,8 +2784,6 @@ struct ProfileDetailView: View {
                 return "Remove the lock file blocking sync"
             case .retrySync:
                 return "Try running the sync again"
-            case .createCheckFiles:
-                return "Create .synctray-check files required for access check"
             case .forceSync:
                 return "Override the 50% deletion safety limit and proceed with sync"
             case .mountAnyway:
@@ -2827,9 +2818,10 @@ struct ProfileDetailView: View {
             return .smartFix
         }
 
-        // Check access failed - need to create check files
-        if error.contains("RCLONE_TEST") || error.contains(".synctray-check") ||
-           error.contains("check file") || error.contains("Access test failed") {
+        // Legacy access-test failure (older rclone --check-access output). SyncTray no
+        // longer uses --check-access, but if such a message ever surfaces, Smart Fix
+        // (unlock → cleanup → --resync) is the correct recovery.
+        if error.contains("Access test failed") {
             return .smartFix
         }
 
@@ -2871,8 +2863,6 @@ struct ProfileDetailView: View {
             removeLockFile()
         case .retrySync:
             syncManager.triggerManualSync(for: profile)
-        case .createCheckFiles:
-            createCheckFilesAndSync()
         case .forceSync:
             runForceSync()
         case .mountAnyway:
@@ -3038,9 +3028,6 @@ struct ProfileDetailView: View {
                 arguments.append(contentsOf: ["--filter-from", capturedFilterPath])
             }
 
-            // Add check access
-            arguments.append(contentsOf: ["--check-access", "--check-filename", ".synctray-check"])
-
             // Add resilient recovery options
             arguments.append(contentsOf: ["--resilient", "--recover", "--conflict-resolve", "newer", "--conflict-loser", "num", "--conflict-suffix", "sync-conflict-{DateOnly}-"])
 
@@ -3155,9 +3142,7 @@ struct ProfileDetailView: View {
         syncManager.setSyncing(for: profile.id, isSyncing: true)
 
         // Capture values from main thread before going to background (CLAUDE.md rule 1)
-        let localPath = profile.localSyncPath
         let lockFilePath = profile.lockFilePath
-        let checkFileName = SyncSetupService.checkFileName
         let bisyncDir = "\(NSHomeDirectory())/Library/Caches/rclone/bisync"
 
         appendOutputLine("🔧 Smart Fix: Resolving sync issues...")
@@ -3204,44 +3189,16 @@ struct ProfileDetailView: View {
                 self.appendOutputLine("")
             }
 
-            // Step 2: Ensure check files exist
+            // Step 2: Remove obsolete .synctray-check files (legacy access-check).
+            // SyncTray no longer uses rclone --check-access, so these are cleaned up.
             DispatchQueue.main.async {
-                self.appendOutputLine("Step 2/3: Verifying check files...")
+                self.appendOutputLine("Step 2/3: Removing legacy check files...")
             }
 
-            // Check local check file
-            let localCheckFile = (localPath as NSString).appendingPathComponent(checkFileName)
-            var localCheckExists = fileManager.fileExists(atPath: localCheckFile)
-
-            if !localCheckExists {
-                // Try to create it
-                if fileManager.createFile(atPath: localCheckFile, contents: nil) {
-                    localCheckExists = true
-                    DispatchQueue.main.async {
-                        self.appendOutputLine("  ✓ Created local .synctray-check file")
-                    }
-                } else {
-                    DispatchQueue.main.async {
-                        self.appendOutputLine("  ⚠ Could not create local .synctray-check file")
-                    }
-                }
-            } else {
-                DispatchQueue.main.async {
-                    self.appendOutputLine("  ✓ Local .synctray-check file exists")
-                }
-            }
-
-            // Ensure remote check file (centralized; verifies by read-back, robust to SFTP/WebDAV exit-code quirks)
             let captureProfile = self.profile
-            let checkFileError = setupService.ensureRemoteCheckFile(for: captureProfile)
-            if checkFileError == nil {
-                DispatchQueue.main.async {
-                    self.appendOutputLine("  ✓ Remote .synctray-check file ready")
-                }
-            } else {
-                DispatchQueue.main.async {
-                    self.appendOutputLine("  ⚠ Could not ensure remote check file: \(checkFileError ?? "unknown error")")
-                }
+            setupService.cleanupLegacyCheckFiles(for: captureProfile)
+            DispatchQueue.main.async {
+                self.appendOutputLine("  ✓ Removed any leftover .synctray-check files")
             }
 
             DispatchQueue.main.async {
@@ -3290,69 +3247,6 @@ struct ProfileDetailView: View {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
             self.isRunningResync = false
             self.runResync()
-        }
-    }
-
-    private func createCheckFilesAndSync() {
-        isRunningResync = true
-        resyncOutputLines = ["Creating check files (.synctray-check)..."]
-        showResyncOutput = true
-
-        // Clear error and set syncing state
-        syncManager.clearError(for: profile.id)
-        syncManager.setSyncing(for: profile.id, isSyncing: true)
-
-        // Capture values from main thread before going to background
-        let localPath = profile.localSyncPath
-        let checkFileName = SyncSetupService.checkFileName
-
-        DispatchQueue.global(qos: .userInitiated).async {
-            let fileManager = FileManager.default
-
-            // Create local check file (.synctray-check)
-            let localCheckFile = (localPath as NSString).appendingPathComponent(checkFileName)
-
-            DispatchQueue.main.async {
-                self.appendOutputLine("Local path: \(localCheckFile)")
-            }
-
-            // Create check file
-            if !fileManager.fileExists(atPath: localCheckFile) {
-                if !fileManager.createFile(atPath: localCheckFile, contents: nil) {
-                    DispatchQueue.main.async {
-                        self.appendOutputLine("✗ Failed to create local check file")
-                        self.isRunningResync = false
-                        self.syncManager.setSyncing(for: self.profile.id, isSyncing: false)
-                    }
-                    return
-                }
-            }
-
-            DispatchQueue.main.async {
-                self.appendOutputLine("✓ Created local .synctray-check file")
-            }
-
-            // Ensure remote check file (centralized; verifies by read-back, robust to SFTP/WebDAV exit-code quirks)
-            let captureProfile = self.profile
-            DispatchQueue.main.async {
-                self.appendOutputLine("Ensuring remote .synctray-check file...")
-            }
-            let checkFileError = setupService.ensureRemoteCheckFile(for: captureProfile)
-
-            DispatchQueue.main.async {
-                if checkFileError == nil {
-                    self.appendOutputLine("✓ Remote .synctray-check file ready")
-                    self.appendOutputLine("")
-                    self.appendOutputLine("Now running initial sync (--resync)...")
-
-                    // Run resync after creating files (needed because check-access failure corrupts listing files)
-                    self.runResync()
-                } else {
-                    self.appendOutputLine("✗ \(checkFileError ?? "Failed to ensure remote check file")")
-                    self.isRunningResync = false
-                    self.syncManager.setSyncing(for: self.profile.id, isSyncing: false)
-                }
-            }
         }
     }
 
