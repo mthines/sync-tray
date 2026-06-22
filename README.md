@@ -267,7 +267,7 @@ The app icon appears in your menu bar. A yellow gear indicates setup is needed.
 Click **Install** to activate the profile. SyncTray will:
 
 - Create the local directory if needed
-- Set up sync check files for safety
+- Establish the initial sync baseline
 - Install a background scheduler (launchd agent)
 - Start monitoring for changes
 
@@ -397,7 +397,7 @@ xattr -cr /Applications/SyncTray.app
 1. Click **View Log** in the menu to see detailed error messages
 2. Common issues:
    - Remote not accessible (check network/credentials)
-   - Check file missing (click Resync to recreate)
+   - Too many deletes detected — a safety limit that blocks accidental mass deletion (use **Fix Sync Issues**, or **Force Sync** if the deletion is intentional)
    - Conflicting changes detected (check log for details)
 
 ### Sync not running on schedule
