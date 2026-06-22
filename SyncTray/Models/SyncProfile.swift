@@ -25,8 +25,10 @@ struct SyncProfile: Identifiable, Codable, Equatable {
     var fallbackRequiresCacheRebuild: Bool
 
     // Mount mode specific settings
+    var mountBackend: MountBackend      // Mount backend: nfs (kext-free, default) or macfuse
     var vfsCacheMode: VFSCacheMode      // VFS cache mode for mount (default: full)
     var vfsCacheMaxSize: String         // Max cache size (e.g., "10G")
+    var vfsCacheMaxAge: String          // Keep cached files this long since last access (e.g., "168h")
     var vfsCachePath: String            // Cache directory path (default: ~/.cache/rclone)
     var allowNonEmptyMount: Bool        // Allow mounting to non-empty folders (default: false)
     var pinnedDirectories: [String]     // Directories to automatically cache offline (mount mode)
@@ -155,8 +157,10 @@ struct SyncProfile: Identifiable, Codable, Equatable {
         fallbackRemote: String = "",
         fallbackRemotePath: String = "",
         fallbackRequiresCacheRebuild: Bool = false,
+        mountBackend: MountBackend = .nfs,
         vfsCacheMode: VFSCacheMode = .full,
         vfsCacheMaxSize: String = "10G",
+        vfsCacheMaxAge: String = "168h",
         vfsCachePath: String = "",
         allowNonEmptyMount: Bool = false,
         pinnedDirectories: [String] = [],
@@ -177,8 +181,10 @@ struct SyncProfile: Identifiable, Codable, Equatable {
         self.fallbackRemote = fallbackRemote
         self.fallbackRemotePath = fallbackRemotePath
         self.fallbackRequiresCacheRebuild = fallbackRequiresCacheRebuild
+        self.mountBackend = mountBackend
         self.vfsCacheMode = vfsCacheMode
         self.vfsCacheMaxSize = vfsCacheMaxSize
+        self.vfsCacheMaxAge = vfsCacheMaxAge
         self.vfsCachePath = vfsCachePath.isEmpty ? "\(NSHomeDirectory())/.cache/rclone" : vfsCachePath
         self.allowNonEmptyMount = allowNonEmptyMount
         self.pinnedDirectories = pinnedDirectories
@@ -210,7 +216,8 @@ extension SyncProfile {
         case drivePathToMonitor, syncIntervalMinutes, additionalRcloneFlags
         case isEnabled, isMuted, syncMode, syncDirection
         case fallbackRemote, fallbackRemotePath, fallbackRequiresCacheRebuild
-        case vfsCacheMode, vfsCacheMaxSize, vfsCachePath, allowNonEmptyMount
+        case mountBackend
+        case vfsCacheMode, vfsCacheMaxSize, vfsCacheMaxAge, vfsCachePath, allowNonEmptyMount
         case pinnedDirectories, rcPort
     }
 
@@ -237,9 +244,13 @@ extension SyncProfile {
         // Backwards compatibility: defaults to false (preserves env-var-override behaviour for old profiles)
         fallbackRequiresCacheRebuild = try container.decodeIfPresent(
             Bool.self, forKey: .fallbackRequiresCacheRebuild) ?? false
-        // Backwards compatibility: mount mode settings with defaults
+        // Backwards compatibility: mount mode settings with defaults.
+        // Profiles created before the kext-free NFS backend existed default to
+        // macFUSE (their `rclone mount` behaviour is unchanged on upgrade).
+        mountBackend = try container.decodeIfPresent(MountBackend.self, forKey: .mountBackend) ?? .macfuse
         vfsCacheMode = try container.decodeIfPresent(VFSCacheMode.self, forKey: .vfsCacheMode) ?? .full
         vfsCacheMaxSize = try container.decodeIfPresent(String.self, forKey: .vfsCacheMaxSize) ?? "10G"
+        vfsCacheMaxAge = try container.decodeIfPresent(String.self, forKey: .vfsCacheMaxAge) ?? "168h"
         let cachePath = try container.decodeIfPresent(String.self, forKey: .vfsCachePath) ?? ""
         vfsCachePath = cachePath.isEmpty ? "\(NSHomeDirectory())/.cache/rclone" : cachePath
         // Backwards compatibility: default to false if not present

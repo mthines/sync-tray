@@ -431,11 +431,15 @@ enum SyncLogPatterns {
             return "Mount point folder is not empty. Choose an empty folder or clear its contents first."
         }
         if cleaned.contains("not supported on MacOS when rclone is installed via Homebrew") {
-            return "Mount mode requires the official rclone binary from rclone.org (Homebrew version doesn't support mount)."
+            return "The macFUSE backend requires the official rclone binary from rclone.org "
+                + "(Homebrew's rclone can't mount). Switch this profile's Mount Backend to "
+                + "NFS to stream without macFUSE."
         }
         if cleaned.contains("macfuse") || cleaned.contains("FUSE") || cleaned.contains("fuse") {
             if cleaned.contains("not found") || cleaned.contains("not installed") {
-                return "macFUSE is required for mount mode. Install via: brew install --cask macfuse"
+                return "macFUSE is required for the macFUSE backend. Install via "
+                    + "`brew install --cask macfuse`, or switch this profile's Mount Backend "
+                    + "to NFS to stream without it."
             }
         }
 

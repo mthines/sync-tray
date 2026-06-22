@@ -10,7 +10,7 @@ enum SyncMode: String, Codable, CaseIterable, Identifiable {
     /// Source is authoritative, destination is overwritten
     case sync = "sync"
 
-    /// Mount remote as virtual filesystem (rclone mount)
+    /// Mount remote as virtual filesystem (rclone mount / nfsmount)
     /// Files are streamed on-demand without local sync
     case mount = "mount"
 
@@ -127,6 +127,55 @@ enum VFSCacheMode: String, Codable, CaseIterable, Identifiable {
             return "Cache metadata and written files"
         case .full:
             return "Cache reads and writes (recommended)"
+        }
+    }
+}
+
+/// The filesystem backend used to expose a mount-mode profile in Finder.
+///
+/// `nfs` uses rclone's built-in NFS server + the macOS native NFS client
+/// (`rclone nfsmount`). It needs **no kernel extension** and nothing extra to
+/// install, so it works on locked-down / MDM-managed Macs where macFUSE's
+/// kext approval is blocked. This is the default.
+///
+/// `macfuse` uses the classic `rclone mount` (FUSE). It requires macFUSE (a
+/// system/kernel extension) plus the official rclone binary, and is kept for
+/// users who already have that set up and want its broader filesystem
+/// compatibility.
+enum MountBackend: String, Codable, CaseIterable, Identifiable {
+    /// Kext-free NFS mount via `rclone nfsmount` (default — no macFUSE needed)
+    case nfs = "nfs"
+
+    /// Classic FUSE mount via `rclone mount` (requires macFUSE)
+    case macfuse = "macfuse"
+
+    var id: String { rawValue }
+
+    var displayName: String {
+        switch self {
+        case .nfs:
+            return "NFS (no macFUSE)"
+        case .macfuse:
+            return "macFUSE"
+        }
+    }
+
+    var description: String {
+        switch self {
+        case .nfs:
+            return "Kext-free — works without macFUSE or special permissions"
+        case .macfuse:
+            return "Requires macFUSE and the official rclone binary"
+        }
+    }
+
+    /// The rclone subcommand used to establish the mount
+    var rcloneSubcommand: String {
+        switch self {
+        case .nfs:
+            return "nfsmount"
+        case .macfuse:
+            return "mount"
         }
     }
 }

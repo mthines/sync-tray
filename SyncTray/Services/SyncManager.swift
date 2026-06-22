@@ -93,7 +93,7 @@ final class SyncManager: ObservableObject {
         setupWorkspaceObserver()
         setupProfileObserver()
         cleanupStaleLockFiles()
-        setupService.cleanupStaleMounts()  // Clean up stale mounts on startup
+        setupService.cleanupStaleMounts(mountProfiles: self.profileStore.profiles)  // Clean up stale mounts on startup
         detectAndResumeRunningSyncs()  // After cleanup, detect external syncs
         checkInitialState()
         startWatchingAllProfiles()

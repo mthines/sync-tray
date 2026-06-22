@@ -747,6 +747,7 @@ final class TelemetryService {
                 "config.is_muted": .bool(profile.isMuted),
                 "config.has_additional_flags": .bool(!profile.additionalRcloneFlags.isEmpty),
                 // Mount-specific preferences
+                "config.mount_backend": .string(profile.isMountMode ? profile.mountBackend.rawValue : "n/a"),
                 "config.vfs_cache_mode": .string(profile.isMountMode ? profile.vfsCacheMode.rawValue : "n/a"),
                 "config.has_pinned_directories": .bool(!profile.pinnedDirectories.isEmpty),
                 "config.pinned_directory_count": .int(profile.pinnedDirectories.count),
