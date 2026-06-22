@@ -8,9 +8,12 @@ final class SyncSetupService {
 
     // MARK: - Constants
 
-    /// The check file name used by rclone bisync --check-access
-    /// This file must exist in both local and remote paths for sync to work
-    /// Note: rclone's --check-filename expects a filename, not a path
+    /// Legacy access-check file name.
+    ///
+    /// SyncTray no longer uses rclone bisync's `--check-access` (which required a
+    /// sentinel file to be uploaded to the remote). Access is now verified by a
+    /// read-only pre-flight in the sync script that mutates nothing. This constant
+    /// is retained only so leftover files from older versions can be cleaned up.
     static let checkFileName = ".synctray-check"
 
     /// Default content for the exclude filter file (uses rclone filter-from format)
@@ -39,6 +42,9 @@ final class SyncSetupService {
 
         # rclone partial transfer files (prevents cascading .partial.partial... issue)
         - *.partial
+
+        # SyncTray legacy access-check sentinel (no longer used; excluded so it is never synced)
+        - .synctray-check
         """
 
     // MARK: - Rclone Path Helper
@@ -265,13 +271,10 @@ final class SyncSetupService {
         }
     }
 
-    /// Initializes sync paths by creating directories and check file (.synctray-check)
+    /// Initializes sync paths by creating the local directory and removing any
+    /// obsolete `.synctray-check` files left behind by older versions.
     /// - Returns: nil on success, error message on failure
     func initializeSyncPaths(for profile: SyncProfile) -> String? {
-        guard let rclonePath = findRclonePath() else {
-            return "rclone not found"
-        }
-
         let fileManager = FileManager.default
 
         // 1. Create local directory if needed
@@ -284,104 +287,50 @@ final class SyncSetupService {
             }
         }
 
-        // 2. Create local check file (.synctray-check)
-        let localCheckFile = (profile.localSyncPath as NSString).appendingPathComponent(
-            Self.checkFileName)
-
-        if !fileManager.fileExists(atPath: localCheckFile) {
-            fileManager.createFile(atPath: localCheckFile, contents: nil)
-        }
-
-        // 3. Create remote check file
-        if let error = ensureRemoteCheckFile(for: profile, rclonePath: rclonePath) {
-            return error
-        }
+        // 2. Remove any obsolete .synctray-check files (best-effort).
+        //    SyncTray no longer relies on rclone --check-access, so nothing is
+        //    written to the remote — access is verified read-only in the sync script.
+        cleanupLegacyCheckFiles(for: profile)
 
         return nil  // Success
     }
 
-    /// Ensure the remote `.synctray-check` file exists at the profile's remote path.
-    /// Idempotent — returns nil (success) when the file ends up existing, regardless of how it got there.
+    /// Best-effort, recursive removal of the legacy `.synctray-check` access-check file
+    /// from the local and remote trees (root and all nested directories).
     ///
-    /// **Why this is non-trivial:** `rclone rcat` over SFTP (notably Synology) often returns a
-    /// non-zero exit code due to post-upload metadata operations (SetModTime, perms) failing,
-    /// even though the file was successfully written. The same applies to some WebDAV servers.
-    /// Trusting only the exit code produces false-failure UX.
+    /// SyncTray previously uploaded this sentinel so rclone bisync's `--check-access`
+    /// could verify both sides were mounted. That mechanism has been replaced by a
+    /// read-only pre-flight in the sync script, so the file is now obsolete. SyncTray
+    /// only ever wrote one at each root, but we scan the whole tree to also catch any
+    /// copies a user (or an older/manual setup) may have scattered into subdirectories.
     ///
-    /// **Strategy:** Try cheap operations first, then verify the actual state via `lsf`.
-    /// 1. If the file already exists → done.
-    /// 2. Try `rclone touch` (cleanest, no upload payload).
-    /// 3. Fall back to `rclone rcat` with empty stdin (some WebDAV servers reject touch).
-    /// 4. **Read-back verify** — if the file exists now, success regardless of prior exit codes.
-    func ensureRemoteCheckFile(for profile: SyncProfile, rclonePath: String? = nil) -> String? {
-        guard let rclonePath = rclonePath ?? findRclonePath() else {
-            return "rclone not found"
+    /// Safe to call repeatedly; never throws. The remote deletion lists the remote, so
+    /// call this from a background context.
+    func cleanupLegacyCheckFiles(for profile: SyncProfile, rclonePath: String? = nil) {
+        let fileManager = FileManager.default
+
+        // Local: remove every .synctray-check at any depth under the sync root.
+        if let enumerator = fileManager.enumerator(atPath: profile.localSyncPath) {
+            for case let relativePath as String in enumerator
+            where (relativePath as NSString).lastPathComponent == Self.checkFileName {
+                let fullPath = (profile.localSyncPath as NSString).appendingPathComponent(relativePath)
+                try? fileManager.removeItem(atPath: fullPath)
+            }
         }
 
-        let remoteCheckFile = "\(profile.rcloneRemote):\(profile.remotePath)/\(Self.checkFileName)"
+        // Remote: delete every .synctray-check at any depth. Skip if we can't resolve a
+        // path/remote. The `--include <basename>` filter matches the file at any level and
+        // (because an include is present) rclone implicitly excludes everything else, so no
+        // user data is ever touched.
+        guard let rclonePath = rclonePath ?? findRclonePath(),
+              !profile.rcloneRemote.isEmpty, !profile.remotePath.isEmpty else { return }
+
+        let remoteRoot = "\(profile.rcloneRemote):\(profile.remotePath)"
         let skipCert = RcloneConfigService.shared.readRemoteConfig(name: profile.rcloneRemote)?.values["no_check_certificate"] == "true"
-
-        // Step A: Already exists?
-        if remoteFileExists(rclonePath: rclonePath, remotePath: remoteCheckFile, skipCert: skipCert) {
-            return nil
-        }
-
-        // Step B: Try `rclone touch`
-        _ = runRcloneSimple(rclonePath: rclonePath, args: ["touch", remoteCheckFile], skipCert: skipCert)
-        if remoteFileExists(rclonePath: rclonePath, remotePath: remoteCheckFile, skipCert: skipCert) {
-            return nil
-        }
-
-        // Step C: Fall back to `rcat` with empty stdin (time-bounded)
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: rclonePath)
-        var rcatArgs = ["rcat", remoteCheckFile, "--contimeout", "5s", "--timeout", "15s", "--retries", "1", "--low-level-retries", "1"]
-        if skipCert { rcatArgs.append("--no-check-certificate") }
-        process.arguments = rcatArgs
-        process.standardOutput = Pipe()
-        process.standardError = Pipe()
-        let stdinPipe = Pipe()
-        process.standardInput = stdinPipe
-
-        do {
-            try process.run()
-            stdinPipe.fileHandleForWriting.closeFile()
-            process.waitUntilExit()
-        } catch {
-            return "Failed to create remote check file: \(error.localizedDescription)"
-        }
-
-        // Step D: Read-back verify — trust actual state over exit codes
-        if remoteFileExists(rclonePath: rclonePath, remotePath: remoteCheckFile, skipCert: skipCert) {
-            return nil
-        }
-
-        // All attempts failed — likely network/reachability issue since we have generous timeouts
-        return "Could not reach the remote to verify check file. Check your network connection and that the remote is online."
-    }
-
-    /// Check if a remote file exists via `rclone lsf`. Returns true on exit code 0 with non-empty output.
-    /// Time-bounded so an unreachable remote fails within ~10s instead of hanging on rclone defaults.
-    private func remoteFileExists(rclonePath: String, remotePath: String, skipCert: Bool) -> Bool {
-        let process = Process()
-        let pipe = Pipe()
-        process.executableURL = URL(fileURLWithPath: rclonePath)
-        var args = ["lsf", remotePath, "--contimeout", "5s", "--timeout", "10s", "--retries", "1", "--low-level-retries", "1"]
-        if skipCert { args.append("--no-check-certificate") }
-        process.arguments = args
-        process.standardOutput = pipe
-        process.standardError = Pipe()
-
-        do {
-            try process.run()
-            process.waitUntilExit()
-            guard process.terminationStatus == 0 else { return false }
-            let data = pipe.fileHandleForReading.readDataToEndOfFile()
-            let output = String(data: data, encoding: .utf8) ?? ""
-            return !output.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-        } catch {
-            return false
-        }
+        _ = runRcloneSimple(
+            rclonePath: rclonePath,
+            args: ["delete", remoteRoot, "--include", Self.checkFileName],
+            skipCert: skipCert)
     }
 
     /// Run rclone with given args, return exit code (or -1 on launch failure).
@@ -631,7 +580,27 @@ final class SyncSetupService {
             elif [[ "$SYNC_MODE" == "bisync" ]]; then
                 # Two-way bidirectional sync
                 echo "$(date '+%Y-%m-%d %H:%M:%S') - Starting bisync" >> "$LOG_FILE"
-                RCLONE_CMD="$RCLONE_BIN bisync \\"$REMOTE\\" \\"$LOCAL_PATH\\" --verbose --use-json-log --stats 2s --filter-from \\"$FILTER_FILE\\" --check-access --check-filename .synctray-check --resilient --recover --conflict-resolve newer --conflict-loser num --conflict-suffix sync-conflict-{DateOnly}-"
+
+                # Read-only pre-flight reachability check. This replaces the old
+                # --check-access mechanism, which required uploading a .synctray-check
+                # sentinel to the remote. We now verify the remote is reachable WITHOUT
+                # writing anything: if it is offline we skip this run (exit 0) rather than
+                # risk bisync acting on a phantom-empty listing, and retry next interval.
+                #
+                # We probe the remote ROOT (not the sync subpath) so a not-yet-created
+                # path on a freshly configured profile does not cause a false skip — the
+                # first run still reaches bisync and self-bootstraps via --resync.
+                #
+                # Catastrophic mass-deletion (a reachable-but-wiped side) remains guarded
+                # by bisync's own --max-delete (default 50%), which aborts with a "too
+                # many deletes" error instead of propagating the deletion.
+                PREFLIGHT_REMOTE_NAME="${REMOTE%%:*}"
+                if ! $RCLONE_BIN lsd "${PREFLIGHT_REMOTE_NAME}:" --max-depth 0 --contimeout 10s --timeout 30s --retries 1 --low-level-retries 1 $NO_CHECK_CERT &>/dev/null; then
+                    echo "$(date '+%Y-%m-%d %H:%M:%S') - Remote unreachable, skipping sync (will retry next interval)" >> "$LOG_FILE"
+                    exit 0
+                fi
+
+                RCLONE_CMD="$RCLONE_BIN bisync \\"$REMOTE\\" \\"$LOCAL_PATH\\" --verbose --use-json-log --stats 2s --filter-from \\"$FILTER_FILE\\" --resilient --recover --conflict-resolve newer --conflict-loser num --conflict-suffix sync-conflict-{DateOnly}-"
             else
                 # One-way sync
                 if [[ "$SYNC_DIRECTION" == "localToRemote" ]]; then
