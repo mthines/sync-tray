@@ -37,7 +37,12 @@ pinned-directory warming, and the RC API behave identically across them.
 **Backend defaults & migration:** the in-app default for newly created profiles is
 `nfs`. Profiles persisted before this field existed decode as `macfuse` (preserving
 their original `rclone mount` behaviour); users can switch to NFS by editing the
-profile, which re-installs the launchd agent with the new mount command.
+profile, which re-installs the launchd agent with the new mount command. The sync
+script applies the **same `macfuse` fallback** when the `mountBackend` key is absent
+from a profile's JSON, so the app and the generated script never disagree on a legacy
+profile's backend. Note that legacy profiles also pick up the new `--vfs-cache-max-age`
+default (168h) on the next script run — previously the flag was unset and rclone used
+its built-in 1h default; total cache size stays bounded by `--vfs-cache-max-size`.
 
 **Cache retention (`vfsCacheMaxAge`):** the "Keep Cached For" setting maps to
 rclone's `--vfs-cache-max-age` (default `168h` = 7 days). A used file stays in the

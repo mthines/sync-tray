@@ -504,7 +504,11 @@ final class SyncSetupService {
             FALLBACK_PATH=$(parse_json "fallbackRemotePath" "")
             FALLBACK_REQUIRES_CACHE_REBUILD=$(parse_json "fallbackRequiresCacheRebuild" "false")
             REMOTE_PATH=$(parse_json "remotePath" "")
-            MOUNT_BACKEND=$(parse_json "mountBackend" "nfs")
+            # Default to macfuse when the key is absent: a profile JSON written before
+            # the mountBackend field existed is a legacy `rclone mount` profile, and the
+            # Swift model decodes the same default — keep the two in lockstep so existing
+            # mounts keep their original backend on upgrade.
+            MOUNT_BACKEND=$(parse_json "mountBackend" "macfuse")
             VFS_CACHE_MODE=$(parse_json "vfsCacheMode" "full")
             VFS_CACHE_MAX_SIZE=$(parse_json "vfsCacheMaxSize" "10G")
             VFS_CACHE_MAX_AGE=$(parse_json "vfsCacheMaxAge" "168h")

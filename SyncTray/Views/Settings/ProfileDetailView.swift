@@ -899,17 +899,20 @@ struct ProfileDetailView: View {
                             .foregroundStyle(.secondary)
                     }
 
-                    // Allow non-empty mount toggle
-                    Toggle(isOn: $allowNonEmptyMount) {
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text("Allow mounting to non-empty folder")
-                                .font(.subheadline)
-                            Text("Mount even if the local folder already contains files")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
+                    // Allow non-empty mount toggle (FUSE-only option; the NFS backend
+                    // ignores --allow-non-empty, so only surface it for macFUSE).
+                    if mountBackend == .macfuse {
+                        Toggle(isOn: $allowNonEmptyMount) {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("Allow mounting to non-empty folder")
+                                    .font(.subheadline)
+                                Text("Mount even if the local folder already contains files")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
                         }
+                        .toggleStyle(.switch)
                     }
-                    .toggleStyle(.switch)
                 }
             }
 
