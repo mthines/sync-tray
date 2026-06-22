@@ -42,6 +42,9 @@ final class SyncSetupService {
 
         # rclone partial transfer files (prevents cascading .partial.partial... issue)
         - *.partial
+
+        # SyncTray legacy access-check sentinel (no longer used; excluded so it is never synced)
+        - .synctray-check
         """
 
     // MARK: - Rclone Path Helper
@@ -292,61 +295,42 @@ final class SyncSetupService {
         return nil  // Success
     }
 
-    /// Best-effort removal of the legacy `.synctray-check` access-check file from both
-    /// the local and remote roots.
+    /// Best-effort, recursive removal of the legacy `.synctray-check` access-check file
+    /// from the local and remote trees (root and all nested directories).
     ///
     /// SyncTray previously uploaded this sentinel so rclone bisync's `--check-access`
     /// could verify both sides were mounted. That mechanism has been replaced by a
-    /// read-only pre-flight in the sync script, so the file is now obsolete. This
-    /// removes any copies left by older versions.
+    /// read-only pre-flight in the sync script, so the file is now obsolete. SyncTray
+    /// only ever wrote one at each root, but we scan the whole tree to also catch any
+    /// copies a user (or an older/manual setup) may have scattered into subdirectories.
     ///
-    /// Safe to call repeatedly; never throws. The remote deletion is time-bounded but
-    /// still involves the network, so call this from a background context.
+    /// Safe to call repeatedly; never throws. The remote deletion lists the remote, so
+    /// call this from a background context.
     func cleanupLegacyCheckFiles(for profile: SyncProfile, rclonePath: String? = nil) {
         let fileManager = FileManager.default
 
-        // Local copy
-        let localCheckFile = (profile.localSyncPath as NSString).appendingPathComponent(
-            Self.checkFileName)
-        if fileManager.fileExists(atPath: localCheckFile) {
-            try? fileManager.removeItem(atPath: localCheckFile)
+        // Local: remove every .synctray-check at any depth under the sync root.
+        if let enumerator = fileManager.enumerator(atPath: profile.localSyncPath) {
+            for case let relativePath as String in enumerator
+            where (relativePath as NSString).lastPathComponent == Self.checkFileName {
+                let fullPath = (profile.localSyncPath as NSString).appendingPathComponent(relativePath)
+                try? fileManager.removeItem(atPath: fullPath)
+            }
         }
 
-        // Remote copy (best-effort, time-bounded). Skip if we can't even resolve a path/remote.
+        // Remote: delete every .synctray-check at any depth. Skip if we can't resolve a
+        // path/remote. The `--include <basename>` filter matches the file at any level and
+        // (because an include is present) rclone implicitly excludes everything else, so no
+        // user data is ever touched.
         guard let rclonePath = rclonePath ?? findRclonePath(),
               !profile.rcloneRemote.isEmpty, !profile.remotePath.isEmpty else { return }
 
-        let remoteCheckFile = "\(profile.rcloneRemote):\(profile.remotePath)/\(Self.checkFileName)"
+        let remoteRoot = "\(profile.rcloneRemote):\(profile.remotePath)"
         let skipCert = RcloneConfigService.shared.readRemoteConfig(name: profile.rcloneRemote)?.values["no_check_certificate"] == "true"
-
-        // Only attempt deletion if it actually exists, to avoid noisy errors on healthy remotes.
-        if remoteFileExists(rclonePath: rclonePath, remotePath: remoteCheckFile, skipCert: skipCert) {
-            _ = runRcloneSimple(rclonePath: rclonePath, args: ["deletefile", remoteCheckFile], skipCert: skipCert)
-        }
-    }
-
-    /// Check if a remote file exists via `rclone lsf`. Returns true on exit code 0 with non-empty output.
-    /// Time-bounded so an unreachable remote fails within ~10s instead of hanging on rclone defaults.
-    private func remoteFileExists(rclonePath: String, remotePath: String, skipCert: Bool) -> Bool {
-        let process = Process()
-        let pipe = Pipe()
-        process.executableURL = URL(fileURLWithPath: rclonePath)
-        var args = ["lsf", remotePath, "--contimeout", "5s", "--timeout", "10s", "--retries", "1", "--low-level-retries", "1"]
-        if skipCert { args.append("--no-check-certificate") }
-        process.arguments = args
-        process.standardOutput = pipe
-        process.standardError = Pipe()
-
-        do {
-            try process.run()
-            process.waitUntilExit()
-            guard process.terminationStatus == 0 else { return false }
-            let data = pipe.fileHandleForReading.readDataToEndOfFile()
-            let output = String(data: data, encoding: .utf8) ?? ""
-            return !output.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-        } catch {
-            return false
-        }
+        _ = runRcloneSimple(
+            rclonePath: rclonePath,
+            args: ["delete", remoteRoot, "--include", Self.checkFileName],
+            skipCert: skipCert)
     }
 
     /// Run rclone with given args, return exit code (or -1 on launch failure).
