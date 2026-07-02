@@ -100,6 +100,7 @@ final class SyncManager: ObservableObject {
         setupWorkspaceObserver()
         setupProfileObserver()
         cleanupStaleLockFiles()
+        setupService.refreshSharedScriptIfChanged()  // Propagate script template updates
         setupService.cleanupStaleMounts()  // Clean up stale mounts on startup
         detectAndResumeRunningSyncs()  // After cleanup, detect external syncs
         checkInitialState()
@@ -559,6 +560,43 @@ final class SyncManager: ObservableObject {
         }
     }
 
+    /// Resolve the remote reference and env-var overrides a resync should target,
+    /// honouring the currently active transport (primary vs fallback) the same way
+    /// the launchd sync script does. Without this, a resync launched while the
+    /// profile runs on fallback would rebuild the wrong (primary) bisync pair.
+    /// - Returns: the effective "remote:path" plus RCLONE_CONFIG_* env overrides
+    ///   (non-empty only for the same-wire-type fallback that preserves the cache
+    ///   by keeping the primary remote name).
+    func resolveActiveRemote(for profile: SyncProfile) -> (remotePath: String, extraEnv: [String: String]) {
+        let transport = profileTransports[profile.id] ?? .unknown
+        let primaryRemotePath = "\(profile.rcloneRemote):\(profile.remotePath)"
+
+        guard transport.isFallback, !profile.fallbackRemote.isEmpty else {
+            return (primaryRemotePath, [:])
+        }
+
+        if profile.fallbackRequiresCacheRebuild || !profile.fallbackRemotePath.isEmpty {
+            // Different wire type OR explicit path: swap full remote reference.
+            // bisync uses a separate listing pair — consistent with the script.
+            let effectiveFallbackPath = profile.fallbackRemotePath.isEmpty
+                ? profile.remotePath : profile.fallbackRemotePath
+            return ("\(profile.fallbackRemote):\(effectiveFallbackPath)", [:])
+        }
+
+        // Same wire type, same path: use env-var overrides to preserve bisync cache.
+        let primaryRemoteName = profile.rcloneRemote.hasSuffix(":")
+            ? String(profile.rcloneRemote.dropLast()) : profile.rcloneRemote
+        let upperName = primaryRemoteName.uppercased().replacingOccurrences(of: "-", with: "_")
+        var extraEnv: [String: String] = [:]
+        if let fallbackConfig = RcloneConfigService.shared.readRemoteConfig(name: profile.fallbackRemote) {
+            for (key, value) in fallbackConfig.values {
+                let envKey = "RCLONE_CONFIG_\(upperName)_\(key.uppercased().replacingOccurrences(of: "-", with: "_"))"
+                extraEnv[envKey] = value
+            }
+        }
+        return (primaryRemotePath, extraEnv)
+    }
+
     /// Run `rclone bisync --resync` for a profile directly (no UI output panel).
     /// Called by `triggerAutoFix`. On completion, state is updated via the existing
     /// log-watcher pipeline (same as scheduled syncs).
@@ -567,7 +605,6 @@ final class SyncManager: ObservableObject {
 
         // Capture all values from the main actor before going to the background
         let rcloneRemote = profile.rcloneRemote
-        let remotePath = profile.remotePath
         let localSyncPath = profile.localSyncPath
         let drivePathToMonitor = profile.drivePathToMonitor
         let filterPath = profile.filterFilePath
@@ -578,8 +615,7 @@ final class SyncManager: ObservableObject {
         let additionalFlags = profile.additionalRcloneFlags
         let fallbackTransport = profileTransports[profileId] ?? .unknown
         let fallbackRemote = profile.fallbackRemote
-        let fallbackRemotePath = profile.fallbackRemotePath
-        let fallbackRequiresCacheRebuild = profile.fallbackRequiresCacheRebuild
+        let (effectiveRemotePath, extraEnv) = resolveActiveRemote(for: profile)
         let bisyncDir = "\(NSHomeDirectory())/Library/Caches/rclone/bisync"
 
         // Pre-flight: if a live lock already exists for a running process, skip.
@@ -642,37 +678,17 @@ final class SyncManager: ObservableObject {
                         return
                     }
 
-                    // Determine effective remote path — apply fallback transport if active.
-                    // This mirrors the fallback logic in the launchd-generated shell script.
-                    var effectiveRemotePath = "\(rcloneRemote):\(remotePath)"
-                    var extraEnv: [String: String] = [:]
                     let isFallbackActive = fallbackTransport.isFallback
-
-                    if isFallbackActive && !fallbackRemote.isEmpty {
-                        if fallbackRequiresCacheRebuild || !fallbackRemotePath.isEmpty {
-                            // Different wire type OR explicit path: swap full remote reference.
-                            // bisync rebuilds listings on first switch — consistent with the script.
-                            let effectiveFallbackPath = fallbackRemotePath.isEmpty ? remotePath : fallbackRemotePath
-                            effectiveRemotePath = "\(fallbackRemote):\(effectiveFallbackPath)"
-                        } else {
-                            // Same wire type, same path: use env-var overrides to preserve bisync cache.
-                            let primaryRemoteName = rcloneRemote.hasSuffix(":")
-                                ? String(rcloneRemote.dropLast()) : rcloneRemote
-                            let upperName = primaryRemoteName.uppercased().replacingOccurrences(of: "-", with: "_")
-                            if let fallbackConfig = RcloneConfigService.shared.readRemoteConfig(name: fallbackRemote) {
-                                for (key, value) in fallbackConfig.values {
-                                    let envKey = "RCLONE_CONFIG_\(upperName)_\(key.uppercased().replacingOccurrences(of: "-", with: "_"))"
-                                    extraEnv[envKey] = value
-                                }
-                            }
-                        }
-                    }
 
                     var arguments: [String]
 
                     if syncMode == .bisync {
+                        // --resync-mode newer: prefer the newest version per file so a
+                        // stale remote copy never overwrites fresher local edits (the
+                        // bare --resync default is path1 = remote wins).
                         arguments = ["bisync", effectiveRemotePath, localSyncPath,
-                                     "--resync", "--verbose", "--use-json-log", "--stats", "2s"]
+                                     "--resync", "--resync-mode", "newer",
+                                     "--verbose", "--use-json-log", "--stats", "2s"]
                     } else if syncDirection == .localToRemote {
                         arguments = ["sync", localSyncPath, effectiveRemotePath,
                                      "--verbose", "--use-json-log", "--stats", "2s"]

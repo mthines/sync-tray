@@ -69,6 +69,29 @@ final class SyncSetupService {
         return result.exitCode == 0
     }
 
+    /// Rewrite the shared sync script if the installed copy differs from the
+    /// current template. The script is normally only written on profile
+    /// install/save, so without this an app update would leave already-installed
+    /// profiles running the old script until the next re-save.
+    /// Called once at app startup. No-op when no profile has been installed yet.
+    func refreshSharedScriptIfChanged() {
+        let path = SyncProfile.sharedScriptPath
+        guard FileManager.default.fileExists(atPath: path) else { return }
+
+        let current = generateSyncScript()
+        let onDisk = try? String(contentsOfFile: path, encoding: .utf8)
+        guard onDisk != current else { return }
+
+        do {
+            try current.write(toFile: path, atomically: true, encoding: .utf8)
+            try FileManager.default.setAttributes(
+                [.posixPermissions: 0o755], ofItemAtPath: path)
+            SyncTraySettings.debugLog("Refreshed shared sync script (template changed)")
+        } catch {
+            print("Failed to refresh shared sync script: \(error)")
+        }
+    }
+
     /// Generate and install the sync script and launchd plist for a profile
     /// - Parameters:
     ///   - profile: The sync profile to install
@@ -641,7 +664,40 @@ final class SyncSetupService {
                     exit 0
                 fi
 
+                # Self-bootstrap: if this (remote, local) pair has no prior bisync
+                # listings, bisync would abort with "cannot find prior Path1/Path2
+                # listings". That happens on the FIRST run against a new transport
+                # pair (e.g. first fallback activation after a REMOTE swap, or a
+                # brand-new profile). Run that first sync as --resync with
+                # newer-wins so failover works unattended (no app required) and a
+                # stale remote copy can never overwrite newer local edits.
+                #
+                # Session name mirrors rclone's bilib.SessionName/CanonicalPath:
+                # trim leading/trailing slashes, replace whitespace and /:?* with
+                # "_", join path1..path2. (Backslashes, which rclone also replaces,
+                # cannot occur in macOS paths or these remote names.)
+                # A pair counts as having state when a .lst OR .lst-new listing
+                # exists for BOTH sides — bisync --recover resumes from .lst-new.
+                BISYNC_WORKDIR="$HOME/Library/Caches/rclone/bisync"
+                SESSION_NAME=$(python3 -c "
+            import sys
+            def canon(p):
+                p = p.strip('/')
+                return ''.join('_' if (ch.isspace() or ch in '/:?*') else ch for ch in p)
+            print(canon(sys.argv[1]) + '..' + canon(sys.argv[2]))
+            " "$REMOTE" "$LOCAL_PATH")
+                BOOTSTRAP_FLAGS=""
+                if [[ ! -e "$BISYNC_WORKDIR/$SESSION_NAME.path1.lst" && ! -e "$BISYNC_WORKDIR/$SESSION_NAME.path1.lst-new" ]] \\
+                    || [[ ! -e "$BISYNC_WORKDIR/$SESSION_NAME.path2.lst" && ! -e "$BISYNC_WORKDIR/$SESSION_NAME.path2.lst-new" ]]; then
+                    echo "$(date '+%Y-%m-%d %H:%M:%S') - Bootstrapping sync state (--resync, newer wins): first run for this transport pair" >> "$LOG_FILE"
+                    BOOTSTRAP_FLAGS="--resync --resync-mode newer"
+                fi
+
                 RCLONE_CMD="$RCLONE_BIN bisync \\"$REMOTE\\" \\"$LOCAL_PATH\\" --verbose --use-json-log --stats 2s --filter-from \\"$FILTER_FILE\\" --resilient --recover --conflict-resolve newer --conflict-loser num --conflict-suffix sync-conflict-{DateOnly}-"
+
+                if [[ -n "$BOOTSTRAP_FLAGS" ]]; then
+                    RCLONE_CMD="$RCLONE_CMD $BOOTSTRAP_FLAGS"
+                fi
             else
                 # One-way sync
                 if [[ "$SYNC_DIRECTION" == "localToRemote" ]]; then
