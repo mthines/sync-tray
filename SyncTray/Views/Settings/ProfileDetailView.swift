@@ -153,8 +153,10 @@ struct ProfileDetailView: View {
         syncDirection != profile.syncDirection ||
         (fallbackEnabled ? fallbackRemote : "") != profile.fallbackRemote ||
         ((fallbackEnabled && fallbackUseDifferentPath) ? fallbackRemotePath : "") != profile.fallbackRemotePath ||
+        mountBackend != profile.mountBackend ||
         vfsCacheMode != profile.vfsCacheMode ||
         vfsCacheMaxSize != profile.vfsCacheMaxSize ||
+        vfsCacheMaxAge != profile.vfsCacheMaxAge ||
         vfsCachePath != profile.vfsCachePath ||
         allowNonEmptyMount != profile.allowNonEmptyMount
     }
