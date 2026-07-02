@@ -644,6 +644,20 @@ final class SyncSetupService {
                     exit 0
                 fi
 
+                # Not mounted, but a previous rclone for this mount point may still
+                # be alive after a failed attempt (its RC/NFS server keeps holding
+                # the RC port). If we start a new one it collides with
+                # "bind: address already in use" and the mount never establishes —
+                # and launchd's KeepAlive turns that into a retry storm. Clear any
+                # such orphan (scoped to THIS mount point) before starting.
+                STALE_MOUNT_PIDS=$(pgrep -f "rclone .*mount .*$LOCAL_PATH" 2>/dev/null)
+                if [[ -n "$STALE_MOUNT_PIDS" ]]; then
+                    echo "$(date '+%Y-%m-%d %H:%M:%S') - Clearing orphaned rclone for $LOCAL_PATH: $STALE_MOUNT_PIDS" >> "$LOG_FILE"
+                    kill $STALE_MOUNT_PIDS 2>/dev/null
+                    # Wait briefly for the RC port to be released
+                    sleep 2
+                fi
+
                 # Choose the mount backend:
                 #   nfs     -> rclone nfsmount (built-in NFS server + native macOS NFS
                 #              client). Kext-free: needs no macFUSE, works on locked-down

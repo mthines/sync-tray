@@ -210,37 +210,48 @@ final class SyncManager: ObservableObject {
                 // Load the launchd agent (which will trigger the mount script)
                 let success = setupService.loadAgent(for: profile)
 
-                await MainActor.run {
-                    if success {
-                        // Give mount a moment to establish
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
-                            if self?.setupService.isMounted(profile: profile) == true {
-                                self?.profileMountStates[profile.id] = .mounted
-                                TelemetryService.shared.recordMountOperation(
-                                    profileId: profile.id,
-                                    profileName: profile.name,
-                                    operation: "mount",
-                                    result: "success"
-                                )
-                                // Auto-refresh pinned directories after successful mount
-                                if !profile.pinnedDirectories.isEmpty {
-                                    Task {
-                                        // Wait for RC API to be ready
-                                        try? await Task.sleep(nanoseconds: 2_000_000_000)
-                                        await self?.cacheService.refreshPinnedDirectories(for: profile)
-                                    }
-                                }
-                            } else {
-                                self?.profileMountStates[profile.id] = .failed("Mount did not establish")
-                                TelemetryService.shared.recordMountOperation(
-                                    profileId: profile.id,
-                                    profileName: profile.name,
-                                    operation: "mount",
-                                    result: "failure"
-                                )
-                            }
+                if success {
+                    // Poll for the mount to establish. NFS mounts can take a few
+                    // seconds — especially right after the script clears a stale
+                    // instance and waits for the RC port to free — so a single
+                    // short check produced false "Mount did not establish" errors.
+                    var established = false
+                    for _ in 0..<12 {
+                        try? await Task.sleep(nanoseconds: 1_000_000_000)
+                        if setupService.isMounted(profile: profile) {
+                            established = true
+                            break
                         }
-                    } else {
+                    }
+                    await MainActor.run {
+                        if established {
+                            profileMountStates[profile.id] = .mounted
+                            TelemetryService.shared.recordMountOperation(
+                                profileId: profile.id,
+                                profileName: profile.name,
+                                operation: "mount",
+                                result: "success"
+                            )
+                            // Auto-refresh pinned directories after successful mount
+                            if !profile.pinnedDirectories.isEmpty {
+                                Task { [weak self] in
+                                    // Wait for RC API to be ready
+                                    try? await Task.sleep(nanoseconds: 2_000_000_000)
+                                    await self?.cacheService.refreshPinnedDirectories(for: profile)
+                                }
+                            }
+                        } else {
+                            profileMountStates[profile.id] = .failed("Mount did not establish")
+                            TelemetryService.shared.recordMountOperation(
+                                profileId: profile.id,
+                                profileName: profile.name,
+                                operation: "mount",
+                                result: "failure"
+                            )
+                        }
+                    }
+                } else {
+                    await MainActor.run {
                         profileMountStates[profile.id] = .failed("Failed to load launchd agent")
                         TelemetryService.shared.recordMountOperation(
                             profileId: profile.id,
