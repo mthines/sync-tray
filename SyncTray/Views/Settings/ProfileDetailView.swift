@@ -219,14 +219,22 @@ struct ProfileDetailView: View {
 
                     Divider().padding(.vertical, 4)
 
-                    // Scheduled Sync Management
-                    sectionHeader("Automatic Sync", icon: "calendar.badge.clock")
-                    scheduledSyncSection
+                    // Streaming (mount) vs Scheduled Sync management — mount mode
+                    // is a continuously running mount, not a periodic sync, so it
+                    // gets Mount/Unmount controls instead of Sync Now/Pause.
+                    if syncMode == .mount {
+                        sectionHeader("Stream (Mount)", icon: "externaldrive.badge.icloud")
+                        mountManagementSection
+                    } else {
+                        sectionHeader("Automatic Sync", icon: "calendar.badge.clock")
+                        scheduledSyncSection
+                    }
 
                     Divider().padding(.vertical, 4)
 
-                    // Sync Configuration
-                    sectionHeader("Sync Configuration", icon: "arrow.triangle.2.circlepath")
+                    // Configuration
+                    sectionHeader(syncMode == .mount ? "Mount Configuration" : "Sync Configuration",
+                                  icon: "arrow.triangle.2.circlepath")
                     syncConfigurationSection
 
                     // Offline Files (mount mode only)
@@ -1338,6 +1346,140 @@ struct ProfileDetailView: View {
             RoundedRectangle(cornerRadius: 8)
                 .strokeBorder(Color.white.opacity(0.06), lineWidth: 1)
         )
+    }
+
+    /// Stream (Mount) management — the mount-mode counterpart to
+    /// `scheduledSyncSection`. A mount is a continuously running daemon, so this
+    /// presents Mount / Unmount + a live streaming status instead of the
+    /// sync-oriented Sync Now / Pause controls.
+    private var mountManagementSection: some View {
+        let mountState = syncManager.mountState(for: profile.id)
+        return VStack(alignment: .leading, spacing: 12) {
+            // Status
+            HStack(spacing: 8) {
+                if !isInstalled {
+                    Label("Not installed", systemImage: "circle.dashed")
+                        .foregroundColor(.secondary)
+                } else {
+                    switch mountState {
+                    case .mounting:
+                        ProgressView().controlSize(.small)
+                        Text("Mounting…").foregroundStyle(.blue)
+                    case .mounted:
+                        Label("Streaming", systemImage: "dot.radiowaves.left.and.right")
+                            .foregroundColor(.green)
+                        Text("from \(profile.fullRemotePath)")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    case .failed(let message):
+                        Label("Mount failed", systemImage: "exclamationmark.triangle.fill")
+                            .foregroundColor(.red)
+                        Text(message)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(2)
+                    case .unmounted:
+                        Label("Not mounted", systemImage: "pause.circle.fill")
+                            .foregroundColor(.gray)
+                    }
+                }
+                Spacer()
+            }
+
+            // Mounted-at + volume details
+            if isInstalled, mountState == .mounted {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Mounted at: \(localSyncPath)")
+                    Text("Volume: \((localSyncPath as NSString).lastPathComponent)  ·  Cache: \(vfsCacheMaxSize) / \(vfsCacheMaxAge)")
+                }
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            }
+
+            // Generated files
+            if isInstalled {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Generated files:")
+                        .font(.caption.weight(.medium))
+                        .foregroundColor(.secondary)
+                    filePathLink(label: "Script", path: SyncProfile.sharedScriptPath)
+                    filePathLink(label: "Config", path: profile.configPath)
+                    filePathLink(label: "Schedule", path: profile.plistPath)
+                    filePathLink(label: "Log", path: profile.logPath)
+                }
+            }
+
+            if let error = installError {
+                Label(error, systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption)
+                    .foregroundColor(.red)
+            }
+
+            // Controls
+            HStack {
+                if isInstalled {
+                    if mountState == .mounted {
+                        Button(action: { syncManager.unmountProfile(profile) }) {
+                            Label("Unmount", systemImage: "eject.fill")
+                        }
+                        .buttonStyle(.borderedProminent)
+                    } else {
+                        Button(action: { syncManager.mountProfile(profile) }) {
+                            Label("Mount", systemImage: "externaldrive.fill.badge.plus")
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .disabled(mountState == .mounting)
+                    }
+
+                    Button(action: { showingUninstallConfirm = true }) {
+                        Label("Uninstall", systemImage: "trash")
+                    }
+                    .disabled(mountState == .mounting)
+
+                    Button(action: { showingReinstallConfirm = true }) {
+                        Label("Reinstall", systemImage: "arrow.clockwise")
+                    }
+                    .disabled(!canInstall || isInstalling || mountState == .mounting)
+                } else {
+                    Button(action: installSync) {
+                        if isInstalling {
+                            ProgressView().controlSize(.small)
+                            Text("Installing…")
+                        } else {
+                            Label("Install & Mount", systemImage: "plus.circle")
+                        }
+                    }
+                    .disabled(!canInstall || isInstalling)
+                    .buttonStyle(.borderedProminent)
+                    .opacity(canInstall ? 1.0 : 0.5)
+                }
+                Spacer()
+            }
+
+            // Why install is disabled
+            if !canInstall && !isInstalled {
+                VStack(alignment: .leading, spacing: 2) {
+                    if rcloneRemote.isEmpty {
+                        Label("Select an rclone remote", systemImage: "exclamationmark.circle")
+                    }
+                    if remotePath.isEmpty {
+                        Label("Enter the folder path on the remote", systemImage: "exclamationmark.circle")
+                    }
+                    if localSyncPath.isEmpty {
+                        Label("Select a local folder", systemImage: "exclamationmark.circle")
+                    }
+                }
+                .font(.caption)
+                .foregroundStyle(.orange)
+            }
+        }
+        .padding(12)
+        .background(Color.black.opacity(0.15), in: .rect(cornerRadius: 8))
+        .overlay(
+            RoundedRectangle(cornerRadius: 8)
+                .strokeBorder(Color.white.opacity(0.06), lineWidth: 1)
+        )
+        .onAppear { syncManager.updateMountStates() }
     }
 
     private var fallbackRemoteSection: some View {
