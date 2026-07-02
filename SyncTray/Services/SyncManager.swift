@@ -1061,7 +1061,12 @@ final class SyncManager: ObservableObject {
     /// Detect running syncs at startup and start monitoring them
     private func detectAndResumeRunningSyncs() {
         var resumedCount = 0
-        for profile in profileStore.enabledProfiles {
+        // Mount profiles hold the lock file for the entire lifetime of their
+        // rclone daemon, so lock-based detection would mark them `.syncing`
+        // forever — which disables the Pause/Uninstall controls and makes the
+        // mount impossible to stop from the UI. Mount state is tracked
+        // separately by updateMountStates(); exclude mount mode here.
+        for profile in profileStore.enabledProfiles where !profile.isMountMode {
             if let pid = detectRunningSyncPID(for: profile) {
                 profileStates[profile.id] = .syncing
                 monitoringExternalSyncs.insert(profile.id)
