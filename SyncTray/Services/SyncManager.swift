@@ -56,6 +56,7 @@ final class SyncManager: ObservableObject {
     private let cacheService = VFSCacheService.shared
 
     private var heartbeatTimer: DispatchSourceTimer?
+    private var mountStateMonitorTimer: DispatchSourceTimer?
     private var workspaceObserver: NSObjectProtocol?
     private var currentSyncChanges: [UUID: [FileChange]] = [:]
     private var cancellables = Set<AnyCancellable>()
@@ -110,12 +111,17 @@ final class SyncManager: ObservableObject {
         TelemetryService.shared.recordProfileCount(self.profileStore.enabledProfiles.count)
         TelemetryService.shared.recordAllProfileConfigurations(self.profileStore.profiles)
         startSessionHeartbeat()
+        startMountStateMonitor()
     }
 
     deinit {
         // Cancel heartbeat timer
         heartbeatTimer?.cancel()
         heartbeatTimer = nil
+
+        // Cancel mount-state monitor
+        mountStateMonitorTimer?.cancel()
+        mountStateMonitorTimer = nil
 
         // Cancel all sync completion pollers
         for timer in syncCompletionPollers.values {
@@ -1838,6 +1844,25 @@ final class SyncManager: ObservableObject {
     }
 
     /// Start a 5-minute session heartbeat for availability monitoring
+    /// Periodically reconcile mount-mode UI state with reality. A mount can be
+    /// established or torn down out-of-band — launchd's KeepAlive (re)starting the
+    /// daemon, an external drive event, or the user ejecting the volume in Finder —
+    /// none of which flow through mountProfile/unmountProfile. Without this, the UI
+    /// can show "Not mounted" while the volume is actually mounted (and vice versa).
+    /// updateMountStates() no-ops (no subprocess) when there are no mount profiles.
+    private func startMountStateMonitor() {
+        mountStateMonitorTimer?.cancel()
+        let timer = DispatchSource.makeTimerSource(queue: .global(qos: .utility))
+        timer.schedule(deadline: .now() + 5, repeating: 5)  // every 5 seconds
+        timer.setEventHandler { [weak self] in
+            DispatchQueue.main.async {
+                self?.updateMountStates()
+            }
+        }
+        mountStateMonitorTimer = timer
+        timer.resume()
+    }
+
     private func startSessionHeartbeat() {
         heartbeatTimer?.cancel()
         let timer = DispatchSource.makeTimerSource(queue: .global(qos: .utility))
