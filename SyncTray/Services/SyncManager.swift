@@ -1843,26 +1843,50 @@ final class SyncManager: ObservableObject {
         }
     }
 
-    /// Start a 5-minute session heartbeat for availability monitoring
     /// Periodically reconcile mount-mode UI state with reality. A mount can be
     /// established or torn down out-of-band — launchd's KeepAlive (re)starting the
     /// daemon, an external drive event, or the user ejecting the volume in Finder —
     /// none of which flow through mountProfile/unmountProfile. Without this, the UI
     /// can show "Not mounted" while the volume is actually mounted (and vice versa).
-    /// updateMountStates() no-ops (no subprocess) when there are no mount profiles.
     private func startMountStateMonitor() {
         mountStateMonitorTimer?.cancel()
         let timer = DispatchSource.makeTimerSource(queue: .global(qos: .utility))
         timer.schedule(deadline: .now() + 5, repeating: 5)  // every 5 seconds
         timer.setEventHandler { [weak self] in
-            DispatchQueue.main.async {
-                self?.updateMountStates()
-            }
+            DispatchQueue.main.async { self?.reconcileMountStatesOffMain() }
         }
         mountStateMonitorTimer = timer
         timer.resume()
     }
 
+    /// Reconcile mount states without blocking the main thread: snapshot the mount
+    /// profiles on the main actor, probe `/sbin/mount` on a background queue, then
+    /// merge results back on the main actor. Used by the repeating 5s monitor so the
+    /// probe never stalls the UI — unlike updateMountStates(), whose synchronous
+    /// probe is fine for one-shot init/onAppear calls. No-ops (no subprocess) when
+    /// there are no mount profiles.
+    private func reconcileMountStatesOffMain() {
+        let mountProfiles = profileStore.enabledProfiles.filter { $0.isMountMode }
+        guard !mountProfiles.isEmpty else { return }
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            guard let self else { return }
+            let mounted = mountProfiles.reduce(into: [UUID: Bool]()) { acc, profile in
+                acc[profile.id] = self.setupService.isMounted(profile: profile)
+            }
+            DispatchQueue.main.async {
+                for profile in mountProfiles {
+                    if mounted[profile.id] == true {
+                        self.profileMountStates[profile.id] = .mounted
+                    } else if self.profileMountStates[profile.id] == nil
+                                || self.profileMountStates[profile.id] == .mounted {
+                        self.profileMountStates[profile.id] = .unmounted
+                    }
+                }
+            }
+        }
+    }
+
+    /// Start a 5-minute session heartbeat for availability monitoring
     private func startSessionHeartbeat() {
         heartbeatTimer?.cancel()
         let timer = DispatchSource.makeTimerSource(queue: .global(qos: .utility))

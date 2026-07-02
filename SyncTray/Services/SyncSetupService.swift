@@ -650,7 +650,11 @@ final class SyncSetupService {
                 # "bind: address already in use" and the mount never establishes —
                 # and launchd's KeepAlive turns that into a retry storm. Clear any
                 # such orphan (scoped to THIS mount point) before starting.
-                STALE_MOUNT_PIDS=$(pgrep -f "rclone .*mount .*$LOCAL_PATH" 2>/dev/null)
+                # Anchor the mount point with a trailing space so a profile whose
+                # path is a prefix of another (…/Reaper vs …/Reaper/Temp) can't match
+                # and kill the wrong mount's rclone. The path is a positional arg
+                # always followed by " --vfs-cache-mode …" on the command line.
+                STALE_MOUNT_PIDS=$(pgrep -f "rclone .*mount .*${LOCAL_PATH} " 2>/dev/null)
                 if [[ -n "$STALE_MOUNT_PIDS" ]]; then
                     echo "$(date '+%Y-%m-%d %H:%M:%S') - Clearing orphaned rclone for $LOCAL_PATH: $STALE_MOUNT_PIDS" >> "$LOG_FILE"
                     kill $STALE_MOUNT_PIDS 2>/dev/null
