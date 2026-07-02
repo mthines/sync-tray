@@ -662,6 +662,14 @@ final class SyncSetupService {
                 # Note: No --daemon flag - launchd manages the process lifecycle.
                 RCLONE_CMD="$RCLONE_BIN $MOUNT_SUBCMD \\"$REMOTE\\" \\"$LOCAL_PATH\\" --vfs-cache-mode $VFS_CACHE_MODE --vfs-cache-max-size $VFS_CACHE_MAX_SIZE --vfs-cache-max-age $VFS_CACHE_MAX_AGE --cache-dir \\"$VFS_CACHE_PATH\\" --log-level INFO --use-json-log"
 
+                # Name the mounted volume after the mount-point folder so Finder
+                # shows e.g. "Temp" instead of the auto-generated NFS share name
+                # ("localhost:/synology home Reaper"). macFUSE already derives the
+                # volume name from the mountpoint; the NFS backend does not, so set
+                # it explicitly. --volname is supported on macOS for both backends.
+                MOUNT_VOLNAME=$(basename "$LOCAL_PATH")
+                RCLONE_CMD="$RCLONE_CMD --volname \\"$MOUNT_VOLNAME\\""
+
                 # Add RC (remote control) API for cache management
                 if [[ "$RC_PORT" != "0" && -n "$RC_PORT" ]]; then
                     RCLONE_CMD="$RCLONE_CMD --rc --rc-addr=localhost:$RC_PORT --rc-no-auth"
