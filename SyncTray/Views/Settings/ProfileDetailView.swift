@@ -50,6 +50,7 @@ struct ProfileDetailView: View {
     @State private var vfsCacheMaxAge: String = "168h"
     @State private var vfsCachePath: String = ""
     @State private var allowNonEmptyMount: Bool = false
+    @State private var mountAtStartup: Bool = true
 
     // UI State
     @State private var showAdvanced: Bool = false
@@ -158,7 +159,8 @@ struct ProfileDetailView: View {
         vfsCacheMaxSize != profile.vfsCacheMaxSize ||
         vfsCacheMaxAge != profile.vfsCacheMaxAge ||
         vfsCachePath != profile.vfsCachePath ||
-        allowNonEmptyMount != profile.allowNonEmptyMount
+        allowNonEmptyMount != profile.allowNonEmptyMount ||
+        mountAtStartup != profile.mountAtStartup
     }
 
     private var canInstall: Bool {
@@ -923,6 +925,18 @@ struct ProfileDetailView: View {
                         }
                         .toggleStyle(.switch)
                     }
+
+                    // Auto-mount on startup toggle
+                    Toggle(isOn: $mountAtStartup) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Mount automatically on startup")
+                                .font(.subheadline)
+                            Text("Mount this stream when SyncTray launches (and at login). Turn off to mount only when you click Mount.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    .toggleStyle(.switch)
                 }
             }
 
@@ -1799,6 +1813,7 @@ struct ProfileDetailView: View {
         vfsCacheMaxAge = profile.vfsCacheMaxAge
         vfsCachePath = profile.vfsCachePath
         allowNonEmptyMount = profile.allowNonEmptyMount
+        mountAtStartup = profile.mountAtStartup
 
         // Show text input if the path contains "/" (nested path) or is a custom path
         // that won't be in the folder picker dropdown
@@ -1830,6 +1845,7 @@ struct ProfileDetailView: View {
         updatedProfile.vfsCacheMaxAge = vfsCacheMaxAge
         updatedProfile.vfsCachePath = vfsCachePath
         updatedProfile.allowNonEmptyMount = allowNonEmptyMount
+        updatedProfile.mountAtStartup = mountAtStartup
         return updatedProfile
     }
 
@@ -1852,7 +1868,8 @@ struct ProfileDetailView: View {
             currentProfile.vfsCacheMode != updatedProfile.vfsCacheMode ||
             currentProfile.vfsCacheMaxSize != updatedProfile.vfsCacheMaxSize ||
             currentProfile.vfsCacheMaxAge != updatedProfile.vfsCacheMaxAge ||
-            currentProfile.vfsCachePath != updatedProfile.vfsCachePath
+            currentProfile.vfsCachePath != updatedProfile.vfsCachePath ||
+            currentProfile.mountAtStartup != updatedProfile.mountAtStartup
         )
 
         profileStore.update(updatedProfile)

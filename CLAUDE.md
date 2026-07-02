@@ -46,6 +46,19 @@ agent with `rclone mount`. Legacy profiles also pick up the new `--vfs-cache-max
 default (168h) on the next script run — previously the flag was unset and rclone used
 its built-in 1h default; total cache size stays bounded by `--vfs-cache-max-size`.
 
+**Auto-mount on startup (`mountAtStartup`, default true):** a per-profile toggle for
+whether a Stream profile mounts on its own. It gates the launchd plist's `RunAtLoad`
+and `KeepAlive` (both `<true/>` only when enabled) — macOS reloads every LaunchAgent
+plist at each login, so those keys, not merely whether the app `launchctl load`ed the
+agent, decide login/reboot auto-mount. When enabled: mounts at login and the app also
+re-mounts it on launch (`mountProfilesAtStartup`, a safety net if the agent was
+unloaded). When disabled: the plist won't auto-start, so the profile mounts only when
+the user clicks **Mount** — which does `launchctl load` **plus** `launchctl kickstart`
+(`SyncSetupService.startAgent`), because with `RunAtLoad=false` loading alone won't
+start the job. `mountAtStartup` is an app/launchd-level setting and is deliberately
+**not** written to the script's `{shortId}.json` (the script never reads it); it does
+force a plist regeneration on save (part of `needsReinstall`).
+
 **The generated per-profile config (`{shortId}.json`) is the script's single source
 of truth.** `SyncSetupService.generateProfileConfig` writes this file (read by the
 sync script via `parse_json`); it is *separate* from the full `SyncProfile` that

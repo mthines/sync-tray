@@ -92,7 +92,7 @@ TelemetryService.shared.recordFileOperation(
 On app launch and every profile save, a structured log captures the user's chosen configuration:
 - `config.sync_mode`, `config.sync_direction`, `config.sync_interval_bucket`
 - `config.has_fallback`, `config.has_external_drive`, `config.is_enabled`, `config.is_muted`
-- Mount-specific: `config.mount_backend` (nfs/macfuse), `config.vfs_cache_mode`, `config.has_pinned_directories`, `config.pinned_directory_count`
+- Mount-specific: `config.mount_backend` (nfs/macfuse), `config.mount_at_startup` (true/false), `config.vfs_cache_mode`, `config.has_pinned_directories`, `config.pinned_directory_count`
 - A summary log with `config.total_profiles`, `config.enabled_profiles`, mode breakdown
 
 This lets you understand feature adoption and preference patterns across installations.

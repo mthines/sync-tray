@@ -112,6 +112,7 @@ final class SyncManager: ObservableObject {
         TelemetryService.shared.recordAllProfileConfigurations(self.profileStore.profiles)
         startSessionHeartbeat()
         startMountStateMonitor()
+        mountProfilesAtStartup()
     }
 
     deinit {
@@ -197,6 +198,21 @@ final class SyncManager: ObservableObject {
 
     // MARK: - Mount Mode Management
 
+    /// On app launch, auto-mount enabled mount profiles that opt in via
+    /// `mountAtStartup`. launchd already re-mounts these at login (RunAtLoad), so
+    /// this is mostly a safety net for when the agent was unloaded — and it honours
+    /// the per-profile setting so opt-out profiles are never mounted behind the
+    /// user's back. `mountProfile` no-ops when the profile is already mounted.
+    private func mountProfilesAtStartup() {
+        for profile in profileStore.enabledProfiles
+        where profile.isMountMode
+            && profile.mountAtStartup
+            && setupService.isInstalled(profile: profile)
+            && !setupService.isMounted(profile: profile) {
+            mountProfile(profile)
+        }
+    }
+
     /// Mount a profile (for mount mode only)
     func mountProfile(_ profile: SyncProfile) {
         guard profile.isMountMode else { return }
@@ -213,8 +229,13 @@ final class SyncManager: ObservableObject {
                     return
                 }
 
-                // Load the launchd agent (which will trigger the mount script)
+                // Load the launchd agent. For auto-mount profiles RunAtLoad starts it;
+                // for opt-out profiles (RunAtLoad/KeepAlive = false) loading alone
+                // won't start the mount, so kick it off explicitly.
                 let success = setupService.loadAgent(for: profile)
+                if success && !profile.mountAtStartup {
+                    setupService.startAgent(for: profile)
+                }
 
                 if success {
                     // Poll for the mount to establish. NFS mounts can take a few

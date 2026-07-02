@@ -164,6 +164,20 @@ final class SyncSetupService {
         return result.exitCode == 0
     }
 
+    /// Explicitly (re)start a loaded agent's job now, regardless of RunAtLoad.
+    /// Needed for mount profiles with `mountAtStartup == false`: their plist has
+    /// RunAtLoad/KeepAlive = false, so `launchctl load` alone won't start the mount —
+    /// the Mount button uses this to kick it off on demand.
+    /// - Returns: true if launchctl reported success.
+    @discardableResult
+    func startAgent(for profile: SyncProfile) -> Bool {
+        let uid = getuid()
+        let target = "gui/\(uid)/\(profile.launchdLabel)"
+        let result = runCommand("/bin/launchctl", arguments: ["kickstart", target])
+        print("[SyncTray] launchctl kickstart \(target) exit: \(result.exitCode), output: \(result.output)")
+        return result.exitCode == 0
+    }
+
     /// Unload the launchd agent WITHOUT removing any files. Used by pause so a
     /// paused profile stops firing scheduled syncs; resume calls `loadAgent`.
     @discardableResult
@@ -872,7 +886,13 @@ final class SyncSetupService {
         let launchdLogPath = logDir + "/synctray-launchd-\(profile.shortId).log"
 
         if profile.isMountMode {
-            // Mount mode: use KeepAlive to maintain daemon
+            // Mount mode: use KeepAlive to maintain the daemon — but only when the
+            // profile is set to auto-mount. macOS reloads every LaunchAgent plist at
+            // each login, so RunAtLoad/KeepAlive (not merely whether we `launchctl
+            // load`ed it) decide whether it mounts on its own. Gating both on
+            // mountAtStartup makes the setting effective at login/reboot; an opt-out
+            // profile is mounted only on demand (the Mount button → startAgent).
+            let autoStart = profile.mountAtStartup ? "<true/>" : "<false/>"
             return """
                 <?xml version="1.0" encoding="UTF-8"?>
                 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -888,10 +908,10 @@ final class SyncSetupService {
                     </array>
 
                     <key>KeepAlive</key>
-                    <true/>
+                    \(autoStart)
 
                     <key>RunAtLoad</key>
-                    <true/>
+                    \(autoStart)
 
                     <key>StandardOutPath</key>
                     <string>\(launchdLogPath)</string>

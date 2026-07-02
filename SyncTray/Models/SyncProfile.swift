@@ -31,6 +31,7 @@ struct SyncProfile: Identifiable, Codable, Equatable {
     var vfsCacheMaxAge: String          // Keep cached files this long since last access (e.g., "168h")
     var vfsCachePath: String            // Cache directory path (default: ~/.cache/rclone)
     var allowNonEmptyMount: Bool        // Allow mounting to non-empty folders (default: false)
+    var mountAtStartup: Bool            // Auto-mount when SyncTray launches (mount mode, default: true)
     var pinnedDirectories: [String]     // Directories to automatically cache offline (mount mode)
     var rcPort: Int                     // Port for rclone RC (remote control) API (mount mode)
 
@@ -163,6 +164,7 @@ struct SyncProfile: Identifiable, Codable, Equatable {
         vfsCacheMaxAge: String = "168h",
         vfsCachePath: String = "",
         allowNonEmptyMount: Bool = false,
+        mountAtStartup: Bool = true,
         pinnedDirectories: [String] = [],
         rcPort: Int = 0
     ) {
@@ -187,6 +189,7 @@ struct SyncProfile: Identifiable, Codable, Equatable {
         self.vfsCacheMaxAge = vfsCacheMaxAge
         self.vfsCachePath = vfsCachePath.isEmpty ? "\(NSHomeDirectory())/.cache/rclone" : vfsCachePath
         self.allowNonEmptyMount = allowNonEmptyMount
+        self.mountAtStartup = mountAtStartup
         self.pinnedDirectories = pinnedDirectories
         self.rcPort = rcPort > 0 ? rcPort : SyncProfile.defaultRCPort(for: id)
     }
@@ -218,6 +221,7 @@ extension SyncProfile {
         case fallbackRemote, fallbackRemotePath, fallbackRequiresCacheRebuild
         case mountBackend
         case vfsCacheMode, vfsCacheMaxSize, vfsCacheMaxAge, vfsCachePath, allowNonEmptyMount
+        case mountAtStartup
         case pinnedDirectories, rcPort
     }
 
@@ -258,6 +262,9 @@ extension SyncProfile {
         vfsCachePath = cachePath.isEmpty ? "\(NSHomeDirectory())/.cache/rclone" : cachePath
         // Backwards compatibility: default to false if not present
         allowNonEmptyMount = try container.decodeIfPresent(Bool.self, forKey: .allowNonEmptyMount) ?? false
+        // Backwards compatibility: auto-mount on startup defaults to true (matches the
+        // pre-existing behaviour where an installed mount profile always came up on launch)
+        mountAtStartup = try container.decodeIfPresent(Bool.self, forKey: .mountAtStartup) ?? true
         // Backwards compatibility: default to empty array if not present
         pinnedDirectories = try container.decodeIfPresent([String].self, forKey: .pinnedDirectories) ?? []
         // Backwards compatibility: generate default RC port if not present
