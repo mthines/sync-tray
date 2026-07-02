@@ -34,15 +34,27 @@ pinned-directory warming, and the RC API behave identically across them.
 | **NFS** (`nfs`, default for new profiles) | `rclone nfsmount` | None beyond rclone itself | **Kext-free.** rclone runs a local NFS server and mounts it via the built-in macOS NFS client. No macFUSE, no kernel/system extension, no admin approval — works on locked-down / MDM-managed Macs where kexts are blocked. |
 | **macFUSE** (`macfuse`, legacy) | `rclone mount` | macFUSE + official rclone binary | Classic FUSE mount. Broader filesystem compatibility, but needs a kernel extension. Profiles created before the NFS backend existed default here so their behaviour is unchanged on upgrade. |
 
-**Backend defaults & migration:** the in-app default for newly created profiles is
-`nfs`. Profiles persisted before this field existed decode as `macfuse` (preserving
-their original `rclone mount` behaviour); users can switch to NFS by editing the
-profile, which re-installs the launchd agent with the new mount command. The sync
-script applies the **same `macfuse` fallback** when the `mountBackend` key is absent
-from a profile's JSON, so the app and the generated script never disagree on a legacy
-profile's backend. Note that legacy profiles also pick up the new `--vfs-cache-max-age`
+**Backend defaults & migration:** the default backend is `nfs` everywhere — for
+newly created profiles and for profiles persisted before this field existed. A
+legacy profile with no `mountBackend` key decodes as `nfs` (the Swift model default)
+and the sync script applies the **same `nfs` fallback** when the key is absent from a
+profile's JSON, so the app and the generated script never disagree. This means a
+profile that previously mounted via macFUSE switches to the kext-free NFS backend on
+its next mount (the VFS cache is shared, so no re-download); users who specifically
+want FUSE can select **macFUSE** in the profile editor, which re-installs the launchd
+agent with `rclone mount`. Legacy profiles also pick up the new `--vfs-cache-max-age`
 default (168h) on the next script run — previously the flag was unset and rclone used
 its built-in 1h default; total cache size stays bounded by `--vfs-cache-max-size`.
+
+**The generated per-profile config (`{shortId}.json`) is the script's single source
+of truth.** `SyncSetupService.generateProfileConfig` writes this file (read by the
+sync script via `parse_json`); it is *separate* from the full `SyncProfile` that
+`ProfileStore` persists to `UserDefaults`. Any mount setting the script consumes
+(`mountBackend`, `vfsCacheMaxAge`, `vfsCacheMode`, …) **must be emitted by
+`generateProfileConfig`** — a field present in the model, UI, and `Codable` but
+missing from this writer silently never reaches the script, which then falls back to
+its default. (This was the cause of the "NFS selected but macFUSE still runs" bug:
+`mountBackend`/`vfsCacheMaxAge` were added everywhere except `generateProfileConfig`.)
 
 **Cache retention (`vfsCacheMaxAge`):** the "Keep Cached For" setting maps to
 rclone's `--vfs-cache-max-age` (default `168h` = 7 days). A used file stays in the

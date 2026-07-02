@@ -245,9 +245,12 @@ extension SyncProfile {
         fallbackRequiresCacheRebuild = try container.decodeIfPresent(
             Bool.self, forKey: .fallbackRequiresCacheRebuild) ?? false
         // Backwards compatibility: mount mode settings with defaults.
-        // Profiles created before the kext-free NFS backend existed default to
-        // macFUSE (their `rclone mount` behaviour is unchanged on upgrade).
-        mountBackend = try container.decodeIfPresent(MountBackend.self, forKey: .mountBackend) ?? .macfuse
+        // Profiles with no explicit backend default to the kext-free NFS backend —
+        // it needs no macFUSE install, so it's the lowest-friction default. A profile
+        // that was running on macFUSE switches to NFS on its next mount (the VFS cache
+        // is shared, so no re-download); users who specifically want FUSE can pick
+        // macFUSE in the profile editor.
+        mountBackend = try container.decodeIfPresent(MountBackend.self, forKey: .mountBackend) ?? .nfs
         vfsCacheMode = try container.decodeIfPresent(VFSCacheMode.self, forKey: .vfsCacheMode) ?? .full
         vfsCacheMaxSize = try container.decodeIfPresent(String.self, forKey: .vfsCacheMaxSize) ?? "10G"
         vfsCacheMaxAge = try container.decodeIfPresent(String.self, forKey: .vfsCacheMaxAge) ?? "168h"

@@ -485,11 +485,11 @@ final class SyncSetupService {
             FALLBACK_PATH=$(parse_json "fallbackRemotePath" "")
             FALLBACK_REQUIRES_CACHE_REBUILD=$(parse_json "fallbackRequiresCacheRebuild" "false")
             REMOTE_PATH=$(parse_json "remotePath" "")
-            # Default to macfuse when the key is absent: a profile JSON written before
-            # the mountBackend field existed is a legacy `rclone mount` profile, and the
-            # Swift model decodes the same default — keep the two in lockstep so existing
-            # mounts keep their original backend on upgrade.
-            MOUNT_BACKEND=$(parse_json "mountBackend" "macfuse")
+            # Default to the kext-free NFS backend when the key is absent — the Swift
+            # model decodes the same default. Keep the two in lockstep so a profile
+            # whose JSON predates the mountBackend field mounts via nfsmount (no macFUSE
+            # install required) rather than falling back to FUSE.
+            MOUNT_BACKEND=$(parse_json "mountBackend" "nfs")
             VFS_CACHE_MODE=$(parse_json "vfsCacheMode" "full")
             VFS_CACHE_MAX_SIZE=$(parse_json "vfsCacheMaxSize" "10G")
             VFS_CACHE_MAX_AGE=$(parse_json "vfsCacheMaxAge" "168h")
@@ -813,8 +813,10 @@ final class SyncSetupService {
             "fallbackRemotePath": profile.fallbackRemotePath,
             "fallbackRequiresCacheRebuild": computeFallbackRequiresCacheRebuild(profile: profile),
             "remotePath": profile.remotePath,
+            "mountBackend": profile.mountBackend.rawValue,
             "vfsCacheMode": profile.vfsCacheMode.rawValue,
             "vfsCacheMaxSize": profile.vfsCacheMaxSize,
+            "vfsCacheMaxAge": profile.vfsCacheMaxAge,
             "vfsCachePath": profile.vfsCachePath,
             "allowNonEmptyMount": profile.allowNonEmptyMount,
             "pinnedDirectories": profile.pinnedDirectories,
