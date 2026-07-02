@@ -170,6 +170,7 @@ final class TelemetryService {
 
         meterProvider = stableMeterProvider
         OpenTelemetry.registerStableMeterProvider(meterProvider: stableMeterProvider)
+        print("[SyncTray][Telemetry] metrics exporter configured → \(metricsEndpoint) (temporality: delta, interval: 30s)")
 
         // MARK: Traces
 
@@ -528,6 +529,35 @@ final class TelemetryService {
                     "sync.duration_s": .double(duration),
                     "error.type": .string(errorType),
                     "error.message": .string(errorMessage ?? "Exit code \(exitCode)"),
+                ],
+                spanContext: span.context
+            )
+        }
+    }
+
+    /// Called when a scheduled sync exited early WITHOUT running — e.g. the
+    /// remote failed the pre-flight reachability check, or the profile was
+    /// paused mid-flight. Ends the active span with result "skipped" so it does
+    /// not linger open and later get reported as "abandoned"/"app_shutdown"
+    /// (which is exactly what produced the 11–37 min phantom "syncing" spans).
+    func recordSyncSkipped(profileId: UUID, profileName: String, reason: String) {
+        guard SyncTraySettings.telemetryEnabled else { return }
+        ensureSetup()
+
+        if let span = activeSyncSpans.removeValue(forKey: profileId) {
+            span.setAttribute(key: "sync.result", value: .string("skipped"))
+            span.setAttribute(key: "sync.skip_reason", value: .string(reason))
+            span.status = .ok
+            span.end()
+
+            emitLog(
+                severity: .info,
+                body: "Sync skipped",
+                attributes: [
+                    "synctray.profile.id": .string(profileId.uuidString),
+                    "synctray.profile.name": .string(profileName),
+                    "sync.result": .string("skipped"),
+                    "sync.skip_reason": .string(reason),
                 ],
                 spanContext: span.context
             )
@@ -1230,7 +1260,13 @@ final class TelemetryService {
         }
         activeSyncSpans.removeAll()
 
-        _ = meterProvider?.forceFlush()
+        // Diagnostic: spans + logs reach Dash0 but the synctray.* metrics do not
+        // show up in the metric catalog. The exporter setup looks correct on
+        // inspection (shared endpoint/headers with traces, wildcard StableView
+        // registered), so surface the flush result here — a non-success on a live
+        // run points at the OTLP /v1/metrics exchange as the real culprit.
+        let metricsFlush = meterProvider?.forceFlush()
+        print("[SyncTray][Telemetry] metrics forceFlush on shutdown: \(String(describing: metricsFlush)) → \(Self.endpoint)/v1/metrics")
         _ = meterProvider?.shutdown()
         tracerProvider?.shutdown()
     }

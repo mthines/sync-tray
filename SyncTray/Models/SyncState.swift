@@ -365,6 +365,16 @@ enum SyncLogPatterns {
         message.lowercased().contains("already running")
     }
 
+    /// Patterns indicating a scheduled run exited early WITHOUT syncing because
+    /// the remote failed the read-only pre-flight reachability check.
+    /// Matches "Remote unreachable, skipping sync ..." but deliberately NOT the
+    /// fallback message "Primary remote unreachable, using fallback: ..." (which
+    /// is a transport change, handled separately) — the discriminator is the
+    /// ", skipping" clause.
+    static func isSyncSkipped(_ message: String) -> Bool {
+        message.lowercased().contains("unreachable, skipping")
+    }
+
     /// Error pattern that triggers automatic recovery via --resync.
     /// Matches the canonical bisync "out of sync" messages that require --resync.
     /// NOTE: Do NOT match bare "--resync" as a substring — rclone error output from a

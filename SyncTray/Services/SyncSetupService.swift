@@ -141,6 +141,15 @@ final class SyncSetupService {
         return result.exitCode == 0
     }
 
+    /// Unload the launchd agent WITHOUT removing any files. Used by pause so a
+    /// paused profile stops firing scheduled syncs; resume calls `loadAgent`.
+    @discardableResult
+    func unloadAgent(for profile: SyncProfile) -> Bool {
+        let result = runCommand("/bin/launchctl", arguments: ["unload", profile.plistPath])
+        print("[SyncTray] launchctl unload exit code: \(result.exitCode), output: \(result.output)")
+        return result.exitCode == 0
+    }
+
     /// Uninstall the sync configuration for a profile
     func uninstall(profile: SyncProfile) throws {
         // Unload the launchd agent first
@@ -497,24 +506,56 @@ final class SyncSetupService {
             REMOTE_NAME="${REMOTE%%:*}"
             NO_CHECK_CERT=$(check_no_cert "$REMOTE_NAME")
 
+            # Run a command with a HARD wall-clock timeout. macOS ships no
+            # coreutils `timeout`, and rclone's own --contimeout/--timeout are
+            # not always honoured by the SMB backend (a hibernating/unreachable
+            # NAS could hang the reachability probe for many minutes while
+            # holding the lock). This kills the probe if it overruns so the run
+            # exits promptly and releases the lock. Returns 124 on timeout.
+            run_with_timeout() {
+                local secs="$1"; shift
+                "$@" &
+                local cmd_pid=$!
+                ( sleep "$secs"; kill -TERM "$cmd_pid" 2>/dev/null; sleep 2; kill -KILL "$cmd_pid" 2>/dev/null ) &
+                local watchdog_pid=$!
+                wait "$cmd_pid" 2>/dev/null
+                local status=$?
+                kill "$watchdog_pid" 2>/dev/null
+                wait "$watchdog_pid" 2>/dev/null
+                return $status
+            }
+
             # Check if drive is mounted (if configured)
             if [[ -n "$DRIVE_PATH" && ! -d "$DRIVE_PATH" ]]; then
                 echo "$(date '+%Y-%m-%d %H:%M:%S') - Drive not mounted, skipping sync" >> "$LOG_FILE"
                 exit 0
             fi
 
-            # Check if another sync is already running
-            if [[ -f "$LOCK_FILE" ]]; then
-                PID=$(cat "$LOCK_FILE")
-                if ps -p "$PID" > /dev/null 2>&1; then
+            # Acquire the lock ATOMICALLY. `set -o noclobber` makes the '>'
+            # redirection fail if the file already exists, so the check and the
+            # write are a single atomic step — closing the check-then-write
+            # (TOCTOU) race where two launchd/manual runs could both pass the
+            # old `[[ -f ]]` test and start concurrently. The PID is still stored
+            # as the file's contents, so the app's lock readers are unchanged.
+            acquire_lock() {
+                ( set -o noclobber; echo $$ > "$LOCK_FILE" ) 2>/dev/null
+            }
+
+            if ! acquire_lock; then
+                PID=$(cat "$LOCK_FILE" 2>/dev/null)
+                if [[ -n "$PID" ]] && ps -p "$PID" > /dev/null 2>&1; then
                     echo "$(date '+%Y-%m-%d %H:%M:%S') - Sync already running (PID $PID), skipping" >> "$LOG_FILE"
                     exit 0
                 fi
+                # Lock owner is gone — reclaim the stale lock and retry once.
+                echo "$(date '+%Y-%m-%d %H:%M:%S') - Removing stale lock (PID ${PID:-unknown} not running)" >> "$LOG_FILE"
+                rm -f "$LOCK_FILE"
+                if ! acquire_lock; then
+                    echo "$(date '+%Y-%m-%d %H:%M:%S') - Could not acquire lock, skipping" >> "$LOG_FILE"
+                    exit 0
+                fi
             fi
-
-            # Create lock file
-            echo $$ > "$LOCK_FILE"
-            trap "rm -f $LOCK_FILE" EXIT
+            trap 'rm -f "$LOCK_FILE"' EXIT
 
             # Ensure local sync directory exists
             mkdir -p "$LOCAL_PATH"
@@ -523,7 +564,7 @@ final class SyncSetupService {
             if [[ -n "$FALLBACK_REMOTE" ]]; then
                 REMOTE_NAME="${REMOTE%%:*}"
                 # Quick reachability check on primary remote (3s connect timeout)
-                if ! $RCLONE_BIN lsd "${REMOTE_NAME}:" --contimeout 3s --timeout 8s --max-depth 0 $NO_CHECK_CERT &>/dev/null; then
+                if ! run_with_timeout 15 $RCLONE_BIN lsd "${REMOTE_NAME}:" --contimeout 3s --timeout 8s --max-depth 0 $NO_CHECK_CERT &>/dev/null; then
                     echo "$(date '+%Y-%m-%d %H:%M:%S') - Primary remote unreachable, using fallback: $FALLBACK_REMOTE" >> "$LOG_FILE"
                     # Re-check cert setting for the fallback remote
                     NO_CHECK_CERT=$(check_no_cert "$FALLBACK_REMOTE")
@@ -595,7 +636,7 @@ final class SyncSetupService {
                 # by bisync's own --max-delete (default 50%), which aborts with a "too
                 # many deletes" error instead of propagating the deletion.
                 PREFLIGHT_REMOTE_NAME="${REMOTE%%:*}"
-                if ! $RCLONE_BIN lsd "${PREFLIGHT_REMOTE_NAME}:" --max-depth 0 --contimeout 10s --timeout 30s --retries 1 --low-level-retries 1 $NO_CHECK_CERT &>/dev/null; then
+                if ! run_with_timeout 45 $RCLONE_BIN lsd "${PREFLIGHT_REMOTE_NAME}:" --max-depth 0 --contimeout 10s --timeout 30s --retries 1 --low-level-retries 1 $NO_CHECK_CERT &>/dev/null; then
                     echo "$(date '+%Y-%m-%d %H:%M:%S') - Remote unreachable, skipping sync (will retry next interval)" >> "$LOG_FILE"
                     exit 0
                 fi
