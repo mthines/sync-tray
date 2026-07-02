@@ -8,7 +8,14 @@ final class SyncManager: ObservableObject {
     @Published private(set) var currentState: SyncState = .idle
     @Published private(set) var lastSyncTime: Date?
     @Published private(set) var recentChanges: [FileChange] = []
-    @Published private(set) var isManualSyncRunning = false
+    /// Profiles with an in-flight app-initiated ("Sync Now" / directory-watch) run.
+    /// Per-profile so one hung profile no longer blocks manual syncs for all others.
+    @Published private(set) var manualSyncingProfiles: Set<UUID> = []
+
+    /// True while any profile has an app-initiated sync in flight.
+    /// Computed from `manualSyncingProfiles` so existing view bindings keep working;
+    /// SwiftUI re-reads it whenever the published set changes.
+    var isManualSyncRunning: Bool { !manualSyncingProfiles.isEmpty }
 
     /// Sync progress per profile (keyed by profile ID)
     @Published private(set) var profileProgress: [UUID: SyncProgress] = [:]
@@ -93,6 +100,7 @@ final class SyncManager: ObservableObject {
         setupWorkspaceObserver()
         setupProfileObserver()
         cleanupStaleLockFiles()
+        setupService.refreshSharedScriptIfChanged()  // Propagate script template updates
         setupService.cleanupStaleMounts()  // Clean up stale mounts on startup
         detectAndResumeRunningSyncs()  // After cleanup, detect external syncs
         checkInitialState()
@@ -135,8 +143,6 @@ final class SyncManager: ObservableObject {
 
     /// Trigger manual sync for all enabled profiles, or a specific profile
     func triggerManualSync(for profile: SyncProfile? = nil) {
-        guard !isManualSyncRunning else { return }
-
         let profilesToSync: [SyncProfile]
         if let profile = profile {
             // Skip if this specific profile is paused
@@ -144,18 +150,29 @@ final class SyncManager: ObservableObject {
                 SyncTraySettings.debugLog("Skipping manual sync for paused profile: \(profile.name)")
                 return
             }
+            // Per-profile guard: don't double-trigger a profile that's already
+            // running an app-initiated sync (a different profile hanging no
+            // longer blocks this one).
+            guard !manualSyncingProfiles.contains(profile.id) else { return }
             profilesToSync = [profile]
         } else {
-            // Filter out paused profiles
-            profilesToSync = profileStore.enabledProfiles.filter { !isPaused(for: $0.id) }
+            // Filter out paused profiles and any already mid-sync
+            profilesToSync = profileStore.enabledProfiles.filter {
+                !isPaused(for: $0.id) && !manualSyncingProfiles.contains($0.id)
+            }
         }
 
         guard !profilesToSync.isEmpty else {
-            currentState = .notConfigured
+            // Only surface "not configured" when there genuinely are no enabled
+            // profiles — not when they're simply all mid-sync already.
+            if profileStore.enabledProfiles.isEmpty {
+                currentState = .notConfigured
+            }
             return
         }
 
-        isManualSyncRunning = true
+        let syncingIds = profilesToSync.map { $0.id }
+        manualSyncingProfiles.formUnion(syncingIds)
 
         Task {
             // Run all profile syncs in parallel for better performance
@@ -167,7 +184,7 @@ final class SyncManager: ObservableObject {
                 }
             }
             await MainActor.run {
-                isManualSyncRunning = false
+                manualSyncingProfiles.subtract(syncingIds)
             }
         }
     }
@@ -543,6 +560,43 @@ final class SyncManager: ObservableObject {
         }
     }
 
+    /// Resolve the remote reference and env-var overrides a resync should target,
+    /// honouring the currently active transport (primary vs fallback) the same way
+    /// the launchd sync script does. Without this, a resync launched while the
+    /// profile runs on fallback would rebuild the wrong (primary) bisync pair.
+    /// - Returns: the effective "remote:path" plus RCLONE_CONFIG_* env overrides
+    ///   (non-empty only for the same-wire-type fallback that preserves the cache
+    ///   by keeping the primary remote name).
+    func resolveActiveRemote(for profile: SyncProfile) -> (remotePath: String, extraEnv: [String: String]) {
+        let transport = profileTransports[profile.id] ?? .unknown
+        let primaryRemotePath = "\(profile.rcloneRemote):\(profile.remotePath)"
+
+        guard transport.isFallback, !profile.fallbackRemote.isEmpty else {
+            return (primaryRemotePath, [:])
+        }
+
+        if profile.fallbackRequiresCacheRebuild || !profile.fallbackRemotePath.isEmpty {
+            // Different wire type OR explicit path: swap full remote reference.
+            // bisync uses a separate listing pair — consistent with the script.
+            let effectiveFallbackPath = profile.fallbackRemotePath.isEmpty
+                ? profile.remotePath : profile.fallbackRemotePath
+            return ("\(profile.fallbackRemote):\(effectiveFallbackPath)", [:])
+        }
+
+        // Same wire type, same path: use env-var overrides to preserve bisync cache.
+        let primaryRemoteName = profile.rcloneRemote.hasSuffix(":")
+            ? String(profile.rcloneRemote.dropLast()) : profile.rcloneRemote
+        let upperName = primaryRemoteName.uppercased().replacingOccurrences(of: "-", with: "_")
+        var extraEnv: [String: String] = [:]
+        if let fallbackConfig = RcloneConfigService.shared.readRemoteConfig(name: profile.fallbackRemote) {
+            for (key, value) in fallbackConfig.values {
+                let envKey = "RCLONE_CONFIG_\(upperName)_\(key.uppercased().replacingOccurrences(of: "-", with: "_"))"
+                extraEnv[envKey] = value
+            }
+        }
+        return (primaryRemotePath, extraEnv)
+    }
+
     /// Run `rclone bisync --resync` for a profile directly (no UI output panel).
     /// Called by `triggerAutoFix`. On completion, state is updated via the existing
     /// log-watcher pipeline (same as scheduled syncs).
@@ -551,7 +605,6 @@ final class SyncManager: ObservableObject {
 
         // Capture all values from the main actor before going to the background
         let rcloneRemote = profile.rcloneRemote
-        let remotePath = profile.remotePath
         let localSyncPath = profile.localSyncPath
         let drivePathToMonitor = profile.drivePathToMonitor
         let filterPath = profile.filterFilePath
@@ -562,8 +615,7 @@ final class SyncManager: ObservableObject {
         let additionalFlags = profile.additionalRcloneFlags
         let fallbackTransport = profileTransports[profileId] ?? .unknown
         let fallbackRemote = profile.fallbackRemote
-        let fallbackRemotePath = profile.fallbackRemotePath
-        let fallbackRequiresCacheRebuild = profile.fallbackRequiresCacheRebuild
+        let (effectiveRemotePath, extraEnv) = resolveActiveRemote(for: profile)
         let bisyncDir = "\(NSHomeDirectory())/Library/Caches/rclone/bisync"
 
         // Pre-flight: if a live lock already exists for a running process, skip.
@@ -626,37 +678,17 @@ final class SyncManager: ObservableObject {
                         return
                     }
 
-                    // Determine effective remote path — apply fallback transport if active.
-                    // This mirrors the fallback logic in the launchd-generated shell script.
-                    var effectiveRemotePath = "\(rcloneRemote):\(remotePath)"
-                    var extraEnv: [String: String] = [:]
                     let isFallbackActive = fallbackTransport.isFallback
-
-                    if isFallbackActive && !fallbackRemote.isEmpty {
-                        if fallbackRequiresCacheRebuild || !fallbackRemotePath.isEmpty {
-                            // Different wire type OR explicit path: swap full remote reference.
-                            // bisync rebuilds listings on first switch — consistent with the script.
-                            let effectiveFallbackPath = fallbackRemotePath.isEmpty ? remotePath : fallbackRemotePath
-                            effectiveRemotePath = "\(fallbackRemote):\(effectiveFallbackPath)"
-                        } else {
-                            // Same wire type, same path: use env-var overrides to preserve bisync cache.
-                            let primaryRemoteName = rcloneRemote.hasSuffix(":")
-                                ? String(rcloneRemote.dropLast()) : rcloneRemote
-                            let upperName = primaryRemoteName.uppercased().replacingOccurrences(of: "-", with: "_")
-                            if let fallbackConfig = RcloneConfigService.shared.readRemoteConfig(name: fallbackRemote) {
-                                for (key, value) in fallbackConfig.values {
-                                    let envKey = "RCLONE_CONFIG_\(upperName)_\(key.uppercased().replacingOccurrences(of: "-", with: "_"))"
-                                    extraEnv[envKey] = value
-                                }
-                            }
-                        }
-                    }
 
                     var arguments: [String]
 
                     if syncMode == .bisync {
+                        // --resync-mode newer: prefer the newest version per file so a
+                        // stale remote copy never overwrites fresher local edits (the
+                        // bare --resync default is path1 = remote wins).
                         arguments = ["bisync", effectiveRemotePath, localSyncPath,
-                                     "--resync", "--verbose", "--use-json-log", "--stats", "2s"]
+                                     "--resync", "--resync-mode", "newer",
+                                     "--verbose", "--use-json-log", "--stats", "2s"]
                     } else if syncDirection == .localToRemote {
                         arguments = ["sync", localSyncPath, effectiveRemotePath,
                                      "--verbose", "--use-json-log", "--stats", "2s"]
@@ -809,8 +841,27 @@ final class SyncManager: ObservableObject {
         directoryWatchers[profileId]?.stop()
         directoryWatchers.removeValue(forKey: profileId)
 
+        // Actually stop scheduled syncs. Previously pause only set an in-memory
+        // flag, so launchd kept firing the sync script every interval — the
+        // "paused" profile still hammered the remote and the spinner never
+        // rested. Unload the agent so no new runs start.
+        setupService.unloadAgent(for: profile)
+
+        // Terminate any in-flight run for this profile and clear its lock, so a
+        // hung/slow sync can't keep holding the lock and block a later resume.
+        terminateRunningSync(for: profile)
+
+        // Close any open telemetry span so it isn't later reported as abandoned.
+        TelemetryService.shared.recordSyncSkipped(
+            profileId: profileId,
+            profileName: profile.name,
+            reason: "paused"
+        )
+
         // Update profile state to paused
         profileStates[profileId] = .paused
+        profileProgress[profileId] = nil
+        logWatchers[profileId]?.setActivelySyncing(false)
 
         updateAggregateState()
 
@@ -822,12 +873,37 @@ final class SyncManager: ObservableObject {
         )
     }
 
+    /// Terminate any running sync process for `profile` (identified via its lock
+    /// file PID) and remove the lock so a killed/stale run can't block the next
+    /// start. Best-effort: signals the process group (launchd runs each job as
+    /// its own group leader) so the bash script and its rclone child both stop.
+    /// Safe to call when nothing is running.
+    private func terminateRunningSync(for profile: SyncProfile) {
+        if let pid = detectRunningSyncPID(for: profile) {
+            // Negative PID targets the whole process group; fall back to the
+            // single process if it isn't a group leader.
+            if kill(-pid, SIGTERM) != 0 {
+                kill(pid, SIGTERM)
+            }
+        }
+        // Stop any external-sync completion poller watching this profile.
+        syncCompletionPollers[profile.id]?.cancel()
+        syncCompletionPollers.removeValue(forKey: profile.id)
+        monitoringExternalSyncs.remove(profile.id)
+        // Remove the lock file so the next run isn't blocked by a stale lock.
+        try? FileManager.default.removeItem(atPath: profile.lockFilePath)
+    }
+
     /// Resume syncing for a specific profile (restarts directory watcher)
     func resumeProfile(_ profileId: UUID) {
         guard let profile = profileStore.profile(for: profileId),
               profile.isEnabled else { return }
 
         pausedProfiles.remove(profileId)
+
+        // Reload the launchd agent that pause unloaded so scheduled syncs run
+        // again. (No-op if it somehow never unloaded.)
+        setupService.loadAgent(for: profile)
 
         // Restart directory watcher for this profile
         startWatchingDirectory(for: profile)
@@ -1645,6 +1721,28 @@ final class SyncManager: ObservableObject {
                     notificationService.notifyDriveNotMounted(profileId: profileId, profileName: profileName)
                 }
             }
+
+        case .syncSkipped(let reason):
+            // A scheduled run exited early without syncing (remote failed the
+            // pre-flight reachability check). "Starting bisync" already set the
+            // profile to `.syncing` and opened a telemetry span; close both here
+            // so the profile returns to rest instead of appearing to sync for
+            // 11–37 min until the next run abandons the stale span.
+            logWatchers[profileId]?.setActivelySyncing(false)
+            profileProgress[profileId] = nil
+            syncStartTimes[profileId] = nil
+            checkPhaseStartTimes.removeValue(forKey: profileId)
+            checkPhaseReported.remove(profileId)
+            // Only downgrade from `.syncing`; never clobber a real error,
+            // paused, or driveNotMounted state.
+            if profileStates[profileId] == .syncing {
+                profileStates[profileId] = .idle
+            }
+            TelemetryService.shared.recordSyncSkipped(
+                profileId: profileId,
+                profileName: profileName,
+                reason: reason
+            )
 
         case .syncAlreadyRunning:
             TelemetryService.shared.recordSyncContention(

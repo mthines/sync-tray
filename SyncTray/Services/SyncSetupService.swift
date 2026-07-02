@@ -69,6 +69,29 @@ final class SyncSetupService {
         return result.exitCode == 0
     }
 
+    /// Rewrite the shared sync script if the installed copy differs from the
+    /// current template. The script is normally only written on profile
+    /// install/save, so without this an app update would leave already-installed
+    /// profiles running the old script until the next re-save.
+    /// Called once at app startup. No-op when no profile has been installed yet.
+    func refreshSharedScriptIfChanged() {
+        let path = SyncProfile.sharedScriptPath
+        guard FileManager.default.fileExists(atPath: path) else { return }
+
+        let current = generateSyncScript()
+        let onDisk = try? String(contentsOfFile: path, encoding: .utf8)
+        guard onDisk != current else { return }
+
+        do {
+            try current.write(toFile: path, atomically: true, encoding: .utf8)
+            try FileManager.default.setAttributes(
+                [.posixPermissions: 0o755], ofItemAtPath: path)
+            SyncTraySettings.debugLog("Refreshed shared sync script (template changed)")
+        } catch {
+            print("Failed to refresh shared sync script: \(error)")
+        }
+    }
+
     /// Generate and install the sync script and launchd plist for a profile
     /// - Parameters:
     ///   - profile: The sync profile to install
@@ -138,6 +161,15 @@ final class SyncSetupService {
 
         let result = runCommand("/bin/launchctl", arguments: ["load", plistPath])
         print("[SyncTray] launchctl load exit code: \(result.exitCode), output: \(result.output)")
+        return result.exitCode == 0
+    }
+
+    /// Unload the launchd agent WITHOUT removing any files. Used by pause so a
+    /// paused profile stops firing scheduled syncs; resume calls `loadAgent`.
+    @discardableResult
+    func unloadAgent(for profile: SyncProfile) -> Bool {
+        let result = runCommand("/bin/launchctl", arguments: ["unload", profile.plistPath])
+        print("[SyncTray] launchctl unload exit code: \(result.exitCode), output: \(result.output)")
         return result.exitCode == 0
     }
 
@@ -497,24 +529,56 @@ final class SyncSetupService {
             REMOTE_NAME="${REMOTE%%:*}"
             NO_CHECK_CERT=$(check_no_cert "$REMOTE_NAME")
 
+            # Run a command with a HARD wall-clock timeout. macOS ships no
+            # coreutils `timeout`, and rclone's own --contimeout/--timeout are
+            # not always honoured by the SMB backend (a hibernating/unreachable
+            # NAS could hang the reachability probe for many minutes while
+            # holding the lock). This kills the probe if it overruns so the run
+            # exits promptly and releases the lock. Returns 124 on timeout.
+            run_with_timeout() {
+                local secs="$1"; shift
+                "$@" &
+                local cmd_pid=$!
+                ( sleep "$secs"; kill -TERM "$cmd_pid" 2>/dev/null; sleep 2; kill -KILL "$cmd_pid" 2>/dev/null ) &
+                local watchdog_pid=$!
+                wait "$cmd_pid" 2>/dev/null
+                local status=$?
+                kill "$watchdog_pid" 2>/dev/null
+                wait "$watchdog_pid" 2>/dev/null
+                return $status
+            }
+
             # Check if drive is mounted (if configured)
             if [[ -n "$DRIVE_PATH" && ! -d "$DRIVE_PATH" ]]; then
                 echo "$(date '+%Y-%m-%d %H:%M:%S') - Drive not mounted, skipping sync" >> "$LOG_FILE"
                 exit 0
             fi
 
-            # Check if another sync is already running
-            if [[ -f "$LOCK_FILE" ]]; then
-                PID=$(cat "$LOCK_FILE")
-                if ps -p "$PID" > /dev/null 2>&1; then
+            # Acquire the lock ATOMICALLY. `set -o noclobber` makes the '>'
+            # redirection fail if the file already exists, so the check and the
+            # write are a single atomic step — closing the check-then-write
+            # (TOCTOU) race where two launchd/manual runs could both pass the
+            # old `[[ -f ]]` test and start concurrently. The PID is still stored
+            # as the file's contents, so the app's lock readers are unchanged.
+            acquire_lock() {
+                ( set -o noclobber; echo $$ > "$LOCK_FILE" ) 2>/dev/null
+            }
+
+            if ! acquire_lock; then
+                PID=$(cat "$LOCK_FILE" 2>/dev/null)
+                if [[ -n "$PID" ]] && ps -p "$PID" > /dev/null 2>&1; then
                     echo "$(date '+%Y-%m-%d %H:%M:%S') - Sync already running (PID $PID), skipping" >> "$LOG_FILE"
                     exit 0
                 fi
+                # Lock owner is gone — reclaim the stale lock and retry once.
+                echo "$(date '+%Y-%m-%d %H:%M:%S') - Removing stale lock (PID ${PID:-unknown} not running)" >> "$LOG_FILE"
+                rm -f "$LOCK_FILE"
+                if ! acquire_lock; then
+                    echo "$(date '+%Y-%m-%d %H:%M:%S') - Could not acquire lock, skipping" >> "$LOG_FILE"
+                    exit 0
+                fi
             fi
-
-            # Create lock file
-            echo $$ > "$LOCK_FILE"
-            trap "rm -f $LOCK_FILE" EXIT
+            trap 'rm -f "$LOCK_FILE"' EXIT
 
             # Ensure local sync directory exists
             mkdir -p "$LOCAL_PATH"
@@ -523,7 +587,7 @@ final class SyncSetupService {
             if [[ -n "$FALLBACK_REMOTE" ]]; then
                 REMOTE_NAME="${REMOTE%%:*}"
                 # Quick reachability check on primary remote (3s connect timeout)
-                if ! $RCLONE_BIN lsd "${REMOTE_NAME}:" --contimeout 3s --timeout 8s --max-depth 0 $NO_CHECK_CERT &>/dev/null; then
+                if ! run_with_timeout 15 $RCLONE_BIN lsd "${REMOTE_NAME}:" --contimeout 3s --timeout 8s --max-depth 0 $NO_CHECK_CERT &>/dev/null; then
                     echo "$(date '+%Y-%m-%d %H:%M:%S') - Primary remote unreachable, using fallback: $FALLBACK_REMOTE" >> "$LOG_FILE"
                     # Re-check cert setting for the fallback remote
                     NO_CHECK_CERT=$(check_no_cert "$FALLBACK_REMOTE")
@@ -595,12 +659,45 @@ final class SyncSetupService {
                 # by bisync's own --max-delete (default 50%), which aborts with a "too
                 # many deletes" error instead of propagating the deletion.
                 PREFLIGHT_REMOTE_NAME="${REMOTE%%:*}"
-                if ! $RCLONE_BIN lsd "${PREFLIGHT_REMOTE_NAME}:" --max-depth 0 --contimeout 10s --timeout 30s --retries 1 --low-level-retries 1 $NO_CHECK_CERT &>/dev/null; then
+                if ! run_with_timeout 45 $RCLONE_BIN lsd "${PREFLIGHT_REMOTE_NAME}:" --max-depth 0 --contimeout 10s --timeout 30s --retries 1 --low-level-retries 1 $NO_CHECK_CERT &>/dev/null; then
                     echo "$(date '+%Y-%m-%d %H:%M:%S') - Remote unreachable, skipping sync (will retry next interval)" >> "$LOG_FILE"
                     exit 0
                 fi
 
+                # Self-bootstrap: if this (remote, local) pair has no prior bisync
+                # listings, bisync would abort with "cannot find prior Path1/Path2
+                # listings". That happens on the FIRST run against a new transport
+                # pair (e.g. first fallback activation after a REMOTE swap, or a
+                # brand-new profile). Run that first sync as --resync with
+                # newer-wins so failover works unattended (no app required) and a
+                # stale remote copy can never overwrite newer local edits.
+                #
+                # Session name mirrors rclone's bilib.SessionName/CanonicalPath:
+                # trim leading/trailing slashes, replace whitespace and /:?* with
+                # "_", join path1..path2. (Backslashes, which rclone also replaces,
+                # cannot occur in macOS paths or these remote names.)
+                # A pair counts as having state when a .lst OR .lst-new listing
+                # exists for BOTH sides — bisync --recover resumes from .lst-new.
+                BISYNC_WORKDIR="$HOME/Library/Caches/rclone/bisync"
+                SESSION_NAME=$(python3 -c "
+            import sys
+            def canon(p):
+                p = p.strip('/')
+                return ''.join('_' if (ch.isspace() or ch in '/:?*') else ch for ch in p)
+            print(canon(sys.argv[1]) + '..' + canon(sys.argv[2]))
+            " "$REMOTE" "$LOCAL_PATH")
+                BOOTSTRAP_FLAGS=""
+                if [[ ! -e "$BISYNC_WORKDIR/$SESSION_NAME.path1.lst" && ! -e "$BISYNC_WORKDIR/$SESSION_NAME.path1.lst-new" ]] \\
+                    || [[ ! -e "$BISYNC_WORKDIR/$SESSION_NAME.path2.lst" && ! -e "$BISYNC_WORKDIR/$SESSION_NAME.path2.lst-new" ]]; then
+                    echo "$(date '+%Y-%m-%d %H:%M:%S') - Bootstrapping sync state (--resync, newer wins): first run for this transport pair" >> "$LOG_FILE"
+                    BOOTSTRAP_FLAGS="--resync --resync-mode newer"
+                fi
+
                 RCLONE_CMD="$RCLONE_BIN bisync \\"$REMOTE\\" \\"$LOCAL_PATH\\" --verbose --use-json-log --stats 2s --filter-from \\"$FILTER_FILE\\" --resilient --recover --conflict-resolve newer --conflict-loser num --conflict-suffix sync-conflict-{DateOnly}-"
+
+                if [[ -n "$BOOTSTRAP_FLAGS" ]]; then
+                    RCLONE_CMD="$RCLONE_CMD $BOOTSTRAP_FLAGS"
+                fi
             else
                 # One-way sync
                 if [[ "$SYNC_DIRECTION" == "localToRemote" ]]; then
