@@ -278,27 +278,30 @@ final class SyncSetupService {
         }
     }
 
-    /// Clean up stale mounts on app startup
-    func cleanupStaleMounts() {
-        // Find all SyncTray mount points
+    /// Clean up stale mounts on app startup.
+    ///
+    /// Matches mount points against the known mount-mode profile paths rather than
+    /// the filesystem type. This is both backend-agnostic (handles macFUSE *and* the
+    /// kext-free NFS backend, whose `mount` lines don't contain "rclone") and safe —
+    /// it will never force-unmount an unrelated NFS share the user mounted themselves.
+    /// - Parameter mountProfiles: mount-mode profiles whose paths are owned by SyncTray.
+    func cleanupStaleMounts(mountProfiles: [SyncProfile]) {
+        let managedPaths = Set(mountProfiles.filter { $0.isMountMode }.map { $0.localSyncPath })
+        guard !managedPaths.isEmpty else { return }
+
         let result = runCommand("/sbin/mount", arguments: [])
         let lines = result.output.components(separatedBy: "\n")
 
         for line in lines {
-            // Look for rclone mounts that match our pattern
-            if line.contains("rclone") {
-                // Extract mount point from line like "remote: on /path/to/mount (osxfuse..."
-                if let onRange = line.range(of: " on "),
-                   let parenRange = line.range(of: " (") {
-                    let mountPoint = String(line[line.index(onRange.upperBound, offsetBy: 0)..<parenRange.lowerBound])
+            // Extract the mount point from a line like "remote: on /path (osxfuse...)"
+            // or "localhost:/ on /path (nfs, ...)".
+            guard let onRange = line.range(of: " on "),
+                  let parenRange = line.range(of: " (") else { continue }
+            let mountPoint = String(line[onRange.upperBound..<parenRange.lowerBound])
 
-                    // Check if this is a SyncTray managed mount (has a corresponding config)
-                    let configExists = FileManager.default.fileExists(atPath: SyncProfile.configDirectory)
-                    if configExists {
-                        // Try to unmount stale mounts
-                        _ = runCommand("/usr/sbin/diskutil", arguments: ["unmount", "force", mountPoint])
-                    }
-                }
+            // Only unmount paths SyncTray manages — never a user's own NFS/FUSE mount.
+            if managedPaths.contains(mountPoint) {
+                _ = runCommand("/usr/sbin/diskutil", arguments: ["unmount", "force", mountPoint])
             }
         }
     }
@@ -482,8 +485,14 @@ final class SyncSetupService {
             FALLBACK_PATH=$(parse_json "fallbackRemotePath" "")
             FALLBACK_REQUIRES_CACHE_REBUILD=$(parse_json "fallbackRequiresCacheRebuild" "false")
             REMOTE_PATH=$(parse_json "remotePath" "")
+            # Default to macfuse when the key is absent: a profile JSON written before
+            # the mountBackend field existed is a legacy `rclone mount` profile, and the
+            # Swift model decodes the same default — keep the two in lockstep so existing
+            # mounts keep their original backend on upgrade.
+            MOUNT_BACKEND=$(parse_json "mountBackend" "macfuse")
             VFS_CACHE_MODE=$(parse_json "vfsCacheMode" "full")
             VFS_CACHE_MAX_SIZE=$(parse_json "vfsCacheMaxSize" "10G")
+            VFS_CACHE_MAX_AGE=$(parse_json "vfsCacheMaxAge" "168h")
             VFS_CACHE_PATH=$(parse_json "vfsCachePath" "$HOME/.cache/rclone")
             ALLOW_NON_EMPTY=$(parse_json "allowNonEmptyMount" "false")
             RC_PORT=$(parse_json "rcPort" "0")
@@ -628,17 +637,32 @@ final class SyncSetupService {
                     exit 0
                 fi
 
-                # Mount command with VFS cache settings
-                # Note: No --daemon flag - launchd manages the process lifecycle
-                RCLONE_CMD="$RCLONE_BIN mount \\"$REMOTE\\" \\"$LOCAL_PATH\\" --vfs-cache-mode $VFS_CACHE_MODE --vfs-cache-max-size $VFS_CACHE_MAX_SIZE --cache-dir \\"$VFS_CACHE_PATH\\" --log-level INFO --use-json-log"
+                # Choose the mount backend:
+                #   nfs     -> rclone nfsmount (built-in NFS server + native macOS NFS
+                #              client). Kext-free: needs no macFUSE, works on locked-down
+                #              Macs. This is the default for new profiles.
+                #   macfuse -> rclone mount (classic FUSE; requires macFUSE + official rclone)
+                if [[ "$MOUNT_BACKEND" == "macfuse" ]]; then
+                    MOUNT_SUBCMD="mount"
+                else
+                    MOUNT_SUBCMD="nfsmount"
+                fi
+                echo "$(date '+%Y-%m-%d %H:%M:%S') - Mount backend: $MOUNT_BACKEND ($MOUNT_SUBCMD)" >> "$LOG_FILE"
+
+                # Mount command with VFS cache settings.
+                # Both backends share the same VFS cache layer, so retention/eviction
+                # (--vfs-cache-max-size / --vfs-cache-max-age) behaves identically.
+                # Note: No --daemon flag - launchd manages the process lifecycle.
+                RCLONE_CMD="$RCLONE_BIN $MOUNT_SUBCMD \\"$REMOTE\\" \\"$LOCAL_PATH\\" --vfs-cache-mode $VFS_CACHE_MODE --vfs-cache-max-size $VFS_CACHE_MAX_SIZE --vfs-cache-max-age $VFS_CACHE_MAX_AGE --cache-dir \\"$VFS_CACHE_PATH\\" --log-level INFO --use-json-log"
 
                 # Add RC (remote control) API for cache management
                 if [[ "$RC_PORT" != "0" && -n "$RC_PORT" ]]; then
                     RCLONE_CMD="$RCLONE_CMD --rc --rc-addr=localhost:$RC_PORT --rc-no-auth"
                 fi
 
-                # Add --allow-non-empty flag if configured
-                if [[ "$ALLOW_NON_EMPTY" == "true" || "$ALLOW_NON_EMPTY" == "True" || "$ALLOW_NON_EMPTY" == "1" ]]; then
+                # --allow-non-empty is a FUSE mount option; it is not valid for the
+                # NFS backend, so only pass it when mounting via macFUSE.
+                if [[ "$MOUNT_SUBCMD" == "mount" && ( "$ALLOW_NON_EMPTY" == "true" || "$ALLOW_NON_EMPTY" == "True" || "$ALLOW_NON_EMPTY" == "1" ) ]]; then
                     RCLONE_CMD="$RCLONE_CMD --allow-non-empty"
                 fi
             elif [[ "$SYNC_MODE" == "bisync" ]]; then

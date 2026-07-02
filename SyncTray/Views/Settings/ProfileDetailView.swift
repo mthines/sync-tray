@@ -44,8 +44,10 @@ struct ProfileDetailView: View {
     @State private var fallbackPathValidationTask: Task<Void, Never>?
 
     // Mount mode specific settings
+    @State private var mountBackend: MountBackend = .nfs
     @State private var vfsCacheMode: VFSCacheMode = .full
     @State private var vfsCacheMaxSize: String = "10G"
+    @State private var vfsCacheMaxAge: String = "168h"
     @State private var vfsCachePath: String = ""
     @State private var allowNonEmptyMount: Bool = false
 
@@ -792,22 +794,52 @@ struct ProfileDetailView: View {
                     }
                     .padding(.vertical, 4)
 
-                    // macFUSE requirement warning
-                    HStack(alignment: .top, spacing: 6) {
-                        Image(systemName: "exclamationmark.triangle.fill")
-                            .foregroundStyle(.orange)
-                            .font(.caption)
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text("Requires macFUSE and official rclone binary")
-                                .font(.caption.weight(.medium))
-                            Text("Homebrew rclone doesn't support mount. Install macFUSE via `brew install --cask macfuse`, then download rclone from rclone.org/downloads")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
+                    // Mount backend picker
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Mount Backend")
+                            .font(.subheadline.weight(.medium))
+                        Picker("", selection: $mountBackend) {
+                            ForEach(MountBackend.allCases) { backend in
+                                Text("\(backend.displayName) - \(backend.description)").tag(backend)
+                            }
                         }
+                        .labelsHidden()
                     }
-                    .padding(8)
-                    .background(Color.orange.opacity(0.1))
-                    .clipShape(.rect(cornerRadius: 6))
+
+                    // Backend-specific requirement note
+                    if mountBackend == .macfuse {
+                        HStack(alignment: .top, spacing: 6) {
+                            Image(systemName: "exclamationmark.triangle.fill")
+                                .foregroundStyle(.orange)
+                                .font(.caption)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("Requires macFUSE and the official rclone binary")
+                                    .font(.caption.weight(.medium))
+                                Text("Homebrew rclone doesn't support mount. Install macFUSE via `brew install --cask macfuse`, then download rclone from rclone.org/downloads. If your Mac blocks kernel extensions (e.g. managed by an employer), use the NFS backend instead — no install required.")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                        .padding(8)
+                        .background(Color.orange.opacity(0.1))
+                        .clipShape(.rect(cornerRadius: 6))
+                    } else {
+                        HStack(alignment: .top, spacing: 6) {
+                            Image(systemName: "checkmark.seal.fill")
+                                .foregroundStyle(.green)
+                                .font(.caption)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("No macFUSE required")
+                                    .font(.caption.weight(.medium))
+                                Text("Streams via rclone's built-in NFS mount using the macOS NFS client — no kernel extension, works on locked-down/managed Macs.")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                        .padding(8)
+                        .background(Color.green.opacity(0.1))
+                        .clipShape(.rect(cornerRadius: 6))
+                    }
 
                     // VFS Cache Mode
                     VStack(alignment: .leading, spacing: 4) {
@@ -835,6 +867,20 @@ struct ProfileDetailView: View {
                         }
                     }
 
+                    // VFS Cache Retention (max age since last access)
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Keep Cached For")
+                            .font(.subheadline.weight(.medium))
+                        HStack {
+                            TextField("e.g., 168h", text: $vfsCacheMaxAge)
+                                .textFieldStyle(.roundedBorder)
+                                .frame(maxWidth: 150)
+                            Text("How long a used file stays cached since last access (e.g. 24h, 168h = 7d). Resets each time the file is opened.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+
                     // VFS Cache Path
                     VStack(alignment: .leading, spacing: 4) {
                         Text("Cache Directory")
@@ -853,17 +899,20 @@ struct ProfileDetailView: View {
                             .foregroundStyle(.secondary)
                     }
 
-                    // Allow non-empty mount toggle
-                    Toggle(isOn: $allowNonEmptyMount) {
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text("Allow mounting to non-empty folder")
-                                .font(.subheadline)
-                            Text("Mount even if the local folder already contains files")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
+                    // Allow non-empty mount toggle (FUSE-only option; the NFS backend
+                    // ignores --allow-non-empty, so only surface it for macFUSE).
+                    if mountBackend == .macfuse {
+                        Toggle(isOn: $allowNonEmptyMount) {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("Allow mounting to non-empty folder")
+                                    .font(.subheadline)
+                                Text("Mount even if the local folder already contains files")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
                         }
+                        .toggleStyle(.switch)
                     }
-                    .toggleStyle(.switch)
                 }
             }
 
@@ -1600,8 +1649,10 @@ struct ProfileDetailView: View {
         fallbackRemotePath = profile.fallbackRemotePath
         fallbackEnabled = !profile.fallbackRemote.isEmpty
         fallbackUseDifferentPath = !profile.fallbackRemotePath.isEmpty
+        mountBackend = profile.mountBackend
         vfsCacheMode = profile.vfsCacheMode
         vfsCacheMaxSize = profile.vfsCacheMaxSize
+        vfsCacheMaxAge = profile.vfsCacheMaxAge
         vfsCachePath = profile.vfsCachePath
         allowNonEmptyMount = profile.allowNonEmptyMount
 
@@ -1629,8 +1680,10 @@ struct ProfileDetailView: View {
         updatedProfile.syncDirection = syncDirection
         updatedProfile.fallbackRemote = fallbackEnabled ? fallbackRemote : ""
         updatedProfile.fallbackRemotePath = (fallbackEnabled && fallbackUseDifferentPath) ? fallbackRemotePath : ""
+        updatedProfile.mountBackend = mountBackend
         updatedProfile.vfsCacheMode = vfsCacheMode
         updatedProfile.vfsCacheMaxSize = vfsCacheMaxSize
+        updatedProfile.vfsCacheMaxAge = vfsCacheMaxAge
         updatedProfile.vfsCachePath = vfsCachePath
         updatedProfile.allowNonEmptyMount = allowNonEmptyMount
         return updatedProfile
@@ -1651,8 +1704,10 @@ struct ProfileDetailView: View {
             currentProfile.syncDirection != updatedProfile.syncDirection ||
             currentProfile.fallbackRemote != updatedProfile.fallbackRemote ||
             currentProfile.fallbackRemotePath != updatedProfile.fallbackRemotePath ||
+            currentProfile.mountBackend != updatedProfile.mountBackend ||
             currentProfile.vfsCacheMode != updatedProfile.vfsCacheMode ||
             currentProfile.vfsCacheMaxSize != updatedProfile.vfsCacheMaxSize ||
+            currentProfile.vfsCacheMaxAge != updatedProfile.vfsCacheMaxAge ||
             currentProfile.vfsCachePath != updatedProfile.vfsCachePath
         )
 

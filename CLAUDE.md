@@ -22,15 +22,45 @@ SyncTray is a macOS menu bar application that provides Google Drive-style backgr
 | Two-Way Sync | `rclone bisync` | Bidirectional sync - changes on either side sync to the other |
 | One-Way Upload | `rclone sync local remote` | Local is authoritative, uploads to remote |
 | One-Way Download | `rclone sync remote local` | Remote is authoritative, downloads to local |
-| Stream (Mount) | `rclone mount` | Virtual filesystem - files stream on-demand without local copy |
+| Stream (Mount) | `rclone nfsmount` (default) or `rclone mount` | Virtual filesystem - files stream on-demand without local copy |
 
-#### Mount Mode Requirements
-Stream (Mount) mode requires additional setup:
-1. **macFUSE**: Install via `brew install --cask macfuse` (restart required)
-2. **Official rclone binary**: Homebrew's rclone doesn't support mount. Download from https://rclone.org/downloads/
+#### Mount Mode Backends
+Stream (Mount) mode supports two backends, chosen per-profile via `mountBackend`
+(`MountBackend` enum). Both share the same VFS cache layer, so caching, retention,
+pinned-directory warming, and the RC API behave identically across them.
+
+| Backend | rclone command | Requirements | When to use |
+|---------|----------------|--------------|-------------|
+| **NFS** (`nfs`, default for new profiles) | `rclone nfsmount` | None beyond rclone itself | **Kext-free.** rclone runs a local NFS server and mounts it via the built-in macOS NFS client. No macFUSE, no kernel/system extension, no admin approval — works on locked-down / MDM-managed Macs where kexts are blocked. |
+| **macFUSE** (`macfuse`, legacy) | `rclone mount` | macFUSE + official rclone binary | Classic FUSE mount. Broader filesystem compatibility, but needs a kernel extension. Profiles created before the NFS backend existed default here so their behaviour is unchanged on upgrade. |
+
+**Backend defaults & migration:** the in-app default for newly created profiles is
+`nfs`. Profiles persisted before this field existed decode as `macfuse` (preserving
+their original `rclone mount` behaviour); users can switch to NFS by editing the
+profile, which re-installs the launchd agent with the new mount command. The sync
+script applies the **same `macfuse` fallback** when the `mountBackend` key is absent
+from a profile's JSON, so the app and the generated script never disagree on a legacy
+profile's backend. Note that legacy profiles also pick up the new `--vfs-cache-max-age`
+default (168h) on the next script run — previously the flag was unset and rclone used
+its built-in 1h default; total cache size stays bounded by `--vfs-cache-max-size`.
+
+**Cache retention (`vfsCacheMaxAge`):** the "Keep Cached For" setting maps to
+rclone's `--vfs-cache-max-age` (default `168h` = 7 days). A used file stays in the
+VFS cache until this long has passed *since it was last accessed* (the timer resets
+on each open); `--vfs-cache-max-size` still bounds total cache size with LRU
+eviction. There is no rclone-native per-file "pin" — `pinnedDirectories` are kept
+warm app-side via the RC API + reads (see Offline Files).
+
+**NFS backend caveats:** writes require `--vfs-cache-mode` ≥ `writes` (default is
+`full`, so this is satisfied). The NFS client couples access/modification times,
+which can occasionally cause an extra re-upload after a file is merely viewed in
+Finder. `--allow-non-empty` is a FUSE-only option and is ignored for the NFS backend.
+
+The **macFUSE** backend additionally requires the official rclone binary
+(Homebrew's rclone can't mount):
 
 ```bash
-# Install macFUSE
+# Only needed for the macFUSE backend — the NFS backend needs none of this.
 brew install --cask macfuse
 # Restart Mac
 

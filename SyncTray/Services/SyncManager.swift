@@ -101,7 +101,7 @@ final class SyncManager: ObservableObject {
         setupProfileObserver()
         cleanupStaleLockFiles()
         setupService.refreshSharedScriptIfChanged()  // Propagate script template updates
-        setupService.cleanupStaleMounts()  // Clean up stale mounts on startup
+        setupService.cleanupStaleMounts(mountProfiles: self.profileStore.profiles)  // Clean up stale mounts on startup
         detectAndResumeRunningSyncs()  // After cleanup, detect external syncs
         checkInitialState()
         startWatchingAllProfiles()
