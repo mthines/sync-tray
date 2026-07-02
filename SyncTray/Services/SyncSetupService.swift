@@ -460,6 +460,13 @@ final class SyncSetupService {
             # Supports bisync (two-way), sync (one-way), and mount (streaming) modes
             # DO NOT EDIT - This file is managed by SyncTray
 
+            # launchd hands us a minimal PATH that omits /sbin. The NFS backend
+            # (`rclone nfsmount`) shells out to the system `mount` / `mount_nfs`
+            # binaries, both in /sbin — without this they fail with
+            # "exec: \\"mount\\": executable file not found in $PATH". Prepend the
+            # system sbin dirs so both backends resolve their helpers.
+            export PATH="/sbin:/usr/sbin:/usr/bin:/bin:$PATH"
+
             CONFIG_FILE="$1"
 
             if [[ -z "$CONFIG_FILE" || ! -f "$CONFIG_FILE" ]]; then
