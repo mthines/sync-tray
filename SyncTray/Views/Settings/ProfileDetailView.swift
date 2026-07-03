@@ -1413,14 +1413,14 @@ struct ProfileDetailView: View {
     private func updateCacheSizeString() {
         let digits = cacheSizeNumber.filter(\.isNumber)
         if digits != cacheSizeNumber { cacheSizeNumber = digits }
-        vfsCacheMaxSize = digits.isEmpty ? "" : digits + cacheSizeUnit
+        vfsCacheMaxSize = digits.isEmpty ? "10\(cacheSizeUnit)" : digits + cacheSizeUnit
     }
 
     /// Recompose vfsCacheMaxAge from the number field + unit picker (digits only).
     private func updateCacheAgeString() {
         let digits = cacheAgeNumber.filter(\.isNumber)
         if digits != cacheAgeNumber { cacheAgeNumber = digits }
-        vfsCacheMaxAge = digits.isEmpty ? "" : digits + cacheAgeUnit
+        vfsCacheMaxAge = digits.isEmpty ? "168\(cacheAgeUnit)" : digits + cacheAgeUnit
     }
 
     /// Stream (Mount) management — the mount-mode counterpart to
@@ -1461,11 +1461,13 @@ struct ProfileDetailView: View {
                 Spacer()
             }
 
-            // Mounted-at + volume details
+            // Mounted-at + volume details. Use the persisted profile values (what
+            // the running daemon was installed with), not the form's @State edit
+            // buffers, so unsaved edits don't misrepresent the live mount.
             if isInstalled, mountState == .mounted {
                 VStack(alignment: .leading, spacing: 2) {
-                    Text("Mounted at: \(localSyncPath)")
-                    Text("Volume: \((localSyncPath as NSString).lastPathComponent)  ·  Cache: \(vfsCacheMaxSize) / \(vfsCacheMaxAge)")
+                    Text("Mounted at: \(profile.localSyncPath)")
+                    Text("Volume: \((profile.localSyncPath as NSString).lastPathComponent)  ·  Cache: \(profile.vfsCacheMaxSize) / \(profile.vfsCacheMaxAge)")
                 }
                 .font(.caption)
                 .foregroundStyle(.secondary)
