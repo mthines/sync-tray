@@ -114,7 +114,54 @@ SyncTray/
 ├── Views/            # SwiftUI views
 ├── Assets.xcassets/  # App icons and images
 └── SyncTrayApp.swift # App entry point and AppDelegate
+SyncTrayFinderSync/   # FinderSync app extension (kext-free, sandboxed)
+├── FinderSyncExtension.swift # FIFinderSync subclass — contextual menu, badges, IPC
+├── Info.plist        # NSExtension point: com.apple.FinderSync
+├── SyncTrayFinderSync.entitlements # App sandbox + App Group (group.com.synctray.app)
+└── Assets.xcassets/  # Badge images (badge-cloud, badge-downloaded)
 ```
+
+### FinderSync Extension
+
+The `SyncTrayFinderSync` app extension adds a right-click Finder contextual menu
+("Make Available Offline" / "Remove from Offline") for directories inside rclone NFS
+mount paths. Extension bundle ID: `com.synctray.app.findersync`. Requires no kernel
+extension (kext-free NFS backend only).
+
+#### App Group IPC Contract
+
+Two distinct IPC mechanisms are used. Both use App Group ID `group.com.synctray.app`:
+
+| Direction | Mechanism | Key / File | Contents |
+|-----------|-----------|------------|----------|
+| Host → Extension | `UserDefaults(suiteName: "group.com.synctray.app")` | `com.synctray.app.mountPaths` | `[String]` — active NFS mount paths |
+| Host → Extension | `UserDefaults(suiteName: "group.com.synctray.app")` | `com.synctray.app.profileData` | `[[String:Any]]` — profileId, pinnedDirectories, vfsCachePath per profile |
+| Extension → Host | JSON file in App Group container | `pending-pin-request.json` | `{action, profileId, paths[]}` |
+| Extension → Host | Darwin distributed notification | `com.synctray.app.pinRequest` | Zero-payload wake signal |
+
+The host app reads `pending-pin-request.json` and deletes it on each Darwin notification
+and on a 1-second fallback poll timer (active only when mount profiles exist).
+
+#### Cross-Target String Constants
+
+`kAppGroupID` (`group.com.synctray.app`), `kMountPathsKey`, and
+`kPinRequestNotificationName` (`com.synctray.app.pinRequest`) are defined as string
+literals in **both** `FinderSyncExtension.swift` and `SyncManager.swift` independently.
+The two targets are separate compilation units. If you rename either constant, rename both.
+
+#### VFS Content Warming (Bug Fix)
+
+`VFSCacheService.warmDirectory(_:for:)` fixes a pre-existing bug: the old
+`refreshPinnedDirectories` only called `/vfs/refresh` (listing-cache metadata), which
+does not populate the rclone VFS content cache. `warmDirectory` now:
+
+1. Calls `/vfs/refresh` first (listing cache pre-step).
+2. Walks `profile.localSyncPath/<dir>` via `FileManager.enumerator`.
+3. Opens each file ≤ 100 MB via `FileHandle` and reads 64 KB chunks — the act of
+   reading through the NFS mount populates `~/.cache/rclone/vfs/…`.
+
+I/O budget: sequential reads (not concurrent), 2 GB total ceiling per call, cancellable
+between files via `try Task.checkCancellation()`.
 
 ### Models/
 

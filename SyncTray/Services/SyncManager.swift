@@ -61,6 +61,24 @@ final class SyncManager: ObservableObject {
     private var currentSyncChanges: [UUID: [FileChange]] = [:]
     private var cancellables = Set<AnyCancellable>()
 
+    // MARK: - FinderSync IPC Constants
+    //
+    // These string literals are intentionally duplicated in FinderSyncExtension.swift
+    // (the extension target). The two targets are separate compilation units and cannot
+    // share a Swift file. Treat them as a cross-target contract — if you rename one, rename both.
+
+    /// App Group identifier shared between host app and the FinderSync extension.
+    private let kAppGroupID = "group.com.synctray.app"
+
+    /// UserDefaults key for the mount-path array read by the extension.
+    private let kMountPathsKey = "com.synctray.app.mountPaths"
+
+    /// Darwin notification name posted by the extension when a pin/unpin request is pending.
+    private let kPinRequestNotificationName = "com.synctray.app.pinRequest"
+
+    /// 1-second fallback poll timer for missed Darwin notifications.
+    private var pinRequestPollTimer: DispatchSourceTimer?
+
     /// Track the last error message per profile (for correlating with syncFailed events)
     private var lastSeenErrorMessage: [UUID: String] = [:]
 
@@ -113,6 +131,8 @@ final class SyncManager: ObservableObject {
         startSessionHeartbeat()
         startMountStateMonitor()
         mountProfilesAtStartup()
+        setupFinderSyncIPC()
+        updateAppGroupMountPaths()
     }
 
     deinit {
@@ -123,6 +143,18 @@ final class SyncManager: ObservableObject {
         // Cancel mount-state monitor
         mountStateMonitorTimer?.cancel()
         mountStateMonitorTimer = nil
+
+        // Cancel pin-request poll timer
+        pinRequestPollTimer?.cancel()
+        pinRequestPollTimer = nil
+
+        // Remove Darwin notification observer to avoid dangling-pointer crash.
+        CFNotificationCenterRemoveObserver(
+            CFNotificationCenterGetDistributedCenter(),
+            Unmanaged.passUnretained(self).toOpaque(),
+            CFNotificationName(kPinRequestNotificationName as CFString),
+            nil
+        )
 
         // Cancel all sync completion pollers
         for timer in syncCompletionPollers.values {
@@ -259,6 +291,9 @@ final class SyncManager: ObservableObject {
                                 operation: "mount",
                                 result: "success"
                             )
+                            // Update App Group mount paths so the FinderSync extension
+                            // registers this newly mounted directory.
+                            updateAppGroupMountPaths()
                             // Auto-refresh pinned directories after successful mount
                             if !profile.pinnedDirectories.isEmpty {
                                 Task { [weak self] in
@@ -307,6 +342,9 @@ final class SyncManager: ObservableObject {
                         operation: "unmount",
                         result: "success"
                     )
+                    // Update App Group mount paths so the FinderSync extension
+                    // unregisters this directory.
+                    updateAppGroupMountPaths()
                 }
             } catch {
                 await MainActor.run {
@@ -1254,6 +1292,7 @@ final class SyncManager: ObservableObject {
             .sink { [weak self] _ in
                 self?.startWatchingAllProfiles()
                 self?.updateAggregateState()
+                self?.updateAppGroupMountPaths()
             }
             .store(in: &cancellables)
     }
@@ -1862,6 +1901,160 @@ final class SyncManager: ObservableObject {
         if recentChanges.count > maxRecentChanges {
             recentChanges = Array(recentChanges.prefix(maxRecentChanges))
         }
+    }
+
+    // MARK: - FinderSync IPC
+
+    /// Set up the Darwin notification observer and fallback poll timer for
+    /// receiving pin/unpin requests from the FinderSync extension.
+    private func setupFinderSyncIPC() {
+        // Register Darwin notification observer.
+        // CFNotificationCenterAddObserver requires a C-callable callback with no captures.
+        // Pass `self` via the `observer` UnsafeRawPointer and cast it back inside the callback.
+        let observer = Unmanaged.passUnretained(self).toOpaque()
+        CFNotificationCenterAddObserver(
+            CFNotificationCenterGetDistributedCenter(),
+            observer,
+            { _, observer, _, _, _ in
+                // The C callback is on an arbitrary thread — bridge to @MainActor.
+                guard let observer = observer else { return }
+                let manager = Unmanaged<SyncManager>.fromOpaque(observer).takeUnretainedValue()
+                Task { @MainActor in
+                    await manager.processPendingPinRequest()
+                }
+            },
+            kPinRequestNotificationName as CFString,
+            nil,
+            .deliverImmediately
+        )
+
+        // 1-second fallback poll timer in case a Darwin notification is missed.
+        // Only polls when there are mounted profiles (avoids CPU waste).
+        let timer = DispatchSource.makeTimerSource(queue: .global(qos: .utility))
+        timer.schedule(deadline: .now() + 1, repeating: 1.0)
+        timer.setEventHandler { [weak self] in
+            guard let self else { return }
+            let hasMountedProfiles = self.profileStore.enabledProfiles.contains { $0.isMountMode }
+            guard hasMountedProfiles else { return }
+            // Check for a pending request without a wake notification.
+            Task { @MainActor in
+                await self.processPendingPinRequest()
+            }
+        }
+        pinRequestPollTimer = timer
+        timer.resume()
+    }
+
+    /// Read and process a pending pin/unpin request written by the FinderSync extension.
+    ///
+    /// Reads `<AppGroupContainer>/pending-pin-request.json`, parses the action and paths,
+    /// updates the profile's `pinnedDirectories`, deletes the file, and initiates
+    /// VFS content warming for pin operations.
+    func processPendingPinRequest() async {
+        guard let containerURL = FileManager.default.containerURL(
+            forSecurityApplicationGroupIdentifier: kAppGroupID
+        ) else {
+            SyncTraySettings.debugLog("processPendingPinRequest: App Group container not accessible")
+            return
+        }
+
+        let requestURL = containerURL.appendingPathComponent("pending-pin-request.json")
+        guard FileManager.default.fileExists(atPath: requestURL.path) else { return }
+
+        do {
+            let data = try Data(contentsOf: requestURL)
+            // Delete the file immediately so we don't process it again.
+            try? FileManager.default.removeItem(at: requestURL)
+
+            guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let action = json["action"] as? String,
+                  let profileIdStr = json["profileId"] as? String,
+                  let profileId = UUID(uuidString: profileIdStr),
+                  let paths = json["paths"] as? [String] else {
+                SyncTraySettings.debugLog("processPendingPinRequest: malformed JSON in pending request")
+                return
+            }
+
+            guard var profile = profileStore.profile(for: profileId) else {
+                SyncTraySettings.debugLog("processPendingPinRequest: profile \(profileIdStr) not found")
+                return
+            }
+
+            let isMountMode = profile.isMountMode
+            guard isMountMode else {
+                SyncTraySettings.debugLog("processPendingPinRequest: profile '\(profile.name)' is not in mount mode")
+                return
+            }
+
+            if action == "pin" {
+                for path in paths where !profile.pinnedDirectories.contains(path) {
+                    profile.pinnedDirectories.append(path)
+                }
+            } else if action == "unpin" {
+                profile.pinnedDirectories.removeAll { paths.contains($0) }
+            }
+
+            profileStore.update(profile)
+
+            TelemetryService.shared.recordOfflinePinOperation(
+                profileId: profileId,
+                profileName: profile.name,
+                action: action,
+                pathCount: paths.count
+            )
+
+            SyncTraySettings.debugLog("processPendingPinRequest: \(action) \(paths.count) path(s) for '\(profile.name)'")
+
+            // For pin operations, start warming the directories.
+            if action == "pin" {
+                for path in paths {
+                    Task {
+                        await self.cacheService.warmDirectory(path, for: profile)
+                    }
+                }
+            }
+
+        } catch {
+            SyncTraySettings.debugLog("processPendingPinRequest: error reading/parsing request: \(error)")
+        }
+    }
+
+    /// Write active mount paths to App Group UserDefaults so the FinderSync extension
+    /// can register them via `FIFinderSyncController.setDirectoryURLs`.
+    ///
+    /// Also writes per-profile data (profileId, pinnedDirectories, vfsCachePath) so the
+    /// extension can determine pin state and show the correct contextual menu item.
+    func updateAppGroupMountPaths() {
+        guard let defaults = UserDefaults(suiteName: kAppGroupID) else {
+            SyncTraySettings.debugLog("updateAppGroupMountPaths: App Group UserDefaults not accessible")
+            return
+        }
+
+        let mountedProfiles = profileStore.enabledProfiles.filter {
+            $0.isMountMode && profileMountStates[$0.id] == .mounted
+        }
+
+        let mountPaths = mountedProfiles.map { $0.localSyncPath }
+        defaults.set(mountPaths, forKey: kMountPathsKey)
+
+        // Write per-profile data for badge state computation in the extension.
+        let profileDataArray = mountedProfiles.map { profile -> [String: Any] in
+            [
+                "localSyncPath": profile.localSyncPath,
+                "profileId": profile.id.uuidString,
+                "pinnedDirectories": profile.pinnedDirectories,
+                "vfsCachePath": cacheDirectory(for: profile) ?? ""
+            ]
+        }
+        defaults.set(profileDataArray, forKey: "com.synctray.app.profileData")
+        defaults.synchronize()
+
+        SyncTraySettings.debugLog("updateAppGroupMountPaths: wrote \(mountPaths.count) mount path(s)")
+    }
+
+    /// Helper to get the VFS cache directory for a profile (delegates to VFSCacheService).
+    private func cacheDirectory(for profile: SyncProfile) -> String? {
+        cacheService.cacheDirectory(for: profile)
     }
 
     /// Periodically reconcile mount-mode UI state with reality. A mount can be

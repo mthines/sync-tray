@@ -259,14 +259,96 @@ final class VFSCacheService {
         }
     }
 
-    /// Pre-cache all pinned directories for a profile
+    /// Pre-cache all pinned directories for a profile.
+    ///
+    /// This calls `warmDirectory(_:for:)` for each pinned directory, which:
+    /// 1. Calls `/vfs/refresh` to refresh rclone's in-memory directory-stat cache.
+    /// 2. Opens and reads file bytes through the NFS mount to populate the VFS content cache.
     func refreshPinnedDirectories(for profile: SyncProfile) async {
         guard !profile.pinnedDirectories.isEmpty else { return }
-        let port = profile.rcPort
 
         for dir in profile.pinnedDirectories {
-            try? await refreshDirectory(dir, port: port)
+            await warmDirectory(dir, for: profile)
         }
+    }
+
+    /// Warm a single directory by: first calling `/vfs/refresh` (listing cache), then
+    /// reading file bytes through the NFS mount to populate the rclone VFS content cache.
+    ///
+    /// I/O budget: reads are sequential (not concurrent); total bytes ceiling is 2 GB per call;
+    /// `try Task.checkCancellation()` between files allows the task to be cancelled by unmount
+    /// or unpin operations.
+    ///
+    /// - Parameters:
+    ///   - dir: Relative directory path within the profile's localSyncPath.
+    ///   - profile: The mount-mode profile whose NFS mount to read through.
+    func warmDirectory(_ dir: String, for profile: SyncProfile) async {
+        let port = profile.rcPort
+        let mountPath = profile.localSyncPath
+        let fullDirPath = (mountPath as NSString).appendingPathComponent(dir)
+
+        // Step 1: refresh rclone's in-memory listing cache (metadata only).
+        try? await refreshDirectory(dir, port: port)
+
+        // Step 2: walk and read file bytes through the mount to populate the VFS content cache.
+        let fm = FileManager.default
+        guard fm.fileExists(atPath: fullDirPath) else {
+            SyncTraySettings.debugLog("warmDirectory: directory not found at \(fullDirPath), skipping byte-read")
+            return
+        }
+
+        guard let enumerator = fm.enumerator(
+            at: URL(fileURLWithPath: fullDirPath),
+            includingPropertiesForKeys: [.fileSizeKey, .isRegularFileKey],
+            options: [.skipsHiddenFiles]
+        ) else { return }
+
+        var totalBytesRead: Int64 = 0
+        let maxTotalBytes: Int64 = 2 * 1024 * 1024 * 1024  // 2 GB ceiling
+        let maxFileBytes: Int64 = 100 * 1024 * 1024         // 100 MB per-file ceiling
+        let chunkSize = 64 * 1024                            // 64 KB read chunks
+
+        for case let fileURL as URL in enumerator {
+            // Check cancellation between files (allows unmount / unpin to interrupt).
+            do { try Task.checkCancellation() } catch { return }
+
+            // Skip if directory was unpinned while we were warming.
+            guard profile.pinnedDirectories.contains(dir) else {
+                SyncTraySettings.debugLog("warmDirectory: '\(dir)' was unpinned during warming, stopping")
+                return
+            }
+
+            guard let resourceValues = try? fileURL.resourceValues(forKeys: [.fileSizeKey, .isRegularFileKey]),
+                  resourceValues.isRegularFile == true else { continue }
+
+            let fileSize = Int64(resourceValues.fileSize ?? 0)
+
+            if fileSize > maxFileBytes {
+                SyncTraySettings.debugLog("warmDirectory: Skipping large file (\(fileSize) bytes): \(fileURL.lastPathComponent)")
+                continue
+            }
+
+            if totalBytesRead + fileSize > maxTotalBytes {
+                SyncTraySettings.debugLog("warmDirectory: 2 GB total ceiling reached, stopping warm for '\(dir)'")
+                return
+            }
+
+            // Read file bytes through the mount — this is what actually populates
+            // the rclone VFS content cache (not the RC /vfs/refresh call above).
+            guard let fileHandle = FileHandle(forReadingAtPath: fileURL.path) else { continue }
+
+            var fileBytesRead: Int64 = 0
+            while true {
+                let chunk = fileHandle.readData(ofLength: chunkSize)
+                if chunk.isEmpty { break }
+                fileBytesRead += Int64(chunk.count)
+            }
+            try? fileHandle.close()
+
+            totalBytesRead += fileBytesRead
+        }
+
+        SyncTraySettings.debugLog("warmDirectory: Finished warming '\(dir)' — \(totalBytesRead) bytes read through mount")
     }
 
     // MARK: - Errors
