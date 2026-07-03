@@ -48,6 +48,13 @@ struct ProfileDetailView: View {
     @State private var vfsCacheMode: VFSCacheMode = .full
     @State private var vfsCacheMaxSize: String = "10G"
     @State private var vfsCacheMaxAge: String = "168h"
+    // UI-only split of the size/age strings into number + unit. The combined
+    // vfsCacheMaxSize / vfsCacheMaxAge strings above stay the source of truth
+    // (persisted, compared in hasChanges); these are recomposed on every edit.
+    @State private var cacheSizeNumber: String = "10"
+    @State private var cacheSizeUnit: String = "G"
+    @State private var cacheAgeNumber: String = "168"
+    @State private var cacheAgeUnit: String = "h"
     @State private var vfsCachePath: String = ""
     @State private var allowNonEmptyMount: Bool = false
     @State private var mountAtStartup: Bool = true
@@ -865,29 +872,47 @@ struct ProfileDetailView: View {
                         .labelsHidden()
                     }
 
-                    // VFS Cache Size
+                    // VFS Cache Size — numeric amount + unit picker
                     VStack(alignment: .leading, spacing: 4) {
                         Text("Cache Size")
                             .font(.subheadline.weight(.medium))
                         HStack {
-                            TextField("e.g., 10G", text: $vfsCacheMaxSize)
+                            TextField("10", text: $cacheSizeNumber)
                                 .textFieldStyle(.roundedBorder)
-                                .frame(maxWidth: 150)
-                            Text("Suggested: 10G for most use cases")
+                                .frame(maxWidth: 80)
+                                .onChange(of: cacheSizeNumber) { _ in updateCacheSizeString() }
+                            Picker("", selection: $cacheSizeUnit) {
+                                ForEach(Self.cacheSizeUnits, id: \.0) { unit in
+                                    Text(unit.1).tag(unit.0)
+                                }
+                            }
+                            .labelsHidden()
+                            .frame(maxWidth: 110)
+                            .onChange(of: cacheSizeUnit) { _ in updateCacheSizeString() }
+                            Text("Max local disk used for cached files. Suggested: 10 GB.")
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                         }
                     }
 
-                    // VFS Cache Retention (max age since last access)
+                    // VFS Cache Retention (max age since last access) — amount + unit
                     VStack(alignment: .leading, spacing: 4) {
                         Text("Keep Cached For")
                             .font(.subheadline.weight(.medium))
                         HStack {
-                            TextField("e.g., 168h", text: $vfsCacheMaxAge)
+                            TextField("168", text: $cacheAgeNumber)
                                 .textFieldStyle(.roundedBorder)
-                                .frame(maxWidth: 150)
-                            Text("How long a used file stays cached since last access (e.g. 24h, 168h = 7d). Resets each time the file is opened.")
+                                .frame(maxWidth: 80)
+                                .onChange(of: cacheAgeNumber) { _ in updateCacheAgeString() }
+                            Picker("", selection: $cacheAgeUnit) {
+                                ForEach(Self.cacheAgeUnits, id: \.0) { unit in
+                                    Text(unit.1).tag(unit.0)
+                                }
+                            }
+                            .labelsHidden()
+                            .frame(maxWidth: 120)
+                            .onChange(of: cacheAgeUnit) { _ in updateCacheAgeString() }
+                            Text("How long a used file stays cached since last access. Resets each time the file is opened.")
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                         }
@@ -1362,6 +1387,42 @@ struct ProfileDetailView: View {
         )
     }
 
+    // Selectable units for the cache size / retention pickers. First element is the
+    // rclone suffix stored in the value string; second is the human label. rclone
+    // size suffixes are powers of 1024; duration suffixes are Go/rclone durations.
+    static let cacheSizeUnits: [(String, String)] = [
+        ("M", "MB"), ("G", "GB"), ("T", "TB"),
+    ]
+    static let cacheAgeUnits: [(String, String)] = [
+        ("h", "Hours"), ("d", "Days"), ("w", "Weeks"),
+    ]
+
+    /// Split a "<number><unit>" value (e.g. "10G", "168h") into its parts, falling
+    /// back to the given defaults when the string is empty or malformed.
+    private static func splitValueUnit(
+        _ value: String, defaultNumber: String, defaultUnit: String
+    ) -> (number: String, unit: String) {
+        let trimmed = value.trimmingCharacters(in: .whitespaces)
+        let number = String(trimmed.prefix { $0.isNumber })
+        let unit = String(trimmed.drop { $0.isNumber }).trimmingCharacters(in: .whitespaces)
+        return (number.isEmpty ? defaultNumber : number,
+                unit.isEmpty ? defaultUnit : unit)
+    }
+
+    /// Recompose vfsCacheMaxSize from the number field + unit picker (digits only).
+    private func updateCacheSizeString() {
+        let digits = cacheSizeNumber.filter(\.isNumber)
+        if digits != cacheSizeNumber { cacheSizeNumber = digits }
+        vfsCacheMaxSize = digits.isEmpty ? "" : digits + cacheSizeUnit
+    }
+
+    /// Recompose vfsCacheMaxAge from the number field + unit picker (digits only).
+    private func updateCacheAgeString() {
+        let digits = cacheAgeNumber.filter(\.isNumber)
+        if digits != cacheAgeNumber { cacheAgeNumber = digits }
+        vfsCacheMaxAge = digits.isEmpty ? "" : digits + cacheAgeUnit
+    }
+
     /// Stream (Mount) management — the mount-mode counterpart to
     /// `scheduledSyncSection`. A mount is a continuously running daemon, so this
     /// presents Mount / Unmount + a live streaming status instead of the
@@ -1811,6 +1872,14 @@ struct ProfileDetailView: View {
         vfsCacheMode = profile.vfsCacheMode
         vfsCacheMaxSize = profile.vfsCacheMaxSize
         vfsCacheMaxAge = profile.vfsCacheMaxAge
+        // Split the stored strings into the number + unit picker state. Clamp an
+        // unrecognised unit to the default so the picker always has a valid selection.
+        let size = Self.splitValueUnit(profile.vfsCacheMaxSize, defaultNumber: "10", defaultUnit: "G")
+        cacheSizeNumber = size.number
+        cacheSizeUnit = Self.cacheSizeUnits.contains { $0.0 == size.unit } ? size.unit : "G"
+        let age = Self.splitValueUnit(profile.vfsCacheMaxAge, defaultNumber: "168", defaultUnit: "h")
+        cacheAgeNumber = age.number
+        cacheAgeUnit = Self.cacheAgeUnits.contains { $0.0 == age.unit } ? age.unit : "h"
         vfsCachePath = profile.vfsCachePath
         allowNonEmptyMount = profile.allowNonEmptyMount
         mountAtStartup = profile.mountAtStartup
