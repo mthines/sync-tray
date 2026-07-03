@@ -164,17 +164,20 @@ final class SyncSetupService {
         return result.exitCode == 0
     }
 
-    /// Explicitly (re)start a loaded agent's job now, regardless of RunAtLoad.
-    /// Needed for mount profiles with `mountAtStartup == false`: their plist has
-    /// RunAtLoad/KeepAlive = false, so `launchctl load` alone won't start the mount —
-    /// the Mount button uses this to kick it off on demand.
+    /// Force a fresh start of a loaded agent's job now, killing any existing
+    /// instance first (`kickstart -k`). This is the reliable "(re)mount now" action:
+    /// it starts the mount for opt-out profiles (whose RunAtLoad is false so `load`
+    /// alone won't run them), AND it recovers a zombie — an `rclone nfsmount` that
+    /// kept running (holding the RC port, KeepAlive sees it alive so won't restart
+    /// it) after its volume was detached. The `-k` kill re-runs the script, whose
+    /// orphan-cleanup + fresh mount then succeed.
     /// - Returns: true if launchctl reported success.
     @discardableResult
     func startAgent(for profile: SyncProfile) -> Bool {
         let uid = getuid()
         let target = "gui/\(uid)/\(profile.launchdLabel)"
-        let result = runCommand("/bin/launchctl", arguments: ["kickstart", target])
-        print("[SyncTray] launchctl kickstart \(target) exit: \(result.exitCode), output: \(result.output)")
+        let result = runCommand("/bin/launchctl", arguments: ["kickstart", "-k", target])
+        print("[SyncTray] launchctl kickstart -k \(target) exit: \(result.exitCode), output: \(result.output)")
         return result.exitCode == 0
     }
 
@@ -269,27 +272,32 @@ final class SyncSetupService {
         return result.output.contains(" on \(profile.localSyncPath) ")
     }
 
-    /// Unmount a mounted profile
+    /// Unmount a mounted profile and stop its daemon.
     func unmount(profile: SyncProfile) throws {
         guard profile.isMountMode else {
             throw SetupError.notMountMode
         }
 
-        // Check if mounted
-        guard isMounted(profile: profile) else {
-            return // Already unmounted
-        }
-
-        // Try graceful unmount first
-        let result = runCommand("/usr/sbin/diskutil", arguments: ["unmount", profile.localSyncPath])
-
-        if result.exitCode != 0 {
-            // Force unmount if graceful fails
-            let forceResult = runCommand("/usr/sbin/diskutil", arguments: ["unmount", "force", profile.localSyncPath])
-            if forceResult.exitCode != 0 {
-                throw SetupError.unmountFailed(forceResult.output)
+        // Detach the volume if it's currently mounted (graceful, then force).
+        if isMounted(profile: profile) {
+            let result = runCommand("/usr/sbin/diskutil", arguments: ["unmount", profile.localSyncPath])
+            if result.exitCode != 0 {
+                let forceResult = runCommand(
+                    "/usr/sbin/diskutil", arguments: ["unmount", "force", profile.localSyncPath])
+                if forceResult.exitCode != 0 {
+                    throw SetupError.unmountFailed(forceResult.output)
+                }
             }
         }
+
+        // Stop the rclone daemon. `rclone nfsmount` does NOT exit when its volume is
+        // detached — it keeps its NFS server + RC port alive as a "running but
+        // unmounted" zombie, and KeepAlive would immediately remount it. Unloading
+        // the agent terminates rclone and makes the unmount stick; the Mount button
+        // (loadAgent + kickstart) brings it back on demand, and an enabled
+        // mountAtStartup re-mounts it on the next launch/login. Runs even when the
+        // volume was already detached, so it also reaps a pre-existing zombie.
+        _ = unloadAgent(for: profile)
     }
 
     /// Clean up stale mounts on app startup.

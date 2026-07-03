@@ -229,13 +229,13 @@ final class SyncManager: ObservableObject {
                     return
                 }
 
-                // Load the launchd agent. For auto-mount profiles RunAtLoad starts it;
-                // for opt-out profiles (RunAtLoad/KeepAlive = false) loading alone
-                // won't start the mount, so kick it off explicitly.
-                let success = setupService.loadAgent(for: profile)
-                if success && !profile.mountAtStartup {
-                    setupService.startAgent(for: profile)
-                }
+                // Ensure the agent is loaded (so kickstart can target it), then force
+                // a fresh start. We only reach here when NOT already mounted, so
+                // kickstart -k is safe and is the reliable path: it starts opt-out
+                // profiles (RunAtLoad=false) and recovers a zombie rclone (running but
+                // unmounted, holding the RC port) that loadAgent alone can't restart.
+                _ = setupService.loadAgent(for: profile)
+                let success = setupService.startAgent(for: profile)
 
                 if success {
                     // Poll for the mount to establish. NFS mounts can take a few
@@ -279,7 +279,7 @@ final class SyncManager: ObservableObject {
                     }
                 } else {
                     await MainActor.run {
-                        profileMountStates[profile.id] = .failed("Failed to load launchd agent")
+                        profileMountStates[profile.id] = .failed("Failed to start mount agent")
                         TelemetryService.shared.recordMountOperation(
                             profileId: profile.id,
                             profileName: profile.name,
