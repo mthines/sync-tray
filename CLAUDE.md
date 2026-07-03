@@ -481,7 +481,7 @@ Anonymous, opt-in telemetry using OpenTelemetry (opentelemetry-swift 1.17.1). Al
 
 ### Three signals
 - **Traces**: Sync lifecycle spans with real duration (start→complete/fail), mount/unmount spans
-- **Metrics**: 19 instruments — sync duration + check phase histograms, operation counters (sync, mount, file ops, contention, recovery, volume events, filter stats), profile gauge (delta temporality, 30s export interval)
+- **Metrics**: 20 instruments — sync duration + check phase histograms, operation counters (sync, mount, file ops, contention, recovery, volume events, filter stats, offline pin/unpin), profile gauge (delta temporality, 30s export interval)
 - **Logs**: Structured log records for all key events (sync lifecycle, mount, transport changes, errors, config snapshots, session heartbeat, stale lock cleanup, precondition failures)
 
 ### User correlation
