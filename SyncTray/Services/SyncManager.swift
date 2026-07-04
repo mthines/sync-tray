@@ -1940,10 +1940,12 @@ final class SyncManager: ObservableObject {
         timer.schedule(deadline: .now() + 1, repeating: 1.0)
         timer.setEventHandler { [weak self] in
             guard let self else { return }
-            let hasMountedProfiles = self.profileStore.enabledProfiles.contains { $0.isMountMode }
-            guard hasMountedProfiles else { return }
-            // Check for a pending request without a wake notification.
+            // profileStore is @MainActor-isolated, but this handler runs on a global
+            // utility queue — read it (and process) on the main actor to avoid a data race.
             Task { @MainActor in
+                let hasMountedProfiles = self.profileStore.enabledProfiles.contains { $0.isMountMode }
+                guard hasMountedProfiles else { return }
+                // Check for a pending request without a wake notification.
                 await self.processPendingPinRequest()
             }
         }
@@ -2011,11 +2013,15 @@ final class SyncManager: ObservableObject {
 
             SyncTraySettings.debugLog("processPendingPinRequest: \(action) \(paths.count) path(s) for '\(profile.name)'")
 
-            // For pin operations, start warming the directories.
+            // For pin operations, start warming the directories. The warmer re-checks
+            // live pin state (via the closure) between files, so an unpin arriving
+            // mid-warm actually stops the read loop instead of running to the ceiling.
             if action == "pin" {
                 for path in paths {
                     Task {
-                        await self.cacheService.warmDirectory(path, for: profile)
+                        await self.cacheService.warmDirectory(path, for: profile) { [weak self] in
+                            await self?.isDirectoryPinned(path, profileId: profileId) ?? false
+                        }
                     }
                 }
             }
@@ -2023,6 +2029,13 @@ final class SyncManager: ObservableObject {
         } catch {
             SyncTraySettings.debugLog("processPendingPinRequest: error reading/parsing request: \(error)")
         }
+    }
+
+    /// Live (main-actor) check of whether `path` is still pinned for the given profile.
+    /// Used by `VFSCacheService.warmDirectory` to honour an unpin that arrives mid-warm.
+    @MainActor
+    private func isDirectoryPinned(_ path: String, profileId: UUID) -> Bool {
+        profileStore.profile(for: profileId)?.pinnedDirectories.contains(path) ?? false
     }
 
     /// Write active mount paths to App Group UserDefaults so the FinderSync extension

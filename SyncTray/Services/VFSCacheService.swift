@@ -268,7 +268,8 @@ final class VFSCacheService {
         guard !profile.pinnedDirectories.isEmpty else { return }
 
         for dir in profile.pinnedDirectories {
-            await warmDirectory(dir, for: profile)
+            // Startup warm: the passed profile is the live state at this point.
+            await warmDirectory(dir, for: profile) { profile.pinnedDirectories.contains(dir) }
         }
     }
 
@@ -282,7 +283,9 @@ final class VFSCacheService {
     /// - Parameters:
     ///   - dir: Relative directory path within the profile's localSyncPath.
     ///   - profile: The mount-mode profile whose NFS mount to read through.
-    func warmDirectory(_ dir: String, for profile: SyncProfile) async {
+    ///   - isStillPinned: Live predicate re-evaluated between files; when it returns
+    ///     false (the directory was unpinned mid-warm) the read loop stops early.
+    func warmDirectory(_ dir: String, for profile: SyncProfile, isStillPinned: @Sendable () async -> Bool) async {
         let port = profile.rcPort
         let mountPath = profile.localSyncPath
         let fullDirPath = (mountPath as NSString).appendingPathComponent(dir)
@@ -312,8 +315,8 @@ final class VFSCacheService {
             // Check cancellation between files (allows unmount / unpin to interrupt).
             do { try Task.checkCancellation() } catch { return }
 
-            // Skip if directory was unpinned while we were warming.
-            guard profile.pinnedDirectories.contains(dir) else {
+            // Stop if the directory was unpinned while we were warming (live check).
+            guard await isStillPinned() else {
                 SyncTraySettings.debugLog("warmDirectory: '\(dir)' was unpinned during warming, stopping")
                 return
             }
@@ -338,9 +341,7 @@ final class VFSCacheService {
             guard let fileHandle = FileHandle(forReadingAtPath: fileURL.path) else { continue }
 
             var fileBytesRead: Int64 = 0
-            while true {
-                let chunk = fileHandle.readData(upToCount: chunkSize)
-                if chunk.isEmpty { break }
+            while let chunk = try? fileHandle.read(upToCount: chunkSize), !chunk.isEmpty {
                 fileBytesRead += Int64(chunk.count)
             }
             try? fileHandle.close()
