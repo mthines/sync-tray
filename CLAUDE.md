@@ -142,6 +142,25 @@ Two distinct IPC mechanisms are used. Both use App Group ID `group.com.synctray.
 The host app reads `pending-pin-request.json` and deletes it on each Darwin notification
 and on a 1-second fallback poll timer (active only when mount profiles exist).
 
+#### Code signing — required to test the extension; disabled on CI/release
+
+macOS **will not load a Finder extension (or grant App Group access) in an unsigned
+app**. So the FinderSync menu only appears in a **code-signed** build:
+
+- **Local testing:** set your **Team** on *both* the `SyncTray` and `SyncTrayFinderSync`
+  targets (Signing & Capabilities → Automatic), confirm the `group.com.synctray.app`
+  App Group is on both, then Build & Run. Enable it once under System Settings →
+  General → Login Items & Extensions → Extensions, and right-click a folder **inside a
+  mounted Stream profile's path** (FinderSync only decorates registered mount dirs).
+  `pluginkit -m -i com.synctray.app.findersync` should list it once loaded.
+- **CI / release build unsigned on purpose.** `CODE_SIGNING_ALLOWED=NO` is **not**
+  hardcoded in the project — it is passed on the `xcodebuild` command line by both the
+  CI `test` job (`.github/workflows/ci.yml`) and `scripts/release-ci.sh`. This keeps the
+  build gate green without signing credentials while letting local dev sign normally.
+  Consequence: the brew-distributed (unsigned) app **cannot** show the offline menu —
+  shipping it requires adding Developer ID signing + notarization + App Group
+  provisioning to the release pipeline.
+
 #### Cross-Target String Constants
 
 `kAppGroupID` (`group.com.synctray.app`), `kMountPathsKey`, and

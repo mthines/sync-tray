@@ -63,6 +63,7 @@ xcodebuild -project "$XCODEPROJ" \
   -derivedDataPath "$BUILD_DIR/DerivedData" \
   clean build \
   ONLY_ACTIVE_ARCH=NO \
+  CODE_SIGNING_ALLOWED=NO \
   DASH0_AUTH_TOKEN="${DASH0_AUTH_TOKEN:-}" \
   | tail -20
 

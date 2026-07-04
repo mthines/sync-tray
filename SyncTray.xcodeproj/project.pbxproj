@@ -569,7 +569,6 @@
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_ENTITLEMENTS = SyncTray/SyncTray.entitlements;
 				CODE_SIGN_STYLE = Automatic;
-				CODE_SIGNING_ALLOWED = NO;
 				COMBINE_HIDPI_IMAGES = YES;
 				CURRENT_PROJECT_VERSION = 1;
 				DASH0_AUTH_TOKEN = "";
@@ -626,7 +625,6 @@
 			buildSettings = {
 				CODE_SIGN_ENTITLEMENTS = SyncTrayFinderSync/SyncTrayFinderSync.entitlements;
 				CODE_SIGN_STYLE = Automatic;
-				CODE_SIGNING_ALLOWED = NO;
 				COMBINE_HIDPI_IMAGES = YES;
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = "";
@@ -652,7 +650,6 @@
 			buildSettings = {
 				CODE_SIGN_ENTITLEMENTS = SyncTrayFinderSync/SyncTrayFinderSync.entitlements;
 				CODE_SIGN_STYLE = Automatic;
-				CODE_SIGNING_ALLOWED = NO;
 				COMBINE_HIDPI_IMAGES = YES;
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = "";
