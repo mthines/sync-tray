@@ -76,6 +76,12 @@ final class SyncManager: ObservableObject {
     /// Darwin notification name posted by the extension when a pin/unpin request is pending.
     private let kPinRequestNotificationName = "com.synctray.app.pinRequest"
 
+    /// UserDefaults key for per-profile data (profileId, pinnedDirectories, vfsCachePath) read by the extension.
+    private let kProfileDataKey = "com.synctray.app.profileData"
+
+    /// Filename of the pending pin/unpin request written by the extension into the App Group container.
+    private let kPendingPinRequestFile = "pending-pin-request.json"
+
     /// 1-second fallback poll timer for missed Darwin notifications.
     private var pinRequestPollTimer: DispatchSourceTimer?
 
@@ -1958,7 +1964,7 @@ final class SyncManager: ObservableObject {
             return
         }
 
-        let requestURL = containerURL.appendingPathComponent("pending-pin-request.json")
+        let requestURL = containerURL.appendingPathComponent(kPendingPinRequestFile)
         guard FileManager.default.fileExists(atPath: requestURL.path) else { return }
 
         do {
@@ -2046,8 +2052,7 @@ final class SyncManager: ObservableObject {
                 "vfsCachePath": cacheDirectory(for: profile) ?? ""
             ]
         }
-        defaults.set(profileDataArray, forKey: "com.synctray.app.profileData")
-        defaults.synchronize()
+        defaults.set(profileDataArray, forKey: kProfileDataKey)
 
         SyncTraySettings.debugLog("updateAppGroupMountPaths: wrote \(mountPaths.count) mount path(s)")
     }

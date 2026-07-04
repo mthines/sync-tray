@@ -339,7 +339,7 @@ final class VFSCacheService {
 
             var fileBytesRead: Int64 = 0
             while true {
-                let chunk = fileHandle.readData(ofLength: chunkSize)
+                let chunk = fileHandle.readData(upToCount: chunkSize)
                 if chunk.isEmpty { break }
                 fileBytesRead += Int64(chunk.count)
             }

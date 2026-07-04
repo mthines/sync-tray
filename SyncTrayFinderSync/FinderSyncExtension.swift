@@ -14,6 +14,12 @@ private let kAppGroupID = "group.com.synctray.app"
 /// UserDefaults key for the mount-path array written by the host app.
 private let kMountPathsKey = "com.synctray.app.mountPaths"
 
+/// UserDefaults key for per-profile data (profileId, pinnedDirectories, vfsCachePath) written by the host app.
+private let kProfileDataKey = "com.synctray.app.profileData"
+
+/// Filename of the pending pin/unpin request written by this extension into the App Group container.
+private let kPendingPinRequestFile = "pending-pin-request.json"
+
 /// Darwin notification name posted by this extension when a pin/unpin request is pending.
 private let kPinRequestNotificationName = "com.synctray.app.pinRequest"
 
@@ -95,7 +101,7 @@ class FinderSyncExtension: FIFinderSync {
         registeredPaths = paths
 
         // Load profile entries (profileId + pinnedDirectories + vfsCachePath)
-        if let profileDataRaw = defaults.object(forKey: "com.synctray.app.profileData") as? [[String: Any]] {
+        if let profileDataRaw = defaults.object(forKey: kProfileDataKey) as? [[String: Any]] {
             var newProfileData: [String: ProfileEntry] = [:]
             for raw in profileDataRaw {
                 guard let localSyncPath = raw["localSyncPath"] as? String,
@@ -286,7 +292,7 @@ class FinderSyncExtension: FIFinderSync {
             return
         }
 
-        let requestURL = containerURL.appendingPathComponent("pending-pin-request.json")
+        let requestURL = containerURL.appendingPathComponent(kPendingPinRequestFile)
         let payload: [String: Any] = [
             "action": action,
             "profileId": profileId,
