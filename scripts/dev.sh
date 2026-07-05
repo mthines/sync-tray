@@ -63,21 +63,42 @@ kill_app() {
 build_app() {
     log_info "Building $SCHEME..."
 
-    if xcodebuild \
-        -scheme "$SCHEME" \
-        -configuration Debug \
-        -derivedDataPath "$PROJECT_DIR/build" \
-        -destination "platform=macOS" \
-        ONLY_ACTIVE_ARCH=YES \
-        DASH0_AUTH_TOKEN="${DASH0_AUTH_TOKEN:-}" \
-        build 2>&1 | grep -E "(error:|warning:|BUILD SUCCEEDED|BUILD FAILED)"; then
+    # Dev iteration must never be blocked by code signing. Try a normal (signed)
+    # build first — so the Finder extension can load when a signing team is set up
+    # (see docs/development.md) — then fall back to an unsigned build so iteration
+    # always works even without a team. To actually test the extension, use a
+    # signed Xcode build.
+    local args=(
+        -scheme "$SCHEME"
+        -configuration Debug
+        -derivedDataPath "$PROJECT_DIR/build"
+        -destination "platform=macOS"
+        ONLY_ACTIVE_ARCH=YES
+        DASH0_AUTH_TOKEN="${DASH0_AUTH_TOKEN:-}"
+        build
+    )
+    local log
+    log=$(mktemp)
 
-        if [ -d "$APP_PATH" ]; then
-            log_success "Build succeeded"
-            return 0
-        fi
+    # Note: the condition tests xcodebuild's real exit code (output goes to $log),
+    # not whether grep matched a line — the old version reported success on failure.
+    if xcodebuild "${args[@]}" > "$log" 2>&1; then
+        grep -E "warning:" "$log" | tail -3 || true
+        rm -f "$log"
+        log_success "Build succeeded"
+        return 0
     fi
 
+    log_warning "Signed build failed — retrying unsigned (Finder extension won't load; use a signed Xcode build to test it)"
+    if xcodebuild "${args[@]}" CODE_SIGNING_ALLOWED=NO > "$log" 2>&1; then
+        rm -f "$log"
+        log_success "Build succeeded (unsigned)"
+        return 0
+    fi
+
+    echo "--- build errors ---"
+    grep -E "error:|BUILD FAILED" "$log" | tail -20 || true
+    rm -f "$log"
     log_error "Build failed"
     return 1
 }
