@@ -299,6 +299,13 @@ jobs:
           RELEASE_VERSION: ${{ needs.version.outputs.tag }}
           PR_NUMBER: ${{ needs.detect-changes.outputs.pr_number }}
           IS_BETA: ${{ needs.detect-changes.outputs.is_beta }}
+          # Developer ID signing + notarization (optional — release-ci.sh builds
+          # unsigned when these are absent). See docs/release-signing.md.
+          MACOS_CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          NOTARY_KEY_P8_BASE64: ${{ secrets.NOTARY_KEY_P8_BASE64 }}
+          NOTARY_KEY_ID: ${{ secrets.NOTARY_KEY_ID }}
+          NOTARY_ISSUER_ID: ${{ secrets.NOTARY_ISSUER_ID }}
         run: bash scripts/release-ci.sh
 
       - name: Sync in-repo cask (stable only)
