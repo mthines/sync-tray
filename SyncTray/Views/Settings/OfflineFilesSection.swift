@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 
 /// Collapsible section for managing offline/cached files in mount mode profiles
 struct OfflineFilesSection: View {
@@ -18,6 +19,7 @@ struct OfflineFilesSection: View {
 
     // Pinned directories editing
     @State private var newPinnedDir: String = ""
+    @State private var browseWarning: String?
     @State private var isRefreshingPins: Bool = false
     @State private var pinnedDirs: [String] = []
 
@@ -101,6 +103,14 @@ struct OfflineFilesSection: View {
         } message: {
             Text("Frees up space by removing downloaded copies of files you've opened. "
                 + "Pinned directories stay available offline — choose Clear Everything to remove those too.")
+        }
+        .alert("Can't pin that folder", isPresented: Binding(
+            get: { browseWarning != nil },
+            set: { if !$0 { browseWarning = nil } }
+        )) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text(browseWarning ?? "")
         }
     }
 
@@ -241,6 +251,11 @@ struct OfflineFilesSection: View {
                     .textFieldStyle(.roundedBorder)
                     .font(.caption)
                     .onSubmit { addPinnedDir() }
+                Button(action: { browsePinnedDir() }) {
+                    Image(systemName: "folder")
+                }
+                .buttonStyle(.plain)
+                .help("Browse for a folder inside the mount")
                 Button(action: { addPinnedDir() }) {
                     Image(systemName: "plus.circle.fill")
                         .foregroundStyle(.blue)
@@ -461,6 +476,36 @@ struct OfflineFilesSection: View {
                 refreshCacheStats()
             }
         }
+    }
+
+    /// Open a folder picker rooted at the mount and fill the field with the chosen
+    /// folder as a path relative to the mount (pinned dirs are mount-relative). Folders
+    /// outside the mount can't be expressed as a relative pin, so they're rejected.
+    private func browsePinnedDir() {
+        let mount = profile.localSyncPath
+        let panel = NSOpenPanel()
+        panel.title = "Choose a folder inside the mount to keep offline"
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = false
+        if !mount.isEmpty, FileManager.default.fileExists(atPath: mount) {
+            panel.directoryURL = URL(fileURLWithPath: mount)
+        }
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+
+        let mountPath = (mount as NSString).standardizingPath
+        let chosen = (url.path as NSString).standardizingPath
+        guard chosen == mountPath || chosen.hasPrefix(mountPath + "/") else {
+            browseWarning = "Pick a folder inside this profile's mount:\n\(mountPath)"
+            return
+        }
+        var rel = String(chosen.dropFirst(mountPath.count))
+        while rel.hasPrefix("/") { rel = String(rel.dropFirst()) }
+        guard !rel.isEmpty else {
+            browseWarning = "Choose a subfolder to pin — not the mount root."
+            return
+        }
+        newPinnedDir = rel
     }
 
     private func addPinnedDir() {
