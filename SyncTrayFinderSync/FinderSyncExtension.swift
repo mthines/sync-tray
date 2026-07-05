@@ -222,35 +222,48 @@ class FinderSyncExtension: FIFinderSync {
             return entry.1.pinnedDirectories.contains(rel)
         }
 
-        if allPinned {
-            let item = NSMenuItem(
-                title: "Remove from Offline",
-                action: #selector(unpinSelected(_:)),
-                keyEquivalent: ""
-            )
-            item.target = self
-            menu.addItem(item)
-        } else {
-            let item = NSMenuItem(
-                title: "Make Available Offline",
-                action: #selector(pinSelected(_:)),
-                keyEquivalent: ""
-            )
-            item.target = self
-            menu.addItem(item)
+        // Group our action under a branded "SyncTray ▸" submenu so it doesn't clutter
+        // the top-level Finder menu. A single "Available Offline" toggle carries a
+        // checkmark when the folder is kept on this Mac — the Google-Drive pattern
+        // (checked = offline-ready, unchecked = streams online-only).
+        let parentItem = NSMenuItem(title: "SyncTray", action: nil, keyEquivalent: "")
+        if let icon = NSImage(systemSymbolName: "externaldrive.badge.icloud",
+                              accessibilityDescription: "SyncTray") {
+            icon.size = NSSize(width: 16, height: 16)
+            // Template rendering makes AppKit tint the glyph for the menu's appearance
+            // (light in dark mode, dark in light mode) — matching the native menu icons.
+            icon.isTemplate = true
+            parentItem.image = icon
         }
+
+        let submenu = NSMenu(title: "SyncTray")
+        let offlineItem = NSMenuItem(
+            title: "Available Offline",
+            action: #selector(toggleOfflineSelected(_:)),
+            keyEquivalent: ""
+        )
+        offlineItem.target = self
+        offlineItem.state = allPinned ? .on : .off
+        submenu.addItem(offlineItem)
+
+        parentItem.submenu = submenu
+        menu.addItem(parentItem)
 
         return menu
     }
 
     // MARK: - Pin / Unpin Actions
 
-    @objc private func pinSelected(_ sender: AnyObject?) {
-        performPinAction(action: "pin")
-    }
-
-    @objc private func unpinSelected(_ sender: AnyObject?) {
-        performPinAction(action: "unpin")
+    @objc private func toggleOfflineSelected(_ sender: AnyObject?) {
+        // Toggle: if every selected item is already kept offline, unpin; otherwise pin.
+        guard let selectedItems = FIFinderSyncController.default().selectedItemURLs(),
+              !selectedItems.isEmpty else { return }
+        let allPinned = selectedItems.allSatisfy { url in
+            guard let entry = profileEntry(for: url) else { return false }
+            let rel = relativePath(url: url, mountPath: entry.0)
+            return entry.1.pinnedDirectories.contains(rel)
+        }
+        performPinAction(action: allPinned ? "unpin" : "pin")
     }
 
     private func performPinAction(action: String) {
