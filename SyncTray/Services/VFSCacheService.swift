@@ -158,21 +158,49 @@ final class VFSCacheService {
 
     /// Clear all cached files for a profile
     /// Prefers RC API when mount is active to safely evict from VFS layer first
-    func clearCache(for profile: SyncProfile) async throws {
+    /// - Parameter preservePinned: when true, files under the profile's
+    ///   `pinnedDirectories` are kept so pinned folders stay available offline.
+    func clearCache(for profile: SyncProfile, preservePinned: Bool = false) async throws {
         let port = profile.rcPort
-
-        // If RC is available, forget the root directory first to safely evict from VFS
-        if port > 0, await isRCAvailable(port: port) {
-            try? await forgetDirectory("", port: port)
-        }
-
-        // Then remove files from disk
+        let pinned = preservePinned ? profile.pinnedDirectories : []
         guard let baseDir = cacheDirectory(for: profile) else { return }
         let fm = FileManager.default
-        if let contents = try? fm.contentsOfDirectory(atPath: baseDir) {
-            for item in contents {
-                let path = (baseDir as NSString).appendingPathComponent(item)
-                try fm.removeItem(atPath: path)
+
+        // Nothing to preserve → clear everything (and drop the whole VFS listing when mounted).
+        if pinned.isEmpty {
+            if port > 0, await isRCAvailable(port: port) {
+                try? await forgetDirectory("", port: port)
+            }
+            if let contents = try? fm.contentsOfDirectory(atPath: baseDir) {
+                for item in contents {
+                    try fm.removeItem(atPath: (baseDir as NSString).appendingPathComponent(item))
+                }
+            }
+            return
+        }
+
+        // Preserve pinned → remove only cache entries that aren't a pinned directory
+        // (or inside one).
+        try clearUnpinned(dir: baseDir, base: baseDir, pinned: pinned, fm: fm)
+    }
+
+    /// Recursively remove cached entries whose path relative to `base` is neither a
+    /// pinned directory nor inside one. A directory that merely *contains* a pinned dir
+    /// is recursed into, so only its unpinned children are deleted.
+    private func clearUnpinned(dir: String, base: String, pinned: [String], fm: FileManager) throws {
+        guard let entries = try? fm.contentsOfDirectory(atPath: dir) else { return }
+        for entry in entries {
+            let full = (dir as NSString).appendingPathComponent(entry)
+            let rel = String(full.dropFirst(base.count + 1))
+            if pinned.contains(where: { rel == $0 || rel.hasPrefix($0 + "/") }) {
+                continue  // the pinned dir itself, or a file inside it — keep
+            }
+            var isDir: ObjCBool = false
+            fm.fileExists(atPath: full, isDirectory: &isDir)
+            if isDir.boolValue && pinned.contains(where: { $0.hasPrefix(rel + "/") }) {
+                try clearUnpinned(dir: full, base: base, pinned: pinned, fm: fm)  // ancestor of a pin
+            } else {
+                try fm.removeItem(atPath: full)
             }
         }
     }

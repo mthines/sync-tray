@@ -93,11 +93,14 @@ struct OfflineFilesSection: View {
             pathHistory = []
             refreshCacheStats()
         }
-        .alert("Clear All Cached Files?", isPresented: $showClearConfirm) {
+        .alert("Clear cached files?", isPresented: $showClearConfirm) {
+            Button("Free Up Space") { clearCache(preservePinned: true) }
+                .keyboardShortcut(.defaultAction)
+            Button("Clear Everything", role: .destructive) { clearCache(preservePinned: false) }
             Button("Cancel", role: .cancel) {}
-            Button("Clear Cache", role: .destructive) { clearAllCache() }
         } message: {
-            Text("This will remove all locally cached files for \"\(profile.name)\". Files will be re-downloaded from the cloud when accessed.")
+            Text("Frees up space by removing downloaded copies of files you've opened. "
+                + "Pinned directories stay available offline — choose Clear Everything to remove those too.")
         }
     }
 
@@ -141,8 +144,8 @@ struct OfflineFilesSection: View {
                     .controlSize(.small)
 
                     if stats.fileCount > 0 {
-                        Button(role: .destructive, action: { showClearConfirm = true }) {
-                            Label(isClearing ? "Clearing..." : "Clear All Cache", systemImage: "trash")
+                        Button(action: { showClearConfirm = true }) {
+                            Label(isClearing ? "Clearing..." : "Clear Cache…", systemImage: "trash")
                                 .font(.caption)
                         }
                         .controlSize(.small)
@@ -448,10 +451,10 @@ struct OfflineFilesSection: View {
         }
     }
 
-    private func clearAllCache() {
+    private func clearCache(preservePinned: Bool) {
         isClearing = true
         Task {
-            try? await cacheService.clearCache(for: profile)
+            try? await cacheService.clearCache(for: profile, preservePinned: preservePinned)
             await MainActor.run {
                 isClearing = false
                 cachedItems = []
