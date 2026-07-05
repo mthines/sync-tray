@@ -128,7 +128,10 @@ struct MenuBarView: View {
                         .buttonStyle(.plain)
                         .help(syncManager.isNotificationsMuted(for: profile.id) ? "Unmute profile notifications" : "Mute profile notifications")
 
-                        // Open folder button
+                        // Open in Finder button — opens the local sync folder
+                        // (or the mount point, for Stream profiles). Hidden when no
+                        // path is configured; openSyncDirectory no-ops safely if the
+                        // folder is missing (e.g. external drive unmounted).
                         if !profile.localSyncPath.isEmpty {
                             Button(action: { syncManager.openSyncDirectory(for: profile) }) {
                                 Image(systemName: "folder")
@@ -136,7 +139,7 @@ struct MenuBarView: View {
                                     .foregroundColor(.secondary)
                             }
                             .buttonStyle(.plain)
-                            .help("Open sync directory")
+                            .help("Open in Finder")
                         }
 
                         // Mount/Unmount button for mount mode, Sync now for sync modes
