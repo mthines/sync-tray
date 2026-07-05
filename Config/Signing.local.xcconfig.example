@@ -1,0 +1,6 @@
+// Template — copy to `Config/Signing.local.xcconfig` (which is gitignored) and set
+// your Apple Developer Team ID. Only needed for LOCAL signed builds (to run the
+// FinderSync extension); CI and release build unsigned.
+//
+// Find your Team ID at https://developer.apple.com/account → Membership → Team ID.
+DEVELOPMENT_TEAM = XXXXXXXXXX

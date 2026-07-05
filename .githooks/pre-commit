@@ -1,0 +1,18 @@
+#!/bin/sh
+# Backstop: never let a personal Apple signing team land in the tracked Xcode project.
+# The Team ID belongs in Config/Signing.local.xcconfig (gitignored) — see Config/Signing.xcconfig.
+# Enable once per clone:  git config core.hooksPath .githooks
+
+staged_pbx=$(git diff --cached --name-only --diff-filter=ACM | grep -E '\.pbxproj$' || true)
+[ -z "$staged_pbx" ] && exit 0
+
+if git diff --cached -U0 -- '*.pbxproj' \
+  | grep -E '^\+' \
+  | grep -E 'DEVELOPMENT_TEAM = ' \
+  | grep -vqE 'DEVELOPMENT_TEAM = "";'; then
+  echo "✖ Commit blocked: a non-empty DEVELOPMENT_TEAM is staged in a .pbxproj."
+  echo "  Your Apple Team ID belongs in Config/Signing.local.xcconfig (gitignored), not the project file."
+  echo "  Fix: git restore --staged '*.pbxproj'   (Xcode re-added it; the xcconfig already provides your team)"
+  exit 1
+fi
+exit 0
