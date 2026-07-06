@@ -23,6 +23,8 @@ SCHEME="SyncTray"
 BUILD_DIR="$PROJECT_DIR/build/Build/Products/Debug"
 APP_NAME="SyncTray.app"
 APP_PATH="$BUILD_DIR/$APP_NAME"
+APPEX_PATH="$APP_PATH/Contents/PlugIns/SyncTrayFinderSync.appex"
+FINDER_EXT_ID="com.synctray.app.findersync"
 
 # Colors for output
 RED='\033[0;31m'
@@ -103,6 +105,30 @@ build_app() {
     return 1
 }
 
+# Register + enable the built Finder extension so Finder loads THIS build's copy
+# (a dev build and an installed release share the bundle id and otherwise fight
+# over the registration). Pass "restart" to also relaunch Finder — required when
+# the extension's own code changed, since Finder caches the loaded plug-in until
+# it relaunches. Only works for a signed build; a no-op if the appex is absent.
+reload_finder_extension() {
+    [ -d "$APPEX_PATH" ] || return 0
+    # Purge every OTHER registered copy of the extension (an installed release in
+    # /Applications, stray Xcode DerivedData builds) — they share this bundle id and
+    # macOS would otherwise load one of them instead of this build, so dev changes
+    # never appear. Leave only this build registered.
+    pluginkit -mAvvv -i "$FINDER_EXT_ID" 2>/dev/null \
+        | awk '/Path = /{ sub(/.*Path = /, ""); print }' \
+        | while IFS= read -r p; do
+            [ -n "$p" ] && [ "$p" != "$APPEX_PATH" ] && pluginkit -r "$p" 2>/dev/null
+        done
+    pluginkit -a "$APPEX_PATH" 2>/dev/null || true
+    pluginkit -e use -i "$FINDER_EXT_ID" 2>/dev/null || true
+    if [ "$1" = "restart" ]; then
+        log_info "Reloading Finder so it picks up the rebuilt extension..."
+        killall Finder 2>/dev/null || true
+    fi
+}
+
 # Launch the app
 launch_app() {
     if [ -d "$APP_PATH" ]; then
@@ -146,6 +172,12 @@ on_change() {
 
     if build_app; then
         launch_app
+        # Restart Finder only when the extension's own sources changed; for app-only
+        # edits just refresh the registration (cheap, keeps Finder windows open).
+        case "$changed_file" in
+            */SyncTrayFinderSync/*) reload_finder_extension restart ;;
+            *) reload_finder_extension ;;
+        esac
     fi
 }
 
@@ -175,12 +207,15 @@ cd "$PROJECT_DIR"
 # Initial build and launch
 if build_app; then
     launch_app
+    # Load this build's Finder extension and relaunch Finder so the right-click
+    # menu / badges reflect the current code from the first run.
+    reload_finder_extension restart
 else
     log_warning "Initial build failed, waiting for changes..."
 fi
 
 echo ""
-log_info "Watching for file changes in SyncTray/..."
+log_info "Watching for file changes in SyncTray/ and SyncTrayFinderSync/..."
 
 # Watch for changes (--latency debounces at the fswatch level too)
 fswatch -0 -r \
@@ -191,6 +226,7 @@ fswatch -0 -r \
     --include='\.xcassets$' \
     --include='\.plist$' \
     --exclude='.*' \
-    "$PROJECT_DIR/SyncTray" | while read -d "" file; do
+    "$PROJECT_DIR/SyncTray" \
+    "$PROJECT_DIR/SyncTrayFinderSync" | while read -d "" file; do
     on_change "$file"
 done
