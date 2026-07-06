@@ -65,7 +65,7 @@ build_app() {
 
     # Dev iteration must never be blocked by code signing. Try a normal (signed)
     # build first — so the Finder extension can load when a signing team is set up
-    # (see docs/development.md) — then fall back to an unsigned build so iteration
+    # (see DEVELOPMENT.md) — then fall back to an unsigned build so iteration
     # always works even without a team. To actually test the extension, use a
     # signed Xcode build.
     local args=(

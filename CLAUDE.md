@@ -158,8 +158,10 @@ app**. So the FinderSync menu only appears in a **code-signed** build:
   CI `test` job (`.github/workflows/ci.yml`) and `scripts/release-ci.sh`. This keeps the
   build gate green without signing credentials while letting local dev sign normally.
   Consequence: the brew-distributed (unsigned) app **cannot** show the offline menu —
-  shipping it requires adding Developer ID signing + notarization + App Group
-  provisioning to the release pipeline.
+  shipping it requires Developer ID signing + notarization + App Group provisioning.
+  The release pipeline (`scripts/release-ci.sh`) does this automatically when the
+  signing secrets are present; setup is documented in [`docs/release-signing.md`](docs/release-signing.md).
+  Local dev-setup steps live in [`DEVELOPMENT.md`](DEVELOPMENT.md).
 
 #### Cross-Target String Constants
 
