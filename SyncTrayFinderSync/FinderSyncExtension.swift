@@ -61,6 +61,7 @@ class FinderSyncExtension: FIFinderSync {
         registerBadges()
         loadMountPaths()
         setupDarwinNotificationObserver()
+        setupAppearanceObserver()
     }
 
     deinit {
@@ -71,6 +72,56 @@ class FinderSyncExtension: FIFinderSync {
             CFNotificationName(kPinRequestNotificationName as CFString),
             nil
         )
+        DistributedNotificationCenter.default().removeObserver(self)
+    }
+
+    // MARK: - Appearance Change Observation
+
+    /// Watch for system light/dark switches so already-registered badges get
+    /// re-tinted. (Menu icons don't need this — the menu is rebuilt on each
+    /// right-click and picks up the current appearance then.)
+    private func setupAppearanceObserver() {
+        DistributedNotificationCenter.default().addObserver(
+            self,
+            selector: #selector(appearanceChanged),
+            name: NSNotification.Name("AppleInterfaceThemeChangedNotification"),
+            object: nil
+        )
+    }
+
+    @objc private func appearanceChanged() {
+        registerBadges()
+    }
+
+    // MARK: - Appearance-Aware Icons
+
+    /// The system-wide dark-mode flag, read from the global domain.
+    ///
+    /// A Finder extension's own `NSApp.effectiveAppearance` does **not** reliably
+    /// track the system light/dark setting — it stays Aqua (light). That makes
+    /// template images (`isTemplate = true`) tint their glyph dark even in dark
+    /// mode, so menu icons and file badges render black-on-dark (invisible).
+    /// `AppleInterfaceStyle` lives in `NSGlobalDomain` and is readable from any
+    /// process regardless of its own effective appearance, so it's the reliable
+    /// signal here.
+    private var systemIsDarkMode: Bool {
+        UserDefaults.standard.string(forKey: "AppleInterfaceStyle")?.lowercased() == "dark"
+    }
+
+    /// An SF Symbol explicitly tinted for the current system appearance —
+    /// white in dark mode, near-black in light mode — so it stays visible in
+    /// Finder's menus and file badges (which don't honour template tinting from
+    /// an extension). Callers must re-request the image when the appearance
+    /// changes; the contextual menu is rebuilt per right-click and badges are
+    /// re-registered by `appearanceChanged()`.
+    private func adaptiveSymbol(_ name: String,
+                                accessibilityDescription: String,
+                                size: CGFloat = 16) -> NSImage {
+        let base = NSImage(systemSymbolName: name, accessibilityDescription: accessibilityDescription) ?? NSImage()
+        let color: NSColor = systemIsDarkMode ? .white : NSColor(white: 0.15, alpha: 1.0)
+        let tinted = base.withSymbolConfiguration(NSImage.SymbolConfiguration(paletteColors: [color])) ?? base
+        tinted.size = NSSize(width: size, height: size)
+        return tinted
     }
 
     // MARK: - Badge Registration
@@ -78,12 +129,12 @@ class FinderSyncExtension: FIFinderSync {
     private func registerBadges() {
         let controller = FIFinderSyncController.default()
         controller.setBadgeImage(
-            NSImage(systemSymbolName: "icloud", accessibilityDescription: "Not cached") ?? NSImage(),
+            adaptiveSymbol("icloud", accessibilityDescription: "Not cached"),
             label: "Not Available Offline",
             forBadgeIdentifier: "badge-cloud"
         )
         controller.setBadgeImage(
-            NSImage(systemSymbolName: "checkmark.icloud", accessibilityDescription: "Cached offline") ?? NSImage(),
+            adaptiveSymbol("checkmark.icloud", accessibilityDescription: "Cached offline"),
             label: "Available Offline",
             forBadgeIdentifier: "badge-downloaded"
         )
@@ -227,14 +278,9 @@ class FinderSyncExtension: FIFinderSync {
         // checkmark when the folder is kept on this Mac — the Google-Drive pattern
         // (checked = offline-ready, unchecked = streams online-only).
         let parentItem = NSMenuItem(title: "SyncTray", action: nil, keyEquivalent: "")
-        if let icon = NSImage(systemSymbolName: "externaldrive.badge.icloud",
-                              accessibilityDescription: "SyncTray") {
-            icon.size = NSSize(width: 16, height: 16)
-            // Template rendering makes AppKit tint the glyph for the menu's appearance
-            // (light in dark mode, dark in light mode) — matching the native menu icons.
-            icon.isTemplate = true
-            parentItem.image = icon
-        }
+        // Explicitly tinted for the current system appearance — a template image
+        // would render dark in dark mode here (see `adaptiveSymbol`).
+        parentItem.image = adaptiveSymbol("externaldrive.badge.icloud", accessibilityDescription: "SyncTray")
 
         let submenu = NSMenu(title: "SyncTray")
         let offlineItem = NSMenuItem(
