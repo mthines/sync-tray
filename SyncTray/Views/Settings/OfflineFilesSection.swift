@@ -58,12 +58,16 @@ struct OfflineFilesSection: View {
             }
             .buttonStyle(.plain)
 
+            // Surfaced even when the section is collapsed: enabling the Finder
+            // extension is the one manual step a fresh install requires (macOS
+            // ships extensions disabled), so it must be impossible to miss.
+            if !extensionEnabled {
+                enableExtensionCard
+                    .padding(.top, 10)
+            }
+
             if isExpanded {
                 VStack(alignment: .leading, spacing: 16) {
-                    if !extensionEnabled {
-                        enableExtensionCard
-                    }
-
                     // Cache overview
                     cacheOverview
 
@@ -136,7 +140,8 @@ struct OfflineFilesSection: View {
             }
             Text("To right-click folders in Finder and mark them Available Offline, turn on the "
                 + "“SyncTray Offline” extension under System Settings → General → Login Items & "
-                + "Extensions → Extensions.")
+                + "Extensions → Extensions. After enabling it, reopen your Finder windows "
+                + "(or restart Finder) so the menu appears.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
