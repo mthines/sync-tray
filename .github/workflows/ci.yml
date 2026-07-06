@@ -281,6 +281,9 @@ jobs:
     needs: [detect-changes, version]
     if: always() && needs.version.outputs.created == 'true'
     runs-on: macos-latest
+    # Backstop: build + sign + notarize is normally <10m. Cap well under the
+    # 6h default so a hung Apple notary wait can't burn macOS runner minutes.
+    timeout-minutes: 45
     permissions:
       contents: write
       pull-requests: write
