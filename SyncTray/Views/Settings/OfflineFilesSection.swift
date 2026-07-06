@@ -16,6 +16,8 @@ struct OfflineFilesSection: View {
     @State private var isClearing: Bool = false
     @State private var showClearConfirm: Bool = false
     @State private var rcAvailable: Bool = false
+    // Default true so the "enable me" card doesn't flash before the async check runs.
+    @State private var extensionEnabled: Bool = true
 
     // Pinned directories editing
     @State private var newPinnedDir: String = ""
@@ -58,6 +60,10 @@ struct OfflineFilesSection: View {
 
             if isExpanded {
                 VStack(alignment: .leading, spacing: 16) {
+                    if !extensionEnabled {
+                        enableExtensionCard
+                    }
+
                     // Cache overview
                     cacheOverview
 
@@ -83,10 +89,12 @@ struct OfflineFilesSection: View {
         .onAppear {
             pinnedDirs = profile.pinnedDirectories
             refreshCacheStats()
+            checkExtensionEnabled()
         }
         .onChange(of: isExpanded) { expanded in
             if expanded {
                 refreshCacheInfo()
+                checkExtensionEnabled()
             }
         }
         .onChange(of: profile.id) { _ in
@@ -111,6 +119,71 @@ struct OfflineFilesSection: View {
             Button("OK", role: .cancel) {}
         } message: {
             Text(browseWarning ?? "")
+        }
+    }
+
+    // MARK: - Enable-extension prompt
+
+    /// Shown only when the Finder extension is registered but not enabled. Guides the
+    /// user to turn it on and self-dismisses once they do (re-checked on appear/expand).
+    private var enableExtensionCard: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 6) {
+                Image(systemName: "puzzlepiece.extension.fill")
+                    .foregroundStyle(.orange)
+                Text("Enable the Finder integration")
+                    .font(.subheadline.weight(.semibold))
+            }
+            Text("To right-click folders in Finder and mark them Available Offline, turn on the "
+                + "“SyncTray Offline” extension under System Settings → General → Login Items & "
+                + "Extensions → Extensions.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            HStack(spacing: 12) {
+                Button("Open System Settings") { openExtensionSettings() }
+                Button("Re-check") { checkExtensionEnabled() }
+                    .buttonStyle(.plain)
+                    .font(.caption)
+                    .foregroundStyle(.blue)
+            }
+        }
+        .padding(10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.orange.opacity(0.1), in: .rect(cornerRadius: 6))
+    }
+
+    /// Ask pluginkit whether the extension is enabled. A leading "+" in its output means
+    /// registered AND enabled. Runs off the main thread; the host app isn't sandboxed.
+    private func checkExtensionEnabled() {
+        Task { extensionEnabled = await Self.finderExtensionEnabled() }
+    }
+
+    private static func finderExtensionEnabled() async -> Bool {
+        await withCheckedContinuation { continuation in
+            DispatchQueue.global(qos: .utility).async {
+                let proc = Process()
+                proc.executableURL = URL(fileURLWithPath: "/usr/bin/pluginkit")
+                proc.arguments = ["-m", "-i", "com.synctray.app.findersync"]
+                let pipe = Pipe()
+                proc.standardOutput = pipe
+                proc.standardError = Pipe()
+                do {
+                    try proc.run()
+                    proc.waitUntilExit()
+                    let out = String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+                        .trimmingCharacters(in: .newlines)
+                    continuation.resume(returning: out.hasPrefix("+"))
+                } catch {
+                    continuation.resume(returning: true)  // can't tell → don't nag
+                }
+            }
+        }
+    }
+
+    private func openExtensionSettings() {
+        if let url = URL(string: "x-apple.systempreferences:com.apple.ExtensionsPreferences") {
+            NSWorkspace.shared.open(url)
         }
     }
 
