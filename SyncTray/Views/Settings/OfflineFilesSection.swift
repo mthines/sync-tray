@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 
 /// Collapsible section for managing offline/cached files in mount mode profiles
 struct OfflineFilesSection: View {
@@ -15,9 +16,12 @@ struct OfflineFilesSection: View {
     @State private var isClearing: Bool = false
     @State private var showClearConfirm: Bool = false
     @State private var rcAvailable: Bool = false
+    // Default true so the "enable me" card doesn't flash before the async check runs.
+    @State private var extensionEnabled: Bool = true
 
     // Pinned directories editing
     @State private var newPinnedDir: String = ""
+    @State private var browseWarning: String?
     @State private var isRefreshingPins: Bool = false
     @State private var pinnedDirs: [String] = []
 
@@ -56,6 +60,10 @@ struct OfflineFilesSection: View {
 
             if isExpanded {
                 VStack(alignment: .leading, spacing: 16) {
+                    if !extensionEnabled {
+                        enableExtensionCard
+                    }
+
                     // Cache overview
                     cacheOverview
 
@@ -81,10 +89,12 @@ struct OfflineFilesSection: View {
         .onAppear {
             pinnedDirs = profile.pinnedDirectories
             refreshCacheStats()
+            checkExtensionEnabled()
         }
         .onChange(of: isExpanded) { expanded in
             if expanded {
                 refreshCacheInfo()
+                checkExtensionEnabled()
             }
         }
         .onChange(of: profile.id) { _ in
@@ -93,11 +103,87 @@ struct OfflineFilesSection: View {
             pathHistory = []
             refreshCacheStats()
         }
-        .alert("Clear All Cached Files?", isPresented: $showClearConfirm) {
+        .alert("Clear cached files?", isPresented: $showClearConfirm) {
+            Button("Free Up Space") { clearCache(preservePinned: true) }
+                .keyboardShortcut(.defaultAction)
+            Button("Clear Everything", role: .destructive) { clearCache(preservePinned: false) }
             Button("Cancel", role: .cancel) {}
-            Button("Clear Cache", role: .destructive) { clearAllCache() }
         } message: {
-            Text("This will remove all locally cached files for \"\(profile.name)\". Files will be re-downloaded from the cloud when accessed.")
+            Text("Frees up space by removing downloaded copies of files you've opened. "
+                + "Pinned directories stay available offline — choose Clear Everything to remove those too.")
+        }
+        .alert("Can't pin that folder", isPresented: Binding(
+            get: { browseWarning != nil },
+            set: { if !$0 { browseWarning = nil } }
+        )) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text(browseWarning ?? "")
+        }
+    }
+
+    // MARK: - Enable-extension prompt
+
+    /// Shown only when the Finder extension is registered but not enabled. Guides the
+    /// user to turn it on and self-dismisses once they do (re-checked on appear/expand).
+    private var enableExtensionCard: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 6) {
+                Image(systemName: "puzzlepiece.extension.fill")
+                    .foregroundStyle(.orange)
+                Text("Enable the Finder integration")
+                    .font(.subheadline.weight(.semibold))
+            }
+            Text("To right-click folders in Finder and mark them Available Offline, turn on the "
+                + "“SyncTray Offline” extension under System Settings → General → Login Items & "
+                + "Extensions → Extensions.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            HStack(spacing: 12) {
+                Button("Open System Settings") { openExtensionSettings() }
+                Button("Re-check") { checkExtensionEnabled() }
+                    .buttonStyle(.plain)
+                    .font(.caption)
+                    .foregroundStyle(.blue)
+            }
+        }
+        .padding(10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.orange.opacity(0.1), in: .rect(cornerRadius: 6))
+    }
+
+    /// Ask pluginkit whether the extension is enabled. A leading "+" in its output means
+    /// registered AND enabled. Runs off the main thread; the host app isn't sandboxed.
+    private func checkExtensionEnabled() {
+        Task { extensionEnabled = await Self.finderExtensionEnabled() }
+    }
+
+    private static func finderExtensionEnabled() async -> Bool {
+        await withCheckedContinuation { continuation in
+            DispatchQueue.global(qos: .utility).async {
+                let proc = Process()
+                proc.executableURL = URL(fileURLWithPath: "/usr/bin/pluginkit")
+                proc.arguments = ["-m", "-i", "com.synctray.app.findersync"]
+                let pipe = Pipe()
+                proc.standardOutput = pipe
+                proc.standardError = Pipe()
+                do {
+                    try proc.run()
+                    proc.waitUntilExit()
+                    let out = String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+                        .trimmingCharacters(in: .newlines)
+                    continuation.resume(returning: out.hasPrefix("+"))
+                } catch {
+                    continuation.resume(returning: true)  // can't tell → don't nag
+                }
+            }
+        }
+    }
+
+    private func openExtensionSettings() {
+        if let url = URL(string: "x-apple.systempreferences:com.apple.ExtensionsPreferences") {
+            NSWorkspace.shared.open(url)
         }
     }
 
@@ -141,8 +227,8 @@ struct OfflineFilesSection: View {
                     .controlSize(.small)
 
                     if stats.fileCount > 0 {
-                        Button(role: .destructive, action: { showClearConfirm = true }) {
-                            Label(isClearing ? "Clearing..." : "Clear All Cache", systemImage: "trash")
+                        Button(action: { showClearConfirm = true }) {
+                            Label(isClearing ? "Clearing..." : "Clear Cache…", systemImage: "trash")
                                 .font(.caption)
                         }
                         .controlSize(.small)
@@ -238,6 +324,11 @@ struct OfflineFilesSection: View {
                     .textFieldStyle(.roundedBorder)
                     .font(.caption)
                     .onSubmit { addPinnedDir() }
+                Button(action: { browsePinnedDir() }) {
+                    Image(systemName: "folder")
+                }
+                .buttonStyle(.plain)
+                .help("Browse for a folder inside the mount")
                 Button(action: { addPinnedDir() }) {
                     Image(systemName: "plus.circle.fill")
                         .foregroundStyle(.blue)
@@ -448,16 +539,46 @@ struct OfflineFilesSection: View {
         }
     }
 
-    private func clearAllCache() {
+    private func clearCache(preservePinned: Bool) {
         isClearing = true
         Task {
-            try? await cacheService.clearCache(for: profile)
+            try? await cacheService.clearCache(for: profile, preservePinned: preservePinned)
             await MainActor.run {
                 isClearing = false
                 cachedItems = []
                 refreshCacheStats()
             }
         }
+    }
+
+    /// Open a folder picker rooted at the mount and fill the field with the chosen
+    /// folder as a path relative to the mount (pinned dirs are mount-relative). Folders
+    /// outside the mount can't be expressed as a relative pin, so they're rejected.
+    private func browsePinnedDir() {
+        let mount = profile.localSyncPath
+        let panel = NSOpenPanel()
+        panel.title = "Choose a folder inside the mount to keep offline"
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = false
+        if !mount.isEmpty, FileManager.default.fileExists(atPath: mount) {
+            panel.directoryURL = URL(fileURLWithPath: mount)
+        }
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+
+        let mountPath = (mount as NSString).standardizingPath
+        let chosen = (url.path as NSString).standardizingPath
+        guard chosen == mountPath || chosen.hasPrefix(mountPath + "/") else {
+            browseWarning = "Pick a folder inside this profile's mount:\n\(mountPath)"
+            return
+        }
+        var rel = String(chosen.dropFirst(mountPath.count))
+        while rel.hasPrefix("/") { rel = String(rel.dropFirst()) }
+        guard !rel.isEmpty else {
+            browseWarning = "Choose a subfolder to pin — not the mount root."
+            return
+        }
+        newPinnedDir = rel
     }
 
     private func addPinnedDir() {

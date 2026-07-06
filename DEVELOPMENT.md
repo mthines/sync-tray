@@ -19,6 +19,37 @@ xcodebuild -scheme SyncTray -destination 'platform=macOS' build 2>&1 | xcbeautif
 open ~/Library/Developer/Xcode/DerivedData/SyncTray-*/Build/Products/Debug/SyncTray.app
 ```
 
+## Code signing & the Finder extension (local dev)
+
+The `SyncTrayFinderSync` Finder extension **only loads in a code-signed build** —
+macOS won't register a Finder extension or grant App Groups otherwise. Set this up
+once per clone:
+
+```bash
+git config core.hooksPath .githooks                                     # team-guard hook
+cp Config/Signing.local.xcconfig.example Config/Signing.local.xcconfig   # then set DEVELOPMENT_TEAM in it
+```
+
+Your Team ID lives only in the gitignored `Config/Signing.local.xcconfig`, never in
+the committed project. CI and release builds are unsigned by design (they pass
+`CODE_SIGNING_ALLOWED=NO`), so no team is needed there.
+
+To exercise the extension:
+
+1. In Xcode set your **Team** on both the `SyncTray` and `SyncTrayFinderSync` targets
+   (Signing & Capabilities → Automatically manage signing); confirm both carry the
+   `group.com.synctray.app` App Group.
+2. Build & run (⌘R), then enable it under System Settings → General → Login Items &
+   Extensions → Extensions → **SyncTray Offline**.
+3. Mount a Stream profile and right-click a folder **inside the mount** →
+   **SyncTray ▸ Available Offline**. Verify with `pluginkit -m -i com.synctray.app.findersync`.
+4. **After every rebuild, run `killall Finder`** so it reloads the extension.
+
+`scripts/dev.sh` (`nx run synctray:dev`) tries a signed build first (extension loads
+when the above is set up) and falls back to unsigned so iteration is never blocked.
+Shipping the extension to users (Developer ID signing + notarization) is covered in
+[docs/release-signing.md](docs/release-signing.md).
+
 ## Project Structure
 
 ```

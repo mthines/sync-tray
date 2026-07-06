@@ -1,0 +1,18 @@
+// SyncTray signing configuration (tracked — contains NO personal data).
+//
+// CI and the release build produce UNSIGNED apps (CODE_SIGNING_ALLOWED=NO is passed
+// on the xcodebuild command line by .github/workflows/ci.yml and scripts/release-ci.sh),
+// so no Team is needed there.
+//
+// A local SIGNED build is required to run/test the FinderSync extension. Your Apple
+// Developer Team ID is read from an OPTIONAL, gitignored local override below, so it
+// never lives in a tracked file and can't be committed by accident.
+//
+// One-time setup on each machine:
+//   cp Config/Signing.local.xcconfig.example Config/Signing.local.xcconfig
+//   # then edit Config/Signing.local.xcconfig and set your Team ID
+CODE_SIGN_STYLE = Automatic
+
+// Optional include — absent on CI / fresh clones, present locally. The `?` means
+// "don't error if the file is missing".
+#include? "Signing.local.xcconfig"

@@ -158,21 +158,49 @@ final class VFSCacheService {
 
     /// Clear all cached files for a profile
     /// Prefers RC API when mount is active to safely evict from VFS layer first
-    func clearCache(for profile: SyncProfile) async throws {
+    /// - Parameter preservePinned: when true, files under the profile's
+    ///   `pinnedDirectories` are kept so pinned folders stay available offline.
+    func clearCache(for profile: SyncProfile, preservePinned: Bool = false) async throws {
         let port = profile.rcPort
-
-        // If RC is available, forget the root directory first to safely evict from VFS
-        if port > 0, await isRCAvailable(port: port) {
-            try? await forgetDirectory("", port: port)
-        }
-
-        // Then remove files from disk
+        let pinned = preservePinned ? profile.pinnedDirectories : []
         guard let baseDir = cacheDirectory(for: profile) else { return }
         let fm = FileManager.default
-        if let contents = try? fm.contentsOfDirectory(atPath: baseDir) {
-            for item in contents {
-                let path = (baseDir as NSString).appendingPathComponent(item)
-                try fm.removeItem(atPath: path)
+
+        // Nothing to preserve → clear everything (and drop the whole VFS listing when mounted).
+        if pinned.isEmpty {
+            if port > 0, await isRCAvailable(port: port) {
+                try? await forgetDirectory("", port: port)
+            }
+            if let contents = try? fm.contentsOfDirectory(atPath: baseDir) {
+                for item in contents {
+                    try fm.removeItem(atPath: (baseDir as NSString).appendingPathComponent(item))
+                }
+            }
+            return
+        }
+
+        // Preserve pinned → remove only cache entries that aren't a pinned directory
+        // (or inside one).
+        try clearUnpinned(dir: baseDir, base: baseDir, pinned: pinned, fm: fm)
+    }
+
+    /// Recursively remove cached entries whose path relative to `base` is neither a
+    /// pinned directory nor inside one. A directory that merely *contains* a pinned dir
+    /// is recursed into, so only its unpinned children are deleted.
+    private func clearUnpinned(dir: String, base: String, pinned: [String], fm: FileManager) throws {
+        guard let entries = try? fm.contentsOfDirectory(atPath: dir) else { return }
+        for entry in entries {
+            let full = (dir as NSString).appendingPathComponent(entry)
+            let rel = String(full.dropFirst(base.count + 1))
+            if pinned.contains(where: { rel == $0 || rel.hasPrefix($0 + "/") }) {
+                continue  // the pinned dir itself, or a file inside it — keep
+            }
+            var isDir: ObjCBool = false
+            fm.fileExists(atPath: full, isDirectory: &isDir)
+            if isDir.boolValue && pinned.contains(where: { $0.hasPrefix(rel + "/") }) {
+                try clearUnpinned(dir: full, base: base, pinned: pinned, fm: fm)  // ancestor of a pin
+            } else {
+                try fm.removeItem(atPath: full)
             }
         }
     }
@@ -259,14 +287,97 @@ final class VFSCacheService {
         }
     }
 
-    /// Pre-cache all pinned directories for a profile
+    /// Pre-cache all pinned directories for a profile.
+    ///
+    /// This calls `warmDirectory(_:for:)` for each pinned directory, which:
+    /// 1. Calls `/vfs/refresh` to refresh rclone's in-memory directory-stat cache.
+    /// 2. Opens and reads file bytes through the NFS mount to populate the VFS content cache.
     func refreshPinnedDirectories(for profile: SyncProfile) async {
         guard !profile.pinnedDirectories.isEmpty else { return }
-        let port = profile.rcPort
 
         for dir in profile.pinnedDirectories {
-            try? await refreshDirectory(dir, port: port)
+            // Startup warm: the passed profile is the live state at this point.
+            await warmDirectory(dir, for: profile) { profile.pinnedDirectories.contains(dir) }
         }
+    }
+
+    /// Warm a single directory by: first calling `/vfs/refresh` (listing cache), then
+    /// reading file bytes through the NFS mount to populate the rclone VFS content cache.
+    ///
+    /// I/O budget: reads are sequential (not concurrent); total bytes ceiling is 2 GB per call;
+    /// `try Task.checkCancellation()` between files allows the task to be cancelled by unmount
+    /// or unpin operations.
+    ///
+    /// - Parameters:
+    ///   - dir: Relative directory path within the profile's localSyncPath.
+    ///   - profile: The mount-mode profile whose NFS mount to read through.
+    ///   - isStillPinned: Live predicate re-evaluated between files; when it returns
+    ///     false (the directory was unpinned mid-warm) the read loop stops early.
+    func warmDirectory(_ dir: String, for profile: SyncProfile, isStillPinned: @Sendable () async -> Bool) async {
+        let port = profile.rcPort
+        let mountPath = profile.localSyncPath
+        let fullDirPath = (mountPath as NSString).appendingPathComponent(dir)
+
+        // Step 1: refresh rclone's in-memory listing cache (metadata only).
+        try? await refreshDirectory(dir, port: port)
+
+        // Step 2: walk and read file bytes through the mount to populate the VFS content cache.
+        let fm = FileManager.default
+        guard fm.fileExists(atPath: fullDirPath) else {
+            SyncTraySettings.debugLog("warmDirectory: directory not found at \(fullDirPath), skipping byte-read")
+            return
+        }
+
+        guard let enumerator = fm.enumerator(
+            at: URL(fileURLWithPath: fullDirPath),
+            includingPropertiesForKeys: [.fileSizeKey, .isRegularFileKey],
+            options: [.skipsHiddenFiles]
+        ) else { return }
+
+        var totalBytesRead: Int64 = 0
+        let maxTotalBytes: Int64 = 2 * 1024 * 1024 * 1024  // 2 GB ceiling
+        let maxFileBytes: Int64 = 100 * 1024 * 1024         // 100 MB per-file ceiling
+        let chunkSize = 64 * 1024                            // 64 KB read chunks
+
+        for case let fileURL as URL in enumerator {
+            // Check cancellation between files (allows unmount / unpin to interrupt).
+            do { try Task.checkCancellation() } catch { return }
+
+            // Stop if the directory was unpinned while we were warming (live check).
+            guard await isStillPinned() else {
+                SyncTraySettings.debugLog("warmDirectory: '\(dir)' was unpinned during warming, stopping")
+                return
+            }
+
+            guard let resourceValues = try? fileURL.resourceValues(forKeys: [.fileSizeKey, .isRegularFileKey]),
+                  resourceValues.isRegularFile == true else { continue }
+
+            let fileSize = Int64(resourceValues.fileSize ?? 0)
+
+            if fileSize > maxFileBytes {
+                SyncTraySettings.debugLog("warmDirectory: Skipping large file (\(fileSize) bytes): \(fileURL.lastPathComponent)")
+                continue
+            }
+
+            if totalBytesRead + fileSize > maxTotalBytes {
+                SyncTraySettings.debugLog("warmDirectory: 2 GB total ceiling reached, stopping warm for '\(dir)'")
+                return
+            }
+
+            // Read file bytes through the mount — this is what actually populates
+            // the rclone VFS content cache (not the RC /vfs/refresh call above).
+            guard let fileHandle = FileHandle(forReadingAtPath: fileURL.path) else { continue }
+
+            var fileBytesRead: Int64 = 0
+            while let chunk = try? fileHandle.read(upToCount: chunkSize), !chunk.isEmpty {
+                fileBytesRead += Int64(chunk.count)
+            }
+            try? fileHandle.close()
+
+            totalBytesRead += fileBytesRead
+        }
+
+        SyncTraySettings.debugLog("warmDirectory: Finished warming '\(dir)' — \(totalBytesRead) bytes read through mount")
     }
 
     // MARK: - Errors

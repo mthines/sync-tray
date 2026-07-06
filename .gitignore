@@ -40,3 +40,6 @@ package-lock.json
 yarn.lock
 pnpm-lock.yaml
 .agent/
+
+# Local Xcode signing override (personal Team ID) — never commit
+Config/Signing.local.xcconfig

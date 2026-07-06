@@ -76,13 +76,14 @@ Access cloud files without downloading them. Files appear in a folder on your Ma
 
 - No local storage used (beyond cache)
 - Ideal for large media libraries or archives
-- Configurable VFS cache for performance
+- Configurable VFS cache with a retention window ("keep cached for N days")
+- Right-click a folder in Finder → **Available Offline** to keep it downloaded for offline use
 
 <p align="center">
   <img src="/docs/assets/profile-stream.png" alt="Stream (Mount) Configuration" height="600">
 </p>
 
-> **Note**: Mount mode requires [macFUSE](#mount-mode-setup) and the official rclone binary.
+> **Note**: Stream mode is **kext-free by default** — it uses rclone's built-in NFS mount, so no macFUSE is required (it works even on locked-down/MDM-managed Macs). A legacy macFUSE backend is still selectable per profile ([details](#mount-mode-setup)).
 
 ---
 
@@ -170,36 +171,29 @@ See [rclone's documentation](https://rclone.org/docs/) for detailed setup guides
 
 ### Mount Mode Setup
 
-Stream (Mount) mode requires additional components:
+Stream (Mount) mode works **out of the box** — no extra setup. By default it uses
+rclone's built-in **NFS** mount (kext-free), so nothing beyond rclone itself is
+required, and it works on locked-down / MDM-managed Macs where kernel extensions
+are blocked.
 
-#### 1. Install macFUSE
+#### Optional: macFUSE backend (legacy)
+
+If you prefer the classic FUSE mount, switch a profile's **Mount Backend** to
+**macFUSE** in the profile editor. That backend additionally requires macFUSE and
+the official rclone binary:
 
 ```bash
+# 1. Install macFUSE, then restart and approve it in
+#    System Settings → Privacy & Security.
 brew install --cask macfuse
-```
 
-After installation:
-
-1. **Restart your Mac**
-2. Go to **System Settings → Privacy & Security**
-3. Approve the macFUSE kernel extension
-
-#### 2. Install Official rclone Binary
-
-> **Important**: Homebrew's rclone doesn't support mount mode. You need the official binary.
-
-```bash
-# Remove Homebrew version (if installed)
+# 2. Homebrew's rclone can't mount — install the official binary.
 brew uninstall rclone
-
-# Download and install official binary
 curl -O https://downloads.rclone.org/rclone-current-osx-arm64.zip
 unzip rclone-current-osx-arm64.zip
 cd rclone-*-osx-arm64
 sudo cp rclone /usr/local/bin/
 sudo chmod +x /usr/local/bin/rclone
-
-# Verify installation
 rclone version
 ```
 

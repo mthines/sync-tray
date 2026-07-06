@@ -63,6 +63,7 @@ xcodebuild -project "$XCODEPROJ" \
   -derivedDataPath "$BUILD_DIR/DerivedData" \
   clean build \
   ONLY_ACTIVE_ARCH=NO \
+  CODE_SIGNING_ALLOWED=NO \
   DASH0_AUTH_TOKEN="${DASH0_AUTH_TOKEN:-}" \
   | tail -20
 
@@ -76,8 +77,63 @@ fi
 ARCH_INFO=$(lipo -info "$BINARY" 2>/dev/null | sed 's/.*: //' || echo "unknown")
 log_success "Build OK ($ARCH_INFO)"
 
-if ! codesign -v "$APP_PATH" 2>/dev/null; then
-  log_warning "App bundle has invalid code signature (expected for unsigned builds)"
+# =============================================================================
+# Developer ID signing (OPT-IN — only runs when the signing secrets are present).
+#
+# Without MACOS_CERTIFICATE_P12_BASE64 the app stays ad-hoc signed exactly as
+# before, so this can never break an existing release; it only *upgrades* the
+# release when configured. A signed + notarized app is REQUIRED for the
+# SyncTrayFinderSync extension (and App Groups) to load on end-user machines —
+# see docs/release-signing.md for the one-time Apple-account + secrets setup.
+# =============================================================================
+SIGNED="false"
+if [ -n "${MACOS_CERTIFICATE_P12_BASE64:-}" ] && [ -n "${MACOS_CERTIFICATE_PASSWORD:-}" ]; then
+  log_info "Developer ID signing enabled — importing certificate into a temp keychain..."
+  KEYCHAIN="$BUILD_DIR/synctray-signing.keychain-db"
+  KEYCHAIN_PW="$(uuidgen)"
+  CERT_P12="$BUILD_DIR/developer_id.p12"
+  echo "$MACOS_CERTIFICATE_P12_BASE64" | base64 --decode > "$CERT_P12"
+
+  security create-keychain -p "$KEYCHAIN_PW" "$KEYCHAIN"
+  security set-keychain-settings -lut 21600 "$KEYCHAIN"
+  security unlock-keychain -p "$KEYCHAIN_PW" "$KEYCHAIN"
+  security import "$CERT_P12" -k "$KEYCHAIN" -P "$MACOS_CERTIFICATE_PASSWORD" \
+    -T /usr/bin/codesign -T /usr/bin/security
+  security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PW" "$KEYCHAIN" >/dev/null
+  # Put our keychain first in the search list so codesign resolves the identity.
+  # shellcheck disable=SC2046
+  security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | sed s/\"//g)
+  rm -f "$CERT_P12"
+
+  IDENTITY="$(security find-identity -v -p codesigning "$KEYCHAIN" \
+    | awk -F'"' '/Developer ID Application/ {print $2; exit}')"
+  [ -n "$IDENTITY" ] || log_error "No 'Developer ID Application' identity in the imported certificate."
+  log_success "Signing identity: $IDENTITY"
+
+  APP_ENTITLEMENTS="$PROJECT_DIR/SyncTray/SyncTray.entitlements"
+  EXT_ENTITLEMENTS="$PROJECT_DIR/SyncTrayFinderSync/SyncTrayFinderSync.entitlements"
+  EXT_PATH="$APP_PATH/Contents/PlugIns/SyncTrayFinderSync.appex"
+
+  # Sign inside-out (nested code first, then the app). Hardened runtime
+  # (--options runtime) + a secure --timestamp are required for notarization.
+  if [ -d "$APP_PATH/Contents/Frameworks" ]; then
+    while IFS= read -r -d '' item; do
+      codesign --force --timestamp --options runtime --keychain "$KEYCHAIN" \
+        --sign "$IDENTITY" "$item"
+    done < <(find "$APP_PATH/Contents/Frameworks" -mindepth 1 -maxdepth 1 -print0)
+  fi
+  if [ -d "$EXT_PATH" ]; then
+    codesign --force --timestamp --options runtime --keychain "$KEYCHAIN" \
+      --entitlements "$EXT_ENTITLEMENTS" --sign "$IDENTITY" "$EXT_PATH"
+  fi
+  codesign --force --timestamp --options runtime --keychain "$KEYCHAIN" \
+    --entitlements "$APP_ENTITLEMENTS" --sign "$IDENTITY" "$APP_PATH"
+
+  codesign --verify --deep --strict --verbose=2 "$APP_PATH"
+  log_success "Signed with Developer ID"
+  SIGNED="true"
+else
+  log_warning "MACOS_CERTIFICATE_* not set — building UNSIGNED. The Finder extension will NOT load for users; see docs/release-signing.md."
 fi
 
 # =============================================================================
@@ -96,6 +152,32 @@ if [ ! -f "$VERIFY_DIR/${PROJECT_NAME}.app/Contents/MacOS/${PROJECT_NAME}" ]; th
   log_error "Zip verification failed — extracted app has no binary"
 fi
 rm -rf "$VERIFY_DIR"
+
+# =============================================================================
+# Notarize + staple (only when signed AND notary creds present). Stapling embeds
+# the notarization ticket so Gatekeeper accepts the app offline; we then re-zip
+# so the distributed archive (and its sha256) covers the stapled bundle.
+# =============================================================================
+if [ "$SIGNED" = "true" ] && [ -n "${NOTARY_KEY_P8_BASE64:-}" ] \
+   && [ -n "${NOTARY_KEY_ID:-}" ] && [ -n "${NOTARY_ISSUER_ID:-}" ]; then
+  log_info "Notarizing with Apple (usually a few minutes; capped at 30m)..."
+  NOTARY_KEY="$BUILD_DIR/notary_key.p8"
+  echo "$NOTARY_KEY_P8_BASE64" | base64 --decode > "$NOTARY_KEY"
+  # --timeout bounds the wait so an Apple Notary Service backlog fails the step
+  # fast instead of blocking until GitHub's 6h job cap (macOS runners bill 10x).
+  xcrun notarytool submit "$ZIP_PATH" \
+    --key "$NOTARY_KEY" --key-id "$NOTARY_KEY_ID" --issuer "$NOTARY_ISSUER_ID" \
+    --wait --timeout 30m
+  rm -f "$NOTARY_KEY"
+  xcrun stapler staple "$APP_PATH"
+  xcrun stapler validate "$APP_PATH"
+  log_success "Notarized + stapled"
+  # Re-zip so the published archive contains the stapled ticket.
+  rm -f "$ZIP_PATH"
+  ditto -c -k --sequesterRsrc --keepParent "$APP_PATH" "$ZIP_PATH"
+elif [ "$SIGNED" = "true" ]; then
+  log_warning "Signed but NOTARY_* not set — skipping notarization. Gatekeeper will still quarantine the app on download."
+fi
 
 ZIP_SHA=$(shasum -a 256 "$ZIP_PATH" | awk '{print $1}')
 ZIP_SIZE=$(du -h "$ZIP_PATH" | cut -f1)

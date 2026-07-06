@@ -136,6 +136,7 @@ jobs:
             -configuration Debug \
             build \
             ONLY_ACTIVE_ARCH=NO \
+            CODE_SIGNING_ALLOWED=NO \
             | tail -30
 
   # ===========================================================================
@@ -280,6 +281,9 @@ jobs:
     needs: [detect-changes, version]
     if: always() && needs.version.outputs.created == 'true'
     runs-on: macos-latest
+    # Backstop: build + sign + notarize is normally <10m. Cap well under the
+    # 6h default so a hung Apple notary wait can't burn macOS runner minutes.
+    timeout-minutes: 45
     permissions:
       contents: write
       pull-requests: write
@@ -298,6 +302,13 @@ jobs:
           RELEASE_VERSION: ${{ needs.version.outputs.tag }}
           PR_NUMBER: ${{ needs.detect-changes.outputs.pr_number }}
           IS_BETA: ${{ needs.detect-changes.outputs.is_beta }}
+          # Developer ID signing + notarization (optional — release-ci.sh builds
+          # unsigned when these are absent). See docs/release-signing.md.
+          MACOS_CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          NOTARY_KEY_P8_BASE64: ${{ secrets.NOTARY_KEY_P8_BASE64 }}
+          NOTARY_KEY_ID: ${{ secrets.NOTARY_KEY_ID }}
+          NOTARY_ISSUER_ID: ${{ secrets.NOTARY_ISSUER_ID }}
         run: bash scripts/release-ci.sh
 
       - name: Sync in-repo cask (stable only)

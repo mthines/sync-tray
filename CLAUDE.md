@@ -114,7 +114,75 @@ SyncTray/
 ├── Views/            # SwiftUI views
 ├── Assets.xcassets/  # App icons and images
 └── SyncTrayApp.swift # App entry point and AppDelegate
+SyncTrayFinderSync/   # FinderSync app extension (kext-free, sandboxed)
+├── FinderSyncExtension.swift # FIFinderSync subclass — contextual menu, badges, IPC
+├── Info.plist        # NSExtension point: com.apple.FinderSync
+├── SyncTrayFinderSync.entitlements # App sandbox + App Group (7HVK85DZG7.group.com.synctray.app)
+└── Assets.xcassets/  # Badge images (badge-cloud, badge-downloaded)
 ```
+
+### FinderSync Extension
+
+The `SyncTrayFinderSync` app extension adds a right-click Finder contextual menu
+("Make Available Offline" / "Remove from Offline") for directories inside rclone NFS
+mount paths. Extension bundle ID: `com.synctray.app.findersync`. Requires no kernel
+extension (kext-free NFS backend only).
+
+#### App Group IPC Contract
+
+Two distinct IPC mechanisms are used. Both use App Group ID `7HVK85DZG7.group.com.synctray.app`:
+
+| Direction | Mechanism | Key / File | Contents |
+|-----------|-----------|------------|----------|
+| Host → Extension | `UserDefaults(suiteName: "7HVK85DZG7.group.com.synctray.app")` | `com.synctray.app.mountPaths` | `[String]` — active NFS mount paths |
+| Host → Extension | `UserDefaults(suiteName: "7HVK85DZG7.group.com.synctray.app")` | `com.synctray.app.profileData` | `[[String:Any]]` — profileId, pinnedDirectories, vfsCachePath per profile |
+| Extension → Host | JSON file in App Group container | `pending-pin-request.json` | `{action, profileId, paths[]}` |
+| Extension → Host | Darwin distributed notification | `com.synctray.app.pinRequest` | Zero-payload wake signal |
+
+The host app reads `pending-pin-request.json` and deletes it on each Darwin notification
+and on a 1-second fallback poll timer (active only when mount profiles exist).
+
+#### Code signing — required to test the extension; disabled on CI/release
+
+macOS **will not load a Finder extension (or grant App Group access) in an unsigned
+app**. So the FinderSync menu only appears in a **code-signed** build:
+
+- **Local testing:** set your **Team** on *both* the `SyncTray` and `SyncTrayFinderSync`
+  targets (Signing & Capabilities → Automatic), confirm the `7HVK85DZG7.group.com.synctray.app`
+  App Group is on both, then Build & Run. Enable it once under System Settings →
+  General → Login Items & Extensions → Extensions, and right-click a folder **inside a
+  mounted Stream profile's path** (FinderSync only decorates registered mount dirs).
+  `pluginkit -m -i com.synctray.app.findersync` should list it once loaded.
+- **CI / release build unsigned on purpose.** `CODE_SIGNING_ALLOWED=NO` is **not**
+  hardcoded in the project — it is passed on the `xcodebuild` command line by both the
+  CI `test` job (`.github/workflows/ci.yml`) and `scripts/release-ci.sh`. This keeps the
+  build gate green without signing credentials while letting local dev sign normally.
+  Consequence: the brew-distributed (unsigned) app **cannot** show the offline menu —
+  shipping it requires Developer ID signing + notarization + App Group provisioning.
+  The release pipeline (`scripts/release-ci.sh`) does this automatically when the
+  signing secrets are present; setup is documented in [`docs/release-signing.md`](docs/release-signing.md).
+  Local dev-setup steps live in [`DEVELOPMENT.md`](DEVELOPMENT.md).
+
+#### Cross-Target String Constants
+
+`kAppGroupID` (`7HVK85DZG7.group.com.synctray.app`), `kMountPathsKey`, and
+`kPinRequestNotificationName` (`com.synctray.app.pinRequest`) are defined as string
+literals in **both** `FinderSyncExtension.swift` and `SyncManager.swift` independently.
+The two targets are separate compilation units. If you rename either constant, rename both.
+
+#### VFS Content Warming (Bug Fix)
+
+`VFSCacheService.warmDirectory(_:for:)` fixes a pre-existing bug: the old
+`refreshPinnedDirectories` only called `/vfs/refresh` (listing-cache metadata), which
+does not populate the rclone VFS content cache. `warmDirectory` now:
+
+1. Calls `/vfs/refresh` first (listing cache pre-step).
+2. Walks `profile.localSyncPath/<dir>` via `FileManager.enumerator`.
+3. Opens each file ≤ 100 MB via `FileHandle` and reads 64 KB chunks — the act of
+   reading through the NFS mount populates `~/.cache/rclone/vfs/…`.
+
+I/O budget: sequential reads (not concurrent), 2 GB total ceiling per call, cancellable
+between files via `try Task.checkCancellation()`.
 
 ### Models/
 
@@ -434,7 +502,7 @@ Anonymous, opt-in telemetry using OpenTelemetry (opentelemetry-swift 1.17.1). Al
 
 ### Three signals
 - **Traces**: Sync lifecycle spans with real duration (start→complete/fail), mount/unmount spans
-- **Metrics**: 19 instruments — sync duration + check phase histograms, operation counters (sync, mount, file ops, contention, recovery, volume events, filter stats), profile gauge (delta temporality, 30s export interval)
+- **Metrics**: 20 instruments — sync duration + check phase histograms, operation counters (sync, mount, file ops, contention, recovery, volume events, filter stats, offline pin/unpin), profile gauge (delta temporality, 30s export interval)
 - **Logs**: Structured log records for all key events (sync lifecycle, mount, transport changes, errors, config snapshots, session heartbeat, stale lock cleanup, precondition failures)
 
 ### User correlation

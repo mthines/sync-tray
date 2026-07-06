@@ -642,6 +642,11 @@ struct ProfileDetailView: View {
                             confirmLocalPathSelection(path)
                         }
                     }
+                    Button(action: { openLocalFolderInFinder() }) {
+                        Image(systemName: "folder")
+                    }
+                    .disabled(!localFolderExists)
+                    .help("Open in Finder")
                 }
 
                 // External drive toggle
@@ -2950,6 +2955,23 @@ struct ProfileDetailView: View {
 
         Only continue if that's what you intend.
         """
+    }
+
+    /// Whether the local folder currently entered in the form exists on disk.
+    /// False when the path is empty or missing (e.g. external drive unmounted),
+    /// which disables the "Open in Finder" button instead of opening nothing.
+    private var localFolderExists: Bool {
+        var isDirectory: ObjCBool = false
+        return !localSyncPath.isEmpty
+            && FileManager.default.fileExists(atPath: localSyncPath, isDirectory: &isDirectory)
+            && isDirectory.boolValue
+    }
+
+    /// Opens the local sync folder (or mount point, for Stream profiles) in Finder.
+    /// Uses the form's current value so the button follows unsaved edits.
+    private func openLocalFolderInFinder() {
+        guard localFolderExists else { return }
+        NSWorkspace.shared.open(URL(fileURLWithPath: localSyncPath))
     }
 
     private func browseForFolder(title: String, completion: @escaping (String) -> Void) {

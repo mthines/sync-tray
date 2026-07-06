@@ -107,6 +107,7 @@ final class TelemetryService {
     private var resumedExternalSyncCounter: LongCounterSdk?
     private var settingsOpenedCounter: LongCounterSdk?
     private var autoFixTriggeredCounter: LongCounterSdk?
+    private var offlinePinOperationsCounter: LongCounterSdk?
 
     // MARK: - Providers (kept alive for shutdown)
 
@@ -333,6 +334,12 @@ final class TelemetryService {
         autoFixTriggeredCounter = meter
             .counterBuilder(name: "synctray.sync.auto_fix_triggered")
             .setDescription("Number of automatic --resync recoveries triggered (by result: triggered, gave_up_backoff)")
+            .setUnit("1")
+            .build()
+
+        offlinePinOperationsCounter = meter
+            .counterBuilder(name: "synctray.offline.pin_operations")
+            .setDescription("Number of offline pin/unpin operations by action (pin or unpin)")
             .setUnit("1")
             .build()
     }
@@ -995,6 +1002,40 @@ final class TelemetryService {
                 "synctray.profile.id": .string(profileId.uuidString),
                 "synctray.profile.name": .string(profileName),
                 "result": .string(result),
+            ]
+        )
+    }
+
+    // MARK: - Offline Pin Operations
+
+    /// Record an offline pin or unpin operation triggered from Finder or the in-app UI.
+    /// - Parameters:
+    ///   - profileId:   UUID of the profile whose pinnedDirectories list was updated.
+    ///   - profileName: Display name of the affected profile.
+    ///   - action:      `"pin"` when a directory is pinned; `"unpin"` when unpinned.
+    ///   - pathCount:   Number of directory paths included in this operation.
+    func recordOfflinePinOperation(
+        profileId: UUID,
+        profileName: String,
+        action: String,    // "pin" | "unpin"
+        pathCount: Int
+    ) {
+        guard SyncTraySettings.telemetryEnabled else { return }
+        ensureSetup()
+
+        offlinePinOperationsCounter?.add(value: 1, attribute: [
+            "synctray.profile.name": .string(profileName),
+            "action": .string(action),
+        ])
+
+        emitLog(
+            severity: .info,
+            body: "Offline pin operation",
+            attributes: [
+                "synctray.profile.id": .string(profileId.uuidString),
+                "synctray.profile.name": .string(profileName),
+                "offline.action": .string(action),
+                "offline.path_count": .int(pathCount),
             ]
         )
     }

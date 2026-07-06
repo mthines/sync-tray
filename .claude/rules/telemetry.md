@@ -182,6 +182,7 @@ rollout. No event is emitted on a fresh install.
 | `synctray.sync.resumed_external` | Counter | Externally-started syncs detected and resumed at app startup |
 | `synctray.app.settings_opened` | Counter | Settings window opens |
 | `synctray.sync.auto_fix_triggered` | Counter | Automatic --resync recovery attempts (`result`: `triggered` or `gave_up_backoff`) |
+| `synctray.offline.pin_operations` | Counter | Offline pin/unpin operations from Finder or in-app UI (`action`: `pin` or `unpin`) |
 
 ### Spans
 | Span | Kind | Description |
@@ -213,6 +214,7 @@ All key lifecycle events are emitted as structured OTel logs:
 - Resumed external syncs: syncs detected running at startup (launchd overlap detection)
 - App upgraded: `service.version` changed since the previous launch (deployment markers)
 - Auto-fix: automatic --resync triggered (`triggered`), suppressed by backoff (`gave_up_backoff`), or skipped because the external drive is not mounted (`skipped_drive_not_mounted`)
+- Offline pin operations: directory pinned or unpinned via Finder right-click or in-app UI (`offline.action`, `offline.path_count`)
 
 ## Swift SDK Gotcha: Wildcard View Required
 
