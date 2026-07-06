@@ -160,12 +160,14 @@ rm -rf "$VERIFY_DIR"
 # =============================================================================
 if [ "$SIGNED" = "true" ] && [ -n "${NOTARY_KEY_P8_BASE64:-}" ] \
    && [ -n "${NOTARY_KEY_ID:-}" ] && [ -n "${NOTARY_ISSUER_ID:-}" ]; then
-  log_info "Notarizing with Apple (a few minutes)..."
+  log_info "Notarizing with Apple (usually a few minutes; capped at 30m)..."
   NOTARY_KEY="$BUILD_DIR/notary_key.p8"
   echo "$NOTARY_KEY_P8_BASE64" | base64 --decode > "$NOTARY_KEY"
+  # --timeout bounds the wait so an Apple Notary Service backlog fails the step
+  # fast instead of blocking until GitHub's 6h job cap (macOS runners bill 10x).
   xcrun notarytool submit "$ZIP_PATH" \
     --key "$NOTARY_KEY" --key-id "$NOTARY_KEY_ID" --issuer "$NOTARY_ISSUER_ID" \
-    --wait
+    --wait --timeout 30m
   rm -f "$NOTARY_KEY"
   xcrun stapler staple "$APP_PATH"
   xcrun stapler validate "$APP_PATH"
