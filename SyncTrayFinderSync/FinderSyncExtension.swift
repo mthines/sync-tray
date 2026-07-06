@@ -9,7 +9,7 @@ import FinderSync
 // if you rename one, rename both.
 
 /// App Group identifier shared between host app and this extension.
-private let kAppGroupID = "group.com.synctray.app"
+private let kAppGroupID = "7HVK85DZG7.group.com.synctray.app"
 
 /// UserDefaults key for the mount-path array written by the host app.
 private let kMountPathsKey = "com.synctray.app.mountPaths"

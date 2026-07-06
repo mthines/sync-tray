@@ -68,7 +68,7 @@ final class SyncManager: ObservableObject {
     // share a Swift file. Treat them as a cross-target contract — if you rename one, rename both.
 
     /// App Group identifier shared between host app and the FinderSync extension.
-    private let kAppGroupID = "group.com.synctray.app"
+    private let kAppGroupID = "7HVK85DZG7.group.com.synctray.app"
 
     /// UserDefaults key for the mount-path array read by the extension.
     private let kMountPathsKey = "com.synctray.app.mountPaths"

@@ -117,7 +117,7 @@ SyncTray/
 SyncTrayFinderSync/   # FinderSync app extension (kext-free, sandboxed)
 ├── FinderSyncExtension.swift # FIFinderSync subclass — contextual menu, badges, IPC
 ├── Info.plist        # NSExtension point: com.apple.FinderSync
-├── SyncTrayFinderSync.entitlements # App sandbox + App Group (group.com.synctray.app)
+├── SyncTrayFinderSync.entitlements # App sandbox + App Group (7HVK85DZG7.group.com.synctray.app)
 └── Assets.xcassets/  # Badge images (badge-cloud, badge-downloaded)
 ```
 
@@ -130,12 +130,12 @@ extension (kext-free NFS backend only).
 
 #### App Group IPC Contract
 
-Two distinct IPC mechanisms are used. Both use App Group ID `group.com.synctray.app`:
+Two distinct IPC mechanisms are used. Both use App Group ID `7HVK85DZG7.group.com.synctray.app`:
 
 | Direction | Mechanism | Key / File | Contents |
 |-----------|-----------|------------|----------|
-| Host → Extension | `UserDefaults(suiteName: "group.com.synctray.app")` | `com.synctray.app.mountPaths` | `[String]` — active NFS mount paths |
-| Host → Extension | `UserDefaults(suiteName: "group.com.synctray.app")` | `com.synctray.app.profileData` | `[[String:Any]]` — profileId, pinnedDirectories, vfsCachePath per profile |
+| Host → Extension | `UserDefaults(suiteName: "7HVK85DZG7.group.com.synctray.app")` | `com.synctray.app.mountPaths` | `[String]` — active NFS mount paths |
+| Host → Extension | `UserDefaults(suiteName: "7HVK85DZG7.group.com.synctray.app")` | `com.synctray.app.profileData` | `[[String:Any]]` — profileId, pinnedDirectories, vfsCachePath per profile |
 | Extension → Host | JSON file in App Group container | `pending-pin-request.json` | `{action, profileId, paths[]}` |
 | Extension → Host | Darwin distributed notification | `com.synctray.app.pinRequest` | Zero-payload wake signal |
 
@@ -148,7 +148,7 @@ macOS **will not load a Finder extension (or grant App Group access) in an unsig
 app**. So the FinderSync menu only appears in a **code-signed** build:
 
 - **Local testing:** set your **Team** on *both* the `SyncTray` and `SyncTrayFinderSync`
-  targets (Signing & Capabilities → Automatic), confirm the `group.com.synctray.app`
+  targets (Signing & Capabilities → Automatic), confirm the `7HVK85DZG7.group.com.synctray.app`
   App Group is on both, then Build & Run. Enable it once under System Settings →
   General → Login Items & Extensions → Extensions, and right-click a folder **inside a
   mounted Stream profile's path** (FinderSync only decorates registered mount dirs).
@@ -165,7 +165,7 @@ app**. So the FinderSync menu only appears in a **code-signed** build:
 
 #### Cross-Target String Constants
 
-`kAppGroupID` (`group.com.synctray.app`), `kMountPathsKey`, and
+`kAppGroupID` (`7HVK85DZG7.group.com.synctray.app`), `kMountPathsKey`, and
 `kPinRequestNotificationName` (`com.synctray.app.pinRequest`) are defined as string
 literals in **both** `FinderSyncExtension.swift` and `SyncManager.swift` independently.
 The two targets are separate compilation units. If you rename either constant, rename both.

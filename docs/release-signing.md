@@ -21,15 +21,18 @@ Team ID for this project: **`7HVK85DZG7`**.
 
 > Requires a **paid** Apple Developer membership.
 
-### 1a. Register the App Group and App IDs
+### 1a. App Group (Team-ID-prefixed — required for Developer ID)
 
-At <https://developer.apple.com/account/resources>:
+macOS requires an App Group used by a **Developer ID** (non-App-Store) app to be
+**prefixed with your Team ID**. This project therefore uses
+**`7HVK85DZG7.group.com.synctray.app`** (in both `*.entitlements` files and in
+`kAppGroupID` in the code). A non-prefixed `group.com.synctray.app` is only valid for
+development/App-Store signing and makes the notarized extension load as **invalid**.
 
-1. **Identifiers → App Groups → +** → register `group.com.synctray.app` (if not already).
-2. **Identifiers → App IDs** — make sure both exist and have **App Groups** enabled and
-   assigned to `group.com.synctray.app`:
-   - `com.synctray.app` (the app)
-   - `com.synctray.app.findersync` (the extension)
+Because the group is Team-ID-prefixed, macOS authorizes it from the code signature's
+team — **no App Group or App ID registration on the developer portal is required** for
+Developer ID distribution. (If you ever change the Team ID, update the prefix in the
+two entitlements files and `kAppGroupID` to match.)
 
 ### 1b. Create a Developer ID Application certificate
 
