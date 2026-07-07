@@ -92,7 +92,10 @@ struct OfflineFilesSection: View {
                 .strokeBorder(Color.white.opacity(0.06), lineWidth: 1)
         )
         .onAppear {
-            pinnedDirs = profile.pinnedDirectories
+            // Seed from the LIVE store, not the passed-in `profile` snapshot, which can
+            // lag ProfileStore (e.g. a folder pinned via Finder in a prior session would
+            // otherwise show as "none" until the store next changes).
+            pinnedDirs = liveProfile.pinnedDirectories
             refreshCacheStats()
             checkExtensionEnabled()
         }
@@ -103,7 +106,7 @@ struct OfflineFilesSection: View {
             }
         }
         .onChange(of: profile.id) { _ in
-            pinnedDirs = profile.pinnedDirectories
+            pinnedDirs = liveProfile.pinnedDirectories
             currentPath = ""
             pathHistory = []
             refreshCacheStats()
@@ -124,7 +127,7 @@ struct OfflineFilesSection: View {
             Button("Cancel", role: .cancel) {}
         } message: {
             Text("Frees up space by removing downloaded copies of files you've opened. "
-                + "Pinned directories stay available offline — choose Clear Everything to remove those too.")
+                + "Folders you've made available offline stay — choose Clear Everything to remove those too.")
         }
         .alert("Can't pin that folder", isPresented: Binding(
             get: { browseWarning != nil },
@@ -221,7 +224,7 @@ struct OfflineFilesSection: View {
                 Image(systemName: "info.circle.fill")
                     .foregroundStyle(.blue)
                     .font(.caption)
-                Text("Cached files are stored locally for faster access. Pinned directories stay cached automatically.")
+                Text("Cached files are stored locally for faster access. Folders available offline stay cached automatically.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -292,7 +295,7 @@ struct OfflineFilesSection: View {
     private var pinnedDirectoriesSection: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack {
-                Text("Pinned Directories")
+                Text("Available Offline")
                     .font(.caption.weight(.medium))
                 Spacer()
                 if !pinnedDirs.isEmpty && rcAvailable {
@@ -305,13 +308,13 @@ struct OfflineFilesSection: View {
                 }
             }
 
-            Text("Pinned directories are automatically downloaded and kept up to date for offline access.")
+            Text("Folders you make available offline are downloaded and kept up to date so they open instantly without a connection.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
 
             // List of pinned directories
             if pinnedDirs.isEmpty {
-                Text("No pinned directories")
+                Text("No folders available offline yet")
                     .font(.caption)
                     .foregroundStyle(.tertiary)
                     .frame(maxWidth: .infinity, alignment: .center)
@@ -477,7 +480,7 @@ struct OfflineFilesSection: View {
                         .font(.caption2)
                 }
                 .buttonStyle(.plain)
-                .help(isPinned ? "Unpin directory" : "Pin for offline access")
+                .help(isPinned ? "Remove from offline" : "Make available offline")
             }
 
             // Delete button
@@ -632,8 +635,16 @@ struct OfflineFilesSection: View {
         savePinnedDirs()
     }
 
+    /// The current profile from the store (source of truth), falling back to the passed-in
+    /// snapshot only if it's somehow absent. Used so display and saves reflect live state.
+    private var liveProfile: SyncProfile {
+        profileStore.profile(for: profile.id) ?? profile
+    }
+
     private func savePinnedDirs() {
-        var updatedProfile = profile
+        // Base the save on the LIVE profile so we only change pinnedDirectories and never
+        // clobber other fields with values from a stale `profile` snapshot.
+        var updatedProfile = liveProfile
         updatedProfile.pinnedDirectories = pinnedDirs
         profileStore.update(updatedProfile)
     }
