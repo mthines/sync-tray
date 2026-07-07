@@ -35,6 +35,7 @@ struct ProfileDetailView: View {
     @State private var fallbackEnabled: Bool = false
     @State private var fallbackRemote: String = ""
     @State private var fallbackRemotePath: String = ""
+    @State private var showingFallbackBrowser: Bool = false
     @State private var fallbackUseDifferentPath: Bool = false
 
     // Fallback path validation state
@@ -1712,14 +1713,32 @@ struct ProfileDetailView: View {
                         Text("The path on the fallback remote (e.g., /volume1/MyShare/Folder)")
                             .font(.caption)
                             .foregroundStyle(.secondary)
-                        TextField("/volume1/MyShare/Folder", text: $fallbackRemotePath)
-                            .textFieldStyle(.roundedBorder)
-                            .onChange(of: fallbackRemotePath) { _ in
-                                scheduleFallbackPathValidation()
+                        HStack(spacing: 4) {
+                            TextField("/volume1/MyShare/Folder", text: $fallbackRemotePath)
+                                .textFieldStyle(.roundedBorder)
+                                .onChange(of: fallbackRemotePath) { _ in
+                                    scheduleFallbackPathValidation()
+                                }
+                            // Browse the fallback remote and pick the real folder — so the
+                            // user doesn't have to guess the layout (SFTP vs SMB rooting).
+                            Button(action: { showingFallbackBrowser = true }) {
+                                Image(systemName: "list.bullet")
                             }
+                            .help("Browse folders on the fallback remote")
+                            .disabled(fallbackRemote.isEmpty)
+                        }
 
                         // Inline validation feedback
                         fallbackPathValidationView
+                    }
+                    .sheet(isPresented: $showingFallbackBrowser) {
+                        RemoteFolderBrowserSheet(
+                            remoteName: fallbackRemote,
+                            initialPath: fallbackRemotePath
+                        ) { picked in
+                            fallbackRemotePath = picked
+                            scheduleFallbackPathValidation()
+                        }
                     }
                 }
 
@@ -3785,6 +3804,167 @@ struct ProfileDetailView: View {
             let truncated = lines.suffix(maxLogLines).joined(separator: "\n")
             // Use non-atomic write to preserve inode (prevents LogWatcher from losing track)
             try? truncated.write(toFile: logPath, atomically: false, encoding: .utf8)
+        }
+    }
+}
+
+/// Browse folders on an rclone remote and pick one directly, instead of guessing the
+/// path layout (which differs by protocol — e.g. SFTP vs SMB rooting on the same NAS).
+/// Navigable: tap a folder to descend, use the breadcrumb to go back, "Use This Folder"
+/// to select the current path. Lists via `rclone lsf --dirs-only` so names with spaces
+/// parse correctly (unlike the older whitespace-split parser).
+struct RemoteFolderBrowserSheet: View {
+    let remoteName: String
+    let initialPath: String
+    let onSelect: (String) -> Void
+    @Environment(\.dismiss) private var dismiss
+
+    @State private var currentPath: String
+    @State private var folders: [String] = []
+    @State private var isLoading = false
+    @State private var errorMessage: String?
+
+    init(remoteName: String, initialPath: String, onSelect: @escaping (String) -> Void) {
+        self.remoteName = remoteName
+        self.initialPath = initialPath
+        self.onSelect = onSelect
+        _currentPath = State(initialValue: initialPath.trimmingCharacters(in: CharacterSet(charactersIn: "/ ")))
+    }
+
+    private var bareRemote: String {
+        remoteName.hasSuffix(":") ? String(remoteName.dropLast()) : remoteName
+    }
+
+    private var displayPath: String {
+        currentPath.isEmpty ? "\(bareRemote): (root)" : "\(bareRemote):\(currentPath)"
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Text("Browse \(bareRemote)").font(.headline)
+                Spacer()
+                if isLoading { ProgressView().controlSize(.small) }
+            }
+
+            // Breadcrumb
+            HStack(spacing: 4) {
+                Button("Root") { currentPath = ""; loadFolders() }.buttonStyle(.link)
+                let parts = currentPath.split(separator: "/").map(String.init)
+                ForEach(Array(parts.enumerated()), id: \.offset) { idx, part in
+                    Text("/").foregroundStyle(.secondary)
+                    Button(part) {
+                        currentPath = parts[0...idx].joined(separator: "/")
+                        loadFolders()
+                    }.buttonStyle(.link)
+                }
+                Spacer()
+            }
+            .font(.caption)
+            .lineLimit(1)
+
+            Divider()
+
+            // Folder list
+            Group {
+                if let err = errorMessage {
+                    VStack(spacing: 6) {
+                        Image(systemName: "exclamationmark.triangle").foregroundStyle(.orange)
+                        Text(err).font(.caption).foregroundStyle(.secondary).multilineTextAlignment(.center)
+                    }.frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else if folders.isEmpty && !isLoading {
+                    Text("No subfolders here — use this folder, or go back.")
+                        .font(.caption).foregroundStyle(.tertiary)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else {
+                    ScrollView {
+                        LazyVStack(alignment: .leading, spacing: 1) {
+                            ForEach(folders, id: \.self) { folder in
+                                Button(action: {
+                                    currentPath = currentPath.isEmpty ? folder : "\(currentPath)/\(folder)"
+                                    loadFolders()
+                                }) {
+                                    HStack {
+                                        Image(systemName: "folder.fill").foregroundStyle(.blue)
+                                        Text(folder).lineLimit(1)
+                                        Spacer()
+                                        Image(systemName: "chevron.right").font(.caption2).foregroundStyle(.tertiary)
+                                    }
+                                    .contentShape(Rectangle())
+                                    .padding(.vertical, 4).padding(.horizontal, 6)
+                                }
+                                .buttonStyle(.plain)
+                            }
+                        }
+                    }
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+
+            Divider()
+
+            HStack {
+                Button("Cancel") { dismiss() }
+                Spacer()
+                Text(displayPath).font(.caption.monospaced()).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
+                Button("Use This Folder") {
+                    onSelect(currentPath)
+                    dismiss()
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(currentPath.isEmpty)
+            }
+        }
+        .padding(16)
+        .frame(width: 440, height: 480)
+        .onAppear { loadFolders() }
+    }
+
+    private func loadFolders() {
+        guard !bareRemote.isEmpty else { return }
+        isLoading = true
+        errorMessage = nil
+        folders = []
+        let remote = bareRemote
+        let path = currentPath
+        DispatchQueue.global(qos: .userInitiated).async {
+            let rclonePaths = ["/opt/homebrew/bin/rclone", "/usr/local/bin/rclone", "/usr/bin/rclone"]
+            guard let rclone = rclonePaths.first(where: { FileManager.default.fileExists(atPath: $0) }) else {
+                DispatchQueue.main.async { self.isLoading = false; self.errorMessage = "rclone not found" }
+                return
+            }
+            let proc = Process()
+            proc.executableURL = URL(fileURLWithPath: rclone)
+            let skipCert = RcloneConfigService.shared.readRemoteConfig(name: remote)?.values["no_check_certificate"] == "true"
+            var args = ["lsf", "\(remote):\(path)", "--dirs-only", "--contimeout", "5s", "--timeout", "15s"]
+            if skipCert { args.append("--no-check-certificate") }
+            proc.arguments = args
+            let pipe = Pipe(); let errPipe = Pipe()
+            proc.standardOutput = pipe; proc.standardError = errPipe
+            do {
+                try proc.run()
+                proc.waitUntilExit()
+                let out = String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+                if proc.terminationStatus != 0 {
+                    let e = String(decoding: errPipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                    DispatchQueue.main.async {
+                        self.isLoading = false
+                        self.errorMessage = e.contains("directory not found")
+                            ? "This folder doesn't exist on the remote."
+                            : (e.isEmpty ? "Couldn't list folders (remote unreachable?)." : e)
+                    }
+                    return
+                }
+                let dirs = out.components(separatedBy: .newlines)
+                    .map { $0.trimmingCharacters(in: .whitespaces) }
+                    .filter { !$0.isEmpty }
+                    .map { $0.hasSuffix("/") ? String($0.dropLast()) : $0 }
+                    .sorted()
+                DispatchQueue.main.async { self.folders = dirs; self.isLoading = false }
+            } catch {
+                DispatchQueue.main.async { self.isLoading = false; self.errorMessage = error.localizedDescription }
+            }
         }
     }
 }
