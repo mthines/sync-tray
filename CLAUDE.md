@@ -124,9 +124,10 @@ SyncTrayFinderSync/   # FinderSync app extension (kext-free, sandboxed)
 ### FinderSync Extension
 
 The `SyncTrayFinderSync` app extension adds a right-click Finder contextual menu
-("Make Available Offline" / "Remove from Offline") for directories inside rclone NFS
-mount paths. Extension bundle ID: `com.synctray.app.findersync`. Requires no kernel
-extension (kext-free NFS backend only).
+(**SyncTray ▸ Available Offline**, a single checkmarked toggle: checked = kept offline,
+unchecked = streams online-only) plus cloud/checkmark file badges, for directories
+inside rclone NFS mount paths. Release extension bundle ID: `com.synctray.app.findersync`.
+Requires no kernel extension (kext-free NFS backend only).
 
 #### App Group IPC Contract
 
@@ -137,10 +138,37 @@ Two distinct IPC mechanisms are used. Both use App Group ID `7HVK85DZG7.group.co
 | Host → Extension | `UserDefaults(suiteName: "7HVK85DZG7.group.com.synctray.app")` | `com.synctray.app.mountPaths` | `[String]` — active NFS mount paths |
 | Host → Extension | `UserDefaults(suiteName: "7HVK85DZG7.group.com.synctray.app")` | `com.synctray.app.profileData` | `[[String:Any]]` — profileId, pinnedDirectories, vfsCachePath per profile |
 | Extension → Host | JSON file in App Group container | `pending-pin-request.json` | `{action, profileId, paths[]}` |
-| Extension → Host | Darwin distributed notification | `com.synctray.app.pinRequest` | Zero-payload wake signal |
+| Extension ↔ Host | Darwin distributed notification | `com.synctray.app.pinRequest` | Zero-payload wake signal — **bidirectional** |
 
-The host app reads `pending-pin-request.json` and deletes it on each Darwin notification
-and on a 1-second fallback poll timer (active only when mount profiles exist).
+The `com.synctray.app.pinRequest` notification is used **both ways**: the extension posts
+it to wake the host when a pin/unpin request file is pending; the host posts it
+(`SyncManager.notifyFinderSyncReload`) after it updates the App Group data (on pin/unpin
+**and** whenever mount paths change in `updateAppGroupMountPaths`) so the extension
+reloads its `directoryURLs` and repaints badges. The host reads/deletes
+`pending-pin-request.json` on each notification and on a 1-second fallback poll timer
+(active only when mount profiles exist); its own posts find no file → harmless no-op.
+
+#### Extension lifecycle — loading & auto-refresh
+
+Finder (not SyncTray) owns the extension process and **does not reload the plug-in when
+the app bundle is replaced** (e.g. by `brew upgrade`) — it keeps serving the pre-upgrade
+binary until Finder is relaunched. SyncTray manages this so the user needn't restart
+Finder by hand:
+
+- **On quit** (`applicationWillTerminate`) it `pkill`s `SyncTrayFinderSync`, so no stale
+  extension process lingers.
+- **On launch** (`refreshFinderSyncExtensionIfNeeded`) it re-registers the appex with
+  `pluginkit -a`, and — if the app version changed since `SyncTraySettings.finderSetupVersion`
+  **and** the extension is enabled — relaunches Finder so it loads the new binary. Gated
+  on *enabled* (no Finder flicker for non-Stream users) and *version changed* (at most
+  once per upgrade).
+- The launch relaunch can race the NFS mount coming up; the extension is re-woken when
+  mount paths are written (see the bidirectional notification above), so it re-registers
+  `directoryURLs` once the mount establishes.
+- The cask's `uninstall quit: "com.synctray.app"` quits the app before an upgrade so the
+  quit handler fires. The cask `caveats` still tells users to `killall Finder` as a manual
+  fallback. **On a brand-new install the user must enable the extension once** in System
+  Settings — a macOS consent gate no app can bypass; the in-app card guides it.
 
 #### Code signing — required to test the extension; disabled on CI/release
 
