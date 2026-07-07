@@ -311,6 +311,18 @@ LogParser detects transport message → SyncManager.profileTransports updated
 MenuBarView shows transport icon (wifi=primary, antenna=fallback)
 ```
 
+**Primary recovery (fallback → primary switch-back).** The reachability check above runs
+once per *script execution*. Sync/bisync profiles re-run on their `StartInterval`, so they
+naturally return to the primary on the next scheduled sync once it's reachable. A **mount**
+is a long-lived `rclone nfsmount` that picks its remote once at mount time (its launchd
+agent is `RunAtLoad`+`KeepAlive`, no `StartInterval`), so it would otherwise stay on the
+fallback until the next relaunch/login/manual remount. `SyncManager.startPrimaryRecoveryMonitor`
+closes that gap: a 2-minute timer probes the primary (`isRemoteReachable`, hard-timeout —
+SMB can hang past its own timeouts) for any mounted mount-mode profile currently on the
+fallback (`ActiveTransport.fallback`), and when the primary is reachable again it remounts
+on the primary (`remountOnPrimary` = unmount → mount, so the script re-picks the remote).
+The switch causes a brief mount hiccup; `recoveringToPrimary` guards against stacking remounts.
+
 **Bisync cache preservation:** When primary and fallback remotes share the same
 rclone wire type (e.g., WebDAV LAN → WebDAV QuickConnect, both `type = webdav`)
 and `fallbackRemotePath` is empty, the sync script uses `RCLONE_CONFIG_*`

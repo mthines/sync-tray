@@ -60,6 +60,9 @@ final class SyncManager: ObservableObject {
 
     private var heartbeatTimer: DispatchSourceTimer?
     private var mountStateMonitorTimer: DispatchSourceTimer?
+    private var primaryRecoveryTimer: DispatchSourceTimer?
+    // Profiles with an in-flight primary-recovery remount, so we don't stack remounts.
+    private var recoveringToPrimary: Set<UUID> = []
     private var workspaceObserver: NSObjectProtocol?
     private var currentSyncChanges: [UUID: [FileChange]] = [:]
     private var cancellables = Set<AnyCancellable>()
@@ -139,6 +142,7 @@ final class SyncManager: ObservableObject {
         TelemetryService.shared.recordAllProfileConfigurations(self.profileStore.profiles)
         startSessionHeartbeat()
         startMountStateMonitor()
+        startPrimaryRecoveryMonitor()
         mountProfilesAtStartup()
         setupFinderSyncIPC()
         updateAppGroupMountPaths()
@@ -152,6 +156,10 @@ final class SyncManager: ObservableObject {
         // Cancel mount-state monitor
         mountStateMonitorTimer?.cancel()
         mountStateMonitorTimer = nil
+
+        // Cancel primary-recovery monitor
+        primaryRecoveryTimer?.cancel()
+        primaryRecoveryTimer = nil
 
         // Cancel pin-request poll timer
         pinRequestPollTimer?.cancel()
@@ -2133,6 +2141,99 @@ final class SyncManager: ObservableObject {
         }
         mountStateMonitorTimer = timer
         timer.resume()
+    }
+
+    /// Periodically check whether a mounted Stream profile that fell back to its
+    /// secondary remote can return to the primary, and remount it on the primary once
+    /// the primary is reachable again.
+    ///
+    /// Unlike sync/bisync profiles (which re-evaluate the primary on every scheduled
+    /// run via `StartInterval`), a mount is a long-lived `rclone nfsmount` that picks
+    /// its remote once at mount time — so a live fallback mount would otherwise stay on
+    /// the fallback until the next relaunch/login/manual remount. This restores the
+    /// "prefer the primary when available" behaviour for mounts.
+    private func startPrimaryRecoveryMonitor() {
+        primaryRecoveryTimer?.cancel()
+        let timer = DispatchSource.makeTimerSource(queue: .global(qos: .utility))
+        timer.schedule(deadline: .now() + 120, repeating: 120)  // every 2 minutes
+        timer.setEventHandler { [weak self] in
+            DispatchQueue.main.async { self?.checkPrimaryRecovery() }
+        }
+        primaryRecoveryTimer = timer
+        timer.resume()
+    }
+
+    private func isOnFallback(_ transport: ActiveTransport?) -> Bool {
+        if case .fallback = transport { return true }
+        return false
+    }
+
+    /// For each mounted mount-mode profile currently on its fallback, probe the primary
+    /// (off the main thread) and remount on the primary if it's reachable again.
+    private func checkPrimaryRecovery() {
+        let candidates = profileStore.enabledProfiles.filter {
+            $0.isMountMode
+                && $0.hasFallback
+                && profileMountStates[$0.id] == .mounted
+                && isOnFallback(profileTransports[$0.id])
+                && !recoveringToPrimary.contains($0.id)
+        }
+        guard !candidates.isEmpty else { return }
+
+        for profile in candidates {
+            let primaryRemote = profile.rcloneRemote
+            let profileId = profile.id
+            recoveringToPrimary.insert(profileId)
+            DispatchQueue.global(qos: .utility).async { [weak self] in
+                guard let self else { return }
+                let reachable = self.isRemoteReachable(primaryRemote)
+                DispatchQueue.main.async {
+                    defer { self.recoveringToPrimary.remove(profileId) }
+                    guard reachable,
+                          self.profileMountStates[profileId] == .mounted,
+                          self.isOnFallback(self.profileTransports[profileId]),
+                          let current = self.profileStore.profile(for: profileId) else { return }
+                    SyncTraySettings.debugLog(
+                        "Primary '\(primaryRemote)' reachable again — remounting '\(current.name)' on primary")
+                    self.remountOnPrimary(current)
+                }
+            }
+        }
+    }
+
+    /// Quick reachability probe for a remote, with a hard timeout — some backends (SMB)
+    /// hang well past their own `--contimeout`/`--timeout`, so we also cap wall-clock.
+    private func isRemoteReachable(_ remoteName: String) -> Bool {
+        let bare = remoteName.hasSuffix(":") ? String(remoteName.dropLast()) : remoteName
+        guard !bare.isEmpty else { return false }
+        let rclonePaths = ["/opt/homebrew/bin/rclone", "/usr/local/bin/rclone", "/usr/bin/rclone"]
+        guard let rclone = rclonePaths.first(where: { FileManager.default.fileExists(atPath: $0) }) else { return false }
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: rclone)
+        proc.arguments = ["lsd", "\(bare):", "--contimeout", "3s", "--timeout", "8s", "--max-depth", "0"]
+        proc.standardOutput = Pipe()
+        proc.standardError = Pipe()
+        do { try proc.run() } catch { return false }
+        let deadline = Date().addingTimeInterval(12)
+        while proc.isRunning && Date() < deadline {
+            Thread.sleep(forTimeInterval: 0.2)
+        }
+        if proc.isRunning {
+            proc.terminate()
+            return false
+        }
+        return proc.terminationStatus == 0
+    }
+
+    /// Remount a profile so the sync script re-evaluates the remote and picks the primary
+    /// (now reachable). Unmount first — the running fallback rclone chose its remote at
+    /// launch and won't switch in place.
+    private func remountOnPrimary(_ profile: SyncProfile) {
+        Task {
+            try? self.setupService.unmount(profile: profile)
+            try? await Task.sleep(nanoseconds: 1_500_000_000)  // let the unmount settle
+            await MainActor.run { self.mountProfile(profile) }
+        }
     }
 
     /// Reconcile mount states without blocking the main thread: snapshot the mount
