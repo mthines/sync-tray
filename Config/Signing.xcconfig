@@ -13,6 +13,17 @@
 //   # then edit Config/Signing.local.xcconfig and set your Team ID
 CODE_SIGN_STYLE = Automatic
 
+// Dev (Debug) builds get a distinct bundle-id suffix so their Finder extension
+// registers under a DIFFERENT identity than an installed release. Without this, a
+// dev build and the brew-installed app share `com.synctray.app.findersync`;
+// whichever is built/run last hijacks the registration and — because they're signed
+// differently — invalidates the other, so Finder shows no menu. Release keeps the
+// empty suffix, so the shipping bundle ids are unchanged.
+//   Debug:   com.synctray.app.dev / com.synctray.app.dev.findersync
+//   Release: com.synctray.app     / com.synctray.app.findersync
+BUNDLE_ID_SUFFIX =
+BUNDLE_ID_SUFFIX[config=Debug] = .dev
+
 // Optional include — absent on CI / fresh clones, present locally. The `?` means
 // "don't error if the file is missing".
 #include? "Signing.local.xcconfig"

@@ -157,7 +157,27 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUserNoti
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        terminateFinderSyncExtension()
         TelemetryService.shared.shutdown()
+    }
+
+    /// Terminate the FinderSync extension process when SyncTray quits.
+    ///
+    /// Finder — not SyncTray — owns the extension's lifecycle, so it otherwise keeps
+    /// running after we quit and, after an app update (e.g. a `brew upgrade`), can keep
+    /// serving *stale* code from the pre-update process until Finder is relaunched. That
+    /// was the "old process" that made the right-click menu / icons look wrong. Killing it
+    /// on quit matches the user's expectation ("quitting SyncTray closes the SyncTray
+    /// Offline extension too") and guarantees Finder spawns a fresh copy from the current
+    /// bundle next time it's needed. Safe: Finder relaunches the extension on demand, and
+    /// it rebuilds its state from the shared App Group data on launch.
+    private func terminateFinderSyncExtension() {
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/usr/bin/pkill")
+        // -x: match the exact process name (the extension's executable).
+        proc.arguments = ["-x", "SyncTrayFinderSync"]
+        try? proc.run()
+        proc.waitUntilExit()
     }
 
     /// Called when the user clicks the Dock icon. While Settings is open the app is in

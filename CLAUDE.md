@@ -152,7 +152,16 @@ app**. So the FinderSync menu only appears in a **code-signed** build:
   App Group is on both, then Build & Run. Enable it once under System Settings →
   General → Login Items & Extensions → Extensions, and right-click a folder **inside a
   mounted Stream profile's path** (FinderSync only decorates registered mount dirs).
-  `pluginkit -m -i com.synctray.app.findersync` should list it once loaded.
+  `pluginkit -m -i com.synctray.app.dev.findersync` should list it once loaded.
+- **Debug builds use a `.dev` bundle id** so a dev build never collides with an
+  installed release. `BUNDLE_ID_SUFFIX` (`Config/Signing.xcconfig`, `[config=Debug] = .dev`)
+  gives Debug the ids `com.synctray.app.dev` / `com.synctray.app.dev.findersync`;
+  Release keeps `com.synctray.app` / `com.synctray.app.findersync`. Both extensions
+  register independently, so `nr synctray:dev` no longer hijacks the brew app's Finder
+  registration (previously the shared id made whichever built last invalidate the other).
+  Caveat: if you enable **both** the dev and release extensions, Finder shows two
+  "SyncTray" submenus — disable one while iterating. `scripts/dev.sh` targets the `.dev`
+  id and the in-app enabled-check switches id via `#if DEBUG`.
 - **CI / release build unsigned on purpose.** `CODE_SIGNING_ALLOWED=NO` is **not**
   hardcoded in the project — it is passed on the `xcodebuild` command line by both the
   CI `test` job (`.github/workflows/ci.yml`) and `scripts/release-ci.sh`. This keeps the

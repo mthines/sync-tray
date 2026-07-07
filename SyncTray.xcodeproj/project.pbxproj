@@ -586,7 +586,7 @@
 				);
 				MARKETING_VERSION = 1.0;
 				OTEL_EXPORTER_OTLP_ENDPOINT = "https://ingress.europe-west4.gcp.dash0-dev.com";
-				PRODUCT_BUNDLE_IDENTIFIER = com.synctray.app;
+				PRODUCT_BUNDLE_IDENTIFIER = "com.synctray.app$(BUNDLE_ID_SUFFIX)";
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SWIFT_EMIT_LOC_STRINGS = YES;
 				SWIFT_VERSION = 5.0;
@@ -615,7 +615,7 @@
 				);
 				MARKETING_VERSION = 1.0;
 				OTEL_EXPORTER_OTLP_ENDPOINT = "https://ingress.europe-west4.gcp.dash0-dev.com";
-				PRODUCT_BUNDLE_IDENTIFIER = com.synctray.app;
+				PRODUCT_BUNDLE_IDENTIFIER = "com.synctray.app$(BUNDLE_ID_SUFFIX)";
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SWIFT_EMIT_LOC_STRINGS = YES;
 				SWIFT_VERSION = 5.0;
@@ -640,7 +640,7 @@
 				);
 				MACOSX_DEPLOYMENT_TARGET = 13.0;
 				MARKETING_VERSION = 0.45.0;
-				PRODUCT_BUNDLE_IDENTIFIER = com.synctray.app.findersync;
+				PRODUCT_BUNDLE_IDENTIFIER = "com.synctray.app$(BUNDLE_ID_SUFFIX).findersync";
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SKIP_INSTALL = YES;
 				SWIFT_EMIT_LOC_STRINGS = YES;
@@ -666,7 +666,7 @@
 				);
 				MACOSX_DEPLOYMENT_TARGET = 13.0;
 				MARKETING_VERSION = 0.45.0;
-				PRODUCT_BUNDLE_IDENTIFIER = com.synctray.app.findersync;
+				PRODUCT_BUNDLE_IDENTIFIER = "com.synctray.app$(BUNDLE_ID_SUFFIX).findersync";
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SKIP_INSTALL = YES;
 				SWIFT_EMIT_LOC_STRINGS = YES;
