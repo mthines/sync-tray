@@ -24,7 +24,9 @@ BUILD_DIR="$PROJECT_DIR/build/Build/Products/Debug"
 APP_NAME="SyncTray.app"
 APP_PATH="$BUILD_DIR/$APP_NAME"
 APPEX_PATH="$APP_PATH/Contents/PlugIns/SyncTrayFinderSync.appex"
-FINDER_EXT_ID="com.synctray.app.findersync"
+# Debug builds use a .dev-suffixed extension id (Config/Signing.xcconfig) so they
+# never collide with an installed release's `com.synctray.app.findersync`.
+FINDER_EXT_ID="com.synctray.app.dev.findersync"
 
 # Colors for output
 RED='\033[0;31m'
@@ -112,10 +114,9 @@ build_app() {
 # it relaunches. Only works for a signed build; a no-op if the appex is absent.
 reload_finder_extension() {
     [ -d "$APPEX_PATH" ] || return 0
-    # Purge every OTHER registered copy of the extension (an installed release in
-    # /Applications, stray Xcode DerivedData builds) — they share this bundle id and
-    # macOS would otherwise load one of them instead of this build, so dev changes
-    # never appear. Leave only this build registered.
+    # Purge every OTHER registered copy of the DEV extension (stray Xcode DerivedData
+    # builds, old worktree builds) so macOS loads THIS build. The installed release
+    # uses a different id (com.synctray.app.findersync) and is never touched.
     pluginkit -mAvvv -i "$FINDER_EXT_ID" 2>/dev/null \
         | awk '/Path = /{ sub(/.*Path = /, ""); print }' \
         | while IFS= read -r p; do

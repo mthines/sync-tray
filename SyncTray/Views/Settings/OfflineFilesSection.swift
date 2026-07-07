@@ -164,12 +164,23 @@ struct OfflineFilesSection: View {
         Task { extensionEnabled = await Self.finderExtensionEnabled() }
     }
 
+    /// FinderSync extension bundle id. Debug builds use a `.dev`-suffixed id (see
+    /// Config/Signing.xcconfig) so a dev build doesn't collide with an installed
+    /// release, so the enabled-check must query the matching id per build config.
+    private static var finderExtensionBundleID: String {
+        #if DEBUG
+        return "com.synctray.app.dev.findersync"
+        #else
+        return "com.synctray.app.findersync"
+        #endif
+    }
+
     private static func finderExtensionEnabled() async -> Bool {
         await withCheckedContinuation { continuation in
             DispatchQueue.global(qos: .utility).async {
                 let proc = Process()
                 proc.executableURL = URL(fileURLWithPath: "/usr/bin/pluginkit")
-                proc.arguments = ["-m", "-i", "com.synctray.app.findersync"]
+                proc.arguments = ["-m", "-i", finderExtensionBundleID]
                 let pipe = Pipe()
                 proc.standardOutput = pipe
                 proc.standardError = Pipe()
