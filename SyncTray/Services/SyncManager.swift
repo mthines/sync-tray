@@ -50,6 +50,9 @@ final class SyncManager: ObservableObject {
 
     private var logWatchers: [UUID: LogWatcher] = [:]
     private var directoryWatchers: [UUID: DirectoryWatcher] = [:]
+    // What last kicked off a sync per profile (manual | directory_watch | startup), consumed
+    // and cleared by the `.syncStarted` handler to attribute `sync.trigger`. Absent = scheduled.
+    private var pendingSyncTrigger: [UUID: String] = [:]
     private let logParser = LogParser()
     private let notificationService = NotificationService.shared
     private let setupService = SyncSetupService.shared
@@ -1409,7 +1412,7 @@ final class SyncManager: ObservableObject {
         // Trigger sync for this specific profile
         // Note: Lock file in sync script handles concurrent sync prevention
         Task {
-            await runSyncScript(for: profile)
+            await runSyncScript(for: profile, trigger: "directory_watch")
         }
     }
 
@@ -1575,7 +1578,12 @@ final class SyncManager: ObservableObject {
         updateAggregateState()
     }
 
-    private func runSyncScript(for profile: SyncProfile) async {
+    private func runSyncScript(for profile: SyncProfile, trigger: String = "manual") async {
+        // Remember what kicked this off so the `.syncStarted` log event (parsed from the
+        // sync log, decoupled from here) can attribute `sync.trigger`. A launchd/scheduled
+        // run never calls this method, so an absent entry means "scheduled".
+        pendingSyncTrigger[profile.id] = trigger
+
         // Check if profile is paused
         if isPaused(for: profile.id) {
             SyncTraySettings.debugLog("Skipping sync script for paused profile: \(profile.name)")
@@ -1664,7 +1672,10 @@ final class SyncManager: ObservableObject {
                 profileName: profileName,
                 syncMode: profile?.syncMode ?? .bisync,
                 syncDirection: profile?.syncDirection,
-                hasFallback: profile?.hasFallback ?? false
+                hasFallback: profile?.hasFallback ?? false,
+                // An app-initiated run recorded its cause in runSyncScript; a bare
+                // launchd/scheduled run left none, so default to "scheduled".
+                trigger: pendingSyncTrigger.removeValue(forKey: profileId) ?? "scheduled"
             )
 
         case .syncCompleted:

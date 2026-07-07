@@ -19,6 +19,8 @@ struct OfflineFilesSection: View {
     @State private var rcAvailable: Bool = false
     // Default true so the "enable me" card doesn't flash before the async check runs.
     @State private var extensionEnabled: Bool = true
+    // One-shot guard so the enable-prompt funnel event fires at most once per view lifetime.
+    @State private var didLogExtensionPrompt: Bool = false
 
     // Pinned directories editing
     @State private var newPinnedDir: String = ""
@@ -160,7 +162,10 @@ struct OfflineFilesSection: View {
                 .fixedSize(horizontal: false, vertical: true)
             HStack(spacing: 12) {
                 Button("Open System Settings") { openExtensionSettings() }
-                Button("Re-check") { checkExtensionEnabled() }
+                Button("Re-check") {
+                    TelemetryService.shared.recordOfflineExtensionSetup(action: "rechecked")
+                    checkExtensionEnabled()
+                }
                     .buttonStyle(.plain)
                     .font(.caption)
                     .foregroundStyle(.blue)
@@ -169,12 +174,26 @@ struct OfflineFilesSection: View {
         .padding(10)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(Color.orange.opacity(0.1), in: .rect(cornerRadius: 6))
+        .onAppear {
+            // Funnel denominator: the user saw the "enable the extension" prompt.
+            guard !didLogExtensionPrompt else { return }
+            didLogExtensionPrompt = true
+            TelemetryService.shared.recordOfflineExtensionSetup(action: "prompt_shown")
+        }
     }
 
     /// Ask pluginkit whether the extension is enabled. A leading "+" in its output means
     /// registered AND enabled. Runs off the main thread; the host app isn't sandboxed.
     private func checkExtensionEnabled() {
-        Task { extensionEnabled = await Self.finderExtensionEnabled() }
+        Task {
+            let nowEnabled = await Self.finderExtensionEnabled()
+            // Record the conversion the first time it flips from disabled (card shown) to
+            // enabled — the funnel's success event.
+            if nowEnabled && !extensionEnabled {
+                TelemetryService.shared.recordOfflineExtensionSetup(action: "enabled")
+            }
+            extensionEnabled = nowEnabled
+        }
     }
 
     /// FinderSync extension bundle id. Debug builds use a `.dev`-suffixed id (see
@@ -211,6 +230,7 @@ struct OfflineFilesSection: View {
     }
 
     private func openExtensionSettings() {
+        TelemetryService.shared.recordOfflineExtensionSetup(action: "open_settings")
         if let url = URL(string: "x-apple.systempreferences:com.apple.ExtensionsPreferences") {
             NSWorkspace.shared.open(url)
         }
@@ -569,6 +589,11 @@ struct OfflineFilesSection: View {
     }
 
     private func clearCache(preservePinned: Bool) {
+        TelemetryService.shared.recordOfflineCacheClear(
+            profileId: profile.id,
+            profileName: profile.name,
+            preservePinned: preservePinned
+        )
         isClearing = true
         Task {
             try? await cacheService.clearCache(for: profile, preservePinned: preservePinned)

@@ -86,6 +86,7 @@ struct AppSettingsView: View {
                 } else {
                     syncManager.disableLoginItem()
                 }
+                TelemetryService.shared.recordSettingChanged(name: "launch_at_login", enabled: enabled)
             }
         )) {
             VStack(alignment: .leading, spacing: 2) {
@@ -110,9 +111,15 @@ struct AppSettingsView: View {
                 }
             }
             .onChange(of: telemetryEnabled) { newValue in
-                SyncTraySettings.telemetryEnabled = newValue
                 if newValue {
+                    SyncTraySettings.telemetryEnabled = newValue
                     TelemetryService.shared.configure()
+                    TelemetryService.shared.recordSettingChanged(name: "telemetry", enabled: true)
+                } else {
+                    // Record the opt-out while telemetry is still enabled, then disable —
+                    // otherwise the method no-ops and the opt-out is never captured.
+                    TelemetryService.shared.recordSettingChanged(name: "telemetry", enabled: false)
+                    SyncTraySettings.telemetryEnabled = newValue
                 }
             }
 
@@ -141,6 +148,7 @@ struct AppSettingsView: View {
         }
         .onChange(of: autoFixSyncIssues) { newValue in
             SyncTraySettings.autoFixSyncIssues = newValue
+            TelemetryService.shared.recordSettingChanged(name: "auto_fix", enabled: newValue)
         }
     }
 
@@ -157,6 +165,7 @@ struct AppSettingsView: View {
         }
         .onChange(of: debugLogging) { newValue in
             SyncTraySettings.debugLoggingEnabled = newValue
+            TelemetryService.shared.recordSettingChanged(name: "debug_logging", enabled: newValue)
         }
     }
 

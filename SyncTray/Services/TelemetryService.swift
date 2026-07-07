@@ -108,6 +108,12 @@ final class TelemetryService {
     private var settingsOpenedCounter: LongCounterSdk?
     private var autoFixTriggeredCounter: LongCounterSdk?
     private var offlinePinOperationsCounter: LongCounterSdk?
+    private var wizardStepCounter: LongCounterSdk?
+    private var oauthOutcomeCounter: LongCounterSdk?
+    private var userRecoveryActionCounter: LongCounterSdk?
+    private var settingChangedCounter: LongCounterSdk?
+    private var offlineExtensionSetupCounter: LongCounterSdk?
+    private var offlineCacheClearCounter: LongCounterSdk?
 
     // MARK: - Providers (kept alive for shutdown)
 
@@ -342,6 +348,42 @@ final class TelemetryService {
             .setDescription("Number of offline pin/unpin operations by action (pin or unpin)")
             .setUnit("1")
             .build()
+
+        wizardStepCounter = meter
+            .counterBuilder(name: "synctray.wizard.step")
+            .setDescription("Setup wizard funnel events by outcome (started, provider_selected, remote_ready, folder_chosen, created, abandoned)")
+            .setUnit("1")
+            .build()
+
+        oauthOutcomeCounter = meter
+            .counterBuilder(name: "synctray.remote.oauth")
+            .setDescription("OAuth authentication outcomes by result (success, failure, cancelled) and provider type")
+            .setUnit("1")
+            .build()
+
+        userRecoveryActionCounter = meter
+            .counterBuilder(name: "synctray.recovery.user_action")
+            .setDescription("User-initiated sync recovery actions by type (force_sync, resync, retry)")
+            .setUnit("1")
+            .build()
+
+        settingChangedCounter = meter
+            .counterBuilder(name: "synctray.setting.changed")
+            .setDescription("App-wide preference changes by setting name and enabled state")
+            .setUnit("1")
+            .build()
+
+        offlineExtensionSetupCounter = meter
+            .counterBuilder(name: "synctray.offline.extension_setup")
+            .setDescription("Finder extension enable-funnel actions (prompt_shown, open_settings, rechecked, enabled)")
+            .setUnit("1")
+            .build()
+
+        offlineCacheClearCounter = meter
+            .counterBuilder(name: "synctray.offline.cache_clear")
+            .setDescription("Cache clear operations by whether pinned folders were preserved")
+            .setUnit("1")
+            .build()
     }
 
     // MARK: - Ensure Setup
@@ -381,7 +423,8 @@ final class TelemetryService {
         profileName: String,
         syncMode: SyncMode,
         syncDirection: SyncDirection? = nil,
-        hasFallback: Bool = false
+        hasFallback: Bool = false,
+        trigger: String = "scheduled"  // manual | directory_watch | scheduled | startup
     ) {
         guard SyncTraySettings.telemetryEnabled else { return }
         ensureSetup()
@@ -394,13 +437,16 @@ final class TelemetryService {
             stale.end()
         }
 
-        let attrs = profileAttributes(
+        var attrs = profileAttributes(
             profileId: profileId,
             profileName: profileName,
             syncMode: syncMode,
             syncDirection: syncDirection,
             hasFallback: hasFallback
         )
+        // What kicked off this sync: an app-initiated run sets the trigger; a bare
+        // launchd/scheduled run leaves it at the default.
+        attrs["sync.trigger"] = .string(trigger)
 
         let span = tracer.spanBuilder(spanName: "synctray sync")
             .setSpanKind(spanKind: .internal)
@@ -1036,6 +1082,137 @@ final class TelemetryService {
                 "synctray.profile.name": .string(profileName),
                 "offline.action": .string(action),
                 "offline.path_count": .int(pathCount),
+            ]
+        )
+    }
+
+    // MARK: - Onboarding Wizard Funnel
+
+    /// Record a step in the setup-wizard funnel so drop-off between provider selection,
+    /// remote creation, folder choice, and profile creation is measurable. All values are
+    /// bounded enums — no paths, remote names, or free text.
+    func recordWizardStep(
+        outcome: String,               // started | provider_selected | remote_ready | folder_chosen | created | abandoned
+        providerType: String? = nil,   // bounded provider rcloneType (e.g. "drive", "s3"); nil when not yet chosen
+        abandonedAtStep: String? = nil // bounded step id when outcome == "abandoned"
+    ) {
+        guard SyncTraySettings.telemetryEnabled else { return }
+        ensureSetup()
+
+        var counterAttrs: [String: AttributeValue] = ["wizard.outcome": .string(outcome)]
+        if let providerType { counterAttrs["provider.type"] = .string(providerType) }
+        if let abandonedAtStep { counterAttrs["wizard.abandoned_at_step"] = .string(abandonedAtStep) }
+
+        wizardStepCounter?.add(value: 1, attribute: counterAttrs)
+        emitLog(severity: .info, body: "Wizard step", attributes: counterAttrs)
+    }
+
+    // MARK: - OAuth Outcome
+
+    /// Record the result of an OAuth authentication attempt during remote setup — a common
+    /// onboarding wall. `result` and `providerType` are bounded.
+    func recordOAuthOutcome(
+        result: String,       // success | failure | cancelled
+        providerType: String  // bounded provider rcloneType
+    ) {
+        guard SyncTraySettings.telemetryEnabled else { return }
+        ensureSetup()
+
+        let attrs: [String: AttributeValue] = [
+            "result": .string(result),
+            "provider.type": .string(providerType),
+        ]
+        oauthOutcomeCounter?.add(value: 1, attribute: attrs)
+        emitLog(severity: result == "failure" ? .warn : .info, body: "OAuth outcome", attributes: attrs)
+    }
+
+    // MARK: - User-Initiated Recovery
+
+    /// Record a user-initiated sync recovery action (distinct from the automatic --resync).
+    /// Signals how often users hit errors bad enough to intervene, and which action they pick.
+    func recordUserRecoveryAction(
+        profileId: UUID,
+        profileName: String,
+        action: String   // force_sync | resync | retry
+    ) {
+        guard SyncTraySettings.telemetryEnabled else { return }
+        ensureSetup()
+
+        userRecoveryActionCounter?.add(value: 1, attribute: [
+            "synctray.profile.name": .string(profileName),
+            "recovery.action": .string(action),
+        ])
+
+        emitLog(
+            severity: .info,
+            body: "User recovery action",
+            attributes: [
+                "synctray.profile.id": .string(profileId.uuidString),
+                "synctray.profile.name": .string(profileName),
+                "recovery.action": .string(action),
+            ]
+        )
+    }
+
+    // MARK: - Setting Changed
+
+    /// Record a change to an app-wide preference (e.g. auto-fix, launch-at-login, debug logging,
+    /// telemetry opt-out). `name` is a bounded setting id; capturing the telemetry opt-out here
+    /// is the only way to see it, since no telemetry is emitted after it's disabled.
+    func recordSettingChanged(
+        name: String,     // bounded: auto_fix | launch_at_login | debug_logging | telemetry
+        enabled: Bool
+    ) {
+        guard SyncTraySettings.telemetryEnabled else { return }
+        ensureSetup()
+
+        let attrs: [String: AttributeValue] = [
+            "setting.name": .string(name),
+            "setting.enabled": .bool(enabled),
+        ]
+        settingChangedCounter?.add(value: 1, attribute: attrs)
+        emitLog(severity: .info, body: "Setting changed", attributes: attrs)
+    }
+
+    // MARK: - Offline Extension Setup Funnel
+
+    /// Record a step in the Finder-extension enable funnel — the one manual step a fresh
+    /// install requires. `action` is a bounded enum.
+    func recordOfflineExtensionSetup(
+        action: String   // prompt_shown | open_settings | rechecked | enabled
+    ) {
+        guard SyncTraySettings.telemetryEnabled else { return }
+        ensureSetup()
+
+        let attrs: [String: AttributeValue] = ["offline.extension_action": .string(action)]
+        offlineExtensionSetupCounter?.add(value: 1, attribute: attrs)
+        emitLog(severity: .info, body: "Offline extension setup", attributes: attrs)
+    }
+
+    // MARK: - Offline Cache Clear
+
+    /// Record a cache-clear operation, capturing whether the user preserved pinned folders
+    /// (the default) or cleared everything — shows whether the preserve-pinned choice is used.
+    func recordOfflineCacheClear(
+        profileId: UUID,
+        profileName: String,
+        preservePinned: Bool
+    ) {
+        guard SyncTraySettings.telemetryEnabled else { return }
+        ensureSetup()
+
+        offlineCacheClearCounter?.add(value: 1, attribute: [
+            "synctray.profile.name": .string(profileName),
+            "offline.preserve_pinned": .bool(preservePinned),
+        ])
+
+        emitLog(
+            severity: .info,
+            body: "Offline cache clear",
+            attributes: [
+                "synctray.profile.id": .string(profileId.uuidString),
+                "synctray.profile.name": .string(profileName),
+                "offline.preserve_pinned": .bool(preservePinned),
             ]
         )
     }
