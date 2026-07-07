@@ -221,7 +221,17 @@ class FinderSyncExtension: FIFinderSync {
             // Capture newStates as an immutable copy to avoid the concurrency warning.
             let captured = newStates
             await MainActor.run { [weak self] in
-                self?.badgeStates = captured
+                guard let self else { return }
+                self.badgeStates = captured
+                // Repaint badges immediately so Finder reflects a just-pinned folder
+                // without waiting for it to re-request (which it otherwise only does on
+                // navigation/refresh). This is the visible feedback after a pin/unpin.
+                for (path, state) in captured {
+                    FIFinderSyncController.default().setBadgeIdentifier(
+                        state == .downloaded ? "badge-downloaded" : "badge-cloud",
+                        for: URL(fileURLWithPath: path)
+                    )
+                }
             }
         }
     }
