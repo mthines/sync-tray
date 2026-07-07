@@ -144,6 +144,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUserNoti
         UNUserNotificationCenter.current().delegate = self
         requestNotificationPermissions()
 
+        // Make the Finder extension "just work" after an install/upgrade — no manual
+        // Finder restart required.
+        refreshFinderSyncExtensionIfNeeded()
+
         // Record app launch telemetry
         TelemetryService.shared.recordAppLaunch()
 
@@ -178,6 +182,77 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUserNoti
         proc.arguments = ["-x", "SyncTrayFinderSync"]
         try? proc.run()
         proc.waitUntilExit()
+    }
+
+    /// The FinderSync extension's bundle id. Debug builds use a `.dev` suffix so a dev
+    /// build never collides with an installed release (see Config/Signing.xcconfig).
+    private var finderExtensionBundleID: String {
+        #if DEBUG
+        return "com.synctray.app.dev.findersync"
+        #else
+        return "com.synctray.app.findersync"
+        #endif
+    }
+
+    /// Make the Finder extension "just work" after an install or upgrade — without the
+    /// user manually restarting Finder.
+    ///
+    /// Finder (not SyncTray) owns the extension and does NOT reload the plug-in when the
+    /// app bundle is replaced (e.g. by `brew upgrade`); it keeps serving the old binary
+    /// until it relaunches. So on launch we:
+    ///   1. (Re)register the embedded appex with LaunchServices/pluginkit (idempotent).
+    ///   2. If the app version changed since we last did this AND the extension is
+    ///      enabled, relaunch Finder so it loads the new binary. Gating on *enabled*
+    ///      means users who don't use Stream mode never see a Finder relaunch; gating on
+    ///      *version changed* means it happens at most once per upgrade, never on a
+    ///      normal launch.
+    ///
+    /// The first-ever enable still needs one-time user approval in System Settings (a
+    /// macOS security gate no app can silently bypass); the in-app card guides that.
+    private func refreshFinderSyncExtensionIfNeeded() {
+        guard let appexURL = Bundle.main.builtInPlugInsURL?
+                .appendingPathComponent("SyncTrayFinderSync.appex"),
+              FileManager.default.fileExists(atPath: appexURL.path) else { return }
+
+        let currentVersion = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String
+        let versionChanged = SyncTraySettings.finderSetupVersion != currentVersion
+        let bundleID = finderExtensionBundleID
+
+        DispatchQueue.global(qos: .utility).async {
+            // Keep the registration pointed at the current bundle (idempotent).
+            Self.runProcess("/usr/bin/pluginkit", ["-a", appexURL.path])
+
+            guard versionChanged else { return }
+
+            // Only relaunch Finder if the extension is actually enabled ("+") — otherwise
+            // there's nothing loaded to refresh and we'd flicker Finder for no reason.
+            let status = Self.runProcess("/usr/bin/pluginkit", ["-m", "-i", bundleID])
+            if status.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("+") {
+                Self.runProcess("/usr/bin/killall", ["Finder"])
+            }
+        }
+
+        // Record immediately so a transient failure doesn't relaunch Finder every launch;
+        // the refresh is a best-effort, once-per-version action.
+        SyncTraySettings.finderSetupVersion = currentVersion
+    }
+
+    /// Run a command and return its stdout (empty string on failure). Background-thread only.
+    @discardableResult
+    private static func runProcess(_ launchPath: String, _ arguments: [String]) -> String {
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: launchPath)
+        proc.arguments = arguments
+        let pipe = Pipe()
+        proc.standardOutput = pipe
+        proc.standardError = Pipe()
+        do {
+            try proc.run()
+            proc.waitUntilExit()
+            return String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+        } catch {
+            return ""
+        }
     }
 
     /// Called when the user clicks the Dock icon. While Settings is open the app is in

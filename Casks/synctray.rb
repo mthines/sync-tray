@@ -17,6 +17,12 @@ cask "synctray" do
 
   app "SyncTray.app"
 
+  # Quit SyncTray before upgrading/uninstalling so its quit handler terminates the
+  # Finder extension process — otherwise Finder keeps serving the pre-upgrade extension
+  # binary until it's relaunched. Combined with the app relaunching Finder on a version
+  # change, upgrades need no manual Finder restart.
+  uninstall quit: "com.synctray.app"
+
   zap trash: [
     "~/.config/synctray",
     "~/.local/log/synctray-*",
