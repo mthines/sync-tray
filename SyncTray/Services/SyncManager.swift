@@ -2092,6 +2092,13 @@ final class SyncManager: ObservableObject {
         }
         defaults.set(profileDataArray, forKey: kProfileDataKey)
 
+        // Wake the extension so it re-registers `directoryURLs` (and re-badges) with the
+        // paths just written. Without this, a race after login/upgrade could leave the
+        // extension loaded with stale/empty paths: the app relaunches Finder before the
+        // NFS mount finishes establishing, the extension reads empty mount paths, and
+        // nothing tells it to re-read once the mount comes up — so the menu never appears.
+        notifyFinderSyncReload()
+
         SyncTraySettings.debugLog("updateAppGroupMountPaths: wrote \(mountPaths.count) mount path(s)")
     }
 
