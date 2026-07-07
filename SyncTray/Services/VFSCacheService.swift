@@ -226,7 +226,10 @@ final class VFSCacheService {
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
 
-        let body: [String: Any] = ["dir": dir, "recursive": true]
+        // rclone's rc parses `/vfs/refresh` params as strings — a JSON boolean is
+        // rejected with `value must be string "recursive"=true`, which rclone logs and
+        // the LogParser then surfaces as a spurious "Sync error". Send the string.
+        let body: [String: Any] = ["dir": dir, "recursive": "true"]
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
 
         let (_, response) = try await URLSession.shared.data(for: request)
