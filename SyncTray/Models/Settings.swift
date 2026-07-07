@@ -34,6 +34,7 @@ struct SyncTraySettings {
         static let installationId = "installationId"
         static let telemetryBannerDismissedVersion = "telemetryBannerDismissedVersion"
         static let lastLaunchedVersion = "lastLaunchedVersion"
+        static let finderSetupVersion = "finderSetupVersion"
     }
 
     // MARK: - Telemetry Settings
@@ -105,6 +106,16 @@ struct SyncTraySettings {
     static var lastLaunchedVersion: String? {
         get { defaults.string(forKey: Keys.lastLaunchedVersion) }
         set { defaults.set(newValue, forKey: Keys.lastLaunchedVersion) }
+    }
+
+    /// App version the FinderSync extension was last (re)loaded for. When this differs
+    /// from the current version — i.e. after an install/upgrade — SyncTray relaunches
+    /// Finder on the next launch so it drops the stale extension and loads the new
+    /// binary, without the user restarting Finder manually. Kept separate from
+    /// `lastLaunchedVersion` so telemetry's deployment tracking and this can't race.
+    static var finderSetupVersion: String? {
+        get { defaults.string(forKey: Keys.finderSetupVersion) }
+        set { defaults.set(newValue, forKey: Keys.finderSetupVersion) }
     }
 
     // MARK: - Auto-Fix Settings
