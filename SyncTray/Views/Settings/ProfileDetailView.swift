@@ -3016,6 +3016,20 @@ struct ProfileDetailView: View {
         case forceSync      // Override "too many deletes" safety check
         case mountAnyway    // Enable non-empty mount and retry
 
+        /// Bounded, low-cardinality id for telemetry (`recovery.action`).
+        var telemetryName: String {
+            switch self {
+            case .smartFix: return "smart_fix"
+            case .resync: return "resync"
+            case .unlockAndResync: return "unlock_and_resync"
+            case .unlockAndRetry: return "unlock_and_retry"
+            case .unlock: return "unlock"
+            case .retrySync: return "retry"
+            case .forceSync: return "force_sync"
+            case .mountAnyway: return "mount_anyway"
+            }
+        }
+
         var buttonText: String {
             switch self {
             case .smartFix:
@@ -3159,6 +3173,11 @@ struct ProfileDetailView: View {
     }
 
     private func handleErrorAction(_ action: ErrorAction) {
+        TelemetryService.shared.recordUserRecoveryAction(
+            profileId: profile.id,
+            profileName: profile.name,
+            action: action.telemetryName
+        )
         switch action {
         case .smartFix:
             runSmartFix()

@@ -183,6 +183,12 @@ rollout. No event is emitted on a fresh install.
 | `synctray.app.settings_opened` | Counter | Settings window opens |
 | `synctray.sync.auto_fix_triggered` | Counter | Automatic --resync recovery attempts (`result`: `triggered` or `gave_up_backoff`) |
 | `synctray.offline.pin_operations` | Counter | Offline pin/unpin operations from Finder or in-app UI (`action`: `pin` or `unpin`) |
+| `synctray.wizard.step` | Counter | Onboarding funnel events (`wizard.outcome`: started/provider_selected/remote_ready/folder_chosen/created/abandoned; `wizard.abandoned_at_step`, `provider.type`) |
+| `synctray.remote.oauth` | Counter | OAuth auth outcomes during remote setup (`result`: success/failure/cancelled; `provider.type`) |
+| `synctray.recovery.user_action` | Counter | User-initiated sync recovery actions (`recovery.action`: force_sync/resync/retry/…) — distinct from automatic auto-fix |
+| `synctray.setting.changed` | Counter | App-wide preference changes (`setting.name`: auto_fix/launch_at_login/debug_logging/telemetry; `setting.enabled`) |
+| `synctray.offline.extension_setup` | Counter | Finder-extension enable funnel (`offline.extension_action`: prompt_shown/open_settings/rechecked/enabled) |
+| `synctray.offline.cache_clear` | Counter | Cache-clear operations (`offline.preserve_pinned`: whether pinned folders were kept) |
 
 ### Spans
 | Span | Kind | Description |
@@ -193,7 +199,7 @@ rollout. No event is emitted on a fresh install.
 
 ### Logs
 All key lifecycle events are emitted as structured OTel logs:
-- Sync started/completed/failed (with profile context, duration, files changed)
+- Sync started/completed/failed (with profile context, duration, files changed; started carries `sync.trigger`: manual/directory_watch/scheduled/startup)
 - Mount/unmount success/failure
 - Directory watch triggers
 - Transport changes (primary ↔ fallback)
@@ -215,6 +221,12 @@ All key lifecycle events are emitted as structured OTel logs:
 - App upgraded: `service.version` changed since the previous launch (deployment markers)
 - Auto-fix: automatic --resync triggered (`triggered`), suppressed by backoff (`gave_up_backoff`), or skipped because the external drive is not mounted (`skipped_drive_not_mounted`)
 - Offline pin operations: directory pinned or unpinned via Finder right-click or in-app UI (`offline.action`, `offline.path_count`)
+- Wizard step: onboarding funnel events (`wizard.outcome`, `wizard.abandoned_at_step`, `provider.type`) — new-profile flow only, not edit mode
+- OAuth outcome: OAuth auth result during remote setup (`result`, `provider.type`)
+- User recovery action: user-initiated recovery from the error banner (`recovery.action`) — distinct from automatic auto-fix
+- Setting changed: app-wide preference toggled (`setting.name`, `setting.enabled`); the telemetry opt-out is recorded just before telemetry disables
+- Offline extension setup: Finder-extension enable-funnel steps (`offline.extension_action`)
+- Offline cache clear: cache cleared, with whether pinned folders were preserved (`offline.preserve_pinned`)
 
 ## Swift SDK Gotcha: Wildcard View Required
 

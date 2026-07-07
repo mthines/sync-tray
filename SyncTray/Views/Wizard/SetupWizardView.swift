@@ -13,6 +13,9 @@ struct SetupWizardView: View {
 
     // Wizard state
     @State private var currentStep: WizardStep = .welcome
+    // Onboarding-funnel bookkeeping (new-profile flow only, not edit mode).
+    @State private var didLogWizardStart = false
+    @State private var wizardCompleted = false
     @State private var remoteConfig = RemoteConfiguration(name: "", provider: .googleDrive)
     @State private var selectedRemote: String = ""
     @State private var remotePath: String = ""
@@ -75,6 +78,20 @@ struct SetupWizardView: View {
             }
         }
 
+        /// Bounded, low-cardinality id for telemetry (`wizard.abandoned_at_step`).
+        var telemetryName: String {
+            switch self {
+            case .welcome: return "welcome"
+            case .provider: return "provider"
+            case .credentials: return "credentials"
+            case .remotePath: return "remote_path"
+            case .localPath: return "local_path"
+            case .syncSettings: return "sync_settings"
+            case .confirmation: return "confirmation"
+            case .helpImprove: return "help_improve"
+            }
+        }
+
         var next: WizardStep? {
             WizardStep(rawValue: rawValue + 1)
         }
@@ -113,6 +130,11 @@ struct SetupWizardView: View {
         .onAppear {
             checkRcloneInstallation()
             loadEditingProfile()
+            // Onboarding funnel: entry event (new-profile flow only, once per presentation).
+            if !isEditMode && !didLogWizardStart {
+                didLogWizardStart = true
+                TelemetryService.shared.recordWizardStep(outcome: "started")
+            }
         }
         .alert("This Folder Is Not Empty", isPresented: $showingNonEmptyDirConfirm) {
             Button("Cancel", role: .cancel) {
@@ -635,6 +657,13 @@ struct SetupWizardView: View {
                 if currentStep == .helpImprove {
                     SyncTraySettings.telemetryBannerDismissedVersion = SyncTraySettings.currentTelemetryConsentVersion
                 }
+                // Onboarding funnel: abandonment, tagged with the step they quit on.
+                if !isEditMode && !wizardCompleted && currentStep != .helpImprove {
+                    TelemetryService.shared.recordWizardStep(
+                        outcome: "abandoned",
+                        abandonedAtStep: currentStep.telemetryName
+                    )
+                }
                 dismiss()
             }
             .keyboardShortcut(.cancelAction)
@@ -705,6 +734,14 @@ struct SetupWizardView: View {
     private func advanceToNextStep(_ nextStep: WizardStep) {
         errorMessage = nil
 
+        // Onboarding funnel: capture the chosen provider as the user leaves the provider step.
+        if currentStep == .provider && !isEditMode {
+            TelemetryService.shared.recordWizardStep(
+                outcome: "provider_selected",
+                providerType: remoteConfig.provider.rcloneType
+            )
+        }
+
         // Skip credentials step if using existing remote
         if currentStep == .welcome && !selectedRemote.isEmpty {
             withAnimation {
@@ -732,13 +769,16 @@ struct SetupWizardView: View {
         isOAuthInProgress = true
         errorMessage = nil
 
+        let providerType = remoteConfig.provider.rcloneType
         configService.startOAuthFlow(for: remoteConfig.provider) { result in
             isOAuthInProgress = false
             switch result {
             case .success(let token):
                 remoteConfig.oauthToken = token
+                TelemetryService.shared.recordOAuthOutcome(result: "success", providerType: providerType)
             case .failure(let error):
                 errorMessage = error.localizedDescription
+                TelemetryService.shared.recordOAuthOutcome(result: "failure", providerType: providerType)
             }
         }
     }
@@ -879,6 +919,13 @@ struct SetupWizardView: View {
 
             profileStore.add(profile)
             profileToInstall = profile
+
+            // Onboarding funnel: completion (new-profile flow only).
+            wizardCompleted = true
+            TelemetryService.shared.recordWizardStep(
+                outcome: "created",
+                providerType: remoteConfig.provider.rcloneType
+            )
         }
 
         // Automatically install the scheduled sync
