@@ -279,12 +279,13 @@ final class SyncManager: ObservableObject {
                 let success = setupService.startAgent(for: profile)
 
                 if success {
-                    // Poll for the mount to establish. NFS mounts can take a few
-                    // seconds — especially right after the script clears a stale
-                    // instance and waits for the RC port to free — so a single
-                    // short check produced false "Mount did not establish" errors.
+                    // Poll for the mount to establish. NFS mounts can take a while —
+                    // especially a fallback over a slower backend (SFTP handshake + VFS
+                    // warm-up + the NFS attach), which was observed taking ~14s and so
+                    // tripped the old 12s cap into a false "Mount did not establish". Give
+                    // it 30s; the 5s mount-state monitor still corrects any later arrival.
                     var established = false
-                    for _ in 0..<12 {
+                    for _ in 0..<30 {
                         try? await Task.sleep(nanoseconds: 1_000_000_000)
                         if setupService.isMounted(profile: profile) {
                             established = true
