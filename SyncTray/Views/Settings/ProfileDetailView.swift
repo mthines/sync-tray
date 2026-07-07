@@ -2389,6 +2389,33 @@ struct ProfileDetailView: View {
         return nil
     }
 
+    /// Ordered candidate fallback paths to probe when the entered path doesn't resolve.
+    /// The protocol heuristic alone is unreliable, so we test several layouts and let the
+    /// caller suggest the first that actually exists on the fallback remote:
+    ///   1. the primary path unchanged (correct when the fallback exposes the same tree,
+    ///      e.g. a Synology SFTP rooted at the volume level),
+    ///   2. the protocol heuristic transform (SMB `home/` ↔ SFTP home dir, etc.),
+    ///   3. leading-slash / no-slash variants.
+    private func fallbackPathCandidates(primaryPath: String, primaryType: String?, fallbackType: String?) -> [(path: String, reason: String)] {
+        let trimmed = primaryPath.trimmingCharacters(in: .whitespaces)
+        var out: [(path: String, reason: String)] = []
+        func add(_ p: String, _ reason: String) {
+            let cleaned = p.trimmingCharacters(in: .whitespaces)
+            guard !cleaned.isEmpty, !out.contains(where: { $0.path == cleaned }) else { return }
+            out.append((cleaned, reason))
+        }
+        add(trimmed, "Use the same path as the primary — this remote exposes the same folder tree.")
+        if let s = suggestFallbackPath(primaryPath: trimmed, primaryType: primaryType, fallbackType: fallbackType) {
+            add(s.path, s.reason)
+        }
+        if trimmed.hasPrefix("/") {
+            add(String(trimmed.dropFirst()), "Share-relative path (leading `/` dropped).")
+        } else {
+            add("/\(trimmed)", "Absolute path from the filesystem root (leading `/` added).")
+        }
+        return out
+    }
+
     /// Apply auto-configuration for the fallback when a remote is selected:
     /// - If protocols differ, enable "different path" toggle
     /// - Pre-fill suggested path when one applies
@@ -2404,13 +2431,13 @@ struct ProfileDetailView: View {
             if !fallbackUseDifferentPath {
                 fallbackUseDifferentPath = true
             }
-            // If user hasn't set a fallback path yet, pre-fill the suggestion (or fall back to primary path)
+            // If user hasn't set a fallback path yet, default to the PRIMARY path. The
+            // protocol heuristic (drop `home/` etc.) is unreliable — e.g. a Synology whose
+            // SFTP roots at the volume level needs the same `home/…` path as SMB, not the
+            // home-relative transform. Validation below probes and suggests a correction if
+            // this default doesn't resolve on the fallback remote.
             if fallbackRemotePath.isEmpty {
-                if let suggestion = suggestFallbackPath(primaryPath: remotePath, primaryType: primary, fallbackType: fallback) {
-                    fallbackRemotePath = suggestion.path
-                } else {
-                    fallbackRemotePath = remotePath
-                }
+                fallbackRemotePath = remotePath
             }
         }
 
@@ -2453,17 +2480,26 @@ struct ProfileDetailView: View {
                 self.fallbackPathSuggestionReason = nil
             case .pathNotFound:
                 self.fallbackPathStatus = .invalid
-                // Compute a suggestion to show next to the error
+                // Probe candidate paths and suggest the first that ACTUALLY exists — the
+                // protocol heuristic alone is unreliable (it once suggested a path that
+                // also didn't exist). This confirms the suggestion against the real remote.
                 let primaryType = self.rcloneType(for: self.rcloneRemote)
                 let fallbackType = self.rcloneType(for: self.fallbackRemote)
-                if let s = self.suggestFallbackPath(primaryPath: self.remotePath, primaryType: primaryType, fallbackType: fallbackType),
-                   s.path != self.fallbackRemotePath {
-                    self.fallbackPathSuggestion = s.path
-                    self.fallbackPathSuggestionReason = s.reason
-                } else {
-                    self.fallbackPathSuggestion = nil
-                    self.fallbackPathSuggestionReason = nil
+                let candidates = self.fallbackPathCandidates(
+                    primaryPath: self.remotePath, primaryType: primaryType, fallbackType: fallbackType
+                )
+                var verified: (path: String, reason: String)?
+                for candidate in candidates where candidate.path != pathToTest {
+                    if Task.isCancelled { return }
+                    // Bail if the user edited the field while we were probing.
+                    guard pathToTest == self.fallbackRemotePath, remoteToTest == self.fallbackRemote else { return }
+                    if case .success = await self.runRcloneLsd(remote: remoteToTest, path: candidate.path) {
+                        verified = candidate
+                        break
+                    }
                 }
+                self.fallbackPathSuggestion = verified?.path
+                self.fallbackPathSuggestionReason = verified?.reason
             case .unreachable:
                 self.fallbackPathStatus = .unreachable
                 self.fallbackPathSuggestion = nil
