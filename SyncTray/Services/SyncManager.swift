@@ -2004,6 +2004,12 @@ final class SyncManager: ObservableObject {
 
             profileStore.update(profile)
 
+            // Push the new pin state to the extension's App Group copy and wake it so it
+            // reloads + repaints the folder badge right away — otherwise the extension
+            // keeps showing the stale badge and the user gets no Finder feedback.
+            updateAppGroupMountPaths()
+            notifyFinderSyncReload()
+
             TelemetryService.shared.recordOfflinePinOperation(
                 profileId: profileId,
                 profileName: profile.name,
@@ -2022,6 +2028,9 @@ final class SyncManager: ObservableObject {
                         await self.cacheService.warmDirectory(path, for: profile) { [weak self] in
                             await self?.isDirectoryPinned(path, profileId: profileId) ?? false
                         }
+                        // Warming populated the VFS cache — nudge the extension again so the
+                        // badge flips from cloud to the "downloaded" checkmark.
+                        await MainActor.run { [weak self] in self?.notifyFinderSyncReload() }
                     }
                 }
             }
@@ -2029,6 +2038,22 @@ final class SyncManager: ObservableObject {
         } catch {
             SyncTraySettings.debugLog("processPendingPinRequest: error reading/parsing request: \(error)")
         }
+    }
+
+    /// Wake the FinderSync extension to reload App Group data and repaint badges.
+    ///
+    /// Reuses the pin-request Darwin notification as a bidirectional "pin state changed"
+    /// signal: the extension observes it and calls `loadMountPaths()`, which re-reads the
+    /// pinned dirs and repaints badges. Our own observer also fires but finds no pending
+    /// request file (we post only after deleting it), so it's a harmless no-op.
+    private func notifyFinderSyncReload() {
+        CFNotificationCenterPostNotification(
+            CFNotificationCenterGetDistributedCenter(),
+            CFNotificationName(kPinRequestNotificationName as CFString),
+            nil,
+            nil,
+            true
+        )
     }
 
     /// Live (main-actor) check of whether `path` is still pinned for the given profile.

@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import Combine
 
 /// Collapsible section for managing offline/cached files in mount mode profiles
 struct OfflineFilesSection: View {
@@ -105,6 +106,15 @@ struct OfflineFilesSection: View {
             pinnedDirs = profile.pinnedDirectories
             currentPath = ""
             pathHistory = []
+            refreshCacheStats()
+        }
+        // Reflect pins made outside this view (e.g. via the Finder right-click menu)
+        // live — the profile store is the source of truth, so mirror its pinned list
+        // whenever it changes for this profile.
+        .onReceive(profileStore.$profiles) { profiles in
+            guard let updated = profiles.first(where: { $0.id == profile.id }),
+                  updated.pinnedDirectories != pinnedDirs else { return }
+            pinnedDirs = updated.pinnedDirectories
             refreshCacheStats()
         }
         .alert("Clear cached files?", isPresented: $showClearConfirm) {
