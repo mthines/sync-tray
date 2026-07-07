@@ -1,0 +1,6 @@
+# Workflow artifacts (per-developer, not committed)
+*/
+
+# Local config overrides and runtime state
+config.local.json
+state.json

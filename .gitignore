@@ -10,8 +10,6 @@ DerivedData/
 build/
 *.app
 
-.gw
-
 tasks
 
 .mcp.json
