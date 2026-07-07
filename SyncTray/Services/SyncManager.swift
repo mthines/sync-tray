@@ -2150,6 +2150,7 @@ final class SyncManager: ObservableObject {
                 acc[profile.id] = self.setupService.isMounted(profile: profile)
             }
             DispatchQueue.main.async {
+                let before = Set(self.profileMountStates.filter { $0.value == .mounted }.keys)
                 for profile in mountProfiles {
                     if mounted[profile.id] == true {
                         self.profileMountStates[profile.id] = .mounted
@@ -2157,6 +2158,15 @@ final class SyncManager: ObservableObject {
                                 || self.profileMountStates[profile.id] == .mounted {
                         self.profileMountStates[profile.id] = .unmounted
                     }
+                }
+                // Republish to the FinderSync extension whenever the set of mounted
+                // profiles changes. Without this, a mount the monitor detects — a slow
+                // fallback that established after the initial poll, a launchd/externally
+                // mounted profile, or one that recovered from .failed — never reaches the
+                // extension, so its right-click menu and badges silently never appear.
+                let after = Set(self.profileMountStates.filter { $0.value == .mounted }.keys)
+                if before != after {
+                    self.updateAppGroupMountPaths()
                 }
             }
         }
