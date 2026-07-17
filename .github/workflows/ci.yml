@@ -4,7 +4,12 @@ on:
   push:
     branches: [main]
   pull_request:
-    types: [opened, synchronize, reopened, ready_for_review]
+    types: [opened, synchronize, reopened]
+  # Betas are published on demand via a `/beta` comment on a PR — never
+  # automatically on every push — so a run of macOS build + notarization
+  # only happens when explicitly requested.
+  issue_comment:
+    types: [created]
   workflow_dispatch:
     inputs:
       force_release:
@@ -21,22 +26,31 @@ permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.event.pull_request.number || github.ref }}
+  # Isolate on-demand betas from PR-push runs so a new push can't cancel a
+  # beta that is mid-notarization.
+  group: ${{ github.event_name == 'issue_comment' && format('ci-beta-{0}', github.event.issue.number) || format('ci-{0}', github.event.pull_request.number || github.ref) }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   # ===========================================================================
-  # detect-changes — determine event context (push vs PR vs dispatch),
-  # whether this run should publish a beta or stable, and skip release-loop
-  # commits to avoid retriggering ourselves.
+  # detect-changes — determine event context (push vs PR vs /beta comment vs
+  # dispatch), whether this run should publish a beta or stable, and skip
+  # release-loop commits to avoid retriggering ourselves. Runs on Linux — this
+  # is pure git/gh/jq work, no macOS needed.
   # ===========================================================================
   detect-changes:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: read
     outputs:
       should_release: ${{ steps.detect.outputs.should_release }}
       is_beta: ${{ steps.detect.outputs.is_beta }}
       pr_number: ${{ steps.detect.outputs.pr_number }}
       base_ref: ${{ steps.detect.outputs.base_ref }}
+      checkout_ref: ${{ steps.detect.outputs.checkout_ref }}
+      run_build: ${{ steps.detect.outputs.run_build }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -50,13 +64,22 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           FORCE_RELEASE: ${{ inputs.force_release }}
+          EVENT_NAME: ${{ github.event_name }}
+          # Passed via env (never inlined into the script) so a crafted comment
+          # body can't inject shell.
+          COMMENT_BODY: ${{ github.event.comment.body }}
+          COMMENT_ASSOC: ${{ github.event.comment.author_association }}
+          IS_PR_COMMENT: ${{ github.event.issue.pull_request != null }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
         run: |
           IS_BETA="false"
           PR_NUMBER=""
           BASE_REF="main"
           SHOULD_RELEASE="true"
+          RUN_BUILD="true"
+          CHECKOUT_REF="${{ github.sha }}"
 
-          if [ "${{ github.event_name }}" = "push" ]; then
+          if [ "$EVENT_NAME" = "push" ]; then
             LAST_STABLE_TAG=$(git tag -l "v*" --sort=-version:refname | grep -E "^v[0-9]" | grep -v "beta" | head -n 1 || echo "")
             if [ -n "$LAST_STABLE_TAG" ]; then
               BASE_REF="$LAST_STABLE_TAG"
@@ -65,17 +88,44 @@ jobs:
             fi
             echo "::notice::Push to main — comparing against $BASE_REF"
 
-          elif [ "${{ github.event_name }}" = "pull_request" ]; then
+          elif [ "$EVENT_NAME" = "pull_request" ]; then
+            # PR pushes run the smoke build only. Betas are published on demand
+            # via a `/beta` comment (see issue_comment below), never per-push.
             BASE_REF="origin/${{ github.base_ref }}"
             PR_NUMBER="${{ github.event.pull_request.number }}"
-            if [ "${{ github.event.pull_request.draft }}" = "false" ]; then
-              IS_BETA="true"
-            else
-              SHOULD_RELEASE="false"
-            fi
-            echo "::notice::PR #$PR_NUMBER — base=$BASE_REF draft=${{ github.event.pull_request.draft }}"
+            CHECKOUT_REF="${{ github.event.pull_request.head.sha }}"
+            SHOULD_RELEASE="false"
+            echo "::notice::PR #$PR_NUMBER — smoke build only (comment /beta to publish a beta)"
 
-          elif [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+          elif [ "$EVENT_NAME" = "issue_comment" ]; then
+            # On-demand beta: an authorized `/beta` comment on an open PR.
+            SHOULD_RELEASE="false"
+            RUN_BUILD="false"
+            TRIMMED=$(printf '%s' "$COMMENT_BODY" | tr -d '\r' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+            AUTHORIZED="false"
+            case "$COMMENT_ASSOC" in
+              OWNER|MEMBER|COLLABORATOR) AUTHORIZED="true" ;;
+            esac
+
+            if [ "$IS_PR_COMMENT" = "true" ] && [ "$TRIMMED" = "/beta" ] && [ "$AUTHORIZED" = "true" ]; then
+              PR_JSON=$(gh pr view "$ISSUE_NUMBER" --json headRefOid,baseRefName,state 2>/dev/null || echo "")
+              PR_STATE=$(echo "$PR_JSON" | jq -r '.state // "UNKNOWN"')
+              if [ "$PR_STATE" = "OPEN" ]; then
+                PR_NUMBER="$ISSUE_NUMBER"
+                CHECKOUT_REF=$(echo "$PR_JSON" | jq -r '.headRefOid')
+                BASE_REF="origin/$(echo "$PR_JSON" | jq -r '.baseRefName')"
+                IS_BETA="true"
+                SHOULD_RELEASE="true"
+                RUN_BUILD="true"
+                echo "::notice::/beta requested on PR #$PR_NUMBER — publishing beta from $CHECKOUT_REF"
+              else
+                echo "::notice::/beta ignored — PR #$ISSUE_NUMBER is not open"
+              fi
+            else
+              echo "::notice::Ignoring comment (not an authorized /beta on an open PR)"
+            fi
+
+          elif [ "$EVENT_NAME" = "workflow_dispatch" ]; then
             if [ "${{ github.ref }}" = "refs/heads/main" ]; then
               LAST_STABLE_TAG=$(git tag -l "v*" --sort=-version:refname | grep -E "^v[0-9]" | grep -v "beta" | head -n 1 || echo "")
               if [ -n "$LAST_STABLE_TAG" ]; then
@@ -102,7 +152,7 @@ jobs:
 
           # Skip release-loop commits on push events (their tag was already pushed in a prior run)
           COMMIT_MSG=$(git log -1 --pretty=%s)
-          if [ "${{ github.event_name }}" = "push" ] && [ "$FORCE_RELEASE" != "true" ]; then
+          if [ "$EVENT_NAME" = "push" ] && [ "$FORCE_RELEASE" != "true" ]; then
             if [[ "$COMMIT_MSG" =~ ^chore\(release\): ]] || [[ "$COMMIT_MSG" =~ ^feat\(cask\): ]]; then
               echo "::notice::Skipping release for commit: $COMMIT_MSG"
               SHOULD_RELEASE="false"
@@ -113,19 +163,44 @@ jobs:
           echo "is_beta=$IS_BETA" >> "$GITHUB_OUTPUT"
           echo "pr_number=$PR_NUMBER" >> "$GITHUB_OUTPUT"
           echo "base_ref=$BASE_REF" >> "$GITHUB_OUTPUT"
+          echo "checkout_ref=$CHECKOUT_REF" >> "$GITHUB_OUTPUT"
+          echo "run_build=$RUN_BUILD" >> "$GITHUB_OUTPUT"
+
+      - name: Acknowledge /beta request
+        if: github.event_name == 'issue_comment' && steps.detect.outputs.run_build == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh api -X POST \
+            "/repos/${{ github.repository }}/issues/comments/${{ github.event.comment.id }}/reactions" \
+            -f content=eyes >/dev/null 2>&1 || true
 
   # ===========================================================================
   # test — compile the Debug build as a smoke test. SyncTray has no XCTest
   # target in its scheme (see project.json `test` target), so the build itself
-  # is the gate.
+  # is the gate. Single-arch (ONLY_ACTIVE_ARCH=YES) — a smoke build only needs
+  # to prove it compiles; the universal binary is built in release-macos.
+  # Skipped for /beta comments — the Release build there already validates
+  # compilation, so a separate Debug build would just burn macOS minutes.
   # ===========================================================================
   test:
     needs: detect-changes
+    if: needs.detect-changes.outputs.run_build == 'true' && github.event_name != 'issue_comment'
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.pull_request.head.sha || github.ref }}
+          ref: ${{ needs.detect-changes.outputs.checkout_ref }}
+
+      - name: Cache SwiftPM dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            .spm
+            ~/Library/Caches/org.swift.swiftpm
+          key: spm-${{ runner.os }}-${{ hashFiles('**/*.xcodeproj/project.pbxproj') }}
+          restore-keys: |
+            spm-${{ runner.os }}-
 
       - name: Build (Debug)
         run: |
@@ -134,29 +209,31 @@ jobs:
             -scheme SyncTray \
             -destination 'platform=macOS' \
             -configuration Debug \
+            -clonedSourcePackagesDirPath .spm \
             build \
-            ONLY_ACTIVE_ARCH=NO \
+            ONLY_ACTIVE_ARCH=YES \
             CODE_SIGNING_ALLOWED=NO \
             | tail -30
 
   # ===========================================================================
   # version — calculate the next version from conventional commits and create
   # the git tag. Stable bumps Info.plist + commits chore(release) to main.
-  # Beta only creates the annotated tag.
+  # Beta only creates the annotated tag. Runs on Linux — git tag math plus a
+  # portable sed plist edit, no macOS tooling required.
   # ===========================================================================
   version:
     needs: [detect-changes, test]
     if: |
       always() &&
-      needs.test.result == 'success' &&
+      (needs.test.result == 'success' || needs.test.result == 'skipped') &&
       needs.detect-changes.outputs.should_release == 'true' &&
       !inputs.dry_run &&
       (
         (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
-        (github.event_name == 'pull_request' && github.event.pull_request.draft == false) ||
+        (github.event_name == 'issue_comment') ||
         (github.event_name == 'workflow_dispatch')
       )
-    runs-on: macos-latest
+    runs-on: ubuntu-latest
     permissions:
       contents: write
     outputs:
@@ -167,7 +244,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          ref: ${{ github.event.pull_request.head.sha || github.ref }}
+          ref: ${{ needs.detect-changes.outputs.checkout_ref }}
           token: ${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}
 
       - name: Fetch all tags
@@ -181,13 +258,16 @@ jobs:
           BASE_REF: ${{ needs.detect-changes.outputs.base_ref }}
           FORCE_RELEASE: ${{ inputs.force_release }}
         run: |
+          PLIST="SyncTray/Info.plist"
           # Version source of truth: latest non-beta git tag, falling back to Info.plist
           LAST_STABLE_TAG=$(git tag -l "v*" --sort=-version:refname | grep -E "^v[0-9]" | grep -v "beta" | head -n 1 || echo "")
           if [ -n "$LAST_STABLE_TAG" ]; then
             CURRENT="${LAST_STABLE_TAG#v}"
             echo "::notice::Version source: tag $LAST_STABLE_TAG"
           else
-            CURRENT=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" SyncTray/Info.plist 2>/dev/null || echo "0.0.0")
+            # Read CFBundleShortVersionString without PlistBuddy (Linux runner)
+            CURRENT=$(awk '/<key>CFBundleShortVersionString<\/key>/{getline; gsub(/.*<string>|<\/string>.*/,""); print; exit}' "$PLIST" 2>/dev/null || echo "0.0.0")
+            [ -z "$CURRENT" ] && CURRENT="0.0.0"
             echo "::notice::Version source: Info.plist ($CURRENT) — no tags found"
           fi
           IFS='.' read -ra V <<< "$CURRENT"
@@ -260,9 +340,12 @@ jobs:
             git push origin "$TAG"
             echo "::notice::Created beta tag $TAG"
           else
-            # Stable: bump Info.plist, commit, tag, push both
-            /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $VERSION" SyncTray/Info.plist
-            git add SyncTray/Info.plist
+            # Stable: bump Info.plist, commit, tag, push both.
+            # Portable sed edit (Linux runner) — replaces the <string> on the
+            # line after the CFBundleShortVersionString key.
+            PLIST="SyncTray/Info.plist"
+            sed -i "/<key>CFBundleShortVersionString<\/key>/{n;s|<string>.*</string>|<string>$VERSION</string>|;}" "$PLIST"
+            git add "$PLIST"
             git commit -m "chore(release): bump version to $TAG"
             git tag -a "$TAG" -m "Release $TAG"
             git push origin main
@@ -275,7 +358,8 @@ jobs:
   # ===========================================================================
   # release-macos — build the Release .app, zip it, create the GitHub release,
   # update the homebrew tap, and (stable only) sync Casks/synctray.rb back to
-  # the source repo so it stays in lockstep with the tap.
+  # the source repo so it stays in lockstep with the tap. macOS is required
+  # here for xcodebuild + codesign + notarytool.
   # ===========================================================================
   release-macos:
     needs: [detect-changes, version]
