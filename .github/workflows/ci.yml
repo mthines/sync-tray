@@ -77,7 +77,10 @@ jobs:
           BASE_REF="main"
           SHOULD_RELEASE="true"
           RUN_BUILD="true"
-          CHECKOUT_REF="${{ github.sha }}"
+          # Default to the branch ref (not the SHA) so the stable-release path
+          # checks out `main` as a real local branch — `git push origin main`
+          # needs it. PR / issue_comment paths override this with the head SHA.
+          CHECKOUT_REF="${{ github.ref }}"
 
           if [ "$EVENT_NAME" = "push" ]; then
             LAST_STABLE_TAG=$(git tag -l "v*" --sort=-version:refname | grep -E "^v[0-9]" | grep -v "beta" | head -n 1 || echo "")
