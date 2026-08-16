@@ -16,6 +16,10 @@
 	<string>$(DASH0_AUTH_TOKEN)</string>
 	<key>GitCommitSHA</key>
 	<string>$(GIT_COMMIT_SHA)</string>
+	<key>GitCommitSHAFull</key>
+	<string>$(GIT_COMMIT_SHA_FULL)</string>
+	<key>VCSRepositoryURL</key>
+	<string>$(VCS_REPOSITORY_URL)</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>13.0</string>
 	<key>LSUIElement</key>

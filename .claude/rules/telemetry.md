@@ -135,9 +135,29 @@ For operations with real duration (like syncs), use the `activeSyncSpans` patter
   (overridable via `OTEL_RESOURCE_ATTRIBUTES`)
 - `os.type` = darwin
 - `os.version` = macOS version
+- `host.arch` = `arm64` / `amd64`, resolved at compile time (a universal binary reports
+  the executing slice, not the host's native arch)
+- `vcs.repository.url.full` = canonical https URL of the `origin` remote (see below)
+- `vcs.repository.ref.revision` = full commit SHA the binary was built from (see below)
 
 `enduser.id` is the primary user correlation key — it survives app reinstalls because
 it's derived from the machine's hardware UUID via a one-way hash.
+
+### Source correlation
+`vcs.repository.url.full` and `vcs.repository.ref.revision` let a backend resolve any
+signal to the exact source revision that produced it — the pair Dash0 and agentic
+tooling look for to jump from a log line straight to the code that emitted it.
+
+Both are injected into `Info.plist` by the `Embed Git Metadata` build phase
+(`VCSRepositoryURL` / `GitCommitSHAFull` keys) and read back by
+`TelemetryService.infoPlistBuildValue`. The remote URL is normalised at build time:
+scp-style SSH (`git@host:owner/repo.git`) and `ssh://` forms are converted to `https://`,
+**embedded credentials are stripped**, and the trailing `.git` is dropped. Credentials
+must never reach telemetry, so that strip is not optional — if you extend the
+normalisation, keep it.
+
+When building from a non-git source tree the phase logs a warning and both attributes
+are simply absent, exactly as `service.version` degrades to `<marketing>+<build>`.
 
 ### Deployment correlation
 `service.version` is the primary key Dash0 uses to correlate telemetry to a specific
@@ -146,10 +166,15 @@ release. `TelemetryService.appVersion()` builds it from
 `0.34.0+1.gabc1234`, so every shipped commit is a distinct deployment for
 version-aware comparison and regression detection.
 
-The SHA is injected into `Info.plist` (`GitCommitSHA` key) by the `Embed Git Commit
-SHA` Xcode build phase (`PlistBuddy` on the built plist; `alwaysOutOfDate` so it
+The SHA is injected into `Info.plist` (`GitCommitSHA` key) by the `Embed Git Metadata`
+Xcode build phase (`PlistBuddy` on the built plist; `alwaysOutOfDate` so it
 re-runs every build). When unavailable (non-git source tree), `service.version`
 gracefully falls back to `<marketing>+<build>`.
+
+The same phase also writes `GitCommitSHAFull` and `VCSRepositoryURL` — see
+[Source correlation](#source-correlation). Any key it writes must stay in sync across
+three files: the phase (writer), `SyncTray/Info.plist` (placeholder), and
+`TelemetryService.infoPlistBuildValue` (reader).
 
 On launch, `recordDeploymentIfChanged()` compares the current `service.version`
 against `SyncTraySettings.lastLaunchedVersion` and, on a change, emits an
