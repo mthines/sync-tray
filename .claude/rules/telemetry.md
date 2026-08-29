@@ -109,11 +109,17 @@ For operations with real duration (like syncs), use the `activeSyncSpans` patter
 ## Rules
 
 ### Privacy
-- **Never** include file paths, remote URLs, or user-identifiable data in telemetry
+- **Never** include file paths, sync remote URLs (rclone remote configs — S3/SFTP/WebDAV
+  endpoints, etc.), or user-identifiable data in telemetry
 - Only use low-cardinality, bounded values (enum cases, profile names, error types)
 - Profile names are user-chosen display names (e.g., "Work", "Personal"), not paths
 - Error messages are categorized into types (e.g., "network", "timeout", "permission_denied")
   via `categorizeError()` — the raw message is truncated to 256 chars max
+- **Carve-out:** `vcs.repository.url.full` (the *source code* repository's origin
+  remote, e.g. `https://github.com/mthines/sync-tray`) is exempt from the remote-URL
+  ban above. It identifies the codebase the binary was built from, not a user's sync
+  destination, carries no user data, and has embedded credentials stripped at build
+  time (see Source correlation below) before it ever reaches telemetry.
 
 ### Naming
 - Metric names: `synctray.<domain>.<measurement>` (e.g., `synctray.sync.duration`)
@@ -136,7 +142,8 @@ For operations with real duration (like syncs), use the `activeSyncSpans` patter
 - `os.type` = darwin
 - `os.version` = macOS version
 - `host.arch` = `arm64` / `amd64`, resolved at compile time (a universal binary reports
-  the executing slice, not the host's native arch)
+  the executing slice, not the host's native arch); omitted on any other architecture
+  rather than sending an undocumented value
 - `vcs.repository.url.full` = canonical https URL of the `origin` remote (see below)
 - `vcs.repository.ref.revision` = full commit SHA the binary was built from (see below)
 

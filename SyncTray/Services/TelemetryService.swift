@@ -1634,8 +1634,11 @@ final class TelemetryService {
             "enduser.id": .string(SyncTraySettings.anonymousUserId),
             ResourceAttributes.osType.rawValue: .string("darwin"),
             ResourceAttributes.osVersion.rawValue: .string(osVersion),
-            "host.arch": .string(hostArch()),
         ]
+
+        if let hostArch = hostArch() {
+            attrs["host.arch"] = .string(hostArch)
+        }
 
         // Source provenance. Lets a backend walk from a log line or span straight
         // to the code that emitted it, which is the difference between "the watcher
@@ -1720,13 +1723,18 @@ final class TelemetryService {
     ///
     /// Resolved at compile time rather than via `uname`, so a universal binary
     /// reports the slice actually executing rather than the host's native arch.
-    private func hostArch() -> String {
+    ///
+    /// Returns nil outside arm64/amd64 rather than an `"unknown"` placeholder — that
+    /// value would sit outside the `host.arch` semconv enum and isn't documented as a
+    /// possible value in CLAUDE.md / telemetry.md, so it's omitted from the resource
+    /// entirely rather than shipped as an undocumented, non-standard string.
+    private func hostArch() -> String? {
         #if arch(arm64)
         return "arm64"
         #elseif arch(x86_64)
         return "amd64"
         #else
-        return "unknown"
+        return nil
         #endif
     }
 
