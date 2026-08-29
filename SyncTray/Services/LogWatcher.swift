@@ -203,7 +203,11 @@ final class LogWatcher {
                 let name = self.profileName
                 DispatchQueue.main.async { [weak self] in
                     self?.handleFileChange()
-                    TelemetryService.shared.recordLogWatcherRecovery(reason: "missed_bytes", profileName: name)
+                    TelemetryService.shared.recordLogWatcherRecovery(
+                        reason: "missed_bytes",
+                        profileName: name,
+                        missedBytes: missedBytes
+                    )
                 }
             }
         } catch {

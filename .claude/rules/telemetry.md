@@ -211,7 +211,7 @@ All key lifecycle events are emitted as structured OTel logs:
 - Configuration summary (profile count breakdown by mode)
 - Remote config operations: create/update/delete/connection_test (with provider type and categorized error type)
 - Sync contention: sync skipped because another was already running (bottleneck detection)
-- LogWatcher recovery: file replaced, missed bytes, polling errors (monitoring health)
+- LogWatcher recovery: file replaced, missed bytes, polling errors (monitoring health) — **coalesced into episodes**: the first event of a run emits `LogWatcher recovery: <reason>` immediately, further events within a 60s quiet window are folded into a single `LogWatcher recovery episode ended: <reason>` carrying `logwatcher.recovery_count`, `logwatcher.missed_bytes`, and `logwatcher.episode_duration_seconds`. The `synctray.logwatcher.recovery` counter still records **every** event, so the true rate is unaffected. A single-event episode emits no summary.
 - Stale lock cleanup: count and type of stale locks cleaned at startup (crash detection)
 - Check phase duration: bisync listing/comparison phase timing (bottleneck analysis)
 - Session heartbeat: periodic (5min) alive signal with profile state summary (availability)

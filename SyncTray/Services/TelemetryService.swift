@@ -1219,11 +1219,46 @@ final class TelemetryService {
 
     // MARK: - LogWatcher Recovery
 
+    /// Quiet period after which a run of recovery events is considered finished.
+    /// A recovery arriving within this window of the previous one joins the same episode.
+    private static let recoveryEpisodeQuietWindow: TimeInterval = 60
+
+    /// An in-flight run of recovery events for one (reason, profile) pair.
+    ///
+    /// A recovery loop fires continuously while its underlying cause persists — a log
+    /// file being appended to faster than the watcher polls produces one `missed_bytes`
+    /// detection per poll, for as long as the writer stays ahead. Emitting a WARN per
+    /// detection turns a single condition into thousands of identical records that say
+    /// nothing the first one didn't. An episode collapses that run into two records:
+    /// the leading edge (emitted immediately, so a genuine one-off is never delayed)
+    /// and a summary once the run goes quiet (carrying the count and totals).
+    private struct RecoveryEpisode {
+        var count: Int
+        var totalBytes: UInt64
+        var startedAt: Date
+        var summaryWorkItem: DispatchWorkItem?
+    }
+
+    /// Keyed by `"<reason>|<profileName>"`. Guarded by `recoveryEpisodeLock`.
+    private var recoveryEpisodes: [String: RecoveryEpisode] = [:]
+    private let recoveryEpisodeLock = NSLock()
+
     /// Record LogWatcher recovery events (file reopen, missed bytes, polling fallback).
     /// Frequent recoveries may indicate file system reliability issues.
+    ///
+    /// The counter metric records **every** event — it is pre-aggregated, so volume costs
+    /// nothing there and the true rate stays visible. Log records are coalesced per
+    /// episode (see `RecoveryEpisode`): the first event emits immediately, the rest are
+    /// folded into one summary emitted once the episode goes quiet.
+    ///
+    /// - Parameter missedBytes: Bytes the watcher had to catch up on, for the
+    ///   `missed_bytes` reason. Carried so the summary can answer *how far behind*
+    ///   the watcher fell, which is the number that distinguishes a benign catch-up
+    ///   from a watcher that cannot keep up with its writer.
     func recordLogWatcherRecovery(
         reason: String,     // "file_replaced", "missed_bytes", "polling_error"
-        profileName: String
+        profileName: String,
+        missedBytes: UInt64 = 0
     ) {
         guard SyncTraySettings.telemetryEnabled else { return }
         ensureSetup()
@@ -1232,13 +1267,100 @@ final class TelemetryService {
             "logwatcher.recovery_reason": .string(reason),
         ])
 
+        let key = "\(reason)|\(profileName)"
+
+        recoveryEpisodeLock.lock()
+
+        if var episode = recoveryEpisodes[key] {
+            // Mid-episode: fold in and reschedule the summary. No log record here —
+            // this is the path that used to produce the storm.
+            episode.count += 1
+            episode.totalBytes += missedBytes
+            episode.summaryWorkItem?.cancel()
+            episode.summaryWorkItem = scheduleRecoveryEpisodeSummary(
+                key: key,
+                reason: reason,
+                profileName: profileName
+            )
+            recoveryEpisodes[key] = episode
+            recoveryEpisodeLock.unlock()
+            return
+        }
+
+        // Leading edge of a new episode.
+        recoveryEpisodes[key] = RecoveryEpisode(
+            count: 1,
+            totalBytes: missedBytes,
+            startedAt: Date(),
+            summaryWorkItem: scheduleRecoveryEpisodeSummary(
+                key: key,
+                reason: reason,
+                profileName: profileName
+            )
+        )
+        recoveryEpisodeLock.unlock()
+
+        var attributes: [String: AttributeValue] = [
+            "synctray.profile.name": .string(profileName),
+            "logwatcher.recovery_reason": .string(reason),
+        ]
+        if missedBytes > 0 {
+            attributes["logwatcher.missed_bytes"] = .int(Int(clamping: missedBytes))
+        }
+
         emitLog(
             severity: .warn,
             body: "LogWatcher recovery: \(reason)",
-            attributes: [
-                "synctray.profile.name": .string(profileName),
-                "logwatcher.recovery_reason": .string(reason),
-            ]
+            attributes: attributes
+        )
+    }
+
+    /// Schedule the end-of-episode summary. Caller must hold `recoveryEpisodeLock`.
+    private func scheduleRecoveryEpisodeSummary(
+        key: String,
+        reason: String,
+        profileName: String
+    ) -> DispatchWorkItem {
+        let workItem = DispatchWorkItem { [weak self] in
+            self?.flushRecoveryEpisode(key: key, reason: reason, profileName: profileName)
+        }
+        DispatchQueue.global(qos: .utility).asyncAfter(
+            deadline: .now() + Self.recoveryEpisodeQuietWindow,
+            execute: workItem
+        )
+        return workItem
+    }
+
+    /// Emit the summary for a finished episode and drop its state.
+    ///
+    /// A single-event episode emits nothing — the leading-edge record already said
+    /// everything, and a summary of one would just double the volume we set out to cut.
+    private func flushRecoveryEpisode(key: String, reason: String, profileName: String) {
+        recoveryEpisodeLock.lock()
+        guard let episode = recoveryEpisodes.removeValue(forKey: key) else {
+            recoveryEpisodeLock.unlock()
+            return
+        }
+        recoveryEpisodeLock.unlock()
+
+        guard episode.count > 1 else { return }
+
+        var attributes: [String: AttributeValue] = [
+            "synctray.profile.name": .string(profileName),
+            "logwatcher.recovery_reason": .string(reason),
+            "logwatcher.recovery_count": .int(episode.count),
+            "logwatcher.episode_duration_seconds": .int(
+                Int(Date().timeIntervalSince(episode.startedAt).rounded())
+            ),
+        ]
+        if episode.totalBytes > 0 {
+            attributes["logwatcher.missed_bytes"] = .int(Int(clamping: episode.totalBytes))
+        }
+
+        emitLog(
+            severity: .warn,
+            body: "LogWatcher recovery episode ended: \(reason)",
+            attributes: attributes
         )
     }
 
