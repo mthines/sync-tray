@@ -12,8 +12,20 @@ import CryptoKit
 final class ConfigSelfWriteRegistry {
     static let shared = ConfigSelfWriteRegistry()
 
-    private var pending: Set<String> = []
+    /// Pending self-write hashes → the time each was noted. Self-bounding:
+    /// entries are never guaranteed to be consumed (FSEvents coalesce, and each
+    /// `save()` rewrites EVERY profile file so rapid self-writes can leave
+    /// hashes no matching event ever claims). Two bounds keep this from growing
+    /// without limit — a 30s TTL (far larger than the ~1s debounce + FSEvents
+    /// latency, so a legitimate echo is never evicted before it arrives) and a
+    /// 512-entry hard cap evicting oldest-first.
+    private var pending: [String: Date] = [:]
     private let lock = NSLock()
+
+    /// Entries older than this are evicted on the next mutation.
+    private let ttl: TimeInterval = 30
+    /// Hard cap on retained entries; oldest are evicted first once exceeded.
+    private let maxEntries = 512
 
     private init() {}
 
@@ -27,18 +39,36 @@ final class ConfigSelfWriteRegistry {
     func noteSelfWrite(contentHash: String) {
         lock.lock()
         defer { lock.unlock() }
-        pending.insert(contentHash)
+        pending[contentHash] = Date()
+        evictStaleLocked(now: Date())
     }
 
     /// Returns true (and CONSUMES the entry) if this content hash matches a
     /// recently self-written file. Consuming avoids a stale hash silently
     /// suppressing a later, genuinely external edit that happens to produce
     /// identical bytes (e.g. a hand-edit that toggles a field back to the
-    /// value SyncTray itself last wrote).
+    /// value SyncTray itself last wrote). Also opportunistically evicts stale
+    /// entries so an unconsumed hash can never accumulate.
     func consumeIfSelfWrite(contentHash: String) -> Bool {
         lock.lock()
         defer { lock.unlock() }
-        return pending.remove(contentHash) != nil
+        let hit = pending.removeValue(forKey: contentHash) != nil
+        evictStaleLocked(now: Date())
+        return hit
+    }
+
+    /// Evict entries past their TTL, then enforce the entry cap by removing the
+    /// oldest first. Caller must hold `lock`.
+    private func evictStaleLocked(now: Date) {
+        for (hash, noted) in pending where now.timeIntervalSince(noted) > ttl {
+            pending.removeValue(forKey: hash)
+        }
+        guard pending.count > maxEntries else { return }
+        let overflow = pending.count - maxEntries
+        let oldest = pending.sorted { $0.value < $1.value }.prefix(overflow)
+        for (hash, _) in oldest {
+            pending.removeValue(forKey: hash)
+        }
     }
 }
 
