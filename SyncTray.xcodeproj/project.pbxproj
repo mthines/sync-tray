@@ -32,14 +32,21 @@
 		A11111110000000000000017 /* Formatters.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000017 /* Formatters.swift */; };
 		A11111110000000000000018 /* ProfileDetailView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000018 /* ProfileDetailView.swift */; };
 		A11111110000000000000019 /* AppSettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000019 /* AppSettingsView.swift */; };
+		A8048FF52AC46AD7139A2000 /* ConfigFileWatcher.swift in Sources */ = {isa = PBXBuildFile; fileRef = 75E6545555EB74D6B9B97A02 /* ConfigFileWatcher.swift */; };
 		AB12CD34EF56789012340001 /* AddRemoteSheet.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB12CD34EF56789012340002 /* AddRemoteSheet.swift */; };
+		AF1148C620DEEB255ED5697E /* profile.schema.json in Resources */ = {isa = PBXBuildFile; fileRef = 0A584CD77E2D28463C2BCE08 /* profile.schema.json */; };
+		CD8DBB07353E3912253F60F6 /* settings.schema.json in Resources */ = {isa = PBXBuildFile; fileRef = 58F65D759543D11557E77A58 /* settings.schema.json */; };
 		D1AA48876BFD939152611C3A /* RemoteProvider.swift in Sources */ = {isa = PBXBuildFile; fileRef = A50EAC070BD6E49AA1131944 /* RemoteProvider.swift */; };
 		D347B9A6D156102131579DED /* SetupWizardView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8DF29F3BB633D9E3DD12136A /* SetupWizardView.swift */; };
 		E1A0B1C2D3E4F56789AB0001 /* VFSCacheService.swift in Sources */ = {isa = PBXBuildFile; fileRef = E1A0B1C2D3E4F56789AB0002 /* VFSCacheService.swift */; };
 		E1A0B1C2D3E4F56789AB0003 /* OfflineFilesSection.swift in Sources */ = {isa = PBXBuildFile; fileRef = E1A0B1C2D3E4F56789AB0004 /* OfflineFilesSection.swift */; };
 		E1A0B1C2D3E4F56789AB0005 /* TelemetryOptInBanner.swift in Sources */ = {isa = PBXBuildFile; fileRef = E1A0B1C2D3E4F56789AB0006 /* TelemetryOptInBanner.swift */; };
 		E1A0B1C2D3E4F56789AB0007 /* TelemetryDetailsSheet.swift in Sources */ = {isa = PBXBuildFile; fileRef = E1A0B1C2D3E4F56789AB0008 /* TelemetryDetailsSheet.swift */; };
+		E98B9E367273424F260154CC /* ConfigReconciler.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5AD2D42E871A6CC074379689 /* ConfigReconciler.swift */; };
 		F2B3C4D5E6F7089012AB0001 /* MigrationRunner.swift in Sources */ = {isa = PBXBuildFile; fileRef = F2B3C4D5E6F7089012AB0002 /* MigrationRunner.swift */; };
+		F9268603C9EA887930F58C52 /* ConfigSchemaInstaller.swift in Sources */ = {isa = PBXBuildFile; fileRef = C537381AA63EEF38035C8CA0 /* ConfigSchemaInstaller.swift */; };
+		FC42AD91FD4C3FCBE784DE4F /* AppSettingsFileStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 48C81844C44AA7C559B6730B /* AppSettingsFileStore.swift */; };
+		FC6298CE8767141C78EB8D75 /* ConfigSelfTest.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7F52EB2FA3D07D3E970F226D /* ConfigSelfTest.swift */; };
 		FS000000000000000000B001 /* FinderSyncExtension.swift in Sources */ = {isa = PBXBuildFile; fileRef = FS000000000000000000A001 /* FinderSyncExtension.swift */; };
 		FS000000000000000000B002 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = FS000000000000000000A002 /* Assets.xcassets */; };
 		FS000000000000000000B003 /* SyncTrayFinderSync.appex in Embed App Extensions */ = {isa = PBXBuildFile; fileRef = FS000000000000000000A003 /* SyncTrayFinderSync.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
@@ -74,9 +81,14 @@
 /* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFileReference section */
-		FSCFG00000000000000000001 /* Signing.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; path = Config/Signing.xcconfig; sourceTree = SOURCE_ROOT; };
+		0A584CD77E2D28463C2BCE08 /* profile.schema.json */ = {isa = PBXFileReference; includeInIndex = 1; path = profile.schema.json; sourceTree = "<group>"; };
 		406416A46963E44FF701814B /* SyncMode.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = SyncMode.swift; sourceTree = "<group>"; };
+		48C81844C44AA7C559B6730B /* AppSettingsFileStore.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = AppSettingsFileStore.swift; sourceTree = "<group>"; };
+		58F65D759543D11557E77A58 /* settings.schema.json */ = {isa = PBXFileReference; includeInIndex = 1; path = settings.schema.json; sourceTree = "<group>"; };
+		5AD2D42E871A6CC074379689 /* ConfigReconciler.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = ConfigReconciler.swift; sourceTree = "<group>"; };
+		75E6545555EB74D6B9B97A02 /* ConfigFileWatcher.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = ConfigFileWatcher.swift; sourceTree = "<group>"; };
 		77CC26F6DC209C0F0B6626D7 /* ProviderFieldsView.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = ProviderFieldsView.swift; sourceTree = "<group>"; };
+		7F52EB2FA3D07D3E970F226D /* ConfigSelfTest.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = ConfigSelfTest.swift; sourceTree = "<group>"; };
 		8DF29F3BB633D9E3DD12136A /* SetupWizardView.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = SetupWizardView.swift; sourceTree = "<group>"; };
 		A10000000000000000000001 /* SyncTrayApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SyncTrayApp.swift; sourceTree = "<group>"; };
 		A10000000000000000000002 /* SyncState.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SyncState.swift; sourceTree = "<group>"; };
@@ -106,6 +118,7 @@
 		A50EAC070BD6E49AA1131944 /* RemoteProvider.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = RemoteProvider.swift; sourceTree = "<group>"; };
 		AB12CD34EF56789012340002 /* AddRemoteSheet.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = AddRemoteSheet.swift; sourceTree = "<group>"; };
 		C0DC6141FBB853681643F593 /* RcloneConfigService.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = RcloneConfigService.swift; sourceTree = "<group>"; };
+		C537381AA63EEF38035C8CA0 /* ConfigSchemaInstaller.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = ConfigSchemaInstaller.swift; sourceTree = "<group>"; };
 		E1A0B1C2D3E4F56789AB0002 /* VFSCacheService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VFSCacheService.swift; sourceTree = "<group>"; };
 		E1A0B1C2D3E4F56789AB0004 /* OfflineFilesSection.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OfflineFilesSection.swift; sourceTree = "<group>"; };
 		E1A0B1C2D3E4F56789AB0006 /* TelemetryOptInBanner.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TelemetryOptInBanner.swift; sourceTree = "<group>"; };
@@ -116,6 +129,7 @@
 		FS000000000000000000A003 /* SyncTrayFinderSync.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = SyncTrayFinderSync.appex; sourceTree = BUILT_PRODUCTS_DIR; };
 		FS000000000000000000A004 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 		FS000000000000000000A005 /* SyncTrayFinderSync.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = SyncTrayFinderSync.entitlements; sourceTree = "<group>"; };
+		FSCFG00000000000000000001 /* Signing.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; path = Config/Signing.xcconfig; sourceTree = SOURCE_ROOT; };
 		OT00000000000000000000A1 /* TelemetryService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TelemetryService.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
@@ -140,6 +154,16 @@
 /* End PBXFrameworksBuildPhase section */
 
 /* Begin PBXGroup section */
+		26D88136031BD0C67C1382F3 /* Schemas */ = {
+			isa = PBXGroup;
+			children = (
+				0A584CD77E2D28463C2BCE08 /* profile.schema.json */,
+				58F65D759543D11557E77A58 /* settings.schema.json */,
+			);
+			name = Schemas;
+			path = Schemas;
+			sourceTree = "<group>";
+		};
 		42ECE8D209B7A77B61EABA9B /* Wizard */ = {
 			isa = PBXGroup;
 			children = (
@@ -170,6 +194,7 @@
 				A13000000000000000000004 /* Services */,
 				A13000000000000000000005 /* Views */,
 				A13000000000000000000007 /* Utilities */,
+				D3B760558F1453233A7DE148 /* Resources */,
 			);
 			path = SyncTray;
 			sourceTree = "<group>";
@@ -201,6 +226,11 @@
 				E1A0B1C2D3E4F56789AB0002 /* VFSCacheService.swift */,
 				F2B3C4D5E6F7089012AB0002 /* MigrationRunner.swift */,
 				OT00000000000000000000A1 /* TelemetryService.swift */,
+				48C81844C44AA7C559B6730B /* AppSettingsFileStore.swift */,
+				75E6545555EB74D6B9B97A02 /* ConfigFileWatcher.swift */,
+				C537381AA63EEF38035C8CA0 /* ConfigSchemaInstaller.swift */,
+				5AD2D42E871A6CC074379689 /* ConfigReconciler.swift */,
+				7F52EB2FA3D07D3E970F226D /* ConfigSelfTest.swift */,
 			);
 			path = Services;
 			sourceTree = "<group>";
@@ -247,6 +277,15 @@
 				E1A0B1C2D3E4F56789AB0008 /* TelemetryDetailsSheet.swift */,
 			);
 			path = Settings;
+			sourceTree = "<group>";
+		};
+		D3B760558F1453233A7DE148 /* Resources */ = {
+			isa = PBXGroup;
+			children = (
+				26D88136031BD0C67C1382F3 /* Schemas */,
+			);
+			name = Resources;
+			path = Resources;
 			sourceTree = "<group>";
 		};
 		FS000000000000000000D001 /* SyncTrayFinderSync */ = {
@@ -351,6 +390,8 @@
 			buildActionMask = 2147483647;
 			files = (
 				A11111110000000000000010 /* Assets.xcassets in Resources */,
+				AF1148C620DEEB255ED5697E /* profile.schema.json in Resources */,
+				CD8DBB07353E3912253F60F6 /* settings.schema.json in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -424,6 +465,11 @@
 				E1A0B1C2D3E4F56789AB0007 /* TelemetryDetailsSheet.swift in Sources */,
 				F2B3C4D5E6F7089012AB0001 /* MigrationRunner.swift in Sources */,
 				OT00000000000000000000B1 /* TelemetryService.swift in Sources */,
+				FC42AD91FD4C3FCBE784DE4F /* AppSettingsFileStore.swift in Sources */,
+				A8048FF52AC46AD7139A2000 /* ConfigFileWatcher.swift in Sources */,
+				F9268603C9EA887930F58C52 /* ConfigSchemaInstaller.swift in Sources */,
+				E98B9E367273424F260154CC /* ConfigReconciler.swift in Sources */,
+				FC6298CE8767141C78EB8D75 /* ConfigSelfTest.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

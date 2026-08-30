@@ -8,11 +8,29 @@ struct SyncTrayApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
 
     init() {
+        // `--self-test` runs the host self-test suite (schema/round-trip/
+        // migration/reconcile/self-write/isolated-login assertions) and exits
+        // immediately — never launches the SwiftUI app. Checked before any
+        // other init work so the self-test never touches real user data.
+        // ConfigSelfTest is #if DEBUG only (no XCTest target; see CLAUDE.md).
+        #if DEBUG
+        if CommandLine.arguments.contains("--self-test") {
+            let exitCode = ConfigSelfTest.run()
+            exit(exitCode)
+        }
+        #endif
+
         // Run any pending data migrations before loading profiles
         MigrationRunner.runPendingMigrations()
 
         // Initialize telemetry (no-op if disabled)
         TelemetryService.shared.configure()
+
+        // Ship the committed JSON Schemas into ~/.config/synctray/schema/ so
+        // ~/.config/synctray is a valid, agent-editable surface from the very
+        // first launch. Also ensures the config directory itself exists
+        // before SyncManager starts its config watcher.
+        ConfigSchemaInstaller.writeSchemas()
 
         // Create the sync manager
         let manager = SyncManager()

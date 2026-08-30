@@ -121,6 +121,7 @@ struct AppSettingsView: View {
                     TelemetryService.shared.recordSettingChanged(name: "telemetry", enabled: false)
                     SyncTraySettings.telemetryEnabled = newValue
                 }
+                syncManager.refreshSettingsFile()
             }
 
             Button("Learn more") {
@@ -149,6 +150,7 @@ struct AppSettingsView: View {
         .onChange(of: autoFixSyncIssues) { newValue in
             SyncTraySettings.autoFixSyncIssues = newValue
             TelemetryService.shared.recordSettingChanged(name: "auto_fix", enabled: newValue)
+            syncManager.refreshSettingsFile()
         }
     }
 
@@ -166,6 +168,7 @@ struct AppSettingsView: View {
         .onChange(of: debugLogging) { newValue in
             SyncTraySettings.debugLoggingEnabled = newValue
             TelemetryService.shared.recordSettingChanged(name: "debug_logging", enabled: newValue)
+            syncManager.refreshSettingsFile()
         }
     }
 

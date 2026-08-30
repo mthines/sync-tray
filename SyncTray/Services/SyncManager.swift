@@ -50,6 +50,9 @@ final class SyncManager: ObservableObject {
 
     private var logWatchers: [UUID: LogWatcher] = [:]
     private var directoryWatchers: [UUID: DirectoryWatcher] = [:]
+    /// Watches ~/.config/synctray for external edits to *.profile.json and
+    /// settings.json and routes them through the reconcile path below.
+    private var configFileWatcher: ConfigFileWatcher?
     // What last kicked off a sync per profile (manual | directory_watch | startup), consumed
     // and cleared by the `.syncStarted` handler to attribute `sync.trigger`. Absent = scheduled.
     private var pendingSyncTrigger: [UUID: String] = [:]
@@ -146,9 +149,14 @@ final class SyncManager: ObservableObject {
         mountProfilesAtStartup()
         setupFinderSyncIPC()
         updateAppGroupMountPaths()
+        refreshSettingsFile()
+        startConfigWatcher()
     }
 
     deinit {
+        configFileWatcher?.stop()
+        configFileWatcher = nil
+
         // Cancel heartbeat timer
         heartbeatTimer?.cancel()
         heartbeatTimer = nil
@@ -453,6 +461,7 @@ final class SyncManager: ObservableObject {
             do {
                 try SMAppService.mainApp.register()
                 objectWillChange.send()  // Notify SwiftUI to update UI
+                refreshSettingsFile()
             } catch {
                 print("Failed to register login item: \(error)")
             }
@@ -464,6 +473,7 @@ final class SyncManager: ObservableObject {
             do {
                 try SMAppService.mainApp.unregister()
                 objectWillChange.send()  // Notify SwiftUI to update UI
+                refreshSettingsFile()
             } catch {
                 print("Failed to unregister login item: \(error)")
             }
@@ -502,6 +512,133 @@ final class SyncManager: ObservableObject {
         }
 
         updateAggregateState()
+    }
+
+    // MARK: - External Config Reconcile
+
+    /// Start watching `~/.config/synctray` for external edits. No-op if the
+    /// directory doesn't exist yet (the app ensures it exists at launch via
+    /// `ConfigSchemaInstaller.writeSchemas()`, called before `SyncManager` is created).
+    private func startConfigWatcher() {
+        let watcher = ConfigFileWatcher(
+            onProfileChange: { [weak self] path in
+                Task { @MainActor in self?.applyExternalProfileEdit(fromFileAt: path) }
+            },
+            onSettingsChange: { [weak self] in
+                Task { @MainActor in self?.applyExternalSettingsEdit() }
+            }
+        )
+        watcher.start()
+        configFileWatcher = watcher
+    }
+
+    /// Rewrite `settings.json` from the current `SyncTraySettings` state.
+    /// Call after any UI-driven change to a safe key so the file stays in
+    /// sync with the app (the write notes its own hash, so the watcher
+    /// ignores the FSEvent it produces).
+    func refreshSettingsFile() {
+        AppSettingsFileStore.writeSettingsFile(isLoginItemEnabled: isLoginItemEnabled)
+    }
+
+    /// Apply an external edit to a `*.profile.json` file, routing through the
+    /// SAME install/uninstall/reinstall reconcile the Save button uses —
+    /// never a bare in-memory struct swap, so the running launchd agent is
+    /// never left stale.
+    ///
+    /// A decode failure (half-written file, or a profile id that doesn't
+    /// match anything SyncTray knows about) is a silent no-op: a half-written
+    /// file will complete and re-trigger; an unknown id is logged and ignored
+    /// rather than treated as a new profile (creating profiles is a UI action).
+    func applyExternalProfileEdit(fromFileAt path: String) {
+        guard let data = FileManager.default.contents(atPath: path),
+              let updatedProfile = try? JSONDecoder().decode(SyncProfile.self, from: data) else {
+            SyncTraySettings.debugLog("[ConfigFileWatcher] Failed to decode external profile edit at \(path); skipping")
+            return
+        }
+
+        guard let currentProfile = profileStore.profile(for: updatedProfile.id) else {
+            SyncTraySettings.debugLog("[ConfigFileWatcher] External profile edit at \(path) references an unknown profile id; ignoring")
+            return
+        }
+
+        let action = Self.reconcileAction(from: currentProfile, to: updatedProfile)
+
+        profileStore.update(updatedProfile)
+        clearError(for: updatedProfile.id)
+
+        switch action {
+        case .none:
+            break
+
+        case .install:
+            do {
+                try setupService.install(profile: updatedProfile)
+                startWatching(profile: updatedProfile)
+            } catch {
+                print("Failed to install externally-edited profile: \(error)")
+            }
+
+        case .uninstall:
+            do {
+                try setupService.uninstall(profile: updatedProfile)
+                stopWatching(profileId: updatedProfile.id)
+            } catch {
+                print("Failed to uninstall externally-edited profile: \(error)")
+            }
+
+        case .reinstall:
+            do {
+                try setupService.uninstall(profile: updatedProfile)
+            } catch {
+                // Ignore uninstall errors, matching ProfileDetailView.reinstallSync.
+            }
+            do {
+                try setupService.install(profile: updatedProfile)
+                startWatching(profile: updatedProfile)
+            } catch {
+                print("Failed to reinstall externally-edited profile: \(error)")
+            }
+        }
+
+        updateAggregateState()
+        TelemetryService.shared.recordExternalConfigEdit(kind: "profile")
+    }
+
+    /// Apply an external edit to `settings.json`. Safe keys apply directly;
+    /// `launchAtLogin` goes through `SettingsReconciler`'s ISOLATED path so an
+    /// `SMAppService` failure can never corrupt anything else.
+    func applyExternalSettingsEdit() {
+        let safeSettings = AppSettingsFileStore.readSafeSettings()
+
+        SettingsReconciler.apply(
+            safeSettings: safeSettings,
+            applySafeKey: { key, value in
+                switch key {
+                case .debugLoggingEnabled:
+                    SyncTraySettings.debugLoggingEnabled = value
+                case .autoFixSyncIssues:
+                    SyncTraySettings.autoFixSyncIssues = value
+                case .telemetryEnabled:
+                    SyncTraySettings.telemetryEnabled = value
+                case .launchAtLogin:
+                    break  // handled by the isolated path below
+                }
+            },
+            currentLoginItemEnabled: { [weak self] in self?.isLoginItemEnabled ?? false },
+            applyLoginItem: { [weak self] enabled in
+                guard let self else { return }
+                if #available(macOS 13.0, *) {
+                    if enabled {
+                        try SMAppService.mainApp.register()
+                    } else {
+                        try SMAppService.mainApp.unregister()
+                    }
+                }
+                self.objectWillChange.send()
+            }
+        )
+
+        TelemetryService.shared.recordExternalConfigEdit(kind: "settings")
     }
 
     /// Get state for a specific profile

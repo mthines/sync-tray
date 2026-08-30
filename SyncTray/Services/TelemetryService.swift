@@ -114,6 +114,7 @@ final class TelemetryService {
     private var settingChangedCounter: LongCounterSdk?
     private var offlineExtensionSetupCounter: LongCounterSdk?
     private var offlineCacheClearCounter: LongCounterSdk?
+    private var externalConfigEditCounter: LongCounterSdk?
 
     // MARK: - Providers (kept alive for shutdown)
 
@@ -382,6 +383,12 @@ final class TelemetryService {
         offlineCacheClearCounter = meter
             .counterBuilder(name: "synctray.offline.cache_clear")
             .setDescription("Cache clear operations by whether pinned folders were preserved")
+            .setUnit("1")
+            .build()
+
+        externalConfigEditCounter = meter
+            .counterBuilder(name: "synctray.config.external_edit")
+            .setDescription("Live external edits to ~/.config/synctray files applied through the reconcile path, by kind (profile, settings)")
             .setUnit("1")
             .build()
     }
@@ -1172,6 +1179,22 @@ final class TelemetryService {
         ]
         settingChangedCounter?.add(value: 1, attribute: attrs)
         emitLog(severity: .info, body: "Setting changed", attributes: attrs)
+    }
+
+    // MARK: - External Config Edit
+
+    /// Record a live external edit to a `~/.config/synctray` file (a
+    /// `*.profile.json` or `settings.json`) that was applied through the
+    /// reconcile path. `kind` is bounded ("profile" | "settings"); the
+    /// attribute set never includes a filesystem path, remote name, or
+    /// credential — only the low-cardinality kind.
+    func recordExternalConfigEdit(kind: String) {
+        guard SyncTraySettings.telemetryEnabled else { return }
+        ensureSetup()
+
+        let attrs: [String: AttributeValue] = ["config.edit_kind": .string(kind)]
+        externalConfigEditCounter?.add(value: 1, attribute: attrs)
+        emitLog(severity: .info, body: "External config edit applied", attributes: attrs)
     }
 
     // MARK: - Offline Extension Setup Funnel

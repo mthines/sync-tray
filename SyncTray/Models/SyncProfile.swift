@@ -62,6 +62,15 @@ struct SyncProfile: Identifiable, Codable, Equatable {
         "\(Self.configDirectory)/\(shortId).json"
     }
 
+    /// NEW authoritative per-profile file carrying the FULL `SyncProfile`
+    /// (including fields the derived `configPath` JSON omits: `isEnabled`,
+    /// `isMuted`, `mountAtStartup`). This is the external-agent-editable
+    /// surface; `configPath` remains the derived, frozen subset the sync
+    /// script reads and stays byte-for-byte unchanged.
+    var profileFilePath: String {
+        "\(Self.configDirectory)/\(shortId).profile.json"
+    }
+
     /// Profile-specific launchd plist
     var plistPath: String {
         "\(NSHomeDirectory())/Library/LaunchAgents/com.synctray.sync.\(shortId).plist"

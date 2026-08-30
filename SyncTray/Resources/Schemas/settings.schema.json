@@ -1,0 +1,30 @@
+{
+  "$id": "https://synctray.app/schema/settings.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "SyncTray global settings file",
+  "description": "Global app settings (~/.config/synctray/settings.json). Mirrors ONLY the safe, enumerated subset of SyncTraySettings — see AppSettingsFileStore.SafeKey. Never contains secrets or telemetry identifiers (installationId, anonymousUserId).",
+  "type": "object",
+  "properties": {
+    "$schema": {
+      "type": "string",
+      "description": "Reference to this schema file. Written automatically; safe to ignore."
+    },
+    "debugLoggingEnabled": {
+      "type": "boolean",
+      "description": "Verbose debug logging for file watchers and sync triggers."
+    },
+    "autoFixSyncIssues": {
+      "type": "boolean",
+      "description": "Automatically run --resync when bisync detects an out-of-sync state."
+    },
+    "telemetryEnabled": {
+      "type": "boolean",
+      "description": "Opt-in anonymous OpenTelemetry usage reporting."
+    },
+    "launchAtLogin": {
+      "type": "boolean",
+      "description": "Whether SyncTray starts automatically at login (SMAppService login item)."
+    }
+  },
+  "additionalProperties": false
+}

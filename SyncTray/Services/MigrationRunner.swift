@@ -44,6 +44,7 @@ enum MigrationRunner {
     private static let migrations: [ProfileMigration] = [
         MigrationV1LegacyToMultiProfile(),
         MigrationV2FixVFSCachePath(),
+        MigrationV3BlobToPerProfileFiles(),
     ]
 
     /// Run all pending migrations. Call this once at app startup,
@@ -99,7 +100,10 @@ enum MigrationRunner {
 
     // MARK: - Helpers for migrations
 
-    /// Read the profile array from UserDefaults as raw dictionaries
+    /// Read the profile array from UserDefaults as raw dictionaries.
+    /// Internal (not private) so `ConfigSelfTest` can seed/inspect an isolated
+    /// `UserDefaults` suite when exercising `MigrationV3BlobToPerProfileFiles`
+    /// without touching `UserDefaults.standard`.
     static func readProfileDicts(from defaults: UserDefaults) -> [[String: Any]]? {
         guard let data = defaults.data(forKey: profilesKey) else { return nil }
         return try? JSONSerialization.jsonObject(with: data) as? [[String: Any]]
@@ -245,5 +249,67 @@ struct MigrationV2FixVFSCachePath: ProfileMigration {
             return String(path.dropLast(4)) // Remove "/vfs"
         }
         return path
+    }
+}
+
+// MARK: - Migration V3: Blob → Per-Profile Files
+
+/// Migrates the single `syncProfiles` UserDefaults blob to per-profile
+/// `{shortId}.profile.json` files — the new authoritative, agent-editable
+/// surface (see `ProfileStore`).
+///
+/// The blob is intentionally RETAINED (never deleted) as a write-only mirror
+/// for one release: an older build can still read it back for rollback
+/// safety, and because `ProfileStore.load()` only ever reads the blob when NO
+/// per-profile files exist, retaining it can never create a split-brain.
+///
+/// Idempotent: if per-profile files already exist (e.g. this migration
+/// already ran, or a fresh install started directly on the file-backed
+/// format), this is a no-op.
+struct MigrationV3BlobToPerProfileFiles: ProfileMigration {
+    let version = 3
+    let description = "Migrate syncProfiles blob to per-profile .profile.json files (blob retained, write-only)"
+
+    /// Overridable for self-test isolation; defaults to the real profiles directory.
+    var profilesDirectoryOverride: String?
+
+    private var profilesDirectory: String { profilesDirectoryOverride ?? SyncProfile.configDirectory }
+
+    func migrateUserDefaults(_ defaults: UserDefaults) throws {
+        guard let profileDicts = MigrationRunner.readProfileDicts(from: defaults), !profileDicts.isEmpty else {
+            return
+        }
+
+        if Self.hasExistingProfileFiles(in: profilesDirectory) {
+            return
+        }
+
+        try Self.writeProfileFiles(from: profileDicts, to: profilesDirectory)
+        // The blob is deliberately NOT removed here — see type doc.
+    }
+
+    /// True if any `*.profile.json` file already exists in `directory`.
+    static func hasExistingProfileFiles(in directory: String) -> Bool {
+        guard let files = try? FileManager.default.contentsOfDirectory(atPath: directory) else { return false }
+        return files.contains { $0.hasSuffix(".profile.json") }
+    }
+
+    /// Write one `{shortId}.profile.json` per dictionary in `profileDicts`.
+    /// Internal (not private) so `ConfigSelfTest` can exercise it directly
+    /// against a temp directory, independent of `UserDefaults`.
+    static func writeProfileFiles(from profileDicts: [[String: Any]], to directory: String) throws {
+        try FileManager.default.createDirectory(atPath: directory, withIntermediateDirectories: true)
+
+        for var dict in profileDicts {
+            guard let idString = dict["id"] as? String else { continue }
+            let shortId = String(idString.prefix(8)).lowercased()
+            dict["$schema"] = "../schema/profile.schema.json"
+
+            guard let data = try? JSONSerialization.data(
+                withJSONObject: dict, options: [.prettyPrinted, .sortedKeys]) else { continue }
+
+            let path = "\(directory)/\(shortId).profile.json"
+            try data.write(to: URL(fileURLWithPath: path), options: .atomic)
+        }
     }
 }
