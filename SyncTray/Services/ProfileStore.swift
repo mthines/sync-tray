@@ -95,12 +95,20 @@ final class ProfileStore: ObservableObject {
 
     /// Write every profile to its `{shortId}.profile.json`, noting the content
     /// hash of each write in `ConfigSelfWriteRegistry` so `ConfigFileWatcher`
-    /// suppresses the FSEvent this write produces.
+    /// suppresses the FSEvent this write produces. After writing the in-memory
+    /// profiles, PRUNES any orphaned `*.profile.json` (a shortId no longer in
+    /// `profiles`) so the file-authoritative `load()` can never resurrect a
+    /// deleted profile. The prune only touches the `*.profile.json` suffix —
+    /// never the derived `{shortId}.json`, the exclude filter, or `schema/`.
+    /// A pruned file generates an FSEvent, but `ConfigFileWatcher.shouldReconcile`
+    /// returns false for a missing file and `classify` only reacts to existing
+    /// `.profile.json` changes, so pruning is safe with the watcher.
     private func writeProfileFiles() {
         let fm = FileManager.default
         guard (try? fm.createDirectory(
             atPath: profilesDirectory, withIntermediateDirectories: true)) != nil else { return }
 
+        var writtenFilenames: Set<String> = []
         for profile in profiles {
             guard var dict = try? encodeProfileDict(profile) else { continue }
             // Relative to profilesDirectory (".../profiles"), the schema lives
@@ -110,13 +118,29 @@ final class ProfileStore: ObservableObject {
             guard let data = try? JSONSerialization.data(
                 withJSONObject: dict, options: [.prettyPrinted, .sortedKeys]) else { continue }
 
-            let path = "\(profilesDirectory)/\(profile.shortId).profile.json"
+            let filename = "\(profile.shortId).profile.json"
+            let path = "\(profilesDirectory)/\(filename)"
             do {
                 try data.write(to: URL(fileURLWithPath: path), options: .atomic)
+                writtenFilenames.insert(filename)
                 ConfigSelfWriteRegistry.shared.noteSelfWrite(contentHash: ConfigSelfWriteRegistry.hash(data))
             } catch {
                 print("Failed to write profile file for \(profile.shortId): \(error)")
             }
+        }
+
+        pruneOrphanProfileFiles(keeping: writtenFilenames)
+    }
+
+    /// Remove any `*.profile.json` in `profilesDirectory` not in `keep`
+    /// (self-healing against orphans left by an interrupted delete or an
+    /// externally-dropped file). Only files matching the `.profile.json`
+    /// suffix are ever removed.
+    private func pruneOrphanProfileFiles(keeping keep: Set<String>) {
+        let fm = FileManager.default
+        guard let files = try? fm.contentsOfDirectory(atPath: profilesDirectory) else { return }
+        for file in files where file.hasSuffix(".profile.json") && !keep.contains(file) {
+            try? fm.removeItem(atPath: "\(profilesDirectory)/\(file)")
         }
     }
 
@@ -148,13 +172,24 @@ final class ProfileStore: ObservableObject {
         TelemetryService.shared.recordProfileConfiguration(profile)
     }
 
-    /// Delete a profile by ID
+    /// Delete a profile by ID. Removes the profile from memory, rewrites the
+    /// blob, AND deletes its `{shortId}.profile.json` so the file-authoritative
+    /// `load()` cannot resurrect it on the next launch. The file path is built
+    /// from the injected `profilesDirectory` (not `SyncProfile.configDirectory`)
+    /// so test isolation holds — matching `writeProfileFiles()`.
     func delete(id: UUID) {
+        // Capture BEFORE removal so we still know the shortId to delete.
+        let removed = profiles.first { $0.id == id }
         profiles.removeAll { $0.id == id }
         if selectedProfileId == id {
             selectedProfileId = profiles.first?.id
         }
         save()
+
+        if let removed {
+            let path = "\(profilesDirectory)/\(removed.shortId).profile.json"
+            try? FileManager.default.removeItem(atPath: path)
+        }
     }
 
     /// Get a profile by ID
