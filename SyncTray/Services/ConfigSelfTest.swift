@@ -48,6 +48,7 @@ enum ConfigSelfTest {
             testSettingsSafeKeys,
             testSchemaInstalledAndReferenced,
             testIsolatedLaunchAtLogin,
+            testDeleteDurable,
         ]
 
         for check in checks {
@@ -433,6 +434,48 @@ enum ConfigSelfTest {
         }
 
         return report("AC-12", "isolated-launch-at-login", true)
+    }
+
+    // MARK: - AC-19 — delete is durable under file-authoritative load
+
+    /// Regression guard: `delete(id:)` must remove the profile's
+    /// `.profile.json`, otherwise the file-authoritative `load()` resurrects a
+    /// deleted profile on the next launch (and reinstalls its launchd agent if
+    /// enabled). Asserts (a) the file exists after add, (b) it's gone after
+    /// delete, and (c) a fresh store over the same directory loads zero profiles.
+    private static func testDeleteDurable() -> Bool {
+        let dir = "\(selfTestRoot)/ac19-delete"
+        let suite = "com.synctray.selftest.ac19.\(UUID().uuidString)"
+
+        let store = ProfileStore(
+            profilesDirectory: dir,
+            defaults: UserDefaults(suiteName: suite)!
+        )
+        let profile = sampleProfile(name: "To Be Deleted")
+        store.add(profile)
+
+        let path = "\(dir)/\(profile.shortId).profile.json"
+        guard FileManager.default.fileExists(atPath: path) else {
+            return report("AC-19", "delete-durable", false, "(profile file not written on add at \(path))")
+        }
+
+        store.delete(id: profile.id)
+
+        guard !FileManager.default.fileExists(atPath: path) else {
+            return report("AC-19", "delete-durable", false, "(profile file still present after delete)")
+        }
+
+        // A fresh store over the same directory must load nothing — proving the
+        // delete is durable under file-authority, not just an in-memory removal.
+        let reloaded = ProfileStore(
+            profilesDirectory: dir,
+            defaults: UserDefaults(suiteName: suite)!
+        )
+        guard reloaded.profiles.isEmpty else {
+            return report("AC-19", "delete-durable", false, "(deleted profile resurrected on reload: \(reloaded.profiles.count) profile(s))")
+        }
+
+        return report("AC-19", "delete-durable", true)
     }
 }
 
