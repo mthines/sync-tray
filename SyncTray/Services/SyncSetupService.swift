@@ -898,8 +898,11 @@ final class SyncSetupService {
         return primaryConfig.provider.rcloneType != fallbackConfig.provider.rcloneType
     }
 
-    /// Generate profile-specific JSON config
-    private func generateProfileConfig(for profile: SyncProfile) -> String {
+    /// Generate profile-specific JSON config.
+    /// Not private — `ConfigSelfTest` calls this directly to verify the
+    /// derived config's key set stays frozen (AC-2) without going through
+    /// the side-effecting `install(profile:)` (which touches launchd).
+    func generateProfileConfig(for profile: SyncProfile) -> String {
         let config: [String: Any] = [
             "profileId": profile.id.uuidString,
             "name": profile.name,

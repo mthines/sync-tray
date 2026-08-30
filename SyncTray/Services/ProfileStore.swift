@@ -1,23 +1,54 @@
 import Foundation
 import Combine
 
-/// Manages the storage and retrieval of sync profiles
+/// Manages the storage and retrieval of sync profiles.
+///
+/// File-authoritative: reads come from per-profile `{shortId}.profile.json`
+/// files under `profilesDirectory` when any exist; the legacy `syncProfiles`
+/// UserDefaults blob is read only as a fallback (pre-migration, or a fresh
+/// install before migration v3 has run). Writes always go to both — the file
+/// (authoritative) and the blob (write-only mirror, kept one release for
+/// rollback safety; see `MigrationV3BlobToPerProfileFiles`). The blob is never
+/// read back once a per-profile file exists, so the dual-write can never
+/// create a split-brain.
 @MainActor
 final class ProfileStore: ObservableObject {
     @Published var profiles: [SyncProfile] = []
     @Published var selectedProfileId: UUID?
 
-    private static let profilesKey = "syncProfiles"
-    private let defaults = UserDefaults.standard
+    /// Not private — `ConfigSelfTest` reads/writes this key directly against an
+    /// isolated `UserDefaults` suite to verify the write-only blob mirror
+    /// without touching a real profile's data.
+    static let profilesKey = "syncProfiles"
 
-    init() {
+    private let defaults: UserDefaults
+
+    /// Directory holding `{shortId}.profile.json` files. Overridable for
+    /// self-test isolation; defaults to the real `~/.config/synctray/profiles`.
+    private let profilesDirectory: String
+
+    init(
+        profilesDirectory: String = SyncProfile.configDirectory,
+        defaults: UserDefaults = .standard
+    ) {
+        self.profilesDirectory = profilesDirectory
+        self.defaults = defaults
         load()
     }
 
     // MARK: - Persistence
 
-    /// Load profiles from UserDefaults
+    /// Load profiles. File-authoritative: reads every `{shortId}.profile.json`
+    /// in `profilesDirectory` via `SyncProfile`'s forgiving decoder. Falls back
+    /// to the legacy `syncProfiles` UserDefaults blob only when no per-profile
+    /// files exist yet.
     func load() {
+        let fromFiles = loadFromProfileFiles()
+        if !fromFiles.isEmpty {
+            profiles = fromFiles
+            return
+        }
+
         guard let data = defaults.data(forKey: Self.profilesKey) else {
             profiles = []
             return
@@ -31,14 +62,72 @@ final class ProfileStore: ObservableObject {
         }
     }
 
-    /// Save profiles to UserDefaults
+    /// Read every `*.profile.json` file in `profilesDirectory`.
+    private func loadFromProfileFiles() -> [SyncProfile] {
+        let fm = FileManager.default
+        guard let files = try? fm.contentsOfDirectory(atPath: profilesDirectory) else { return [] }
+
+        var result: [SyncProfile] = []
+        for file in files.sorted() where file.hasSuffix(".profile.json") {
+            let path = (profilesDirectory as NSString).appendingPathComponent(file)
+            guard let data = fm.contents(atPath: path),
+                  let profile = try? JSONDecoder().decode(SyncProfile.self, from: data) else {
+                continue
+            }
+            result.append(profile)
+        }
+        return result
+    }
+
+    /// Save profiles: writes each profile's `.profile.json` (authoritative,
+    /// with a `$schema` reference) AND dual-writes the legacy `syncProfiles`
+    /// blob (write-only mirror; never read back once any `.profile.json` exists).
     func save() {
+        writeProfileFiles()
+
         do {
             let data = try JSONEncoder().encode(profiles)
             defaults.set(data, forKey: Self.profilesKey)
         } catch {
             print("Failed to encode profiles: \(error)")
         }
+    }
+
+    /// Write every profile to its `{shortId}.profile.json`, noting the content
+    /// hash of each write in `ConfigSelfWriteRegistry` so `ConfigFileWatcher`
+    /// suppresses the FSEvent this write produces.
+    private func writeProfileFiles() {
+        let fm = FileManager.default
+        guard (try? fm.createDirectory(
+            atPath: profilesDirectory, withIntermediateDirectories: true)) != nil else { return }
+
+        for profile in profiles {
+            guard var dict = try? encodeProfileDict(profile) else { continue }
+            // Relative to profilesDirectory (".../profiles"), the schema lives
+            // one level up, under "schema/" (see ConfigSchemaInstaller).
+            dict["$schema"] = "../schema/profile.schema.json"
+
+            guard let data = try? JSONSerialization.data(
+                withJSONObject: dict, options: [.prettyPrinted, .sortedKeys]) else { continue }
+
+            let path = "\(profilesDirectory)/\(profile.shortId).profile.json"
+            do {
+                try data.write(to: URL(fileURLWithPath: path), options: .atomic)
+                ConfigSelfWriteRegistry.shared.noteSelfWrite(contentHash: ConfigSelfWriteRegistry.hash(data))
+            } catch {
+                print("Failed to write profile file for \(profile.shortId): \(error)")
+            }
+        }
+    }
+
+    /// Encode a profile to a plain dictionary (round-tripping through JSON) so
+    /// `$schema` can be merged in alongside the CodingKeys-driven fields.
+    private func encodeProfileDict(_ profile: SyncProfile) throws -> [String: Any] {
+        let data = try JSONEncoder().encode(profile)
+        guard let dict = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw CocoaError(.propertyListReadCorrupt)
+        }
+        return dict
     }
 
     // MARK: - CRUD Operations
