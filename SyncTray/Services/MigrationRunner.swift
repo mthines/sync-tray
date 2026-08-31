@@ -263,9 +263,13 @@ struct MigrationV2FixVFSCachePath: ProfileMigration {
 /// safety, and because `ProfileStore.load()` only ever reads the blob when NO
 /// per-profile files exist, retaining it can never create a split-brain.
 ///
-/// Idempotent: if per-profile files already exist (e.g. this migration
-/// already ran, or a fresh install started directly on the file-backed
-/// format), this is a no-op.
+/// Idempotent PER PROFILE: a profile whose `.profile.json` already exists is
+/// left untouched (it's already migrated, or has since been edited), while
+/// any sibling still blob-only is written. This is deliberately not gated on
+/// "any file already exists" — that all-or-nothing check would treat a single
+/// existing file as "fully migrated" and permanently strand the rest of a
+/// blob if an earlier run wrote only the first profile before being
+/// interrupted (crash, force-quit) partway through.
 struct MigrationV3BlobToPerProfileFiles: ProfileMigration {
     let version = 3
     let description = "Migrate syncProfiles blob to per-profile .profile.json files (blob retained, write-only)"
@@ -280,21 +284,13 @@ struct MigrationV3BlobToPerProfileFiles: ProfileMigration {
             return
         }
 
-        if Self.hasExistingProfileFiles(in: profilesDirectory) {
-            return
-        }
-
         try Self.writeProfileFiles(from: profileDicts, to: profilesDirectory)
         // The blob is deliberately NOT removed here — see type doc.
     }
 
-    /// True if any `*.profile.json` file already exists in `directory`.
-    static func hasExistingProfileFiles(in directory: String) -> Bool {
-        guard let files = try? FileManager.default.contentsOfDirectory(atPath: directory) else { return false }
-        return files.contains { $0.hasSuffix(".profile.json") }
-    }
-
-    /// Write one `{shortId}.profile.json` per dictionary in `profileDicts`.
+    /// Write one `{shortId}.profile.json` per dictionary in `profileDicts`,
+    /// skipping any whose file already exists in `directory` (see type doc
+    /// for why this is per-profile rather than an all-or-nothing gate).
     /// Internal (not private) so `ConfigSelfTest` can exercise it directly
     /// against a temp directory, independent of `UserDefaults`.
     static func writeProfileFiles(from profileDicts: [[String: Any]], to directory: String) throws {
@@ -303,12 +299,15 @@ struct MigrationV3BlobToPerProfileFiles: ProfileMigration {
         for var dict in profileDicts {
             guard let idString = dict["id"] as? String else { continue }
             let shortId = String(idString.prefix(8)).lowercased()
+            let path = "\(directory)/\(shortId).profile.json"
+
+            guard !FileManager.default.fileExists(atPath: path) else { continue }
+
             dict["$schema"] = "../schema/profile.schema.json"
 
             guard let data = try? JSONSerialization.data(
                 withJSONObject: dict, options: [.prettyPrinted, .sortedKeys]) else { continue }
 
-            let path = "\(directory)/\(shortId).profile.json"
             try data.write(to: URL(fileURLWithPath: path), options: .atomic)
         }
     }
