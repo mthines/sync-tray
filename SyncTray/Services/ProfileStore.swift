@@ -79,11 +79,21 @@ final class ProfileStore: ObservableObject {
         return result
     }
 
-    /// Save profiles: writes each profile's `.profile.json` (authoritative,
-    /// with a `$schema` reference) AND dual-writes the legacy `syncProfiles`
-    /// blob (write-only mirror; never read back once any `.profile.json` exists).
-    func save() {
-        writeProfileFiles()
+    /// Save profiles: writes `.profile.json` file(s) (authoritative, with a
+    /// `$schema` reference) AND dual-writes the legacy `syncProfiles` blob
+    /// (write-only mirror; never read back once any `.profile.json` exists).
+    ///
+    /// - Parameter only: when set, only this single profile's file is written
+    ///   (no full directory listing/prune) — the common case for `add`/`update`,
+    ///   where exactly one profile changed. `nil` (the default) falls back to
+    ///   rewriting every profile's file and pruning orphans, which is required
+    ///   whenever the on-disk set of profiles may have shrunk (e.g. `delete`).
+    func save(only profile: SyncProfile? = nil) {
+        if let profile {
+            writeProfileFile(profile)
+        } else {
+            writeProfileFiles()
+        }
 
         do {
             let data = try JSONEncoder().encode(profiles)
@@ -104,32 +114,48 @@ final class ProfileStore: ObservableObject {
     /// returns false for a missing file and `classify` only reacts to existing
     /// `.profile.json` changes, so pruning is safe with the watcher.
     private func writeProfileFiles() {
-        let fm = FileManager.default
-        guard (try? fm.createDirectory(
+        guard (try? FileManager.default.createDirectory(
             atPath: profilesDirectory, withIntermediateDirectories: true)) != nil else { return }
 
         var writtenFilenames: Set<String> = []
         for profile in profiles {
-            guard var dict = try? encodeProfileDict(profile) else { continue }
-            // Relative to profilesDirectory (".../profiles"), the schema lives
-            // one level up, under "schema/" (see ConfigSchemaInstaller).
-            dict["$schema"] = "../schema/profile.schema.json"
-
-            guard let data = try? JSONSerialization.data(
-                withJSONObject: dict, options: [.prettyPrinted, .sortedKeys]) else { continue }
-
-            let filename = "\(profile.shortId).profile.json"
-            let path = "\(profilesDirectory)/\(filename)"
-            do {
-                try data.write(to: URL(fileURLWithPath: path), options: .atomic)
+            if let filename = writeProfileFile(profile) {
                 writtenFilenames.insert(filename)
-                ConfigSelfWriteRegistry.shared.noteSelfWrite(contentHash: ConfigSelfWriteRegistry.hash(data))
-            } catch {
-                print("Failed to write profile file for \(profile.shortId): \(error)")
             }
         }
 
         pruneOrphanProfileFiles(keeping: writtenFilenames)
+    }
+
+    /// Write a single profile's `{shortId}.profile.json`, noting the content
+    /// hash in `ConfigSelfWriteRegistry` so `ConfigFileWatcher` suppresses the
+    /// FSEvent this write produces. Returns the written filename on success,
+    /// or `nil` if encoding/writing failed. Does NOT prune orphans — callers
+    /// that may have removed a profile must use `writeProfileFiles()` instead.
+    @discardableResult
+    private func writeProfileFile(_ profile: SyncProfile) -> String? {
+        let fm = FileManager.default
+        guard (try? fm.createDirectory(
+            atPath: profilesDirectory, withIntermediateDirectories: true)) != nil else { return nil }
+
+        guard var dict = try? encodeProfileDict(profile) else { return nil }
+        // Relative to profilesDirectory (".../profiles"), the schema lives
+        // one level up, under "schema/" (see ConfigSchemaInstaller).
+        dict["$schema"] = "../schema/profile.schema.json"
+
+        guard let data = try? JSONSerialization.data(
+            withJSONObject: dict, options: [.prettyPrinted, .sortedKeys]) else { return nil }
+
+        let filename = "\(profile.shortId).profile.json"
+        let path = "\(profilesDirectory)/\(filename)"
+        do {
+            try data.write(to: URL(fileURLWithPath: path), options: .atomic)
+            ConfigSelfWriteRegistry.shared.noteSelfWrite(contentHash: ConfigSelfWriteRegistry.hash(data))
+            return filename
+        } catch {
+            print("Failed to write profile file for \(profile.shortId): \(error)")
+            return nil
+        }
     }
 
     /// Remove any `*.profile.json` in `profilesDirectory` not in `keep`
@@ -156,19 +182,21 @@ final class ProfileStore: ObservableObject {
 
     // MARK: - CRUD Operations
 
-    /// Add a new profile
+    /// Add a new profile. Only the new profile's `.profile.json` is written
+    /// (existing profiles' files are untouched — see `save(only:)`).
     func add(_ profile: SyncProfile) {
         profiles.append(profile)
-        save()
+        save(only: profile)
     }
 
-    /// Update an existing profile
+    /// Update an existing profile. Only the edited profile's `.profile.json`
+    /// is written (existing profiles' files are untouched — see `save(only:)`).
     func update(_ profile: SyncProfile) {
         guard let index = profiles.firstIndex(where: { $0.id == profile.id }) else {
             return
         }
         profiles[index] = profile
-        save()
+        save(only: profile)
         TelemetryService.shared.recordProfileConfiguration(profile)
     }
 
