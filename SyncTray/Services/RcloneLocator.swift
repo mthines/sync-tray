@@ -49,14 +49,24 @@ enum RcloneLocator {
     /// Returns `nil` when rclone can't be found anywhere. A `nil` is deliberately not cached
     /// so installing rclone while the app runs is picked up on the next call.
     static func resolve() -> String? {
+        if let cached = cachedResult() { return cached }
+        // Resolve outside the lock: locate() may spawn a login shell, and holding the lock
+        // across it would serialize every concurrent caller behind one (up-to-5s) spawn.
+        let result = locate()
+        if let path = result.path { storeResult(path) }
+        return result.path
+    }
+
+    private static func cachedResult() -> String? {
         lock.lock()
         defer { lock.unlock() }
-        if let cachedPath { return cachedPath }
-        let result = locate()
-        if let path = result.path {
-            cachedPath = path
-        }
-        return result.path
+        return cachedPath
+    }
+
+    private static func storeResult(_ path: String) {
+        lock.lock()
+        cachedPath = path
+        lock.unlock()
     }
 
     /// Whether rclone is installed and locatable.
@@ -69,11 +79,7 @@ enum RcloneLocator {
     /// following `resolve()` doesn't repeat the (possibly shell-spawning) work.
     static func resolveDetailed() -> (path: String?, source: Source, location: String) {
         let result = locate()
-        if let path = result.path {
-            lock.lock()
-            cachedPath = path
-            lock.unlock()
-        }
+        if let path = result.path { storeResult(path) }
         return (result.path, result.source, locationBucket(for: result.path))
     }
 
@@ -104,7 +110,9 @@ enum RcloneLocator {
         process.arguments = ["-lc", "command -v rclone"]
         let pipe = Pipe()
         process.standardOutput = pipe
-        process.standardError = Pipe()
+        // Discard stderr rather than pipe it: a login profile that writes a lot to stderr
+        // would fill an undrained pipe buffer and hang the shell until the watchdog fires.
+        process.standardError = FileHandle.nullDevice
 
         do {
             try process.run()
