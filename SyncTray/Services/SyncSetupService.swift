@@ -191,6 +191,40 @@ final class SyncSetupService {
 
     /// Uninstall the sync configuration for a profile
     func uninstall(profile: SyncProfile) throws {
+        // For mount-mode profiles, detach the volume gracefully BEFORE unloading the
+        // launchd agent. `rclone nfsmount`/`rclone mount` does not exit when its
+        // volume is torn down by killing the process out from under it (see
+        // `unmount(profile:)` below) — it can leave a stale mount-table entry
+        // pointing at a dead server, so any in-flight file access (e.g. an active
+        // Stream read) hangs until the entry is cleaned up. This path is reachable
+        // any time a mounted profile is uninstalled — including the settings-save
+        // reinstall flow (`ProfileDetailView.reinstallSync`), which previously went
+        // straight to `launchctl unload` with no detach step at all and could freeze
+        // an in-progress stream read for as long as the stale mount lingered.
+        if profile.isMountMode {
+            let detachStart = Date()
+            let wasMounted = isMounted(profile: profile)
+            var detachResult = "not_mounted"
+            if wasMounted {
+                let result = runCommand("/usr/sbin/diskutil", arguments: ["unmount", profile.localSyncPath])
+                if result.exitCode == 0 {
+                    detachResult = "success"
+                } else {
+                    let forceResult = runCommand(
+                        "/usr/sbin/diskutil", arguments: ["unmount", "force", profile.localSyncPath])
+                    detachResult = forceResult.exitCode == 0 ? "success_forced" : "failure"
+                }
+            }
+            let detachDuration = Date().timeIntervalSince(detachStart)
+            TelemetryService.shared.recordReinstallDetach(
+                profileId: profile.id,
+                profileName: profile.name,
+                wasMounted: wasMounted,
+                result: detachResult,
+                durationSeconds: detachDuration
+            )
+        }
+
         // Unload the launchd agent first
         _ = runCommand("/bin/launchctl", arguments: ["unload", profile.plistPath])
 
