@@ -189,6 +189,8 @@ rollout. No event is emitted on a fresh install.
 | `synctray.setting.changed` | Counter | App-wide preference changes (`setting.name`: auto_fix/launch_at_login/debug_logging/telemetry; `setting.enabled`) |
 | `synctray.offline.extension_setup` | Counter | Finder-extension enable funnel (`offline.extension_action`: prompt_shown/open_settings/rechecked/enabled) |
 | `synctray.offline.cache_clear` | Counter | Cache-clear operations (`offline.preserve_pinned`: whether pinned folders were kept) |
+| `synctray.mount.reinstall_detach` | Counter | Pre-uninstall volume detach attempts for mount-mode profiles, reached on every `SyncSetupService.uninstall` (including the settings-save reinstall path) — `mount.result`: `not_mounted`/`success`/`success_forced`/`failure` |
+| `synctray.mount.reinstall_detach.duration` | Histogram | Time taken to gracefully detach a mounted volume before reinstall (seconds) — regression signal for the "settings change freezes an active Stream mount" failure mode; only recorded when the profile was actually mounted |
 
 ### Spans
 | Span | Kind | Description |
@@ -196,6 +198,7 @@ rollout. No event is emitted on a fresh install.
 | `synctray sync` | INTERNAL | Full sync lifecycle (start→complete/fail) |
 | `synctray mount` | INTERNAL | Mount operation |
 | `synctray unmount` | INTERNAL | Unmount operation |
+| `synctray reinstall_detach` | INTERNAL | Pre-uninstall graceful volume detach for a mount-mode profile (fires on every `uninstall`, including settings-save reinstall) |
 
 ### Logs
 All key lifecycle events are emitted as structured OTel logs:
@@ -227,6 +230,7 @@ All key lifecycle events are emitted as structured OTel logs:
 - Setting changed: app-wide preference toggled (`setting.name`, `setting.enabled`); the telemetry opt-out is recorded just before telemetry disables
 - Offline extension setup: Finder-extension enable-funnel steps (`offline.extension_action`)
 - Offline cache clear: cache cleared, with whether pinned folders were preserved (`offline.preserve_pinned`)
+- Reinstall pre-detach: graceful volume detach before a mount-mode profile's `uninstall` (settings-save reinstall, manual uninstall, or delete), only logged when the profile was mounted — `success` at info, `success_forced` at warn (diskutil needed `unmount force`), `failure` at error (still mounted after both attempts — the freeze condition this replaces)
 
 ## Swift SDK Gotcha: Wildcard View Required
 

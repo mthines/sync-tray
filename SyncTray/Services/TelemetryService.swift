@@ -112,6 +112,8 @@ final class TelemetryService {
     private var oauthOutcomeCounter: LongCounterSdk?
     private var userRecoveryActionCounter: LongCounterSdk?
     private var settingChangedCounter: LongCounterSdk?
+    private var reinstallDetachCounter: LongCounterSdk?
+    private var reinstallDetachDurationHistogram: DoubleHistogramMeterSdk?
     private var offlineExtensionSetupCounter: LongCounterSdk?
     private var offlineCacheClearCounter: LongCounterSdk?
 
@@ -263,6 +265,18 @@ final class TelemetryService {
             .counterBuilder(name: "synctray.mount.operations")
             .setDescription("Number of mount/unmount operations")
             .setUnit("1")
+            .build()
+
+        reinstallDetachCounter = meter
+            .counterBuilder(name: "synctray.mount.reinstall_detach")
+            .setDescription("Number of pre-uninstall volume detach attempts for mount-mode profiles (settings-save reinstall path)")
+            .setUnit("1")
+            .build()
+
+        reinstallDetachDurationHistogram = meter
+            .histogramBuilder(name: "synctray.mount.reinstall_detach.duration")
+            .setDescription("Time taken to gracefully detach a mounted volume before a profile reinstall")
+            .setUnit("s")
             .build()
 
         directoryWatchTriggerCounter = meter
@@ -658,6 +672,65 @@ final class TelemetryService {
             ],
             spanContext: span.context
         )
+    }
+
+    /// Record the pre-uninstall graceful volume detach performed for a mount-mode
+    /// profile (`SyncSetupService.uninstall`). This is the regression signal for the
+    /// "settings change freezes an active Stream mount" failure mode: a mounted
+    /// profile whose detach is slow or falls back to a force-unmount (or a profile
+    /// that reaches `uninstall` still mounted at all) is the same condition that
+    /// previously froze in-flight reads with no telemetry at all on this path.
+    func recordReinstallDetach(
+        profileId: UUID,
+        profileName: String,
+        wasMounted: Bool,
+        result: String,             // "not_mounted", "success", "success_forced", "failure"
+        durationSeconds: Double
+    ) {
+        guard SyncTraySettings.telemetryEnabled else { return }
+        ensureSetup()
+
+        reinstallDetachCounter?.add(value: 1, attribute: [
+            "mount.operation": .string("reinstall_detach"),
+            "mount.result": .string(result),
+            "synctray.profile.name": .string(profileName),
+        ])
+
+        if wasMounted {
+            reinstallDetachDurationHistogram?.record(value: durationSeconds, attributes: [
+                "mount.result": .string(result),
+                "synctray.profile.name": .string(profileName),
+            ])
+        }
+
+        guard let tracer = tracer else { return }
+
+        let span = tracer.spanBuilder(spanName: "synctray reinstall_detach")
+            .setSpanKind(spanKind: .internal)
+            .startSpan()
+        span.setAttribute(key: "synctray.profile.id", value: .string(profileId.uuidString))
+        span.setAttribute(key: "synctray.profile.name", value: .string(profileName))
+        span.setAttribute(key: "mount.operation", value: .string("reinstall_detach"))
+        span.setAttribute(key: "mount.result", value: .string(result))
+        span.setAttribute(key: "mount.was_mounted", value: .bool(wasMounted))
+        span.setAttribute(key: "mount.detach_duration_s", value: .double(durationSeconds))
+        span.status = result == "failure" ? .error(description: "reinstall_detach failed") : .ok
+        span.end()
+
+        if wasMounted {
+            emitLog(
+                severity: result == "failure" ? .error : (result == "success_forced" ? .warn : .info),
+                body: "Reinstall pre-detach \(result)",
+                attributes: [
+                    "synctray.profile.id": .string(profileId.uuidString),
+                    "synctray.profile.name": .string(profileName),
+                    "mount.operation": .string("reinstall_detach"),
+                    "mount.result": .string(result),
+                    "mount.detach_duration_s": .double(durationSeconds),
+                ],
+                spanContext: span.context
+            )
+        }
     }
 
     // MARK: - Directory Watch Triggers
