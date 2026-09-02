@@ -50,8 +50,7 @@ final class SyncSetupService {
     // MARK: - Rclone Path Helper
 
     private func findRclonePath() -> String? {
-        let paths = ["/usr/local/bin/rclone", "/opt/homebrew/bin/rclone", "/usr/bin/rclone"]
-        return paths.first { FileManager.default.fileExists(atPath: $0) }
+        RcloneLocator.resolve()
     }
 
     // MARK: - Public Methods (Profile-based)
@@ -531,14 +530,30 @@ final class SyncSetupService {
                 exit 1
             fi
 
-            # Find rclone binary (check multiple locations)
+            # Find rclone binary. Cover the common package-manager locations,
+            # including nix-darwin's system and per-user profiles which live outside
+            # Homebrew's dirs (issue #53). $USER can be unset under launchd, so derive
+            # it. Fall back to a PATH lookup for any other install layout.
+            RCLONE_USER="${USER:-$(id -un)}"
             RCLONE_BIN=""
-            for path in /usr/local/bin/rclone /opt/homebrew/bin/rclone /usr/bin/rclone; do
+            RCLONE_CANDIDATES=(
+                /opt/homebrew/bin/rclone
+                /usr/local/bin/rclone
+                /run/current-system/sw/bin/rclone
+                "/etc/profiles/per-user/$RCLONE_USER/bin/rclone"
+                "$HOME/.nix-profile/bin/rclone"
+                /usr/bin/rclone
+            )
+            for path in "${RCLONE_CANDIDATES[@]}"; do
                 if [[ -x "$path" ]]; then
                     RCLONE_BIN="$path"
                     break
                 fi
             done
+
+            if [[ -z "$RCLONE_BIN" ]]; then
+                RCLONE_BIN=$(command -v rclone 2>/dev/null || true)
+            fi
 
             if [[ -z "$RCLONE_BIN" ]]; then
                 echo "$(date '+%Y-%m-%d %H:%M:%S') - Error: rclone not found" >> "$LOG_FILE"
@@ -930,7 +945,7 @@ final class SyncSetupService {
                     <key>EnvironmentVariables</key>
                     <dict>
                         <key>PATH</key>
-                        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+                        <string>/opt/homebrew/bin:/usr/local/bin:/run/current-system/sw/bin:/etc/profiles/per-user/\(NSUserName())/bin:\(NSHomeDirectory())/.nix-profile/bin:/usr/bin:/bin</string>
                     </dict>
                 </dict>
                 </plist>
@@ -967,7 +982,7 @@ final class SyncSetupService {
                     <key>EnvironmentVariables</key>
                     <dict>
                         <key>PATH</key>
-                        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+                        <string>/opt/homebrew/bin:/usr/local/bin:/run/current-system/sw/bin:/etc/profiles/per-user/\(NSUserName())/bin:\(NSHomeDirectory())/.nix-profile/bin:/usr/bin:/bin</string>
                     </dict>
                 </dict>
                 </plist>

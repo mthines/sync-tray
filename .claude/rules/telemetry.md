@@ -189,6 +189,7 @@ rollout. No event is emitted on a fresh install.
 | `synctray.setting.changed` | Counter | App-wide preference changes (`setting.name`: auto_fix/launch_at_login/debug_logging/telemetry; `setting.enabled`) |
 | `synctray.offline.extension_setup` | Counter | Finder-extension enable funnel (`offline.extension_action`: prompt_shown/open_settings/rechecked/enabled) |
 | `synctray.offline.cache_clear` | Counter | Cache-clear operations (`offline.preserve_pinned`: whether pinned folders were kept) |
+| `synctray.rclone.discovery` | Counter | rclone binary discovery at launch (`rclone.discovery_source`: candidate_path/login_shell/not_found; `rclone.location`: homebrew/usr_local/nix_system/nix_per_user/nix_profile/usr_bin/other/none) |
 
 ### Spans
 | Span | Kind | Description |
@@ -227,6 +228,7 @@ All key lifecycle events are emitted as structured OTel logs:
 - Setting changed: app-wide preference toggled (`setting.name`, `setting.enabled`); the telemetry opt-out is recorded just before telemetry disables
 - Offline extension setup: Finder-extension enable-funnel steps (`offline.extension_action`)
 - Offline cache clear: cache cleared, with whether pinned folders were preserved (`offline.preserve_pinned`)
+- rclone discovery: where rclone was found at launch, or a warn-level "rclone not found" (`rclone.discovery_source`, `rclone.location`) — measures install-location coverage, e.g. nix-darwin (issue #53). Never emits the raw path.
 
 ## Swift SDK Gotcha: Wildcard View Required
 

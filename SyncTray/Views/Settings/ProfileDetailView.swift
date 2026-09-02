@@ -2029,15 +2029,7 @@ struct ProfileDetailView: View {
             let process = Process()
             let pipe = Pipe()
 
-            let rclonePaths = ["/opt/homebrew/bin/rclone", "/usr/local/bin/rclone", "/usr/bin/rclone"]
-            var rclonePath: String?
-
-            for path in rclonePaths {
-                if FileManager.default.fileExists(atPath: path) {
-                    rclonePath = path
-                    break
-                }
-            }
+            let rclonePath = RcloneLocator.resolve()
 
             guard let path = rclonePath else {
                 DispatchQueue.main.async {
@@ -2092,15 +2084,7 @@ struct ProfileDetailView: View {
             let process = Process()
             let pipe = Pipe()
 
-            let rclonePaths = ["/opt/homebrew/bin/rclone", "/usr/local/bin/rclone", "/usr/bin/rclone"]
-            var rclonePath: String?
-
-            for path in rclonePaths {
-                if FileManager.default.fileExists(atPath: path) {
-                    rclonePath = path
-                    break
-                }
-            }
+            let rclonePath = RcloneLocator.resolve()
 
             guard let path = rclonePath else {
                 DispatchQueue.main.async {
@@ -2540,8 +2524,7 @@ struct ProfileDetailView: View {
     private func runRcloneLsd(remote: String, path: String) async -> LsdResult {
         await withCheckedContinuation { continuation in
             DispatchQueue.global(qos: .userInitiated).async {
-                let rclonePaths = ["/opt/homebrew/bin/rclone", "/usr/local/bin/rclone", "/usr/bin/rclone"]
-                guard let rclone = rclonePaths.first(where: { FileManager.default.fileExists(atPath: $0) }) else {
+                guard let rclone = RcloneLocator.resolve() else {
                     continuation.resume(returning: .unreachable)
                     return
                 }
@@ -2699,15 +2682,7 @@ struct ProfileDetailView: View {
             let errorPipe = Pipe()
 
             // Find rclone
-            let rclonePaths = ["/opt/homebrew/bin/rclone", "/usr/local/bin/rclone", "/usr/bin/rclone"]
-            var rclonePath: String?
-
-            for path in rclonePaths {
-                if fileManager.fileExists(atPath: path) {
-                    rclonePath = path
-                    break
-                }
-            }
+            let rclonePath = RcloneLocator.resolve()
 
             guard let path = rclonePath else {
                 let errMsg = "Error: rclone not found. Install with: brew install rclone"
@@ -3381,15 +3356,7 @@ struct ProfileDetailView: View {
             let errorPipe = Pipe()
 
             // Find rclone
-            let rclonePaths = ["/opt/homebrew/bin/rclone", "/usr/local/bin/rclone", "/usr/bin/rclone"]
-            var rclonePath: String?
-
-            for path in rclonePaths {
-                if fileManager.fileExists(atPath: path) {
-                    rclonePath = path
-                    break
-                }
-            }
+            let rclonePath = RcloneLocator.resolve()
 
             guard let path = rclonePath else {
                 let errMsg = "Error: rclone not found. Install with: brew install rclone"
@@ -3928,8 +3895,7 @@ struct RemoteFolderBrowserSheet: View {
         let remote = bareRemote
         let path = currentPath
         DispatchQueue.global(qos: .userInitiated).async {
-            let rclonePaths = ["/opt/homebrew/bin/rclone", "/usr/local/bin/rclone", "/usr/bin/rclone"]
-            guard let rclone = rclonePaths.first(where: { FileManager.default.fileExists(atPath: $0) }) else {
+            guard let rclone = RcloneLocator.resolve() else {
                 DispatchQueue.main.async { self.isLoading = false; self.errorMessage = "rclone not found" }
                 return
             }

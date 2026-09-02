@@ -761,8 +761,7 @@ final class SyncManager: ObservableObject {
                     }
 
                     // Locate rclone binary
-                    let rclonePaths = ["/opt/homebrew/bin/rclone", "/usr/local/bin/rclone", "/usr/bin/rclone"]
-                    guard let rclonePath = rclonePaths.first(where: { fileManager.fileExists(atPath: $0) }) else {
+                    guard let rclonePath = RcloneLocator.resolve() else {
                         try? fileManager.removeItem(atPath: lockPath)
                         continuation.resume(throwing: NSError(
                             domain: "SyncManager",
@@ -2206,8 +2205,7 @@ final class SyncManager: ObservableObject {
     private func isRemoteReachable(_ remoteName: String) -> Bool {
         let bare = remoteName.hasSuffix(":") ? String(remoteName.dropLast()) : remoteName
         guard !bare.isEmpty else { return false }
-        let rclonePaths = ["/opt/homebrew/bin/rclone", "/usr/local/bin/rclone", "/usr/bin/rclone"]
-        guard let rclone = rclonePaths.first(where: { FileManager.default.fileExists(atPath: $0) }) else { return false }
+        guard let rclone = RcloneLocator.resolve() else { return false }
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: rclone)
         proc.arguments = ["lsd", "\(bare):", "--contimeout", "3s", "--timeout", "8s", "--max-depth", "0"]

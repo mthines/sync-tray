@@ -114,6 +114,7 @@ final class TelemetryService {
     private var settingChangedCounter: LongCounterSdk?
     private var offlineExtensionSetupCounter: LongCounterSdk?
     private var offlineCacheClearCounter: LongCounterSdk?
+    private var rcloneDiscoveryCounter: LongCounterSdk?
 
     // MARK: - Providers (kept alive for shutdown)
 
@@ -382,6 +383,12 @@ final class TelemetryService {
         offlineCacheClearCounter = meter
             .counterBuilder(name: "synctray.offline.cache_clear")
             .setDescription("Cache clear operations by whether pinned folders were preserved")
+            .setUnit("1")
+            .build()
+
+        rcloneDiscoveryCounter = meter
+            .counterBuilder(name: "synctray.rclone.discovery")
+            .setDescription("rclone binary discovery outcome at launch (by source + location bucket)")
             .setUnit("1")
             .build()
     }
@@ -1552,6 +1559,28 @@ final class TelemetryService {
         emitLog(severity: .info, body: "App launched", attributes: [:])
 
         recordDeploymentIfChanged()
+        recordRcloneDiscovery()
+    }
+
+    /// Record where (and whether) the rclone binary was found at launch. This gives
+    /// measurable coverage of the install-location fix for issue #53: a rise in the
+    /// `nix_system` / `nix_per_user` / `login_shell` buckets confirms nix-darwin users are
+    /// now discovered, and the `not_found` source flags installs still missing rclone.
+    ///
+    /// Only the low-cardinality source and location bucket are emitted — never the raw path,
+    /// so no username or custom directory leaks (privacy rule).
+    private func recordRcloneDiscovery() {
+        let result = RcloneLocator.resolveDetailed()
+        let attributes: [String: AttributeValue] = [
+            "rclone.discovery_source": .string(result.source.rawValue),
+            "rclone.location": .string(result.location),
+        ]
+        rcloneDiscoveryCounter?.add(value: 1, attribute: attributes)
+        emitLog(
+            severity: result.path == nil ? .warn : .info,
+            body: result.path == nil ? "rclone not found" : "rclone discovered",
+            attributes: attributes
+        )
     }
 
     /// Detect that this install is now running a different `service.version`
