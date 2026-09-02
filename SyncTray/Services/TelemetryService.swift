@@ -1831,6 +1831,13 @@ final class TelemetryService {
         if SyncLogPatterns.isTransientAllFilesChangedError(msg) {
             return "transient_all_files_changed"
         }
+        if msg.contains("lack of support for") && msg.contains("exclusive") {
+            // rclone raises this when a backend (observed on WebDAV) can't honor an
+            // exclusive/atomic create that bisync's conflict-safety check requires.
+            // This is a backend capability gap, not a transient or generic failure,
+            // so it gets its own bucket instead of falling into "other".
+            return "exclusive_mode_unsupported"
+        }
         if msg.contains("not found") || msg.contains("no such") {
             return "file_not_found"
         }
