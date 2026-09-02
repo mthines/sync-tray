@@ -17,8 +17,7 @@ final class RcloneConfigService {
     // MARK: - Rclone Path
 
     private func findRclonePath() -> String? {
-        let paths = ["/opt/homebrew/bin/rclone", "/usr/local/bin/rclone", "/usr/bin/rclone"]
-        return paths.first { FileManager.default.fileExists(atPath: $0) }
+        RcloneLocator.resolve()
     }
 
     /// Check if rclone is installed
