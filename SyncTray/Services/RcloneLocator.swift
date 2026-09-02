@@ -126,7 +126,14 @@ enum RcloneLocator {
         guard process.terminationStatus == 0,
               let output = String(data: data, encoding: .utf8) else { return nil }
 
-        let path = output.trimmingCharacters(in: .whitespacesAndNewlines)
+        // Take the last non-empty line: a login shell (`-lc`) sources profile files
+        // that may print their own output (an `echo` in `.zprofile`, a banner) before
+        // `command -v`'s result, so trimming the whole output would keep that noise.
+        guard let path = output
+            .split(whereSeparator: \.isNewline)
+            .map({ $0.trimmingCharacters(in: .whitespaces) })
+            .last(where: { !$0.isEmpty })
+        else { return nil }
         // `command -v` can also print a builtin/alias/function name; only trust an absolute
         // path to a real executable.
         guard path.hasPrefix("/"), FileManager.default.isExecutableFile(atPath: path) else { return nil }

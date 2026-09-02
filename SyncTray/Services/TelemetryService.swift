@@ -1643,17 +1643,23 @@ final class TelemetryService {
     /// Only the low-cardinality source and location bucket are emitted — never the raw path,
     /// so no username or custom directory leaks (privacy rule).
     private func recordRcloneDiscovery() {
-        let result = RcloneLocator.resolveDetailed()
-        let attributes: [String: AttributeValue] = [
-            "rclone.discovery_source": .string(result.source.rawValue),
-            "rclone.location": .string(result.location),
-        ]
-        rcloneDiscoveryCounter?.add(value: 1, attribute: attributes)
-        emitLog(
-            severity: result.path == nil ? .warn : .info,
-            body: result.path == nil ? "rclone not found" : "rclone discovered",
-            attributes: attributes
-        )
+        // Resolution can spawn a login shell (blocking up to the 5s watchdog), and
+        // recordAppLaunch() runs on the main thread at startup. Run it off-main so it
+        // never hangs launch — the same reason AppSettingsView.detectRcloneVersion
+        // resolves rclone inside a detached task (CLAUDE.md Critical Rules #1 and #2).
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let result = RcloneLocator.resolveDetailed()
+            let attributes: [String: AttributeValue] = [
+                "rclone.discovery_source": .string(result.source.rawValue),
+                "rclone.location": .string(result.location),
+            ]
+            self?.rcloneDiscoveryCounter?.add(value: 1, attribute: attributes)
+            self?.emitLog(
+                severity: result.path == nil ? .warn : .info,
+                body: result.path == nil ? "rclone not found" : "rclone discovered",
+                attributes: attributes
+            )
+        }
     }
 
     /// Detect that this install is now running a different `service.version`
