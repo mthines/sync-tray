@@ -1,6 +1,6 @@
 cask "synctray" do
-  version "0.66.0"
-  sha256 "0644ea89815fe3d91fba289d2e18f67411f3a03d9588b29d74ba64e56bcc65a7"
+  version "0.67.0"
+  sha256 "7f6eb1648f8ae1e79a25e23aa5ca115912d8a05fc232ab2eab8cc4c6baf16c7c"
 
   url "https://github.com/mthines/sync-tray/releases/download/v#{version}/SyncTray-v#{version}-macOS.zip"
   name "SyncTray"
