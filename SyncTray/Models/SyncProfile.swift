@@ -34,7 +34,7 @@ struct SyncProfile: Identifiable, Codable, Equatable {
     var mountAtStartup: Bool            // Auto-mount when SyncTray launches (mount mode, default: true)
     var pinnedDirectories: [String]     // Directories to automatically cache offline (mount mode)
     /// Glob patterns (fnmatch) excluded from offline warming, matched against each file's
-    /// name and its path relative to the pinned dir (e.g. "*.rpp-bak", "*.bak", "Backups/*").
+    /// name and its path relative to the pinned dir (e.g. "*.bak", "*.tmp", "Cache/*").
     /// Excluded files are skipped by the warmer so they never download into the offline cache.
     var warmExcludePatterns: [String]
     var rcPort: Int                     // Port for rclone RC (remote control) API (mount mode)

@@ -514,14 +514,14 @@ struct OfflineFilesSection: View {
             Text("Don't Download")
                 .font(.caption.weight(.medium))
 
-            Text("Files matching these patterns are skipped when warming offline folders — "
-                + "for example, \u{201C}*.rpp-bak\u{201D} to skip Reaper backups. Use glob patterns "
-                + "(\u{201C}*.bak\u{201D}, \u{201C}Backups/*\u{201D}).")
+            Text("Skip files you don't need offline so they never download. Use wildcards: "
+                + "*.bak matches any file ending in .bak, and Cache/* matches everything "
+                + "inside a folder named Cache.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
 
             if excludePatterns.isEmpty {
-                Text("No exclude patterns")
+                Text("Nothing excluded — every file downloads")
                     .font(.caption)
                     .foregroundStyle(.tertiary)
                     .frame(maxWidth: .infinity, alignment: .center)
@@ -552,7 +552,7 @@ struct OfflineFilesSection: View {
             }
 
             HStack(spacing: 4) {
-                TextField("Pattern (e.g., *.rpp-bak)", text: $newExcludePattern)
+                TextField("Pattern (e.g., *.bak)", text: $newExcludePattern)
                     .textFieldStyle(.roundedBorder)
                     .font(.caption)
                     .onSubmit { addExcludePattern() }
