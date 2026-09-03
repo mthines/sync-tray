@@ -235,13 +235,77 @@ between files via `try Task.checkCancellation()`.
 | File | Purpose |
 |------|---------|
 | `SyncManager.swift` | Central orchestrator - manages all profile states, log watchers, directory watchers |
-| `ProfileStore.swift` | Persistent storage for profiles (JSON files in `~/.config/synctray/profiles/`) |
+| `ProfileStore.swift` | File-backed, file-authoritative profile persistence — reads/writes per-profile `{shortId}.profile.json` files (see "File-Backed Configuration" below); dual-writes the legacy `syncProfiles` UserDefaults blob write-only |
 | `SyncSetupService.swift` | Generates sync scripts, launchd plists, manages agent install/uninstall |
 | `LogWatcher.swift` | FSEvents + polling hybrid file watcher for rclone log files |
 | `LogParser.swift` | Parses plain text and JSON log lines into typed `ParsedLogEvent` |
 | `DirectoryWatcher.swift` | FSEvents-based directory monitoring with debouncing |
+| `ConfigFileWatcher.swift` | FSEvents watcher on `~/.config/synctray` for external profile/settings edits; self-write suppression via `ConfigSelfWriteRegistry` |
+| `ConfigReconciler.swift` | `SyncManager.reconcileAction` (shared launchd install/uninstall/reinstall delta logic), `warmReconcileNeeded`/`applyWarmReconcileIfNeeded` (orthogonal app-side warm delta — pinned dirs / warm-exclude globs), and `SettingsReconciler` (isolated launch-at-login apply) |
+| `AppSettingsFileStore.swift` | Reads/writes `~/.config/synctray/settings.json` — an enumerated safe-key mirror of `SyncTraySettings` (no secrets, no telemetry IDs) |
+| `ConfigSchemaInstaller.swift` | Copies the committed JSON Schemas into `~/.config/synctray/schema/` at launch |
+| `ConfigSelfTest.swift` | `#if DEBUG` host self-test suite (`SyncTray --self-test`) — round-trip (incl. `warmExcludePatterns`), migration + migration-integrity, reconcile-delta, warm-reconcile-trigger, self-write, isolated-login assertions |
 | `NotificationService.swift` | Batched macOS notifications with action support |
 | `TelemetryService.swift` | Opt-in OTel telemetry (traces, metrics, logs) via OTLP/HTTP |
+
+### File-Backed Configuration
+
+`~/.config/synctray/` is the editable, authoritative surface for SyncTray's
+configuration: an external agent or human can hand-edit these files and the
+running app applies the change live, without a restart.
+
+| Path | Contents | Notes |
+|------|----------|-------|
+| `profiles/{shortId}.profile.json` | Full `SyncProfile`, including `isEnabled`, `isMuted`, `mountAtStartup`, and the app-side warm fields `pinnedDirectories` / `warmExcludePatterns` | NEW authoritative file. Written by `ProfileStore.save()` (encodes the whole model, so any new `SyncProfile` field flows in automatically); read by `ProfileStore.load()` (file-authoritative). References `../schema/profile.schema.json` via `$schema`. |
+| `profiles/{shortId}.json` | Derived, script-only subset (frozen key set) | Unchanged, byte-for-byte — this is `SyncSetupService.generateProfileConfig`'s output, consumed only by the sync shell script. The app never reads it back. |
+| `settings.json` | Enumerated safe subset of `SyncTraySettings` (`debugLoggingEnabled`, `autoFixSyncIssues`, `telemetryEnabled`, `launchAtLogin`) | Written by `AppSettingsFileStore`. Never contains secrets or telemetry identifiers (`installationId`, `anonymousUserId`). |
+| `schema/profile.schema.json`, `schema/settings.schema.json` | Committed JSON Schemas | Copied out of the app bundle by `ConfigSchemaInstaller` at every launch. Kept in lockstep with `SyncProfile.CodingKeys` by the fail-closed `scripts/check-schema-in-sync.sh`, run locally and in CI. |
+
+**Live apply, not a struct swap.** A single `ConfigFileWatcher` (FSEvents,
+~1s debounce) watches the whole `~/.config/synctray` directory. Every edit —
+from the UI's Save button or an external file write — routes through the SAME
+reconcile path (`SyncManager.applyExternalProfileEdit` /
+`applyExternalSettingsEdit`), which mirrors the reinstall/enable/disable
+decision `ProfileDetailView.saveProfile` used to compute inline (now shared
+via `SyncManager.reconcileAction`, `ConfigReconciler.swift`). A watcher that
+only swapped the in-memory struct would leave a running launchd agent stale
+after an external edit — this is why the file, not memory, is authoritative,
+and why both paths share one decision function.
+
+**Warm reconcile is orthogonal to the launchd reconcile.** Editing an app-side
+warm field — `warmExcludePatterns` or `pinnedDirectories` — changes what the VFS
+warmer downloads, not the launchd script/plist/agent, so `reconcileAction`
+returns `.none` for it. `applyExternalProfileEdit` therefore ALSO runs a separate
+app-side warm reconcile (`applyWarmReconcileIfNeeded` → `applyWarmReconcile`): on
+a currently-mounted mount-mode profile it re-pushes the App Group data and
+re-warms via `VFSCacheService`, reusing the exact primitives the in-app
+pin/unpin path uses (`updateAppGroupMountPaths` + `startWarm`) so the two can't
+drift. A warm-only edit NEVER reinstalls the agent or remounts.
+
+**Self-write suppression.** `ConfigSelfWriteRegistry` tracks the content hash
+of every file SyncTray itself writes; `ConfigFileWatcher.shouldReconcile`
+drops an FSEvent whose file content hash matches a just-noted self-write, so
+the app never reacts to its own writes.
+
+**Launch-at-login isolation.** `settings.json`'s `launchAtLogin` key is
+read-write via `SMAppService.register`/`unregister`, applied through
+`SettingsReconciler` in a path ISOLATED from every other safe key and from all
+profile state — a thrown `SMAppService` error can never corrupt profile
+reconcile or another setting.
+
+**Migration.** `MigrationV3BlobToPerProfileFiles` (`MigrationRunner.swift`)
+moves the legacy `syncProfiles` UserDefaults blob to per-profile files on
+first launch. The blob is retained as a write-only mirror for one release
+(rollback safety) — `ProfileStore.load()` only reads it back when NO
+per-profile file exists yet, so the mirror can never create a split-brain.
+`writeProfileFiles` returns a `WriteResult` and debug-logs an integrity mismatch
+when the number of files accounted for on disk is fewer than the profiles in the
+source blob, so a silent partial migration is observable.
+
+**Testing.** SyncTray has no XCTest target (Option A — see `docs/` if this
+changes). `ConfigSelfTest.swift` (`#if DEBUG`) runs as `SyncTray --self-test`
+and exits non-zero on any failed assertion; `scripts/check-schema-in-sync.sh`
+is the separate, fail-closed schema-drift gate.
 
 ### Views/
 
@@ -539,7 +603,8 @@ open ~/Library/Developer/Xcode/DerivedData/SyncTray-*/Build/Products/Debug/SyncT
 | `SyncSetupService.swift` | Script generation, launchd management, profile installation |
 | `SyncManager.swift` | Central state manager, LogWatcher/DirectoryWatcher coordination |
 | `SettingsView.swift` | Main settings UI with profile editing |
-| `ProfileStore.swift` | Profile persistence (JSON files) |
+| `ProfileStore.swift` | File-backed profile persistence — authoritative `{shortId}.profile.json` per profile, write-only blob mirror (see "File-Backed Configuration") |
+| `ConfigFileWatcher.swift` | Live-apply watcher for `~/.config/synctray` (profiles + settings) |
 | `SyncLogPatterns` | Centralized log message pattern matching (includes `isOutOfSyncError`) |
 | `TelemetryService.swift` | OTel singleton — traces, metrics, logs via OTLP/HTTP |
 | `TelemetryDetailsSheet.swift` | Shared privacy disclosure sheet for wizard, banner, and settings |

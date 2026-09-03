@@ -195,6 +195,9 @@ jobs:
         with:
           ref: ${{ needs.detect-changes.outputs.checkout_ref }}
 
+      - name: Check schema in sync
+        run: bash scripts/check-schema-in-sync.sh
+
       - name: Cache SwiftPM dependencies
         uses: actions/cache@v4
         with:

@@ -44,6 +44,7 @@ enum MigrationRunner {
     private static let migrations: [ProfileMigration] = [
         MigrationV1LegacyToMultiProfile(),
         MigrationV2FixVFSCachePath(),
+        MigrationV3BlobToPerProfileFiles(),
     ]
 
     /// Run all pending migrations. Call this once at app startup,
@@ -99,7 +100,10 @@ enum MigrationRunner {
 
     // MARK: - Helpers for migrations
 
-    /// Read the profile array from UserDefaults as raw dictionaries
+    /// Read the profile array from UserDefaults as raw dictionaries.
+    /// Internal (not private) so `ConfigSelfTest` can seed/inspect an isolated
+    /// `UserDefaults` suite when exercising `MigrationV3BlobToPerProfileFiles`
+    /// without touching `UserDefaults.standard`.
     static func readProfileDicts(from defaults: UserDefaults) -> [[String: Any]]? {
         guard let data = defaults.data(forKey: profilesKey) else { return nil }
         return try? JSONSerialization.jsonObject(with: data) as? [[String: Any]]
@@ -245,5 +249,103 @@ struct MigrationV2FixVFSCachePath: ProfileMigration {
             return String(path.dropLast(4)) // Remove "/vfs"
         }
         return path
+    }
+}
+
+// MARK: - Migration V3: Blob → Per-Profile Files
+
+/// Migrates the single `syncProfiles` UserDefaults blob to per-profile
+/// `{shortId}.profile.json` files — the new authoritative, agent-editable
+/// surface (see `ProfileStore`).
+///
+/// The blob is intentionally RETAINED (never deleted) as a write-only mirror
+/// for one release: an older build can still read it back for rollback
+/// safety, and because `ProfileStore.load()` only ever reads the blob when NO
+/// per-profile files exist, retaining it can never create a split-brain.
+///
+/// Idempotent PER PROFILE: a profile whose `.profile.json` already exists is
+/// left untouched (it's already migrated, or has since been edited), while
+/// any sibling still blob-only is written. This is deliberately not gated on
+/// "any file already exists" — that all-or-nothing check would treat a single
+/// existing file as "fully migrated" and permanently strand the rest of a
+/// blob if an earlier run wrote only the first profile before being
+/// interrupted (crash, force-quit) partway through.
+struct MigrationV3BlobToPerProfileFiles: ProfileMigration {
+    let version = 3
+    let description = "Migrate syncProfiles blob to per-profile .profile.json files (blob retained, write-only)"
+
+    /// Overridable for self-test isolation; defaults to the real profiles directory.
+    var profilesDirectoryOverride: String?
+
+    private var profilesDirectory: String { profilesDirectoryOverride ?? SyncProfile.configDirectory }
+
+    func migrateUserDefaults(_ defaults: UserDefaults) throws {
+        guard let profileDicts = MigrationRunner.readProfileDicts(from: defaults), !profileDicts.isEmpty else {
+            return
+        }
+
+        try Self.writeProfileFiles(from: profileDicts, to: profilesDirectory)
+        // The blob is deliberately NOT removed here — see type doc.
+    }
+
+    /// Outcome of a `writeProfileFiles` pass, exposed so callers (and
+    /// `ConfigSelfTest`) can assert MIGRATION INTEGRITY: every profile in the
+    /// source blob must end up with a `.profile.json` (written this pass or
+    /// already present). `accountedFor < expected` means a profile was silently
+    /// dropped (missing/invalid `id`, or an un-encodable dict).
+    struct WriteResult: Equatable {
+        /// Profiles in the source blob.
+        let expected: Int
+        /// Files written this pass.
+        let written: Int
+        /// Files that already existed (idempotent skip).
+        let present: Int
+        /// Profiles that ended up with a file on disk.
+        var accountedFor: Int { written + present }
+        /// True when every source profile is accounted for on disk.
+        var isComplete: Bool { accountedFor == expected }
+    }
+
+    /// Write one `{shortId}.profile.json` per dictionary in `profileDicts`,
+    /// skipping any whose file already exists in `directory` (see type doc
+    /// for why this is per-profile rather than an all-or-nothing gate).
+    /// Internal (not private) so `ConfigSelfTest` can exercise it directly
+    /// against a temp directory, independent of `UserDefaults`.
+    ///
+    /// Returns a `WriteResult` and emits a debug-log line when the migration is
+    /// incomplete, so a silent partial migration (a source profile that never
+    /// got a file) is OBSERVABLE rather than losing config quietly.
+    @discardableResult
+    static func writeProfileFiles(from profileDicts: [[String: Any]], to directory: String) throws -> WriteResult {
+        try FileManager.default.createDirectory(atPath: directory, withIntermediateDirectories: true)
+
+        var written = 0
+        var present = 0
+
+        for var dict in profileDicts {
+            guard let idString = dict["id"] as? String else { continue }
+            let shortId = String(idString.prefix(8)).lowercased()
+            let path = "\(directory)/\(shortId).profile.json"
+
+            guard !FileManager.default.fileExists(atPath: path) else { present += 1; continue }
+
+            dict["$schema"] = "../schema/profile.schema.json"
+
+            guard let data = try? JSONSerialization.data(
+                withJSONObject: dict, options: [.prettyPrinted, .sortedKeys]) else { continue }
+
+            try data.write(to: URL(fileURLWithPath: path), options: .atomic)
+            written += 1
+        }
+
+        let result = WriteResult(expected: profileDicts.count, written: written, present: present)
+        if !result.isComplete {
+            SyncTraySettings.debugLog(
+                "[MigrationV3] integrity mismatch: \(result.expected) profile(s) in source blob but only "
+                + "\(result.accountedFor) accounted for on disk (written \(written), already present \(present)) "
+                + "— a silent partial migration occurred"
+            )
+        }
+        return result
     }
 }

@@ -1948,24 +1948,11 @@ struct ProfileDetailView: View {
         let updatedProfile = buildProfileFromForm()
         let currentProfile = profile
 
-        // Check if sync-related settings changed (require reinstall)
-        let needsReinstall = isInstalled && (
-            currentProfile.rcloneRemote != updatedProfile.rcloneRemote ||
-            currentProfile.remotePath != updatedProfile.remotePath ||
-            currentProfile.localSyncPath != updatedProfile.localSyncPath ||
-            currentProfile.syncIntervalMinutes != updatedProfile.syncIntervalMinutes ||
-            currentProfile.additionalRcloneFlags != updatedProfile.additionalRcloneFlags ||
-            currentProfile.syncMode != updatedProfile.syncMode ||
-            currentProfile.syncDirection != updatedProfile.syncDirection ||
-            currentProfile.fallbackRemote != updatedProfile.fallbackRemote ||
-            currentProfile.fallbackRemotePath != updatedProfile.fallbackRemotePath ||
-            currentProfile.mountBackend != updatedProfile.mountBackend ||
-            currentProfile.vfsCacheMode != updatedProfile.vfsCacheMode ||
-            currentProfile.vfsCacheMaxSize != updatedProfile.vfsCacheMaxSize ||
-            currentProfile.vfsCacheMaxAge != updatedProfile.vfsCacheMaxAge ||
-            currentProfile.vfsCachePath != updatedProfile.vfsCachePath ||
-            currentProfile.mountAtStartup != updatedProfile.mountAtStartup
-        )
+        // Delegates to the SAME delta helper `applyExternalProfileEdit` uses,
+        // so the Save button and an external file edit can never drift on
+        // "what work does this change need" (see plan Decisions).
+        let needsReinstall = isInstalled
+            && SyncManager.reconcileAction(from: currentProfile, to: updatedProfile) == .reinstall
 
         profileStore.update(updatedProfile)
 
