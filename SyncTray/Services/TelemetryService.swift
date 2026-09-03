@@ -1355,11 +1355,24 @@ final class TelemetryService {
     /// it never pollutes CLI output) and also flushes the logger, so a CLI run's
     /// `synctray.cli.invoked` counter AND its "CLI invoked" log both reach the
     /// collector before the process dies. No-op when telemetry is disabled.
-    func flushForExit() {
+    func flushForExit(timeout: TimeInterval = 3) {
         guard SyncTraySettings.telemetryEnabled else { return }
-        _ = meterProvider?.forceFlush()
-        logProcessor?.forceFlush()
-        tracerProvider?.forceFlush()
+        // The OTLP exporters run on a default URLSession with no custom request
+        // timeout, so a synchronous `forceFlush()` can block ~60s against an
+        // unreachable/black-holed collector. That is unacceptable for a CLI meant
+        // for fast agent scripting, so flush on a background queue and wait only a
+        // short, bounded deadline. Telemetry is best-effort: if the flush hasn't
+        // landed by the deadline, the process exits anyway and the event is lost —
+        // far better than hanging the command.
+        let group = DispatchGroup()
+        group.enter()
+        DispatchQueue.global(qos: .utility).async {
+            _ = self.meterProvider?.forceFlush()
+            self.logProcessor?.forceFlush()
+            self.tracerProvider?.forceFlush()
+            group.leave()
+        }
+        _ = group.wait(timeout: .now() + timeout)
     }
 
     // MARK: - Offline Extension Setup Funnel
