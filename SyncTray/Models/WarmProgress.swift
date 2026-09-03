@@ -46,10 +46,13 @@ struct WarmProgress: Equatable {
         }
     }
 
-    /// Determinate fraction [0, 1] when the total is known, else nil (indeterminate).
+    /// Determinate fraction [0, 1]. Byte-based when the total size is known, so the bar
+    /// moves smoothly as bytes stream (file-based progress barely moves for big files).
+    /// Falls back to file count, then indeterminate.
     var fractionComplete: Double? {
-        guard filesTotal > 0 else { return nil }
-        return min(1.0, Double(filesDone) / Double(filesTotal))
+        if bytesTotal > 0 { return min(1.0, Double(bytesDone) / Double(bytesTotal)) }
+        if filesTotal > 0 { return min(1.0, Double(filesDone) / Double(filesTotal)) }
+        return nil
     }
 
     /// Wall-clock duration, frozen at `finishedAt` once the run ends.
@@ -66,6 +69,16 @@ struct WarmProgress: Equatable {
 
     var formattedBytesDone: String {
         ByteCountFormatter.string(fromByteCount: bytesDone, countStyle: .file)
+    }
+
+    var formattedBytesTotal: String {
+        ByteCountFormatter.string(fromByteCount: bytesTotal, countStyle: .file)
+    }
+
+    /// "84.9 MB / 2.1 GB" when the total is known, else just the amount done.
+    var formattedBytesProgress: String {
+        guard bytesTotal > 0 else { return formattedBytesDone }
+        return "\(formattedBytesDone) / \(formattedBytesTotal)"
     }
 
     var formattedElapsed: String {

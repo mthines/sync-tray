@@ -27,6 +27,10 @@ struct OfflineFilesSection: View {
     @State private var browseWarning: String?
     @State private var pinnedDirs: [String] = []
 
+    // Offline exclude globs (e.g. *.rpp-bak) — files matching these never download.
+    @State private var newExcludePattern: String = ""
+    @State private var excludePatterns: [String] = []
+
     private let cacheService = VFSCacheService.shared
 
     /// Live warming progress for this profile, published by SyncManager.
@@ -83,6 +87,11 @@ struct OfflineFilesSection: View {
 
                     Divider()
 
+                    // Exclude patterns
+                    excludePatternsSection
+
+                    Divider()
+
                     // Cached files browser
                     cachedFilesBrowser
                 }
@@ -100,6 +109,7 @@ struct OfflineFilesSection: View {
             // lag ProfileStore (e.g. a folder pinned via Finder in a prior session would
             // otherwise show as "none" until the store next changes).
             pinnedDirs = liveProfile.pinnedDirectories
+            excludePatterns = liveProfile.warmExcludePatterns
             refreshCacheStats()
             checkExtensionEnabled()
         }
@@ -111,6 +121,7 @@ struct OfflineFilesSection: View {
         }
         .onChange(of: profile.id) { _ in
             pinnedDirs = liveProfile.pinnedDirectories
+            excludePatterns = liveProfile.warmExcludePatterns
             currentPath = ""
             pathHistory = []
             refreshCacheStats()
@@ -124,8 +135,11 @@ struct OfflineFilesSection: View {
         // live — the profile store is the source of truth, so mirror its pinned list
         // whenever it changes for this profile.
         .onReceive(profileStore.$profiles) { profiles in
-            guard let updated = profiles.first(where: { $0.id == profile.id }),
-                  updated.pinnedDirectories != pinnedDirs else { return }
+            guard let updated = profiles.first(where: { $0.id == profile.id }) else { return }
+            if updated.warmExcludePatterns != excludePatterns {
+                excludePatterns = updated.warmExcludePatterns
+            }
+            guard updated.pinnedDirectories != pinnedDirs else { return }
             pinnedDirs = updated.pinnedDirectories
             refreshCacheStats()
         }
@@ -418,7 +432,10 @@ struct OfflineFilesSection: View {
                     // while large files are mid-read (no per-file update arrives then).
                     TimelineView(.periodic(from: Date(), by: 1)) { _ in
                         VStack(alignment: .leading, spacing: 4) {
-                            if let fraction = w.fractionComplete {
+                            // Byte-level bar once data is flowing; an indeterminate spinner
+                            // before the first bytes arrive, so a slow/stalled start reads as
+                            // "waiting", not a bar frozen at 0%.
+                            if w.bytesDone > 0, let fraction = w.fractionComplete {
                                 ProgressView(value: fraction).controlSize(.small)
                             } else {
                                 ProgressView().controlSize(.small)
@@ -436,15 +453,9 @@ struct OfflineFilesSection: View {
                                     .font(.caption2.monospacedDigit())
                                     .foregroundStyle(.secondary)
                             }
-                            if w.filesInFlight > 1 {
-                                Text("\(w.filesInFlight) files downloading in parallel · \(w.formattedRate)")
-                                    .font(.caption2)
-                                    .foregroundStyle(.tertiary)
-                            } else {
-                                Text(w.formattedRate)
-                                    .font(.caption2.monospacedDigit())
-                                    .foregroundStyle(.tertiary)
-                            }
+                            Text(warmSubline(w))
+                                .font(.caption2)
+                                .foregroundStyle(.tertiary)
                         }
                     }
                 case .completed:
@@ -475,17 +486,103 @@ struct OfflineFilesSection: View {
         }
     }
 
-    /// Compact "12 of 340 · 118 MB · 45s" summary for the downloading row.
+    /// Right-aligned size + time, e.g. "84.9 MB / 2.1 GB · 45s".
     private func warmDetail(_ w: WarmProgress) -> String {
+        "\(w.formattedBytesProgress) · \(w.formattedElapsed)"
+    }
+
+    /// Secondary line: file count, parallelism, and rate — e.g.
+    /// "12 of 340 files · 4 downloading in parallel · 2 MB/s".
+    private func warmSubline(_ w: WarmProgress) -> String {
         var parts: [String] = []
         if w.filesTotal > 0 {
-            parts.append("\(w.filesDone) of \(w.filesTotal)")
+            parts.append("\(w.filesDone) of \(w.filesTotal) files")
         } else if w.filesDone > 0 {
             parts.append("\(w.filesDone) files")
         }
-        parts.append(w.formattedBytesDone)
-        parts.append(w.formattedElapsed)
+        if w.filesInFlight > 1 {
+            parts.append("\(w.filesInFlight) downloading in parallel")
+        }
+        parts.append(w.bytesDone > 0 ? w.formattedRate : "waiting for data…")
         return parts.joined(separator: " · ")
+    }
+
+    // MARK: - Exclude Patterns
+
+    private var excludePatternsSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Don't Download")
+                .font(.caption.weight(.medium))
+
+            Text("Files matching these patterns are skipped when warming offline folders — "
+                + "for example, \u{201C}*.rpp-bak\u{201D} to skip Reaper backups. Use glob patterns "
+                + "(\u{201C}*.bak\u{201D}, \u{201C}Backups/*\u{201D}).")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            if excludePatterns.isEmpty {
+                Text("No exclude patterns")
+                    .font(.caption)
+                    .foregroundStyle(.tertiary)
+                    .frame(maxWidth: .infinity, alignment: .center)
+                    .padding(.vertical, 6)
+            } else {
+                ForEach(excludePatterns, id: \.self) { pattern in
+                    HStack(spacing: 8) {
+                        Image(systemName: "nosign")
+                            .foregroundStyle(.secondary)
+                            .font(.caption2)
+                        Text(pattern)
+                            .font(.caption.monospaced())
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                        Spacer()
+                        Button(action: { removeExcludePattern(pattern) }) {
+                            Image(systemName: "xmark.circle.fill")
+                                .foregroundStyle(.secondary)
+                                .font(.caption)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                    .padding(.vertical, 3)
+                    .padding(.horizontal, 6)
+                    .background(Color.secondary.opacity(0.08))
+                    .clipShape(.rect(cornerRadius: 4))
+                }
+            }
+
+            HStack(spacing: 4) {
+                TextField("Pattern (e.g., *.rpp-bak)", text: $newExcludePattern)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.caption)
+                    .onSubmit { addExcludePattern() }
+                Button(action: { addExcludePattern() }) {
+                    Image(systemName: "plus.circle.fill")
+                        .foregroundStyle(.blue)
+                }
+                .buttonStyle(.plain)
+                .disabled(newExcludePattern.trimmingCharacters(in: .whitespaces).isEmpty)
+            }
+        }
+    }
+
+    private func addExcludePattern() {
+        let pattern = newExcludePattern.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !pattern.isEmpty, !excludePatterns.contains(pattern) else { return }
+        excludePatterns.append(pattern)
+        newExcludePattern = ""
+        saveExcludePatterns()
+    }
+
+    private func removeExcludePattern(_ pattern: String) {
+        excludePatterns.removeAll { $0 == pattern }
+        saveExcludePatterns()
+    }
+
+    private func saveExcludePatterns() {
+        var updated = liveProfile
+        updated.warmExcludePatterns = excludePatterns
+        profileStore.update(updated)
     }
 
     // MARK: - Cached Files Browser

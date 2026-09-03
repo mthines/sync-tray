@@ -2119,12 +2119,17 @@ final class SyncManager: ObservableObject {
                     p.filesInFlight += 1
                     self.warmProgress[profileId] = p
                 }
-            }, onFinish: { [weak self] bytes in
+            }, onProgress: { [weak self] bytes in
+                await MainActor.run {
+                    guard let self, var p = self.warmProgress[profileId] else { return }
+                    p.bytesDone += bytes    // advances mid-file, per chunk
+                    self.warmProgress[profileId] = p
+                }
+            }, onFileComplete: { [weak self] in
                 await MainActor.run {
                     guard let self, var p = self.warmProgress[profileId] else { return }
                     p.filesDone += 1
                     p.filesInFlight = max(0, p.filesInFlight - 1)
-                    p.bytesDone += bytes
                     self.warmProgress[profileId] = p
                 }
             })

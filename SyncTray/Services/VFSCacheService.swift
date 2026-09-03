@@ -1,4 +1,5 @@
 import Foundation
+import Darwin  // fnmatch for offline-warming exclude globs
 
 /// Represents a cached file or directory in the VFS cache
 struct CachedItem: Identifiable, Comparable {
@@ -337,11 +338,27 @@ final class VFSCacheService {
         }
     }
 
+    /// True if a file should be skipped by offline warming because it matches one of the
+    /// profile's `warmExcludePatterns` (fnmatch globs). Matched case-insensitively against
+    /// both the bare file name and its path relative to the pinned dir, so `*.rpp-bak`
+    /// matches the file and `Backups/*` matches by subpath.
+    static func isExcluded(relativePath: String, name: String, patterns: [String]) -> Bool {
+        for pattern in patterns {
+            let p = pattern.trimmingCharacters(in: .whitespaces)
+            guard !p.isEmpty else { continue }
+            if fnmatch(p, name, FNM_CASEFOLD) == 0 { return true }
+            if fnmatch(p, relativePath, FNM_CASEFOLD) == 0 { return true }
+        }
+        return false
+    }
+
     /// Estimated work for warming a directory: number of regular files and their total bytes.
     struct WarmEstimate { let files: Int; let bytes: Int64 }
 
     /// Count the regular files and total bytes under a pinned directory with a metadata-only
-    /// walk (no byte reads). Used to give the warming UI a determinate progress bar.
+    /// walk (no byte reads). Used to give the warming UI a determinate progress bar. Files
+    /// matching the profile's exclude patterns are not counted, so the total matches what the
+    /// warmer will actually download.
     func estimateWarmWork(_ dir: String, for profile: SyncProfile) -> WarmEstimate {
         let fullDirPath = (profile.localSyncPath as NSString).appendingPathComponent(dir)
         let fm = FileManager.default
@@ -352,11 +369,16 @@ final class VFSCacheService {
                 options: [.skipsHiddenFiles]
               ) else { return WarmEstimate(files: 0, bytes: 0) }
 
+        let patterns = profile.warmExcludePatterns
+        let prefixLen = fullDirPath.count + 1
         var files = 0
         var bytes: Int64 = 0
         for case let fileURL as URL in enumerator {
             guard let rv = try? fileURL.resourceValues(forKeys: [.fileSizeKey, .isRegularFileKey]),
                   rv.isRegularFile == true else { continue }
+            let rel = fileURL.path.count > prefixLen ? String(fileURL.path.dropFirst(prefixLen)) : fileURL.lastPathComponent
+            if !patterns.isEmpty,
+               Self.isExcluded(relativePath: rel, name: fileURL.lastPathComponent, patterns: patterns) { continue }
             files += 1
             bytes += Int64(rv.fileSize ?? 0)
         }
@@ -384,15 +406,18 @@ final class VFSCacheService {
     ///   - isStillPinned: Live predicate re-evaluated between files; when it returns
     ///     false (the directory was unpinned mid-warm) the loop stops scheduling.
     ///   - onStart: Called when a file's read begins, with its name. Runs off the main actor.
-    ///   - onFinish: Called when a file's read completes, with the bytes actually read, so a
-    ///     caller can advance accurate progress. Runs off the main actor.
+    ///   - onProgress: Called for each chunk read, with the bytes in that chunk, so a caller
+    ///     can advance byte-level progress *while a file is still downloading* (large files on
+    ///     a slow link would otherwise show no movement until they finish). Runs off the main actor.
+    ///   - onFileComplete: Called when a file's read finishes. Runs off the main actor.
     func warmDirectory(
         _ dir: String,
         for profile: SyncProfile,
         concurrency: Int = defaultWarmConcurrency,
         isStillPinned: @Sendable () async -> Bool,
         onStart: (@Sendable (_ name: String) async -> Void)? = nil,
-        onFinish: (@Sendable (_ bytes: Int64) async -> Void)? = nil
+        onProgress: (@Sendable (_ bytes: Int64) async -> Void)? = nil,
+        onFileComplete: (@Sendable () async -> Void)? = nil
     ) async {
         let port = profile.rcPort
         let mountPath = profile.localSyncPath
@@ -415,6 +440,8 @@ final class VFSCacheService {
         ) else { return }
 
         let maxConcurrent = max(1, concurrency)
+        let excludePatterns = profile.warmExcludePatterns
+        let prefixLen = fullDirPath.count + 1
 
         // Bounded-concurrency task group: keep up to `maxConcurrent` file reads in flight,
         // starting a new one each time a running one completes.
@@ -434,6 +461,13 @@ final class VFSCacheService {
                 let name = fileURL.lastPathComponent
                 let path = fileURL.path
 
+                // Skip files matching the profile's offline exclude globs (e.g. *.rpp-bak),
+                // so backups and other unwanted files never download into the offline cache.
+                if !excludePatterns.isEmpty {
+                    let rel = path.count > prefixLen ? String(path.dropFirst(prefixLen)) : name
+                    if Self.isExcluded(relativePath: rel, name: name, patterns: excludePatterns) { continue }
+                }
+
                 if running >= maxConcurrent {
                     await group.next()      // wait for a slot
                     running -= 1
@@ -442,29 +476,26 @@ final class VFSCacheService {
                 await onStart?(name)
                 group.addTask {
                     // Reading bytes through the mount is what populates the rclone VFS
-                    // content cache (not the RC /vfs/refresh call above).
-                    let bytes = Self.readFileThroughMount(path: path)
-                    await onFinish?(bytes)
+                    // content cache (not the RC /vfs/refresh call above). Report each chunk
+                    // as it arrives so byte progress advances mid-file. 1 MB chunks keep the
+                    // NFS round-trips (and the main-actor progress hops) low on slow links.
+                    guard let fileHandle = FileHandle(forReadingAtPath: path) else {
+                        await onFileComplete?()
+                        return
+                    }
+                    let chunkSize = 1024 * 1024  // 1 MB
+                    while let chunk = try? fileHandle.read(upToCount: chunkSize), !chunk.isEmpty {
+                        await onProgress?(Int64(chunk.count))
+                        if Task.isCancelled { break }
+                    }
+                    try? fileHandle.close()
+                    await onFileComplete?()
                 }
             }
             await group.waitForAll()
         }
 
         SyncTraySettings.debugLog("warmDirectory: Finished warming '\(dir)'")
-    }
-
-    /// Read a file end-to-end through the mount to force rclone to cache its content.
-    /// Returns the number of bytes read. 1 MB chunks keep the number of NFS round-trips low
-    /// on high-latency links.
-    private static func readFileThroughMount(path: String) -> Int64 {
-        guard let fileHandle = FileHandle(forReadingAtPath: path) else { return 0 }
-        defer { try? fileHandle.close() }
-        let chunkSize = 1024 * 1024  // 1 MB
-        var bytesRead: Int64 = 0
-        while let chunk = try? fileHandle.read(upToCount: chunkSize), !chunk.isEmpty {
-            bytesRead += Int64(chunk.count)
-        }
-        return bytesRead
     }
 
     // MARK: - Errors
