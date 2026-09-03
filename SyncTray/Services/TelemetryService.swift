@@ -117,6 +117,10 @@ final class TelemetryService {
     private var offlineExtensionSetupCounter: LongCounterSdk?
     private var offlineCacheClearCounter: LongCounterSdk?
     private var rcloneDiscoveryCounter: LongCounterSdk?
+    private var warmDurationHistogram: DoubleHistogramMeterSdk?
+    private var warmThroughputHistogram: DoubleHistogramMeterSdk?
+    private var warmFilesCounter: LongCounterSdk?
+    private var warmBytesCounter: LongCounterSdk?
 
     // MARK: - Providers (kept alive for shutdown)
 
@@ -404,6 +408,27 @@ final class TelemetryService {
             .counterBuilder(name: "synctray.rclone.discovery")
             .setDescription("rclone binary discovery outcome at launch (by source + location bucket)")
             .setUnit("1")
+            .build()
+
+        warmDurationHistogram = meter
+            .histogramBuilder(name: "synctray.offline.warm.duration")
+            .setDescription("Duration of an offline-file warming run (seconds)")
+            .setUnit("s")
+            .build()
+        warmThroughputHistogram = meter
+            .histogramBuilder(name: "synctray.offline.warm.throughput")
+            .setDescription("Average read throughput of an offline-file warming run (MB/s) — the signal for slow-fallback diagnosis")
+            .setUnit("MBy/s")
+            .build()
+        warmFilesCounter = meter
+            .counterBuilder(name: "synctray.offline.warm.files")
+            .setDescription("Files warmed into the VFS content cache")
+            .setUnit("1")
+            .build()
+        warmBytesCounter = meter
+            .counterBuilder(name: "synctray.offline.warm.bytes")
+            .setDescription("Bytes read through the mount while warming the VFS content cache")
+            .setUnit("By")
             .build()
     }
 
@@ -1797,6 +1822,99 @@ final class TelemetryService {
     }
 
     /// Emit a structured OTel log record, optionally correlated to a span.
+    // MARK: - Offline warming
+
+    /// Opaque handle returned by `beginWarm` and passed back to `endWarm`, carrying the
+    /// span and the low-cardinality labels for the end-of-run metrics.
+    struct WarmSpanToken {
+        let span: (any Span)?
+        let profileName: String
+        let concurrency: Int
+        let trigger: String
+    }
+
+    /// Start a `synctray warm` span for an offline-file warming run. No-op (returns an
+    /// empty token) when telemetry is disabled.
+    func beginWarm(
+        profileId: UUID,
+        profileName: String,
+        directoryCount: Int,
+        concurrency: Int,
+        trigger: String
+    ) -> WarmSpanToken {
+        guard SyncTraySettings.telemetryEnabled else {
+            return WarmSpanToken(span: nil, profileName: profileName, concurrency: concurrency, trigger: trigger)
+        }
+        ensureSetup()
+
+        let attrs: [String: AttributeValue] = [
+            "synctray.profile.id": .string(profileId.uuidString),
+            "synctray.profile.name": .string(profileName),
+            "warm.directory_count": .int(directoryCount),
+            "warm.concurrency": .int(concurrency),
+            "warm.trigger": .string(trigger),
+        ]
+
+        let span = tracer?.spanBuilder(spanName: "synctray warm")
+            .setSpanKind(spanKind: .internal)
+            .startSpan()
+        if let span {
+            for (key, value) in attrs { span.setAttribute(key: key, value: value) }
+        }
+
+        emitLog(severity: .info, body: "Offline warm started", attributes: attrs, spanContext: span?.context)
+        return WarmSpanToken(span: span, profileName: profileName, concurrency: concurrency, trigger: trigger)
+    }
+
+    /// End the warm span and record duration / throughput / file / byte metrics.
+    ///
+    /// - Parameter outcome: how the run ended — `"completed"` (ran to the end) or
+    ///   `"cancelled"` (superseded, cache cleared, or profile unmounted mid-warm). Recorded
+    ///   as a `warm.outcome` label on every metric and on the span/log so an interrupted
+    ///   warm is distinguishable from a finished one.
+    func endWarm(
+        _ token: WarmSpanToken,
+        filesWarmed: Int,
+        bytesWarmed: Int64,
+        durationSeconds: Double,
+        outcome: String = "completed"
+    ) {
+        guard SyncTraySettings.telemetryEnabled else { return }
+
+        let throughputMBps = durationSeconds > 0
+            ? (Double(bytesWarmed) / durationSeconds) / (1024 * 1024)
+            : 0
+
+        // Low-cardinality labels for the metrics (never files/bytes — those are the values).
+        let labels: [String: AttributeValue] = [
+            "synctray.profile.name": .string(token.profileName),
+            "warm.trigger": .string(token.trigger),
+            "warm.outcome": .string(outcome),
+        ]
+        warmDurationHistogram?.record(value: durationSeconds, attributes: labels)
+        warmThroughputHistogram?.record(value: throughputMBps, attributes: labels)
+        warmFilesCounter?.add(value: filesWarmed, attribute: labels)
+        warmBytesCounter?.add(value: Int(bytesWarmed), attribute: labels)
+
+        let endAttrs: [String: AttributeValue] = [
+            "synctray.profile.name": .string(token.profileName),
+            "warm.trigger": .string(token.trigger),
+            "warm.outcome": .string(outcome),
+            "warm.concurrency": .int(token.concurrency),
+            "warm.files": .int(filesWarmed),
+            "warm.bytes": .int(Int(bytesWarmed)),
+            "warm.duration_seconds": .double(durationSeconds),
+            "warm.throughput_mbps": .double(throughputMBps),
+        ]
+        if let span = token.span {
+            for (key, value) in endAttrs { span.setAttribute(key: key, value: value) }
+            span.status = .ok
+            span.end()
+        }
+        let body = outcome == "cancelled" ? "Offline warm cancelled" : "Offline warm completed"
+        emitLog(severity: .info, body: body, attributes: endAttrs, spanContext: token.span?.context)
+    }
+
     private func emitLog(
         severity: Severity,
         body: String,

@@ -33,6 +33,12 @@ struct SyncProfile: Identifiable, Codable, Equatable {
     var allowNonEmptyMount: Bool        // Allow mounting to non-empty folders (default: false)
     var mountAtStartup: Bool            // Auto-mount when SyncTray launches (mount mode, default: true)
     var pinnedDirectories: [String]     // Directories to automatically cache offline (mount mode)
+    /// Glob patterns excluded from offline warming, matched **case-sensitively** against each
+    /// file's name and its path relative to the pinned dir. Supports `*` (within a segment),
+    /// `?`, and `**` (across segments), so `*.bak` skips backup files and `**/BACKUP/**` skips
+    /// every folder named BACKUP at any depth (e.g. "*.bak", "*.tmp", "**/BACKUP/**").
+    /// Excluded files are skipped by the warmer so they never download into the offline cache.
+    var warmExcludePatterns: [String]
     var rcPort: Int                     // Port for rclone RC (remote control) API (mount mode)
 
     /// Short ID for file naming (first 8 chars of UUID)
@@ -166,6 +172,7 @@ struct SyncProfile: Identifiable, Codable, Equatable {
         allowNonEmptyMount: Bool = false,
         mountAtStartup: Bool = true,
         pinnedDirectories: [String] = [],
+        warmExcludePatterns: [String] = [],
         rcPort: Int = 0
     ) {
         self.id = id
@@ -191,6 +198,7 @@ struct SyncProfile: Identifiable, Codable, Equatable {
         self.allowNonEmptyMount = allowNonEmptyMount
         self.mountAtStartup = mountAtStartup
         self.pinnedDirectories = pinnedDirectories
+        self.warmExcludePatterns = warmExcludePatterns
         self.rcPort = rcPort > 0 ? rcPort : SyncProfile.defaultRCPort(for: id)
     }
 
@@ -222,7 +230,7 @@ extension SyncProfile {
         case mountBackend
         case vfsCacheMode, vfsCacheMaxSize, vfsCacheMaxAge, vfsCachePath, allowNonEmptyMount
         case mountAtStartup
-        case pinnedDirectories, rcPort
+        case pinnedDirectories, warmExcludePatterns, rcPort
     }
 
     init(from decoder: Decoder) throws {
@@ -267,6 +275,8 @@ extension SyncProfile {
         mountAtStartup = try container.decodeIfPresent(Bool.self, forKey: .mountAtStartup) ?? true
         // Backwards compatibility: default to empty array if not present
         pinnedDirectories = try container.decodeIfPresent([String].self, forKey: .pinnedDirectories) ?? []
+        // Backwards compatibility: default to empty array if not present
+        warmExcludePatterns = try container.decodeIfPresent([String].self, forKey: .warmExcludePatterns) ?? []
         // Backwards compatibility: generate default RC port if not present
         let decodedRCPort = try container.decodeIfPresent(Int.self, forKey: .rcPort) ?? 0
         rcPort = decodedRCPort > 0 ? decodedRCPort : SyncProfile.defaultRCPort(for: id)

@@ -46,6 +46,16 @@ final class SyncManager: ObservableObject {
     /// Paused profiles (session-only, not persisted - resets on app restart)
     @Published private(set) var pausedProfiles: Set<UUID> = []
 
+    /// Live progress of offline-file warming per profile (session-only). Drives the
+    /// "Available Offline" progress row in `OfflineFilesSection`. Set by
+    /// `warmPinnedDirectories`, which every warm entry point routes through.
+    @Published private(set) var warmProgress: [UUID: WarmProgress] = [:]
+
+    /// In-flight warming tasks per profile, kept so a warm run can be cancelled when the
+    /// cache is cleared, the profile is unmounted, or a new run supersedes it. Without this,
+    /// clearing the cache mid-warm just re-downloads the files the warmer is still reading.
+    private var warmTasks: [UUID: Task<Void, Never>] = [:]
+
     let profileStore: ProfileStore
 
     private var logWatchers: [UUID: LogWatcher] = [:]
@@ -324,7 +334,7 @@ final class SyncManager: ObservableObject {
                                 Task { [weak self] in
                                     // Wait for RC API to be ready
                                     try? await Task.sleep(nanoseconds: 2_000_000_000)
-                                    await self?.cacheService.refreshPinnedDirectories(for: profile)
+                                    self?.startWarm(for: profile.id, trigger: "startup")
                                 }
                             }
                         } else {
@@ -355,6 +365,9 @@ final class SyncManager: ObservableObject {
     /// Unmount a profile (for mount mode only)
     func unmountProfile(_ profile: SyncProfile) {
         guard profile.isMountMode else { return }
+
+        // Stop any warming first — reads through a mount that's going away would hang or fail.
+        cancelWarm(for: profile.id)
 
         Task {
             do {
@@ -2045,24 +2058,144 @@ final class SyncManager: ObservableObject {
 
             SyncTraySettings.debugLog("processPendingPinRequest: \(action) \(paths.count) path(s) for '\(profile.name)'")
 
-            // For pin operations, start warming the directories. The warmer re-checks
-            // live pin state (via the closure) between files, so an unpin arriving
-            // mid-warm actually stops the read loop instead of running to the ceiling.
+            // For pin operations, start warming the newly pinned directories. Routed through
+            // warmPinnedDirectories so the offline-files UI shows progress, and so the warmer
+            // re-checks live pin state between files (an unpin mid-warm stops the read loop).
             if action == "pin" {
-                for path in paths {
-                    Task {
-                        await self.cacheService.warmDirectory(path, for: profile) { [weak self] in
-                            await self?.isDirectoryPinned(path, profileId: profileId) ?? false
-                        }
-                        // Warming populated the VFS cache — nudge the extension again so the
-                        // badge flips from cloud to the "downloaded" checkmark.
-                        await MainActor.run { [weak self] in self?.notifyFinderSyncReload() }
-                    }
-                }
+                startWarm(for: profileId, dirs: paths, trigger: "finder_pin")
             }
 
         } catch {
             SyncTraySettings.debugLog("processPendingPinRequest: error reading/parsing request: \(error)")
+        }
+    }
+
+    /// Start a warming run for a profile as a cancellable, tracked task, superseding any run
+    /// already in flight. This is the entry point every trigger uses so the run can later be
+    /// stopped (`cancelWarm`) when the cache is cleared or the profile is unmounted.
+    func startWarm(for profileId: UUID, dirs: [String]? = nil, trigger: String = "manual") {
+        let previous = warmTasks[profileId]
+        previous?.cancel()  // supersede any run in flight
+        warmTasks[profileId] = Task { [weak self] in
+            // Wait for the superseded run to fully wind down before starting. Its cleanup
+            // clears `warmProgress[profileId]`, so without this await the new run would hit
+            // `warmPinnedDirectories`' still-active coalesce guard and bail — cancelling the
+            // old warm without starting the new one (the exclude/pin "apply right away" path).
+            await previous?.value
+            await self?.warmPinnedDirectories(for: profileId, dirs: dirs, trigger: trigger)
+        }
+    }
+
+    /// Cancel an in-flight warming run for a profile. The run stops within one file chunk and
+    /// its completion block drops the progress row and records a `cancelled` outcome. Call
+    /// before clearing the cache or unmounting so the warmer doesn't re-download files that
+    /// are about to be evicted (or read through a mount that's going away).
+    func cancelWarm(for profileId: UUID) {
+        warmTasks[profileId]?.cancel()
+    }
+
+    /// Warm (download into the VFS content cache) a profile's pinned folders, publishing
+    /// live progress via `warmProgress[profileId]`.
+    ///
+    /// Every warm entry point routes through `startWarm` into here — the manual "Sync All"
+    /// button, the post-mount startup warm, and Finder pin requests — so all three surface the
+    /// same progress UI. Concurrent runs for one profile are coalesced: a call while a run is
+    /// active is ignored. The run stops promptly when its task is cancelled (cache cleared /
+    /// unmounted): the directory loop and `warmDirectory` both check `Task.isCancelled`. Emits
+    /// a `synctray warm` span + metrics (with a `warm.outcome` of completed/cancelled) so a run
+    /// is measurable in telemetry (throughput is the signal for the slow-fallback case).
+    ///
+    /// - Parameters:
+    ///   - profileId: The mount-mode profile to warm.
+    ///   - specificDirs: Warm only these directories (e.g. the paths from a Finder pin);
+    ///     when nil, warm all of the profile's pinned directories.
+    ///   - trigger: What started the run (manual / startup / finder_pin) — recorded on the span.
+    func warmPinnedDirectories(for profileId: UUID, dirs specificDirs: [String]? = nil, trigger: String = "manual") async {
+        guard warmProgress[profileId]?.isActive != true else { return }  // coalesce
+        guard let profile = profileStore.profile(for: profileId) else { return }
+        let targets = specificDirs ?? profile.pinnedDirectories
+        guard !targets.isEmpty else { return }
+
+        var progress = WarmProgress()
+        warmProgress[profileId] = progress
+
+        let telemetry = TelemetryService.shared.beginWarm(
+            profileId: profileId,
+            profileName: profile.name,
+            directoryCount: targets.count,
+            concurrency: VFSCacheService.defaultWarmConcurrency,
+            trigger: trigger
+        )
+
+        // Estimate work up front (metadata-only walk) so the bar can be determinate. The
+        // walk can hit the network on an NFS mount, so run it off the main actor.
+        let estimate = await Task.detached(priority: .utility) {
+            targets.reduce(into: (files: 0, bytes: Int64(0))) { acc, dir in
+                let e = VFSCacheService.shared.estimateWarmWork(dir, for: profile)
+                acc.files += e.files
+                acc.bytes += e.bytes
+            }
+        }.value
+
+        progress.filesTotal = estimate.files
+        progress.bytesTotal = estimate.bytes
+        progress.phase = .downloading
+        warmProgress[profileId] = progress
+
+        for dir in targets {
+            if Task.isCancelled { break }  // cache cleared or profile unmounted mid-run
+            await cacheService.warmDirectory(dir, for: profile, isStillPinned: { [weak self] in
+                await self?.isDirectoryPinned(dir, profileId: profileId) ?? false
+            }, onStart: { [weak self] name in
+                await MainActor.run {
+                    guard let self, var p = self.warmProgress[profileId] else { return }
+                    p.currentDirectory = dir
+                    p.inFlightFiles.append(name)
+                    self.warmProgress[profileId] = p
+                }
+            }, onProgress: { [weak self] bytes in
+                await MainActor.run {
+                    guard let self, var p = self.warmProgress[profileId] else { return }
+                    p.bytesDone += bytes    // advances mid-file, per chunk
+                    self.warmProgress[profileId] = p
+                }
+            }, onFileComplete: { [weak self] name in
+                await MainActor.run {
+                    guard let self, var p = self.warmProgress[profileId] else { return }
+                    p.filesDone += 1
+                    if let idx = p.inFlightFiles.firstIndex(of: name) {
+                        p.inFlightFiles.remove(at: idx)
+                    }
+                    self.warmProgress[profileId] = p
+                }
+            })
+            // Warming populated the VFS cache — nudge the extension so folder badges flip
+            // from cloud to the "downloaded" checkmark as each directory finishes.
+            notifyFinderSyncReload()
+        }
+
+        let cancelled = Task.isCancelled
+        if var p = warmProgress[profileId] {
+            let files = p.filesDone
+            let bytes = p.bytesDone
+            let elapsed = p.elapsed
+            if cancelled {
+                // Drop the row — the cache was cleared or the mount went away, so a lingering
+                // "completed" summary would be misleading.
+                warmProgress[profileId] = nil
+            } else {
+                p.phase = .completed
+                p.finishedAt = Date()
+                p.inFlightFiles = []
+                warmProgress[profileId] = p
+            }
+            TelemetryService.shared.endWarm(
+                telemetry,
+                filesWarmed: files,
+                bytesWarmed: bytes,
+                durationSeconds: elapsed,
+                outcome: cancelled ? "cancelled" : "completed"
+            )
         }
     }
 
