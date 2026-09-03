@@ -46,6 +46,11 @@ final class SyncManager: ObservableObject {
     /// Paused profiles (session-only, not persisted - resets on app restart)
     @Published private(set) var pausedProfiles: Set<UUID> = []
 
+    /// Live progress of offline-file warming per profile (session-only). Drives the
+    /// "Available Offline" progress row in `OfflineFilesSection`. Set by
+    /// `warmPinnedDirectories`, which every warm entry point routes through.
+    @Published private(set) var warmProgress: [UUID: WarmProgress] = [:]
+
     let profileStore: ProfileStore
 
     private var logWatchers: [UUID: LogWatcher] = [:]
@@ -317,7 +322,7 @@ final class SyncManager: ObservableObject {
                                 Task { [weak self] in
                                     // Wait for RC API to be ready
                                     try? await Task.sleep(nanoseconds: 2_000_000_000)
-                                    await self?.cacheService.refreshPinnedDirectories(for: profile)
+                                    await self?.warmPinnedDirectories(for: profile.id, trigger: "startup")
                                 }
                             }
                         } else {
@@ -2038,24 +2043,101 @@ final class SyncManager: ObservableObject {
 
             SyncTraySettings.debugLog("processPendingPinRequest: \(action) \(paths.count) path(s) for '\(profile.name)'")
 
-            // For pin operations, start warming the directories. The warmer re-checks
-            // live pin state (via the closure) between files, so an unpin arriving
-            // mid-warm actually stops the read loop instead of running to the ceiling.
+            // For pin operations, start warming the newly pinned directories. Routed through
+            // warmPinnedDirectories so the offline-files UI shows progress, and so the warmer
+            // re-checks live pin state between files (an unpin mid-warm stops the read loop).
             if action == "pin" {
-                for path in paths {
-                    Task {
-                        await self.cacheService.warmDirectory(path, for: profile) { [weak self] in
-                            await self?.isDirectoryPinned(path, profileId: profileId) ?? false
-                        }
-                        // Warming populated the VFS cache — nudge the extension again so the
-                        // badge flips from cloud to the "downloaded" checkmark.
-                        await MainActor.run { [weak self] in self?.notifyFinderSyncReload() }
-                    }
-                }
+                Task { await self.warmPinnedDirectories(for: profileId, dirs: paths, trigger: "finder_pin") }
             }
 
         } catch {
             SyncTraySettings.debugLog("processPendingPinRequest: error reading/parsing request: \(error)")
+        }
+    }
+
+    /// Warm (download into the VFS content cache) a profile's pinned folders, publishing
+    /// live progress via `warmProgress[profileId]`.
+    ///
+    /// Every warm entry point routes through here — the manual "Sync All" button, the
+    /// post-mount startup warm, and Finder pin requests — so all three surface the same
+    /// progress UI. Concurrent runs for one profile are coalesced: a call while a run is
+    /// active is ignored. Emits a `synctray warm` span + metrics so a run is measurable in
+    /// telemetry (throughput is the signal for the slow-fallback case).
+    ///
+    /// - Parameters:
+    ///   - profileId: The mount-mode profile to warm.
+    ///   - specificDirs: Warm only these directories (e.g. the paths from a Finder pin);
+    ///     when nil, warm all of the profile's pinned directories.
+    ///   - trigger: What started the run (manual / startup / finder_pin) — recorded on the span.
+    func warmPinnedDirectories(for profileId: UUID, dirs specificDirs: [String]? = nil, trigger: String = "manual") async {
+        guard warmProgress[profileId]?.isActive != true else { return }  // coalesce
+        guard let profile = profileStore.profile(for: profileId) else { return }
+        let targets = specificDirs ?? profile.pinnedDirectories
+        guard !targets.isEmpty else { return }
+
+        var progress = WarmProgress()
+        warmProgress[profileId] = progress
+
+        let telemetry = TelemetryService.shared.beginWarm(
+            profileId: profileId,
+            profileName: profile.name,
+            directoryCount: targets.count,
+            concurrency: VFSCacheService.defaultWarmConcurrency,
+            trigger: trigger
+        )
+
+        // Estimate work up front (metadata-only walk) so the bar can be determinate. The
+        // walk can hit the network on an NFS mount, so run it off the main actor.
+        let estimate = await Task.detached(priority: .utility) {
+            targets.reduce(into: (files: 0, bytes: Int64(0))) { acc, dir in
+                let e = VFSCacheService.shared.estimateWarmWork(dir, for: profile)
+                acc.files += e.files
+                acc.bytes += e.bytes
+            }
+        }.value
+
+        progress.filesTotal = estimate.files
+        progress.bytesTotal = estimate.bytes
+        progress.phase = .downloading
+        warmProgress[profileId] = progress
+
+        for dir in targets {
+            await cacheService.warmDirectory(dir, for: profile, isStillPinned: { [weak self] in
+                await self?.isDirectoryPinned(dir, profileId: profileId) ?? false
+            }, onStart: { [weak self] name in
+                await MainActor.run {
+                    guard let self, var p = self.warmProgress[profileId] else { return }
+                    p.currentDirectory = dir
+                    p.currentFile = name
+                    p.filesInFlight += 1
+                    self.warmProgress[profileId] = p
+                }
+            }, onFinish: { [weak self] bytes in
+                await MainActor.run {
+                    guard let self, var p = self.warmProgress[profileId] else { return }
+                    p.filesDone += 1
+                    p.filesInFlight = max(0, p.filesInFlight - 1)
+                    p.bytesDone += bytes
+                    self.warmProgress[profileId] = p
+                }
+            })
+            // Warming populated the VFS cache — nudge the extension so folder badges flip
+            // from cloud to the "downloaded" checkmark as each directory finishes.
+            notifyFinderSyncReload()
+        }
+
+        if var p = warmProgress[profileId] {
+            p.phase = .completed
+            p.finishedAt = Date()
+            p.currentFile = ""
+            p.filesInFlight = 0
+            warmProgress[profileId] = p
+            TelemetryService.shared.endWarm(
+                telemetry,
+                filesWarmed: p.filesDone,
+                bytesWarmed: p.bytesDone,
+                durationSeconds: p.elapsed
+            )
         }
     }
 

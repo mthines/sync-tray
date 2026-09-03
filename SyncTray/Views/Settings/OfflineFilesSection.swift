@@ -25,10 +25,12 @@ struct OfflineFilesSection: View {
     // Pinned directories editing
     @State private var newPinnedDir: String = ""
     @State private var browseWarning: String?
-    @State private var isRefreshingPins: Bool = false
     @State private var pinnedDirs: [String] = []
 
     private let cacheService = VFSCacheService.shared
+
+    /// Live warming progress for this profile, published by SyncManager.
+    private var warm: WarmProgress? { syncManager.warmProgress[profile.id] }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -112,6 +114,11 @@ struct OfflineFilesSection: View {
             currentPath = ""
             pathHistory = []
             refreshCacheStats()
+        }
+        // A warming run just ended (completed or failed) — refresh the cache counts and
+        // file browser so the newly downloaded files show up.
+        .onChange(of: syncManager.warmProgress[profile.id]?.isActive) { active in
+            if active == false { refreshCacheInfo() }
         }
         // Reflect pins made outside this view (e.g. via the Finder right-click menu)
         // live — the profile store is the source of truth, so mirror its pinned list
@@ -319,18 +326,21 @@ struct OfflineFilesSection: View {
                     .font(.caption.weight(.medium))
                 Spacer()
                 if !pinnedDirs.isEmpty && rcAvailable {
+                    let warming = warm?.isActive == true
                     Button(action: { refreshPinnedDirs() }) {
-                        Label(isRefreshingPins ? "Syncing..." : "Sync All", systemImage: "arrow.clockwise.icloud")
+                        Label(warming ? "Syncing…" : "Sync All", systemImage: "arrow.clockwise.icloud")
                             .font(.caption)
                     }
                     .controlSize(.mini)
-                    .disabled(isRefreshingPins)
+                    .disabled(warming)
                 }
             }
 
             Text("Folders you make available offline are downloaded and kept up to date so they open instantly without a connection.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
+
+            warmProgressRow
 
             // List of pinned directories
             if pinnedDirs.isEmpty {
@@ -386,6 +396,96 @@ struct OfflineFilesSection: View {
                 .disabled(newPinnedDir.isEmpty)
             }
         }
+    }
+
+    /// Live progress of the current (or last) warming run. Shown for all three warm
+    /// triggers — manual "Sync All", post-mount startup, and Finder pins — so there is
+    /// always an indication of whether offline sync is running and how far along it is.
+    @ViewBuilder
+    private var warmProgressRow: some View {
+        if let w = warm {
+            VStack(alignment: .leading, spacing: 4) {
+                switch w.phase {
+                case .preparing:
+                    HStack(spacing: 8) {
+                        ProgressView().controlSize(.small)
+                        Text("Preparing…")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                case .downloading:
+                    // TimelineView keeps the elapsed timer and throughput ticking even
+                    // while large files are mid-read (no per-file update arrives then).
+                    TimelineView(.periodic(from: Date(), by: 1)) { _ in
+                        VStack(alignment: .leading, spacing: 4) {
+                            if let fraction = w.fractionComplete {
+                                ProgressView(value: fraction).controlSize(.small)
+                            } else {
+                                ProgressView().controlSize(.small)
+                            }
+                            HStack(spacing: 6) {
+                                Image(systemName: "arrow.down.circle")
+                                    .font(.caption2)
+                                    .foregroundStyle(.blue)
+                                Text(w.currentFile.isEmpty ? "Downloading…" : w.currentFile)
+                                    .font(.caption)
+                                    .lineLimit(1)
+                                    .truncationMode(.middle)
+                                Spacer()
+                                Text(warmDetail(w))
+                                    .font(.caption2.monospacedDigit())
+                                    .foregroundStyle(.secondary)
+                            }
+                            if w.filesInFlight > 1 {
+                                Text("\(w.filesInFlight) files downloading in parallel · \(w.formattedRate)")
+                                    .font(.caption2)
+                                    .foregroundStyle(.tertiary)
+                            } else {
+                                Text(w.formattedRate)
+                                    .font(.caption2.monospacedDigit())
+                                    .foregroundStyle(.tertiary)
+                            }
+                        }
+                    }
+                case .completed:
+                    HStack(spacing: 6) {
+                        Image(systemName: "checkmark.circle.fill")
+                            .font(.caption)
+                            .foregroundStyle(.green)
+                        Text("Synced \(w.filesDone) \(w.filesDone == 1 ? "file" : "files") · "
+                            + "\(w.formattedBytesDone) · \(w.formattedElapsed)")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                case .failed(let message):
+                    HStack(spacing: 6) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .font(.caption)
+                            .foregroundStyle(.orange)
+                        Text(message)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(2)
+                    }
+                }
+            }
+            .padding(8)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(Color.blue.opacity(0.06), in: .rect(cornerRadius: 6))
+        }
+    }
+
+    /// Compact "12 of 340 · 118 MB · 45s" summary for the downloading row.
+    private func warmDetail(_ w: WarmProgress) -> String {
+        var parts: [String] = []
+        if w.filesTotal > 0 {
+            parts.append("\(w.filesDone) of \(w.filesTotal)")
+        } else if w.filesDone > 0 {
+            parts.append("\(w.filesDone) files")
+        }
+        parts.append(w.formattedBytesDone)
+        parts.append(w.formattedElapsed)
+        return parts.joined(separator: " · ")
     }
 
     // MARK: - Cached Files Browser
@@ -532,20 +632,21 @@ struct OfflineFilesSection: View {
     }
 
     private func refreshCacheStats() {
-        DispatchQueue.global(qos: .utility).async {
-            let stats = cacheService.cacheStats(for: profile)
-            DispatchQueue.main.async {
-                self.cacheStats = stats
-            }
+        // RC-aware: reads the cache directory the live mount actually uses, so the counts
+        // stay correct even when the mount is running on the fallback remote (the disk
+        // cache is then keyed by the fallback's name, not the primary's).
+        Task {
+            let stats = await cacheService.resolvedCacheStats(for: liveProfile)
+            await MainActor.run { self.cacheStats = stats }
         }
     }
 
     private func loadCachedItems() {
         isLoading = true
         let path = currentPath
-        DispatchQueue.global(qos: .userInitiated).async {
-            let items = cacheService.listCachedItems(for: profile, at: path)
-            DispatchQueue.main.async {
+        Task {
+            let items = await cacheService.resolvedCachedItems(for: liveProfile, at: path)
+            await MainActor.run {
                 self.cachedItems = items
                 self.isLoading = false
             }
@@ -675,14 +776,9 @@ struct OfflineFilesSection: View {
     }
 
     private func refreshPinnedDirs() {
-        isRefreshingPins = true
-        Task {
-            await cacheService.refreshPinnedDirectories(for: profile)
-            await MainActor.run {
-                isRefreshingPins = false
-                refreshCacheInfo()
-            }
-        }
+        // Route through SyncManager so progress is published to `warmProgress` and the
+        // row above updates live. Stats refresh when the run finishes (see .onChange).
+        Task { await syncManager.warmPinnedDirectories(for: profile.id, trigger: "manual") }
     }
 
     // MARK: - Helpers

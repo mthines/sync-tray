@@ -192,6 +192,10 @@ rollout. No event is emitted on a fresh install.
 | `synctray.rclone.discovery` | Counter | rclone binary discovery at launch (`rclone.discovery_source`: candidate_path/login_shell/not_found; `rclone.location`: homebrew/usr_local/nix_system/nix_per_user/nix_profile/usr_bin/other/none) |
 | `synctray.mount.reinstall_detach` | Counter | Pre-uninstall volume detach attempts for mount-mode profiles, reached on every `SyncSetupService.uninstall` (including the settings-save reinstall path) — `mount.result`: `not_mounted`/`success`/`success_forced`/`failure` |
 | `synctray.mount.reinstall_detach.duration` | Histogram | Time taken to gracefully detach a mounted volume before reinstall (seconds) — regression signal for the "settings change freezes an active Stream mount" failure mode; only recorded when the profile was actually mounted |
+| `synctray.offline.warm.duration` | Histogram | Duration of an offline-file warming run, seconds (`warm.trigger`: manual/startup/finder_pin) |
+| `synctray.offline.warm.throughput` | Histogram | Average read throughput of a warming run, MB/s — the primary signal for slow-fallback diagnosis (the SFTP fallback caps aggregate throughput) |
+| `synctray.offline.warm.files` | Counter | Files warmed into the VFS content cache |
+| `synctray.offline.warm.bytes` | Counter | Bytes read through the mount while warming |
 
 ### Spans
 | Span | Kind | Description |
@@ -200,6 +204,7 @@ rollout. No event is emitted on a fresh install.
 | `synctray mount` | INTERNAL | Mount operation |
 | `synctray unmount` | INTERNAL | Unmount operation |
 | `synctray reinstall_detach` | INTERNAL | Pre-uninstall graceful volume detach for a mount-mode profile (fires on every `uninstall`, including settings-save reinstall) |
+| `synctray warm` | INTERNAL | Offline-file warming run for a profile's pinned folders (start→complete). Carries `warm.trigger`, `warm.concurrency`, `warm.files`, `warm.bytes`, `warm.duration_seconds`, `warm.throughput_mbps`. Exports on completion, so an in-progress warm shows only the "Offline warm started" log, not the span. |
 
 ### Logs
 All key lifecycle events are emitted as structured OTel logs:
@@ -233,6 +238,7 @@ All key lifecycle events are emitted as structured OTel logs:
 - Offline cache clear: cache cleared, with whether pinned folders were preserved (`offline.preserve_pinned`)
 - rclone discovery: where rclone was found at launch, or a warn-level "rclone not found" (`rclone.discovery_source`, `rclone.location`) — measures install-location coverage, e.g. nix-darwin (issue #53). Never emits the raw path.
 - Reinstall pre-detach: graceful volume detach before a mount-mode profile's `uninstall` (settings-save reinstall, manual uninstall, or delete), only logged when the profile was mounted — `success` at info, `success_forced` at warn (diskutil needed `unmount force`), `failure` at error (still mounted after both attempts — the freeze condition this replaces)
+- Offline warm started/completed: a pinned-folder warming run began (`Offline warm started`, with `warm.trigger`, `warm.directory_count`, `warm.concurrency`) or finished (`Offline warm completed`, with `warm.files`, `warm.bytes`, `warm.duration_seconds`, `warm.throughput_mbps`). An in-progress or interrupted run emits only the started log — use `synctray.offline.warm.throughput` to spot the slow-fallback case.
 
 ## Swift SDK Gotcha: Wildcard View Required
 

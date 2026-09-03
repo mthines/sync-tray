@@ -12,6 +12,7 @@
 		7D9FBA7536F4EB2EDCAEE043 /* RcloneConfigService.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0DC6141FBB853681643F593 /* RcloneConfigService.swift */; };
 		A11111110000000000000001 /* SyncTrayApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000001 /* SyncTrayApp.swift */; };
 		A11111110000000000000002 /* SyncState.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000002 /* SyncState.swift */; };
+		A11111110000000000000099 /* WarmProgress.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000099 /* WarmProgress.swift */; };
 		A11111110000000000000003 /* RcloneLogEntry.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000003 /* RcloneLogEntry.swift */; };
 		A11111110000000000000004 /* LogWatcher.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000004 /* LogWatcher.swift */; };
 		A11111110000000000000005 /* LogParser.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000005 /* LogParser.swift */; };
@@ -80,6 +81,7 @@
 		8DF29F3BB633D9E3DD12136A /* SetupWizardView.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = SetupWizardView.swift; sourceTree = "<group>"; };
 		A10000000000000000000001 /* SyncTrayApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SyncTrayApp.swift; sourceTree = "<group>"; };
 		A10000000000000000000002 /* SyncState.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SyncState.swift; sourceTree = "<group>"; };
+		A10000000000000000000099 /* WarmProgress.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WarmProgress.swift; sourceTree = "<group>"; };
 		A10000000000000000000003 /* RcloneLogEntry.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RcloneLogEntry.swift; sourceTree = "<group>"; };
 		A10000000000000000000004 /* LogWatcher.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LogWatcher.swift; sourceTree = "<group>"; };
 		A10000000000000000000005 /* LogParser.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LogParser.swift; sourceTree = "<group>"; };
@@ -181,6 +183,7 @@
 			children = (
 				A1000000000000000000000E /* Settings.swift */,
 				A10000000000000000000002 /* SyncState.swift */,
+				A10000000000000000000099 /* WarmProgress.swift */,
 				A10000000000000000000003 /* RcloneLogEntry.swift */,
 				A10000000000000000000012 /* SyncProfile.swift */,
 				406416A46963E44FF701814B /* SyncMode.swift */,
@@ -397,6 +400,7 @@
 				A11111110000000000000001 /* SyncTrayApp.swift in Sources */,
 				A1111111000000000000000E /* Settings.swift in Sources */,
 				A11111110000000000000002 /* SyncState.swift in Sources */,
+				A11111110000000000000099 /* WarmProgress.swift in Sources */,
 				A11111110000000000000003 /* RcloneLogEntry.swift in Sources */,
 				A11111110000000000000012 /* SyncProfile.swift in Sources */,
 				A11111110000000000000004 /* LogWatcher.swift in Sources */,
