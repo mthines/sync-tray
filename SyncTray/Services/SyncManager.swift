@@ -63,6 +63,13 @@ final class SyncManager: ObservableObject {
     private var primaryRecoveryTimer: DispatchSourceTimer?
     // Profiles with an in-flight primary-recovery remount, so we don't stack remounts.
     private var recoveringToPrimary: Set<UUID> = []
+    // Consecutive successful primary probes per profile. We only remount back onto the
+    // primary after the primary has been reachable for several probes in a row, so a
+    // flapping primary can't trigger a remount storm (every remount is an unmount+mount,
+    // which surfaces a macOS "Server connections interrupted" dialog for a Stream mount).
+    private var primaryRecoveryStreak: [UUID: Int] = [:]
+    // Probes are 120s apart, so 3 in a row means ~6 minutes of stable primary.
+    private let primaryRecoveryRequiredStreak = 3
     private var workspaceObserver: NSObjectProtocol?
     private var currentSyncChanges: [UUID: [FileChange]] = [:]
     private var cancellables = Set<AnyCancellable>()
@@ -2177,6 +2184,10 @@ final class SyncManager: ObservableObject {
                 && isOnFallback(profileTransports[$0.id])
                 && !recoveringToPrimary.contains($0.id)
         }
+        // Drop stale streaks for profiles that are no longer on a fallback mount, so a
+        // future fallback episode starts counting from zero.
+        let candidateIds = Set(candidates.map { $0.id })
+        primaryRecoveryStreak = primaryRecoveryStreak.filter { candidateIds.contains($0.key) }
         guard !candidates.isEmpty else { return }
 
         for profile in candidates {
@@ -2188,12 +2199,30 @@ final class SyncManager: ObservableObject {
                 let reachable = self.isRemoteReachable(primaryRemote)
                 DispatchQueue.main.async {
                     defer { self.recoveringToPrimary.remove(profileId) }
+
+                    // A single unreachable probe resets the streak — the primary must be
+                    // continuously reachable, not merely reachable right now.
                     guard reachable,
                           self.profileMountStates[profileId] == .mounted,
                           self.isOnFallback(self.profileTransports[profileId]),
-                          let current = self.profileStore.profile(for: profileId) else { return }
+                          let current = self.profileStore.profile(for: profileId) else {
+                        self.primaryRecoveryStreak[profileId] = 0
+                        return
+                    }
+
+                    let streak = (self.primaryRecoveryStreak[profileId] ?? 0) + 1
+                    guard streak >= self.primaryRecoveryRequiredStreak else {
+                        self.primaryRecoveryStreak[profileId] = streak
+                        SyncTraySettings.debugLog(
+                            "Primary '\(primaryRemote)' reachable for '\(current.name)' "
+                                + "(\(streak)/\(self.primaryRecoveryRequiredStreak)) — "
+                                + "waiting for it to stay up before remounting")
+                        return
+                    }
+
+                    self.primaryRecoveryStreak[profileId] = 0
                     SyncTraySettings.debugLog(
-                        "Primary '\(primaryRemote)' reachable again — remounting '\(current.name)' on primary")
+                        "Primary '\(primaryRemote)' stable — remounting '\(current.name)' on primary")
                     self.remountOnPrimary(current)
                 }
             }
