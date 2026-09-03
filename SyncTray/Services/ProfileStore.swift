@@ -143,20 +143,32 @@ final class ProfileStore: ObservableObject {
     /// that may have removed a profile must use `writeProfileFiles()` instead.
     @discardableResult
     private func writeProfileFile(_ profile: SyncProfile) -> String? {
+        Self.writeProfileFile(profile, in: profilesDirectory)
+    }
+
+    /// Write a single profile's `{shortId}.profile.json` into `directory`,
+    /// injecting the `$schema` pointer and noting the content hash in
+    /// `ConfigSelfWriteRegistry` (so a running app's `ConfigFileWatcher`
+    /// suppresses its own FSEvent). Returns the written filename, or `nil` on
+    /// failure. `nonisolated` and callable off `@MainActor` so the headless CLI
+    /// (`SyncTrayCLI`'s `profile create`/`enable`/`disable`) writes the exact
+    /// same byte format the app does — the write counterpart to
+    /// `profilesOnDisk(in:)`, keeping one source of truth for the on-disk shape.
+    nonisolated static func writeProfileFile(_ profile: SyncProfile, in directory: String) -> String? {
         let fm = FileManager.default
         guard (try? fm.createDirectory(
-            atPath: profilesDirectory, withIntermediateDirectories: true)) != nil else { return nil }
+            atPath: directory, withIntermediateDirectories: true)) != nil else { return nil }
 
         guard var dict = try? encodeProfileDict(profile) else { return nil }
-        // Relative to profilesDirectory (".../profiles"), the schema lives
-        // one level up, under "schema/" (see ConfigSchemaInstaller).
+        // Relative to `directory` (".../profiles"), the schema lives one level
+        // up, under "schema/" (see ConfigSchemaInstaller).
         dict["$schema"] = "../schema/profile.schema.json"
 
         guard let data = try? JSONSerialization.data(
             withJSONObject: dict, options: [.prettyPrinted, .sortedKeys]) else { return nil }
 
         let filename = "\(profile.shortId).profile.json"
-        let path = "\(profilesDirectory)/\(filename)"
+        let path = "\(directory)/\(filename)"
         do {
             try data.write(to: URL(fileURLWithPath: path), options: .atomic)
             ConfigSelfWriteRegistry.shared.noteSelfWrite(contentHash: ConfigSelfWriteRegistry.hash(data))
@@ -181,7 +193,7 @@ final class ProfileStore: ObservableObject {
 
     /// Encode a profile to a plain dictionary (round-tripping through JSON) so
     /// `$schema` can be merged in alongside the CodingKeys-driven fields.
-    private func encodeProfileDict(_ profile: SyncProfile) throws -> [String: Any] {
+    nonisolated private static func encodeProfileDict(_ profile: SyncProfile) throws -> [String: Any] {
         let data = try JSONEncoder().encode(profile)
         guard let dict = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             throw CocoaError(.propertyListReadCorrupt)

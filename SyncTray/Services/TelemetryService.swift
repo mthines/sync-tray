@@ -122,12 +122,17 @@ final class TelemetryService {
     private var warmFilesCounter: LongCounterSdk?
     private var warmBytesCounter: LongCounterSdk?
     private var externalConfigEditCounter: LongCounterSdk?
+    private var cliInvokedCounter: LongCounterSdk?
 
     // MARK: - Providers (kept alive for shutdown)
 
     private var meterProvider: StableMeterProviderSdk?
     private var tracerProvider: TracerProviderSdk?
     private var loggerProvider: LoggerProviderSdk?
+    /// Retained so a short-lived process (the CLI) can force-flush queued log
+    /// records before exit — `LoggerProviderSdk` exposes no flush, only the
+    /// `BatchLogRecordProcessor` does. See `flushForExit`.
+    private var logProcessor: BatchLogRecordProcessor?
 
     // MARK: - Tracer & Logger
 
@@ -221,6 +226,7 @@ final class TelemetryService {
             .with(processors: [logProcessor])
             .build()
 
+        self.logProcessor = logProcessor
         loggerProvider = loggerProviderSdk
         OpenTelemetry.registerLoggerProvider(loggerProvider: loggerProviderSdk)
         logger = loggerProviderSdk
@@ -435,6 +441,12 @@ final class TelemetryService {
         externalConfigEditCounter = meter
             .counterBuilder(name: "synctray.config.external_edit")
             .setDescription("Live external edits to ~/.config/synctray files applied through the reconcile path, by kind (profile, settings)")
+            .setUnit("1")
+            .build()
+
+        cliInvokedCounter = meter
+            .counterBuilder(name: "synctray.cli.invoked")
+            .setDescription("Headless synctray CLI invocations, by bounded command verb and ok/error result")
             .setUnit("1")
             .build()
     }
@@ -1305,6 +1317,49 @@ final class TelemetryService {
         ]
         externalConfigEditCounter?.add(value: 1, attribute: attrs)
         emitLog(severity: .info, body: "External config edit applied", attributes: attrs)
+    }
+
+    // MARK: - Headless CLI
+
+    /// Record one headless `synctray` CLI invocation. Privacy: only the bounded
+    /// command verb (allowlisted by the caller; an unrecognised one is mapped to
+    /// `(other)` before it reaches here), a coarse `ok`/`error` result, the exit
+    /// code, and the wall-clock duration are recorded — never args, profile
+    /// names, filesystem paths, or remote names. Called once per CLI run, right
+    /// before the process flushes and exits (see `flushForExit`).
+    func recordCLIInvocation(command: String, exitCode: Int32, durationSeconds: Double) {
+        guard SyncTraySettings.telemetryEnabled else { return }
+        ensureSetup()
+
+        let ok = exitCode == 0
+        let attrs: [String: AttributeValue] = [
+            "cli.command": .string(command),
+            "cli.result": .string(ok ? "ok" : "error"),
+        ]
+        cliInvokedCounter?.add(value: 1, attribute: attrs)
+        emitLog(
+            severity: ok ? .info : .warn,
+            body: "CLI invoked",
+            attributes: [
+                "cli.command": .string(command),
+                "cli.result": .string(ok ? "ok" : "error"),
+                "cli.exit_code": .int(Int(exitCode)),
+                "cli.duration_seconds": .double(durationSeconds),
+            ]
+        )
+    }
+
+    /// Flush every signal for a short-lived process (the CLI) that is about to
+    /// `exit()`. Unlike `shutdown()` — the app's terminate path, which prints a
+    /// diagnostic line and ends the sync spans — this is SILENT (no stdout, so
+    /// it never pollutes CLI output) and also flushes the logger, so a CLI run's
+    /// `synctray.cli.invoked` counter AND its "CLI invoked" log both reach the
+    /// collector before the process dies. No-op when telemetry is disabled.
+    func flushForExit() {
+        guard SyncTraySettings.telemetryEnabled else { return }
+        _ = meterProvider?.forceFlush()
+        logProcessor?.forceFlush()
+        tracerProvider?.forceFlush()
     }
 
     // MARK: - Offline Extension Setup Funnel

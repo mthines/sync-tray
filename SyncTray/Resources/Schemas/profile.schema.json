@@ -122,11 +122,7 @@
     "name",
     "rcloneRemote",
     "remotePath",
-    "localSyncPath",
-    "drivePathToMonitor",
-    "syncIntervalMinutes",
-    "additionalRcloneFlags",
-    "isEnabled"
+    "localSyncPath"
   ],
   "additionalProperties": true
 }

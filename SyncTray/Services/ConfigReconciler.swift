@@ -64,7 +64,7 @@ extension SyncManager {
     /// (`SyncManager.applyExternalProfileEdit`) call this so they can never
     /// drift apart (see plan Decisions — a watcher-only copy of this logic
     /// would leave live-edited profiles stale).
-    static func reconcileAction(from current: SyncProfile, to updated: SyncProfile) -> ProfileReconcileAction {
+    nonisolated static func reconcileAction(from current: SyncProfile, to updated: SyncProfile) -> ProfileReconcileAction {
         if current.isEnabled != updated.isEnabled {
             return updated.isEnabled ? .install : .uninstall
         }

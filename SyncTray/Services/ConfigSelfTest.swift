@@ -59,6 +59,7 @@ enum ConfigSelfTest {
             testExternalCreateTelemetryAction,
             testCLIArgParsing,
             testCLIDispatchGate,
+            testCLIWriteCommands,
             testDoctorPureChecks,
             testCLIResolveAndList,
             testShimInstallIdempotentNonClobber,
@@ -195,16 +196,16 @@ enum ConfigSelfTest {
     // MARK: - AC-4 — forgiving decoder on partial JSON
 
     private static func testPartialDecode() -> Bool {
+        // Only the five truly-required keys — the minimal profile an agent can
+        // author against profile.schema.json. drivePathToMonitor /
+        // syncIntervalMinutes / additionalRcloneFlags / isEnabled are now
+        // optional-with-default and deliberately OMITTED here.
         let requiredOnly: [String: Any] = [
             "id": UUID().uuidString,
             "name": "Partial",
             "rcloneRemote": "remote:",
             "remotePath": "Path",
             "localSyncPath": "/tmp/synctray-selftest-partial",
-            "drivePathToMonitor": "",
-            "syncIntervalMinutes": 10,
-            "additionalRcloneFlags": "",
-            "isEnabled": false,
         ]
 
         guard let data = try? JSONSerialization.data(withJSONObject: requiredOnly) else {
@@ -212,7 +213,7 @@ enum ConfigSelfTest {
         }
 
         guard let decoded = try? JSONDecoder().decode(SyncProfile.self, from: data) else {
-            return report("AC-4", "partial-decode", false, "(decode threw on partial JSON)")
+            return report("AC-4", "partial-decode", false, "(decode threw on minimal JSON)")
         }
 
         let defaultsApplied = decoded.isMuted == false
@@ -220,6 +221,11 @@ enum ConfigSelfTest {
             && decoded.mountBackend == .nfs
             && decoded.mountAtStartup == true
             && decoded.vfsCacheMaxAge == "168h"
+            // Newly-optional keys fall back to their memberwise-init defaults.
+            && decoded.drivePathToMonitor == ""
+            && decoded.syncIntervalMinutes == 5
+            && decoded.additionalRcloneFlags == ""
+            && decoded.isEnabled == false
 
         guard defaultsApplied else {
             return report("AC-4", "partial-decode", false, "(defaults not applied correctly)")
@@ -817,6 +823,13 @@ enum ConfigSelfTest {
         fileExists: @escaping (String) -> Bool = { _ in false },
         runLaunchctl: @escaping (_ args: [String]) -> (Int32, String) = { _ in (0, "") },
         schemaFilesPresent: @escaping () -> Bool = { true },
+        writeProfile: @escaping (SyncProfile) -> Bool = { _ in true },
+        installProfile: @escaping (SyncProfile) -> String? = { _ in nil },
+        uninstallProfile: @escaping (SyncProfile) -> String? = { _ in nil },
+        deleteProfileFile: @escaping (SyncProfile) -> Void = { _ in },
+        runSyncScript: @escaping (_ configPath: String) -> Int32 = { _ in 0 },
+        readStdin: @escaping () -> String? = { nil },
+        readFile: @escaping (String) -> String? = { _ in nil },
         stdout: @escaping (String) -> Void = { _ in },
         stderr: @escaping (String) -> Void = { _ in }
     ) -> CLIEnvironment {
@@ -826,6 +839,13 @@ enum ConfigSelfTest {
             fileExists: fileExists,
             runLaunchctl: runLaunchctl,
             schemaFilesPresent: schemaFilesPresent,
+            writeProfile: writeProfile,
+            installProfile: installProfile,
+            uninstallProfile: uninstallProfile,
+            deleteProfileFile: deleteProfileFile,
+            runSyncScript: runSyncScript,
+            readStdin: readStdin,
+            readFile: readFile,
             stdout: stdout,
             stderr: stderr,
             now: { Date() }
@@ -857,6 +877,115 @@ enum ConfigSelfTest {
             return report("AC-CLI5", "cli-dispatch-gate", false, "(--help did not exit 0)")
         }
         return report("AC-CLI5", "cli-dispatch-gate", true, "")
+    }
+
+    // MARK: - AC-CLI6 — write commands: create / enable / disable / delete / sync route to the right side effect
+
+    /// Drives the mutating subcommands through `execute` with spied closures —
+    /// asserting each triggers the SINGLE correct side effect: create persists +
+    /// installs an enabled profile, an id collision refuses without writing,
+    /// enable/disable route via the shared `reconcileAction` to install vs.
+    /// uninstall, delete uninstalls + removes the file, and `sync` refuses a
+    /// mount profile but runs the script for a sync profile. Also locks the
+    /// bounded telemetry-verb mapping (never a raw arg).
+    private static func testCLIWriteCommands() -> Bool {
+        let id = UUID()
+        let enabled = sampleProfile(id: id, name: "CLIWrite", isEnabled: true)
+        guard let json = try? JSONEncoder().encode(enabled),
+              let jsonStr = String(data: json, encoding: .utf8) else {
+            return report("AC-CLI6", "cli-write-commands", false, "(could not encode sample profile)")
+        }
+
+        // create (stdin) → writes + installs an enabled+valid profile.
+        var wrote = false, installed = false
+        let createEnv = fakeCLIEnvironment(
+            readProfiles: { [] },
+            writeProfile: { _ in wrote = true; return true },
+            installProfile: { _ in installed = true; return nil },
+            readStdin: { jsonStr }
+        )
+        guard SyncTrayCLI.execute(["profile", "create", "-"], env: createEnv) == 0, wrote, installed else {
+            return report("AC-CLI6", "cli-write-commands", false, "(create did not write+install, exit/wrote/installed=\(wrote)/\(installed))")
+        }
+
+        // create with a colliding id → refuses, no write.
+        var wroteOnCollision = false
+        let collideEnv = fakeCLIEnvironment(
+            readProfiles: { [enabled] },
+            writeProfile: { _ in wroteOnCollision = true; return true },
+            readStdin: { jsonStr }
+        )
+        guard SyncTrayCLI.execute(["profile", "create", "-"], env: collideEnv) != 0, !wroteOnCollision else {
+            return report("AC-CLI6", "cli-write-commands", false, "(create did not refuse a colliding id)")
+        }
+
+        // enable a disabled profile → reconcile .install → installProfile fires.
+        let disabled = sampleProfile(id: UUID(), name: "ToEnable", isEnabled: false)
+        var enableInstalled = false
+        let enableEnv = fakeCLIEnvironment(
+            readProfiles: { [disabled] },
+            installProfile: { _ in enableInstalled = true; return nil },
+            uninstallProfile: { _ in "should-not-be-called" }
+        )
+        guard SyncTrayCLI.execute(["profile", "enable", disabled.shortId], env: enableEnv) == 0, enableInstalled else {
+            return report("AC-CLI6", "cli-write-commands", false, "(enable did not install)")
+        }
+
+        // disable an enabled profile → reconcile .uninstall → uninstallProfile fires.
+        var disableUninstalled = false
+        let disableEnv = fakeCLIEnvironment(
+            readProfiles: { [enabled] },
+            installProfile: { _ in "should-not-be-called" },
+            uninstallProfile: { _ in disableUninstalled = true; return nil }
+        )
+        guard SyncTrayCLI.execute(["profile", "disable", enabled.shortId], env: disableEnv) == 0, disableUninstalled else {
+            return report("AC-CLI6", "cli-write-commands", false, "(disable did not uninstall)")
+        }
+
+        // delete → uninstall + deleteProfileFile both fire.
+        var delUninstalled = false, delRemoved = false
+        let deleteEnv = fakeCLIEnvironment(
+            readProfiles: { [enabled] },
+            uninstallProfile: { _ in delUninstalled = true; return nil },
+            deleteProfileFile: { _ in delRemoved = true }
+        )
+        guard SyncTrayCLI.execute(["profile", "delete", enabled.shortId], env: deleteEnv) == 0, delUninstalled, delRemoved else {
+            return report("AC-CLI6", "cli-write-commands", false, "(delete did not uninstall+remove)")
+        }
+
+        // sync refuses a mount profile.
+        var mount = sampleProfile(id: UUID(), name: "Streamer", isEnabled: true)
+        mount.syncMode = .mount
+        let mountSyncEnv = fakeCLIEnvironment(readProfiles: { [mount] })
+        guard SyncTrayCLI.execute(["sync", mount.shortId], env: mountSyncEnv) != 0 else {
+            return report("AC-CLI6", "cli-write-commands", false, "(sync did not refuse a mount profile)")
+        }
+
+        // sync runs the script for a sync profile (script + config present).
+        var ranScript = false
+        let syncEnv = fakeCLIEnvironment(
+            readProfiles: { [enabled] },
+            fileExists: { _ in true },
+            runSyncScript: { _ in ranScript = true; return 0 }
+        )
+        guard SyncTrayCLI.execute(["sync", enabled.shortId], env: syncEnv) == 0, ranScript else {
+            return report("AC-CLI6", "cli-write-commands", false, "(sync did not run the script)")
+        }
+
+        // Bounded telemetry verb — never a raw arg or profile name.
+        let verbCases: [([String], String)] = [
+            (["doctor"], "doctor"),
+            (["profile", "create", "-"], "profile-create"),
+            (["profile", "enable", "SECRET-NAME"], "profile-enable"),
+            (["sync", "SECRET-NAME"], "sync"),
+            (["totally-bogus"], "(other)"),
+            (["profile", "frobnicate"], "(other)"),
+        ]
+        for (argv, expected) in verbCases where SyncTrayCLI.telemetryVerb(for: argv) != expected {
+            return report("AC-CLI6", "cli-write-commands", false, "(telemetryVerb\(argv) != \(expected))")
+        }
+
+        return report("AC-CLI6", "cli-write-commands", true)
     }
 
     // MARK: - AC-CLI1 — arg parsing: unknown/absent → usage error; known commands route correctly
