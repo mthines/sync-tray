@@ -107,6 +107,11 @@
       "items": { "type": "string" },
       "description": "Directories kept warm in the VFS cache for offline access (mount mode)."
     },
+    "warmExcludePatterns": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Glob patterns excluded from offline warming (mount mode). Applied app-side by the warmer; not emitted into the derived {shortId}.json script config."
+    },
     "rcPort": {
       "type": "integer",
       "description": "Port for rclone's RC (remote control) API (mount mode)."

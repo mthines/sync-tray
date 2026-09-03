@@ -288,20 +288,46 @@ struct MigrationV3BlobToPerProfileFiles: ProfileMigration {
         // The blob is deliberately NOT removed here — see type doc.
     }
 
+    /// Outcome of a `writeProfileFiles` pass, exposed so callers (and
+    /// `ConfigSelfTest`) can assert MIGRATION INTEGRITY: every profile in the
+    /// source blob must end up with a `.profile.json` (written this pass or
+    /// already present). `accountedFor < expected` means a profile was silently
+    /// dropped (missing/invalid `id`, or an un-encodable dict).
+    struct WriteResult: Equatable {
+        /// Profiles in the source blob.
+        let expected: Int
+        /// Files written this pass.
+        let written: Int
+        /// Files that already existed (idempotent skip).
+        let present: Int
+        /// Profiles that ended up with a file on disk.
+        var accountedFor: Int { written + present }
+        /// True when every source profile is accounted for on disk.
+        var isComplete: Bool { accountedFor == expected }
+    }
+
     /// Write one `{shortId}.profile.json` per dictionary in `profileDicts`,
     /// skipping any whose file already exists in `directory` (see type doc
     /// for why this is per-profile rather than an all-or-nothing gate).
     /// Internal (not private) so `ConfigSelfTest` can exercise it directly
     /// against a temp directory, independent of `UserDefaults`.
-    static func writeProfileFiles(from profileDicts: [[String: Any]], to directory: String) throws {
+    ///
+    /// Returns a `WriteResult` and emits a debug-log line when the migration is
+    /// incomplete, so a silent partial migration (a source profile that never
+    /// got a file) is OBSERVABLE rather than losing config quietly.
+    @discardableResult
+    static func writeProfileFiles(from profileDicts: [[String: Any]], to directory: String) throws -> WriteResult {
         try FileManager.default.createDirectory(atPath: directory, withIntermediateDirectories: true)
+
+        var written = 0
+        var present = 0
 
         for var dict in profileDicts {
             guard let idString = dict["id"] as? String else { continue }
             let shortId = String(idString.prefix(8)).lowercased()
             let path = "\(directory)/\(shortId).profile.json"
 
-            guard !FileManager.default.fileExists(atPath: path) else { continue }
+            guard !FileManager.default.fileExists(atPath: path) else { present += 1; continue }
 
             dict["$schema"] = "../schema/profile.schema.json"
 
@@ -309,6 +335,17 @@ struct MigrationV3BlobToPerProfileFiles: ProfileMigration {
                 withJSONObject: dict, options: [.prettyPrinted, .sortedKeys]) else { continue }
 
             try data.write(to: URL(fileURLWithPath: path), options: .atomic)
+            written += 1
         }
+
+        let result = WriteResult(expected: profileDicts.count, written: written, present: present)
+        if !result.isComplete {
+            SyncTraySettings.debugLog(
+                "[MigrationV3] integrity mismatch: \(result.expected) profile(s) in source blob but only "
+                + "\(result.accountedFor) accounted for on disk (written \(written), already present \(present)) "
+                + "— a silent partial migration occurred"
+            )
+        }
+        return result
     }
 }

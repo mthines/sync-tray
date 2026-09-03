@@ -49,6 +49,9 @@ enum ConfigSelfTest {
             testSchemaInstalledAndReferenced,
             testIsolatedLaunchAtLogin,
             testDeleteDurable,
+            testWarmExcludePatternsRoundTrip,
+            testWarmReconcileTrigger,
+            testMigrationIntegrity,
         ]
 
         for check in checks {
@@ -126,7 +129,9 @@ enum ConfigSelfTest {
         let profile = sampleProfile()
         let json = SyncSetupService.shared.generateProfileConfig(for: profile)
 
-        let forbidden = ["\"isEnabled\"", "\"isMuted\"", "\"mountAtStartup\""]
+        // `warmExcludePatterns` is consumed app-side by the warmer (VFSCacheService),
+        // never by the sync script — it must NOT leak into the derived config.
+        let forbidden = ["\"isEnabled\"", "\"isMuted\"", "\"mountAtStartup\"", "\"warmExcludePatterns\""]
         for key in forbidden where json.contains(key) {
             return report("AC-2", "derived-json-frozen", false, "(unexpectedly contains \(key))")
         }
@@ -476,6 +481,143 @@ enum ConfigSelfTest {
         }
 
         return report("AC-19", "delete-durable", true)
+    }
+
+    // MARK: - AC-20 — warmExcludePatterns survives the file round-trip
+
+    /// `warmExcludePatterns` is the one new persisted field on `SyncProfile`.
+    /// Because `ProfileStore.writeProfileFiles` encodes the whole model, it flows
+    /// into `.profile.json` automatically — this asserts it actually survives
+    /// encode → decode (alongside `pinnedDirectories`, the sibling app-side field).
+    private static func testWarmExcludePatternsRoundTrip() -> Bool {
+        var profile = sampleProfile()
+        profile.pinnedDirectories = ["Docs", "Photos/2024"]
+        profile.warmExcludePatterns = ["*.bak", "**/BACKUP/**"]
+
+        guard let data = try? JSONEncoder().encode(profile) else {
+            return report("AC-20", "warm-exclude-roundtrip", false, "(encode failed)")
+        }
+        guard let decoded = try? JSONDecoder().decode(SyncProfile.self, from: data) else {
+            return report("AC-20", "warm-exclude-roundtrip", false, "(decode failed)")
+        }
+        guard decoded.warmExcludePatterns == profile.warmExcludePatterns else {
+            return report("AC-20", "warm-exclude-roundtrip", false, "(warmExcludePatterns not preserved: \(decoded.warmExcludePatterns))")
+        }
+        guard decoded.pinnedDirectories == profile.pinnedDirectories else {
+            return report("AC-20", "warm-exclude-roundtrip", false, "(pinnedDirectories not preserved: \(decoded.pinnedDirectories))")
+        }
+        // A file missing the key must still decode (forgiving decoder → []).
+        let noKey: [String: Any] = [
+            "id": UUID().uuidString, "name": "NoWarmKey", "rcloneRemote": "r:",
+            "remotePath": "P", "localSyncPath": "/tmp/x", "drivePathToMonitor": "",
+            "syncIntervalMinutes": 10, "additionalRcloneFlags": "", "isEnabled": false,
+        ]
+        guard let noKeyData = try? JSONSerialization.data(withJSONObject: noKey),
+              let noKeyDecoded = try? JSONDecoder().decode(SyncProfile.self, from: noKeyData),
+              noKeyDecoded.warmExcludePatterns == [] else {
+            return report("AC-20", "warm-exclude-roundtrip", false, "(missing key did not default to [])")
+        }
+        return report("AC-20", "warm-exclude-roundtrip", true)
+    }
+
+    // MARK: - AC-21 — external warm-field edit triggers the app-side warm path
+
+    /// An external `.profile.json` edit that changes `warmExcludePatterns` or
+    /// `pinnedDirectories` on a MOUNTED mount-mode profile must trigger the
+    /// app-side warm reconcile (re-push + re-warm) — and NOTHING else must.
+    /// Exercises the pure decision/dispatch (`applyWarmReconcileIfNeeded`) with a
+    /// spy in place of the real warm, so no mount is needed. The production caller
+    /// (`applyExternalProfileEdit`) uses this exact function, so a green here means
+    /// the real path fires on the same conditions.
+    private static func testWarmReconcileTrigger() -> Bool {
+        func mountModeProfile() -> SyncProfile {
+            var p = sampleProfile()
+            p.syncMode = .mount
+            return p
+        }
+        let base = mountModeProfile()
+
+        // Helper: run the gated dispatch and report whether the spy fired.
+        func fired(from current: SyncProfile, to updated: SyncProfile, isMounted: Bool) -> [UUID] {
+            var calls: [UUID] = []
+            SyncManager.applyWarmReconcileIfNeeded(from: current, to: updated, isMounted: isMounted) { calls.append($0) }
+            return calls
+        }
+
+        var excludeChanged = base
+        excludeChanged.warmExcludePatterns = ["*.tmp"]
+        guard fired(from: base, to: excludeChanged, isMounted: true) == [base.id] else {
+            return report("AC-21", "warm-reconcile-trigger", false, "(warmExcludePatterns change did not fire warm)")
+        }
+
+        var pinsChanged = base
+        pinsChanged.pinnedDirectories = ["NewDir"]
+        guard fired(from: base, to: pinsChanged, isMounted: true) == [base.id] else {
+            return report("AC-21", "warm-reconcile-trigger", false, "(pinnedDirectories change did not fire warm)")
+        }
+
+        // Not mounted → no warm (nothing to read through).
+        guard fired(from: base, to: excludeChanged, isMounted: false).isEmpty else {
+            return report("AC-21", "warm-reconcile-trigger", false, "(unmounted profile wrongly fired warm)")
+        }
+
+        // Non-warm field change (name) → no warm.
+        var nameChanged = base
+        nameChanged.name = "Renamed"
+        guard fired(from: base, to: nameChanged, isMounted: true).isEmpty else {
+            return report("AC-21", "warm-reconcile-trigger", false, "(name-only change wrongly fired warm)")
+        }
+
+        // Warm field changed but NOT mount-mode → no warm.
+        var bisync = sampleProfile()
+        bisync.syncMode = .bisync
+        var bisyncExclude = bisync
+        bisyncExclude.warmExcludePatterns = ["*.tmp"]
+        guard fired(from: bisync, to: bisyncExclude, isMounted: true).isEmpty else {
+            return report("AC-21", "warm-reconcile-trigger", false, "(non-mount profile wrongly fired warm)")
+        }
+
+        return report("AC-21", "warm-reconcile-trigger", true)
+    }
+
+    // MARK: - AC-22 — migration integrity (files written == profiles in blob)
+
+    /// A silent partial migration (a source profile that never got a
+    /// `.profile.json`) must be observable. `writeProfileFiles` returns a
+    /// `WriteResult` whose `isComplete` is false when a source profile is dropped
+    /// (missing/invalid `id`). Asserts a full blob is complete and a blob with an
+    /// invalid entry is flagged incomplete with the right counts.
+    private static func testMigrationIntegrity() -> Bool {
+        let dir = "\(selfTestRoot)/ac22-integrity"
+        try? FileManager.default.removeItem(atPath: dir)
+
+        func dict(id: String) -> [String: Any] {
+            ["id": id, "name": "P-\(id.prefix(4))", "rcloneRemote": "r:", "remotePath": "P",
+             "localSyncPath": "/tmp/x", "drivePathToMonitor": "", "syncIntervalMinutes": 15,
+             "additionalRcloneFlags": "", "isEnabled": true]
+        }
+
+        // Happy path: every profile accounted for.
+        let full = [dict(id: UUID().uuidString), dict(id: UUID().uuidString)]
+        guard let complete = try? MigrationV3BlobToPerProfileFiles.writeProfileFiles(from: full, to: dir) else {
+            return report("AC-22", "migration-integrity", false, "(writeProfileFiles threw on full blob)")
+        }
+        guard complete.isComplete, complete.written == full.count, complete.accountedFor == full.count else {
+            return report("AC-22", "migration-integrity", false, "(full blob not complete: \(complete))")
+        }
+
+        // Partial: one dict has no `id` → dropped → integrity mismatch observable.
+        let partialDir = "\(selfTestRoot)/ac22-partial"
+        try? FileManager.default.removeItem(atPath: partialDir)
+        let partial: [[String: Any]] = [dict(id: UUID().uuidString), ["name": "no-id"]]
+        guard let incomplete = try? MigrationV3BlobToPerProfileFiles.writeProfileFiles(from: partial, to: partialDir) else {
+            return report("AC-22", "migration-integrity", false, "(writeProfileFiles threw on partial blob)")
+        }
+        guard !incomplete.isComplete, incomplete.expected == 2, incomplete.accountedFor == 1 else {
+            return report("AC-22", "migration-integrity", false, "(partial blob not flagged incomplete: \(incomplete))")
+        }
+
+        return report("AC-22", "migration-integrity", true)
     }
 }
 

@@ -47,6 +47,44 @@ extension SyncManager {
 
         return needsReinstall ? .reinstall : .none
     }
+
+    /// Whether a profile edit needs the APP-SIDE offline-warm reconcile — i.e.
+    /// the pinned-directory set or the warm-exclude globs changed. These are the
+    /// two fields that feed the VFS content warmer (`VFSCacheService`); neither is
+    /// part of `reconcileAction`'s `needsReinstall` set because they change what
+    /// gets warmed, not the launchd script/plist/agent.
+    ///
+    /// Pure — no I/O, no side effects — and DELIBERATELY orthogonal to
+    /// `ProfileReconcileAction`: a warm-only change returns `.none` from
+    /// `reconcileAction` (so the agent is neither reinstalled nor remounted) yet
+    /// `true` here, so the two reconciles compose without one implying the other.
+    static func warmReconcileNeeded(from current: SyncProfile, to updated: SyncProfile) -> Bool {
+        current.pinnedDirectories != updated.pinnedDirectories ||
+        current.warmExcludePatterns != updated.warmExcludePatterns
+    }
+
+    /// Decide whether an edit should trigger the app-side warm reconcile and, if
+    /// so, invoke `warm`. Gated on the profile being a mount-mode profile that is
+    /// CURRENTLY mounted (`isMounted`) — warming reads through the live mount, so
+    /// there is nothing to warm for an unmounted or non-mount profile.
+    ///
+    /// Pure decision + dispatch (the side effect is entirely in the injected
+    /// `warm` closure), so `ConfigSelfTest` exercises the full trigger logic with
+    /// a spy and no real mount. The production caller
+    /// (`applyExternalProfileEdit`) passes a `warm` that runs the SAME primitives
+    /// the in-app pin/unpin path uses (`updateAppGroupMountPaths` + `startWarm`),
+    /// so the external-edit and in-app warm paths cannot drift.
+    static func applyWarmReconcileIfNeeded(
+        from current: SyncProfile,
+        to updated: SyncProfile,
+        isMounted: Bool,
+        warm: (UUID) -> Void
+    ) {
+        guard updated.isMountMode,
+              isMounted,
+              warmReconcileNeeded(from: current, to: updated) else { return }
+        warm(updated.id)
+    }
 }
 
 /// Applies a `settings.json` edit, ISOLATING the launch-at-login

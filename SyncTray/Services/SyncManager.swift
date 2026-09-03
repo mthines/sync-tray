@@ -620,8 +620,38 @@ final class SyncManager: ObservableObject {
             }
         }
 
+        // App-side warm reconcile, ORTHOGONAL to the launchd `action` above: an
+        // external edit that changes `warmExcludePatterns` or `pinnedDirectories`
+        // must take effect (re-warm) just as the in-app pin/unpin edit does, even
+        // though such a change yields `action == .none` (no reinstall/remount).
+        // Gated on the profile being currently mounted; runs the same primitives
+        // as the in-app path via `applyWarmReconcile` so the two cannot drift.
+        Self.applyWarmReconcileIfNeeded(
+            from: currentProfile,
+            to: updatedProfile,
+            isMounted: profileMountStates[updatedProfile.id] == .mounted
+        ) { [weak self] id in
+            self?.applyWarmReconcile(for: id, trigger: "external_edit")
+        }
+
         updateAggregateState()
         TelemetryService.shared.recordExternalConfigEdit(kind: "profile")
+    }
+
+    /// App-side warm reconcile: re-push the App Group data the FinderSync
+    /// extension reads (pinned set / cache path may have changed) and (re)start a
+    /// warming run for the profile's pinned directories. This is the SAME pair of
+    /// primitives the in-app pin/unpin flow uses (`processPendingPinRequest` →
+    /// `updateAppGroupMountPaths` + `startWarm`), reused here so an external
+    /// `.profile.json` edit and an in-app edit warm identically.
+    ///
+    /// SEPARATE from `ProfileReconcileAction` / `setupService` — this NEVER
+    /// reinstalls the launchd agent or remounts. `startWarm` supersedes any run
+    /// already in flight, so re-running it after an exclude/pin change re-applies
+    /// the new filter to the current download rather than only the next one.
+    func applyWarmReconcile(for profileId: UUID, dirs: [String]? = nil, trigger: String) {
+        updateAppGroupMountPaths()  // re-push pinnedDirectories/vfsCachePath; also wakes the extension
+        startWarm(for: profileId, dirs: dirs, trigger: trigger)
     }
 
     /// Apply an external edit to `settings.json`. Safe keys apply directly;
