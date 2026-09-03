@@ -2115,8 +2115,7 @@ final class SyncManager: ObservableObject {
                 await MainActor.run {
                     guard let self, var p = self.warmProgress[profileId] else { return }
                     p.currentDirectory = dir
-                    p.currentFile = name
-                    p.filesInFlight += 1
+                    p.inFlightFiles.append(name)
                     self.warmProgress[profileId] = p
                 }
             }, onProgress: { [weak self] bytes in
@@ -2125,11 +2124,13 @@ final class SyncManager: ObservableObject {
                     p.bytesDone += bytes    // advances mid-file, per chunk
                     self.warmProgress[profileId] = p
                 }
-            }, onFileComplete: { [weak self] in
+            }, onFileComplete: { [weak self] name in
                 await MainActor.run {
                     guard let self, var p = self.warmProgress[profileId] else { return }
                     p.filesDone += 1
-                    p.filesInFlight = max(0, p.filesInFlight - 1)
+                    if let idx = p.inFlightFiles.firstIndex(of: name) {
+                        p.inFlightFiles.remove(at: idx)
+                    }
                     self.warmProgress[profileId] = p
                 }
             })
@@ -2141,8 +2142,7 @@ final class SyncManager: ObservableObject {
         if var p = warmProgress[profileId] {
             p.phase = .completed
             p.finishedAt = Date()
-            p.currentFile = ""
-            p.filesInFlight = 0
+            p.inFlightFiles = []
             warmProgress[profileId] = p
             TelemetryService.shared.endWarm(
                 telemetry,

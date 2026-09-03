@@ -435,23 +435,35 @@ struct OfflineFilesSection: View {
                             // Byte-level bar once data is flowing; an indeterminate spinner
                             // before the first bytes arrive, so a slow/stalled start reads as
                             // "waiting", not a bar frozen at 0%.
-                            if w.bytesDone > 0, let fraction = w.fractionComplete {
-                                ProgressView(value: fraction).controlSize(.small)
-                            } else {
-                                ProgressView().controlSize(.small)
-                            }
                             HStack(spacing: 6) {
-                                Image(systemName: "arrow.down.circle")
-                                    .font(.caption2)
-                                    .foregroundStyle(.blue)
-                                Text(w.currentFile.isEmpty ? "Downloading…" : w.currentFile)
-                                    .font(.caption)
-                                    .lineLimit(1)
-                                    .truncationMode(.middle)
-                                Spacer()
+                                if w.bytesDone > 0, let fraction = w.fractionComplete {
+                                    ProgressView(value: fraction).controlSize(.small)
+                                } else {
+                                    ProgressView().controlSize(.small)
+                                }
                                 Text(warmDetail(w))
                                     .font(.caption2.monospacedDigit())
                                     .foregroundStyle(.secondary)
+                                    .layoutPriority(1)
+                            }
+                            // One row per file currently reading through the mount, so all
+                            // parallel downloads are visible (not just the latest to start).
+                            if w.inFlightFiles.isEmpty {
+                                Text("Downloading…")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            } else {
+                                ForEach(w.inFlightFiles, id: \.self) { file in
+                                    HStack(spacing: 6) {
+                                        Image(systemName: "arrow.down.circle")
+                                            .font(.caption2)
+                                            .foregroundStyle(.blue)
+                                        Text(file)
+                                            .font(.caption)
+                                            .lineLimit(1)
+                                            .truncationMode(.middle)
+                                    }
+                                }
                             }
                             Text(warmSubline(w))
                                 .font(.caption2)
@@ -515,8 +527,8 @@ struct OfflineFilesSection: View {
                 .font(.caption.weight(.medium))
 
             Text("Skip files you don't need offline so they never download. Use wildcards: "
-                + "*.bak matches any file ending in .bak, and Cache/* matches everything "
-                + "inside a folder named Cache.")
+                + "*.bak matches any file ending in .bak, and **/BACKUP/** skips every "
+                + "folder named BACKUP, at any depth. Patterns are case-sensitive.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
 
@@ -552,7 +564,7 @@ struct OfflineFilesSection: View {
             }
 
             HStack(spacing: 4) {
-                TextField("Pattern (e.g., *.bak)", text: $newExcludePattern)
+                TextField("Pattern (e.g., *.bak or **/BACKUP/**)", text: $newExcludePattern)
                     .textFieldStyle(.roundedBorder)
                     .font(.caption)
                     .onSubmit { addExcludePattern() }

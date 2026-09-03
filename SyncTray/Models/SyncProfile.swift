@@ -33,8 +33,10 @@ struct SyncProfile: Identifiable, Codable, Equatable {
     var allowNonEmptyMount: Bool        // Allow mounting to non-empty folders (default: false)
     var mountAtStartup: Bool            // Auto-mount when SyncTray launches (mount mode, default: true)
     var pinnedDirectories: [String]     // Directories to automatically cache offline (mount mode)
-    /// Glob patterns (fnmatch) excluded from offline warming, matched against each file's
-    /// name and its path relative to the pinned dir (e.g. "*.bak", "*.tmp", "Cache/*").
+    /// Glob patterns excluded from offline warming, matched **case-sensitively** against each
+    /// file's name and its path relative to the pinned dir. Supports `*` (within a segment),
+    /// `?`, and `**` (across segments), so `*.bak` skips backup files and `**/BACKUP/**` skips
+    /// every folder named BACKUP at any depth (e.g. "*.bak", "*.tmp", "**/BACKUP/**").
     /// Excluded files are skipped by the warmer so they never download into the offline cache.
     var warmExcludePatterns: [String]
     var rcPort: Int                     // Port for rclone RC (remote control) API (mount mode)

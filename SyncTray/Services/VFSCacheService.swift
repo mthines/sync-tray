@@ -1,5 +1,4 @@
 import Foundation
-import Darwin  // fnmatch for offline-warming exclude globs
 
 /// Represents a cached file or directory in the VFS cache
 struct CachedItem: Identifiable, Comparable {
@@ -338,18 +337,72 @@ final class VFSCacheService {
         }
     }
 
-    /// True if a file should be skipped by offline warming because it matches one of the
-    /// profile's `warmExcludePatterns` (fnmatch globs). Matched case-insensitively against
-    /// both the bare file name and its path relative to the pinned dir, so `*.rpp-bak`
-    /// matches the file and `Backups/*` matches by subpath.
-    static func isExcluded(relativePath: String, name: String, patterns: [String]) -> Bool {
-        for pattern in patterns {
-            let p = pattern.trimmingCharacters(in: .whitespaces)
-            guard !p.isEmpty else { continue }
-            if fnmatch(p, name, FNM_CASEFOLD) == 0 { return true }
-            if fnmatch(p, relativePath, FNM_CASEFOLD) == 0 { return true }
+    /// Translate a user glob into an anchored regex fragment (no `^`/`$`), path-aware.
+    ///
+    /// Segment semantics, so a pattern can target folders at any depth:
+    /// - `**/` matches zero or more leading directories, so `**/BACKUP/**` catches a
+    ///   `BACKUP` folder at the top level *and* nested anywhere.
+    /// - `**` on its own matches across `/` (any number of path segments).
+    /// - `*` matches within one segment (does not cross `/`); `?` matches one non-`/` char.
+    /// Every other character is matched literally (regex metacharacters escaped).
+    static func globToRegex(_ glob: String) -> String {
+        let chars = Array(glob)
+        let n = chars.count
+        var out = ""
+        var i = 0
+        while i < n {
+            let c = chars[i]
+            if c == "*" && i + 1 < n && chars[i + 1] == "*" {
+                if i + 2 < n && chars[i + 2] == "/" {
+                    out += "(?:.*/)?"   // **/  → zero or more leading dirs
+                    i += 3
+                } else {
+                    out += ".*"          // trailing/standalone ** → cross segments
+                    i += 2
+                }
+            } else if c == "*" {
+                out += "[^/]*"          // * → within a single segment
+                i += 1
+            } else if c == "?" {
+                out += "[^/]"
+                i += 1
+            } else {
+                if "\\.^$|()[]{}+".contains(c) { out += "\\" }
+                out.append(c)
+                i += 1
+            }
         }
-        return false
+        return out
+    }
+
+    /// Compiled, **case-sensitive** matcher for a profile's `warmExcludePatterns`. Built once
+    /// per warm run (regex compilation per file would be far too costly for large trees).
+    /// Each pattern is matched against both the bare file name and the file's path relative
+    /// to the pinned directory, so `*.bak` matches by name at any depth and `**/BACKUP/**`
+    /// matches by subpath.
+    struct ExcludeMatcher {
+        private let regexes: [NSRegularExpression]
+
+        init(patterns: [String]) {
+            regexes = patterns.compactMap { pattern in
+                let p = pattern.trimmingCharacters(in: .whitespaces)
+                guard !p.isEmpty else { return nil }
+                // No `.caseInsensitive` → matching is case-sensitive by design.
+                return try? NSRegularExpression(pattern: "^" + VFSCacheService.globToRegex(p) + "$")
+            }
+        }
+
+        var isEmpty: Bool { regexes.isEmpty }
+
+        func matches(relativePath: String, name: String) -> Bool {
+            for re in regexes {
+                let nameRange = NSRange(name.startIndex..., in: name)
+                if re.firstMatch(in: name, range: nameRange) != nil { return true }
+                let relRange = NSRange(relativePath.startIndex..., in: relativePath)
+                if re.firstMatch(in: relativePath, range: relRange) != nil { return true }
+            }
+            return false
+        }
     }
 
     /// Estimated work for warming a directory: number of regular files and their total bytes.
@@ -369,7 +422,7 @@ final class VFSCacheService {
                 options: [.skipsHiddenFiles]
               ) else { return WarmEstimate(files: 0, bytes: 0) }
 
-        let patterns = profile.warmExcludePatterns
+        let matcher = ExcludeMatcher(patterns: profile.warmExcludePatterns)
         let prefixLen = fullDirPath.count + 1
         var files = 0
         var bytes: Int64 = 0
@@ -377,8 +430,8 @@ final class VFSCacheService {
             guard let rv = try? fileURL.resourceValues(forKeys: [.fileSizeKey, .isRegularFileKey]),
                   rv.isRegularFile == true else { continue }
             let rel = fileURL.path.count > prefixLen ? String(fileURL.path.dropFirst(prefixLen)) : fileURL.lastPathComponent
-            if !patterns.isEmpty,
-               Self.isExcluded(relativePath: rel, name: fileURL.lastPathComponent, patterns: patterns) { continue }
+            if !matcher.isEmpty,
+               matcher.matches(relativePath: rel, name: fileURL.lastPathComponent) { continue }
             files += 1
             bytes += Int64(rv.fileSize ?? 0)
         }
@@ -405,11 +458,14 @@ final class VFSCacheService {
     ///   - concurrency: Max files to read in parallel.
     ///   - isStillPinned: Live predicate re-evaluated between files; when it returns
     ///     false (the directory was unpinned mid-warm) the loop stops scheduling.
-    ///   - onStart: Called when a file's read begins, with its name. Runs off the main actor.
+    ///   - onStart: Called when a file's read begins, with its name. Several files may be in
+    ///     flight at once (up to `concurrency`), so a caller tracking the in-flight set should
+    ///     add the name here and remove it in `onFileComplete`. Runs off the main actor.
     ///   - onProgress: Called for each chunk read, with the bytes in that chunk, so a caller
     ///     can advance byte-level progress *while a file is still downloading* (large files on
     ///     a slow link would otherwise show no movement until they finish). Runs off the main actor.
-    ///   - onFileComplete: Called when a file's read finishes. Runs off the main actor.
+    ///   - onFileComplete: Called when a file's read finishes, with its name (matching the
+    ///     `onStart` name) so the caller can remove it from the in-flight set. Runs off the main actor.
     func warmDirectory(
         _ dir: String,
         for profile: SyncProfile,
@@ -417,7 +473,7 @@ final class VFSCacheService {
         isStillPinned: @Sendable () async -> Bool,
         onStart: (@Sendable (_ name: String) async -> Void)? = nil,
         onProgress: (@Sendable (_ bytes: Int64) async -> Void)? = nil,
-        onFileComplete: (@Sendable () async -> Void)? = nil
+        onFileComplete: (@Sendable (_ name: String) async -> Void)? = nil
     ) async {
         let port = profile.rcPort
         let mountPath = profile.localSyncPath
@@ -440,7 +496,7 @@ final class VFSCacheService {
         ) else { return }
 
         let maxConcurrent = max(1, concurrency)
-        let excludePatterns = profile.warmExcludePatterns
+        let matcher = ExcludeMatcher(patterns: profile.warmExcludePatterns)
         let prefixLen = fullDirPath.count + 1
 
         // Bounded-concurrency task group: keep up to `maxConcurrent` file reads in flight,
@@ -461,11 +517,12 @@ final class VFSCacheService {
                 let name = fileURL.lastPathComponent
                 let path = fileURL.path
 
-                // Skip files matching the profile's offline exclude globs (e.g. *.rpp-bak),
-                // so backups and other unwanted files never download into the offline cache.
-                if !excludePatterns.isEmpty {
+                // Skip files matching the profile's offline exclude globs (e.g. *.bak or
+                // **/BACKUP/**), so backups and other unwanted files never download into the
+                // offline cache.
+                if !matcher.isEmpty {
                     let rel = path.count > prefixLen ? String(path.dropFirst(prefixLen)) : name
-                    if Self.isExcluded(relativePath: rel, name: name, patterns: excludePatterns) { continue }
+                    if matcher.matches(relativePath: rel, name: name) { continue }
                 }
 
                 if running >= maxConcurrent {
@@ -480,7 +537,7 @@ final class VFSCacheService {
                     // as it arrives so byte progress advances mid-file. 1 MB chunks keep the
                     // NFS round-trips (and the main-actor progress hops) low on slow links.
                     guard let fileHandle = FileHandle(forReadingAtPath: path) else {
-                        await onFileComplete?()
+                        await onFileComplete?(name)
                         return
                     }
                     let chunkSize = 1024 * 1024  // 1 MB
@@ -489,7 +546,7 @@ final class VFSCacheService {
                         if Task.isCancelled { break }
                     }
                     try? fileHandle.close()
-                    await onFileComplete?()
+                    await onFileComplete?(name)
                 }
             }
             await group.waitForAll()

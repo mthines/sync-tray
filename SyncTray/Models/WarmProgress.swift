@@ -15,10 +15,9 @@ struct WarmProgress: Equatable {
     }
 
     var phase: Phase
-    var currentFile: String     // most recently started file (several may be in flight)
+    var inFlightFiles: [String]  // names of files currently downloading in parallel, in start order
     var currentDirectory: String
     var filesDone: Int          // files fully read (advances on completion, not start)
-    var filesInFlight: Int      // files currently downloading in parallel
     var filesTotal: Int         // 0 = not yet estimated / unknown
     var bytesDone: Int64        // bytes actually read through the mount so far
     var bytesTotal: Int64       // 0 = unknown
@@ -27,16 +26,22 @@ struct WarmProgress: Equatable {
 
     init(startedAt: Date = Date()) {
         self.phase = .preparing
-        self.currentFile = ""
+        self.inFlightFiles = []
         self.currentDirectory = ""
         self.filesDone = 0
-        self.filesInFlight = 0
         self.filesTotal = 0
         self.bytesDone = 0
         self.bytesTotal = 0
         self.startedAt = startedAt
         self.finishedAt = nil
     }
+
+    /// Number of files reading through the mount right now (drives the "N downloading in
+    /// parallel" copy). Derived from `inFlightFiles` so the count and the list never drift.
+    var filesInFlight: Int { inFlightFiles.count }
+
+    /// Most recently started file, for compact single-line displays.
+    var currentFile: String { inFlightFiles.last ?? "" }
 
     /// True while the run is still working (preparing or downloading).
     var isActive: Bool {
