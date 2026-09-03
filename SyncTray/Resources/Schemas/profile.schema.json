@@ -1,5 +1,5 @@
 {
-  "$id": "https://synctray.app/schema/profile.schema.json",
+  "$id": "https://raw.githubusercontent.com/mthines/sync-tray/main/SyncTray/Resources/Schemas/profile.schema.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "SyncTray profile file",
   "description": "Authoritative per-profile file (~/.config/synctray/profiles/{shortId}.profile.json). Hand-editing this file and saving live-applies through SyncTray's reconcile path. Keep this file's `properties` in lockstep with SyncProfile.CodingKeys (SyncTray/Models/SyncProfile.swift) — verified by scripts/check-schema-in-sync.sh.",
