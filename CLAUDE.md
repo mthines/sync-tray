@@ -291,6 +291,16 @@ pruned (the canonical write notes its own hash in `ConfigSelfWriteRegistry`, so
 this can never loop). See `ConfigSelfTest`'s AC-C1–AC-C5 for the exact
 enabled/disabled/garbage/canonicalize/telemetry matrix.
 
+**Threat model — this is a conscious acceptance, not an oversight.** Creating and
+installing a launchd agent from a dropped file is the deliberate goal: an agent or
+a human edits files under `~/.config/synctray` to set SyncTray up. It does not
+widen the trust boundary. Every writer of `~/.config/synctray/profiles/` already
+runs as the user, and a same-user process can write a `~/Library/LaunchAgents/*.plist`
+and `launchctl load` it directly — SyncTray adds no privilege the attacker lacked.
+The profile files are also credential-free: rclone remotes and secrets live in
+`~/.config/rclone/rclone.conf`, never here, so a malicious drop can schedule an
+agent but can't exfiltrate or forge credentials through this path.
+
 **Warm reconcile is orthogonal to the launchd reconcile.** Editing an app-side
 warm field — `warmExcludePatterns` or `pinnedDirectories` — changes what the VFS
 warmer downloads, not the launchd script/plist/agent, so `reconcileAction`
