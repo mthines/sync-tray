@@ -58,6 +58,7 @@ enum ConfigSelfTest {
             testExternalCreateCanonicalNoLoop,
             testExternalCreateTelemetryAction,
             testCLIArgParsing,
+            testCLIDispatchGate,
             testDoctorPureChecks,
             testCLIResolveAndList,
             testShimInstallIdempotentNonClobber,
@@ -829,6 +830,33 @@ enum ConfigSelfTest {
             stderr: stderr,
             now: { Date() }
         )
+    }
+
+    // MARK: - AC-CLI5 — dispatch gate: bare tokens are subcommands, flags/no-args fall to the GUI
+
+    /// Guards the real `dispatch` gate, not just the pure `execute` core: an
+    /// unknown bare subcommand must return usage+non-zero, NEVER `nil` (which
+    /// would launch the GUI and hang a terminal — the bug this test locks down).
+    private static func testCLIDispatchGate() -> Bool {
+        if SyncTrayCLI.dispatch(arguments: ["SyncTray"]) != nil {
+            return report("AC-CLI5", "cli-dispatch-gate", false, "(no-args did not fall through to GUI)")
+        }
+        if SyncTrayCLI.dispatch(arguments: ["SyncTray", "--self-test"]) != nil {
+            return report("AC-CLI5", "cli-dispatch-gate", false, "(--self-test did not fall through to GUI/self-test path)")
+        }
+        if SyncTrayCLI.dispatch(arguments: ["SyncTray", "-psn_0_12345"]) != nil {
+            return report("AC-CLI5", "cli-dispatch-gate", false, "(macOS -psn_ GUI arg did not fall through)")
+        }
+        guard let bogus = SyncTrayCLI.dispatch(arguments: ["SyncTray", "bogus"]), bogus != 0 else {
+            return report("AC-CLI5", "cli-dispatch-gate", false, "(unknown subcommand fell through to GUI instead of usage+non-zero)")
+        }
+        guard SyncTrayCLI.dispatch(arguments: ["SyncTray", "help"]) == 0 else {
+            return report("AC-CLI5", "cli-dispatch-gate", false, "(help did not exit 0)")
+        }
+        guard SyncTrayCLI.dispatch(arguments: ["SyncTray", "--help"]) == 0 else {
+            return report("AC-CLI5", "cli-dispatch-gate", false, "(--help did not exit 0)")
+        }
+        return report("AC-CLI5", "cli-dispatch-gate", true, "")
     }
 
     // MARK: - AC-CLI1 — arg parsing: unknown/absent → usage error; known commands route correctly

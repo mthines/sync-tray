@@ -47,8 +47,15 @@ enum CLIShimInstaller {
             }
         }
 
+        // With no arguments, print CLI usage instead of `exec`ing the app binary
+        // bare — a bare launch starts the GUI/menu-bar app, which is surprising
+        // for a command typed in a terminal. `open -a SyncTray` remains the way
+        // to launch the app. Any subcommand is forwarded verbatim.
         let script = """
         \(ownershipMarker)
+        if [ "$#" -eq 0 ]; then
+          exec "\(executablePath)" help
+        fi
         exec "\(executablePath)" "$@"
         """
 

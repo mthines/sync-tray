@@ -7,6 +7,7 @@ enum CLICommand: Equatable {
     case logs(target: String, follow: Bool)
     case listRemotes
     case profiles
+    case help
 }
 
 /// A `parse` failure — carries the usage message printed to stderr.
@@ -58,8 +59,6 @@ struct CLIEnvironment {
 /// fakes. Only `CLIEnvironment.production()` and `dispatch` touch real
 /// process/filesystem state.
 enum SyncTrayCLI {
-    private static let knownCommands: Set<String> = ["doctor", "test-remote", "logs", "listremotes", "profiles"]
-
     static let usage = """
     usage: synctray <command> [args]
 
@@ -73,14 +72,22 @@ enum SyncTrayCLI {
 
     // MARK: - Entry point
 
-    /// Returns the process exit code if `arguments` names a recognized CLI
-    /// subcommand, or `nil` if not — leaving `--self-test` and a normal
-    /// (no-argument) launch untouched. `arguments` is `CommandLine.arguments`
-    /// (program name included).
+    /// Returns the process exit code when `arguments` names a CLI invocation, or
+    /// `nil` to fall through to the GUI. A bare first token (not `-`-prefixed) is
+    /// ALWAYS treated as a subcommand and routed through `execute` — an unknown
+    /// one prints usage and exits non-zero (EX_USAGE) rather than silently
+    /// launching the GUI and hanging the terminal (the bug this guards against).
+    /// `nil` is returned only for a no-argument launch and for `-`-prefixed args
+    /// (`--self-test`, and macOS's own `-psn_…`/`-NS…` GUI arguments), which the
+    /// GUI/self-test path handles — except `-h`/`--help`, routed to `execute`.
     static func dispatch(arguments: [String]) -> Int32? {
         let argv = Array(arguments.dropFirst())
-        guard let first = argv.first, knownCommands.contains(first) else { return nil }
-        return execute(argv, env: .production())
+        guard let first = argv.first else { return nil }        // no args → normal GUI launch
+        if first == "-h" || first == "--help" {                 // help flags → usage
+            return execute(argv, env: .production())
+        }
+        if first.hasPrefix("-") { return nil }                  // other flags → GUI/self-test path
+        return execute(argv, env: .production())                // bare token → subcommand (unknown ⇒ usage+non-zero)
     }
 
     // MARK: - Pure core
@@ -114,6 +121,9 @@ enum SyncTrayCLI {
         case "profiles":
             return .success(.profiles)
 
+        case "help", "-h", "--help":
+            return .success(.help)
+
         default:
             return .failure(CLIUsageError(message: usage))
         }
@@ -144,6 +154,9 @@ enum SyncTrayCLI {
             return runListRemotes(env: env)
         case .profiles:
             return runProfiles(env: env)
+        case .help:
+            env.stdout(Self.usage + "\n")
+            return 0
         }
     }
 
