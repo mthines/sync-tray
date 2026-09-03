@@ -350,7 +350,7 @@ struct OfflineFilesSection: View {
                 }
             }
 
-            Text("Folders you make available offline are downloaded and kept up to date so they open instantly without a connection.")
+            Text("Folders you make available offline are downloaded and kept up to date so they open instantly without a connection. Changes apply right away — no need to Save.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
 
@@ -528,7 +528,8 @@ struct OfflineFilesSection: View {
 
             Text("Skip files you don't need offline so they never download. Use wildcards: "
                 + "*.bak matches any file ending in .bak, and **/BACKUP/** skips every "
-                + "folder named BACKUP, at any depth. Patterns are case-sensitive.")
+                + "folder named BACKUP, at any depth. Patterns are case-sensitive and apply "
+                + "right away — files already downloaded stay until you free up space.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
 
@@ -595,6 +596,17 @@ struct OfflineFilesSection: View {
         var updated = liveProfile
         updated.warmExcludePatterns = excludePatterns
         profileStore.update(updated)
+        // Excludes take effect on the next warm. If one is running, restart it so the new
+        // filter applies now instead of after the current run finishes. Already-cached files
+        // are left in place — excludes only block future downloads.
+        restartWarmIfActive()
+    }
+
+    /// If a warm run is in flight, cancel and restart it so a just-changed pin/exclude filter
+    /// applies to the current download rather than only the next one.
+    private func restartWarmIfActive() {
+        guard syncManager.warmProgress[profile.id]?.isActive == true else { return }
+        syncManager.startWarm(for: profile.id, trigger: "manual")  // startWarm supersedes the running task
     }
 
     // MARK: - Cached Files Browser
