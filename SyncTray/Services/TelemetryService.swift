@@ -1867,7 +1867,18 @@ final class TelemetryService {
     }
 
     /// End the warm span and record duration / throughput / file / byte metrics.
-    func endWarm(_ token: WarmSpanToken, filesWarmed: Int, bytesWarmed: Int64, durationSeconds: Double) {
+    ///
+    /// - Parameter outcome: how the run ended — `"completed"` (ran to the end) or
+    ///   `"cancelled"` (superseded, cache cleared, or profile unmounted mid-warm). Recorded
+    ///   as a `warm.outcome` label on every metric and on the span/log so an interrupted
+    ///   warm is distinguishable from a finished one.
+    func endWarm(
+        _ token: WarmSpanToken,
+        filesWarmed: Int,
+        bytesWarmed: Int64,
+        durationSeconds: Double,
+        outcome: String = "completed"
+    ) {
         guard SyncTraySettings.telemetryEnabled else { return }
 
         let throughputMBps = durationSeconds > 0
@@ -1878,6 +1889,7 @@ final class TelemetryService {
         let labels: [String: AttributeValue] = [
             "synctray.profile.name": .string(token.profileName),
             "warm.trigger": .string(token.trigger),
+            "warm.outcome": .string(outcome),
         ]
         warmDurationHistogram?.record(value: durationSeconds, attributes: labels)
         warmThroughputHistogram?.record(value: throughputMBps, attributes: labels)
@@ -1887,6 +1899,7 @@ final class TelemetryService {
         let endAttrs: [String: AttributeValue] = [
             "synctray.profile.name": .string(token.profileName),
             "warm.trigger": .string(token.trigger),
+            "warm.outcome": .string(outcome),
             "warm.concurrency": .int(token.concurrency),
             "warm.files": .int(filesWarmed),
             "warm.bytes": .int(Int(bytesWarmed)),
@@ -1898,7 +1911,8 @@ final class TelemetryService {
             span.status = .ok
             span.end()
         }
-        emitLog(severity: .info, body: "Offline warm completed", attributes: endAttrs, spanContext: token.span?.context)
+        let body = outcome == "cancelled" ? "Offline warm cancelled" : "Offline warm completed"
+        emitLog(severity: .info, body: body, attributes: endAttrs, spanContext: token.span?.context)
     }
 
     private func emitLog(

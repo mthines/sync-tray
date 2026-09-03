@@ -51,6 +51,11 @@ final class SyncManager: ObservableObject {
     /// `warmPinnedDirectories`, which every warm entry point routes through.
     @Published private(set) var warmProgress: [UUID: WarmProgress] = [:]
 
+    /// In-flight warming tasks per profile, kept so a warm run can be cancelled when the
+    /// cache is cleared, the profile is unmounted, or a new run supersedes it. Without this,
+    /// clearing the cache mid-warm just re-downloads the files the warmer is still reading.
+    private var warmTasks: [UUID: Task<Void, Never>] = [:]
+
     let profileStore: ProfileStore
 
     private var logWatchers: [UUID: LogWatcher] = [:]
@@ -329,7 +334,7 @@ final class SyncManager: ObservableObject {
                                 Task { [weak self] in
                                     // Wait for RC API to be ready
                                     try? await Task.sleep(nanoseconds: 2_000_000_000)
-                                    await self?.warmPinnedDirectories(for: profile.id, trigger: "startup")
+                                    self?.startWarm(for: profile.id, trigger: "startup")
                                 }
                             }
                         } else {
@@ -360,6 +365,9 @@ final class SyncManager: ObservableObject {
     /// Unmount a profile (for mount mode only)
     func unmountProfile(_ profile: SyncProfile) {
         guard profile.isMountMode else { return }
+
+        // Stop any warming first — reads through a mount that's going away would hang or fail.
+        cancelWarm(for: profile.id)
 
         Task {
             do {
@@ -2054,7 +2062,7 @@ final class SyncManager: ObservableObject {
             // warmPinnedDirectories so the offline-files UI shows progress, and so the warmer
             // re-checks live pin state between files (an unpin mid-warm stops the read loop).
             if action == "pin" {
-                Task { await self.warmPinnedDirectories(for: profileId, dirs: paths, trigger: "finder_pin") }
+                startWarm(for: profileId, dirs: paths, trigger: "finder_pin")
             }
 
         } catch {
@@ -2062,14 +2070,34 @@ final class SyncManager: ObservableObject {
         }
     }
 
+    /// Start a warming run for a profile as a cancellable, tracked task, superseding any run
+    /// already in flight. This is the entry point every trigger uses so the run can later be
+    /// stopped (`cancelWarm`) when the cache is cleared or the profile is unmounted.
+    func startWarm(for profileId: UUID, dirs: [String]? = nil, trigger: String = "manual") {
+        warmTasks[profileId]?.cancel()  // supersede any run in flight
+        warmTasks[profileId] = Task { [weak self] in
+            await self?.warmPinnedDirectories(for: profileId, dirs: dirs, trigger: trigger)
+        }
+    }
+
+    /// Cancel an in-flight warming run for a profile. The run stops within one file chunk and
+    /// its completion block drops the progress row and records a `cancelled` outcome. Call
+    /// before clearing the cache or unmounting so the warmer doesn't re-download files that
+    /// are about to be evicted (or read through a mount that's going away).
+    func cancelWarm(for profileId: UUID) {
+        warmTasks[profileId]?.cancel()
+    }
+
     /// Warm (download into the VFS content cache) a profile's pinned folders, publishing
     /// live progress via `warmProgress[profileId]`.
     ///
-    /// Every warm entry point routes through here — the manual "Sync All" button, the
-    /// post-mount startup warm, and Finder pin requests — so all three surface the same
-    /// progress UI. Concurrent runs for one profile are coalesced: a call while a run is
-    /// active is ignored. Emits a `synctray warm` span + metrics so a run is measurable in
-    /// telemetry (throughput is the signal for the slow-fallback case).
+    /// Every warm entry point routes through `startWarm` into here — the manual "Sync All"
+    /// button, the post-mount startup warm, and Finder pin requests — so all three surface the
+    /// same progress UI. Concurrent runs for one profile are coalesced: a call while a run is
+    /// active is ignored. The run stops promptly when its task is cancelled (cache cleared /
+    /// unmounted): the directory loop and `warmDirectory` both check `Task.isCancelled`. Emits
+    /// a `synctray warm` span + metrics (with a `warm.outcome` of completed/cancelled) so a run
+    /// is measurable in telemetry (throughput is the signal for the slow-fallback case).
     ///
     /// - Parameters:
     ///   - profileId: The mount-mode profile to warm.
@@ -2109,6 +2137,7 @@ final class SyncManager: ObservableObject {
         warmProgress[profileId] = progress
 
         for dir in targets {
+            if Task.isCancelled { break }  // cache cleared or profile unmounted mid-run
             await cacheService.warmDirectory(dir, for: profile, isStillPinned: { [weak self] in
                 await self?.isDirectoryPinned(dir, profileId: profileId) ?? false
             }, onStart: { [weak self] name in
@@ -2139,16 +2168,27 @@ final class SyncManager: ObservableObject {
             notifyFinderSyncReload()
         }
 
+        let cancelled = Task.isCancelled
         if var p = warmProgress[profileId] {
-            p.phase = .completed
-            p.finishedAt = Date()
-            p.inFlightFiles = []
-            warmProgress[profileId] = p
+            let files = p.filesDone
+            let bytes = p.bytesDone
+            let elapsed = p.elapsed
+            if cancelled {
+                // Drop the row — the cache was cleared or the mount went away, so a lingering
+                // "completed" summary would be misleading.
+                warmProgress[profileId] = nil
+            } else {
+                p.phase = .completed
+                p.finishedAt = Date()
+                p.inFlightFiles = []
+                warmProgress[profileId] = p
+            }
             TelemetryService.shared.endWarm(
                 telemetry,
-                filesWarmed: p.filesDone,
-                bytesWarmed: p.bytesDone,
-                durationSeconds: p.elapsed
+                filesWarmed: files,
+                bytesWarmed: bytes,
+                durationSeconds: elapsed,
+                outcome: cancelled ? "cancelled" : "completed"
             )
         }
     }

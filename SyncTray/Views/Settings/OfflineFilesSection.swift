@@ -804,6 +804,10 @@ struct OfflineFilesSection: View {
             profileName: profile.name,
             preservePinned: preservePinned
         )
+        // Stop any warming run first, otherwise it keeps reading files through the mount and
+        // re-populates the very cache we're about to clear.
+        let wasWarming = syncManager.warmProgress[profile.id]?.isActive == true
+        syncManager.cancelWarm(for: profile.id)
         isClearing = true
         Task {
             try? await cacheService.clearCache(for: profile, preservePinned: preservePinned)
@@ -811,6 +815,12 @@ struct OfflineFilesSection: View {
                 isClearing = false
                 cachedItems = []
                 refreshCacheStats()
+            }
+            // "Free Up Space" keeps pinned folders offline. If a warm was interrupted by this
+            // clear, resume it so the pinned folders finish downloading. "Clear Everything"
+            // deliberately drops the pinned cache too, so it is not resumed.
+            if preservePinned, wasWarming, !liveProfile.pinnedDirectories.isEmpty {
+                syncManager.startWarm(for: profile.id, trigger: "manual")
             }
         }
     }
@@ -887,7 +897,7 @@ struct OfflineFilesSection: View {
     private func refreshPinnedDirs() {
         // Route through SyncManager so progress is published to `warmProgress` and the
         // row above updates live. Stats refresh when the run finishes (see .onChange).
-        Task { await syncManager.warmPinnedDirectories(for: profile.id, trigger: "manual") }
+        syncManager.startWarm(for: profile.id, trigger: "manual")
     }
 
     // MARK: - Helpers
