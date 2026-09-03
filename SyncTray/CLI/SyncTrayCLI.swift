@@ -160,10 +160,11 @@ enum SyncTrayCLI {
         }
     }
 
-    /// Resolve `target` against `profiles`: exact `shortId` match first, then
-    /// a case-insensitive `name` match. Returns `nil` when nothing matches, or
-    /// when the name matches more than one profile (ambiguous — caller reports
-    /// the collision rather than guessing).
+    /// Resolve `target` against `profiles`: exact `shortId` match first, then a
+    /// case-insensitive `name` match. Returns `nil` when nothing matches AND when
+    /// the name is ambiguous (matches >1 profile) — callers treat both as "no
+    /// profile matches". An ambiguous name is therefore indistinguishable from an
+    /// absent one; disambiguate with the profile's shortId.
     static func resolveProfile(_ target: String, in profiles: [SyncProfile]) -> SyncProfile? {
         if let byShortId = profiles.first(where: { $0.shortId == target }) {
             return byShortId
@@ -375,8 +376,18 @@ extension CLIEnvironment {
         let watchdog = DispatchWorkItem { if proc.isRunning { proc.terminate() } }
         DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + timeout, execute: watchdog)
 
+        // Drain stdout and stderr CONCURRENTLY. Reading one to EOF before the
+        // other deadlocks when the child fills the still-unread pipe's ~64 KB
+        // buffer — exactly what an unreachable remote does to stderr, the very
+        // buffer test-remote/doctor need. (RcloneLocator sidesteps this by
+        // nulling stderr; here we need it, so we drain both at once.)
+        var errData = Data()
+        let errGroup = DispatchGroup()
+        DispatchQueue.global(qos: .utility).async(group: errGroup) {
+            errData = stderrPipe.fileHandleForReading.readDataToEndOfFile()
+        }
         let outData = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
-        let errData = stderrPipe.fileHandleForReading.readDataToEndOfFile()
+        errGroup.wait()
         proc.waitUntilExit()
         watchdog.cancel()
 
@@ -387,20 +398,27 @@ extension CLIEnvironment {
         )
     }
 
-    fileprivate static func runProcess(launchPath: String, args: [String]) -> (Int32, String) {
+    fileprivate static func runProcess(launchPath: String, args: [String], timeout: TimeInterval = 10) -> (Int32, String) {
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: launchPath)
         proc.arguments = args
         let pipe = Pipe()
         proc.standardOutput = pipe
-        proc.standardError = Pipe()
+        // stderr → /dev/null: callers use only stdout + the exit code, and an
+        // unread stderr Pipe can deadlock if the child fills its buffer.
+        // nullDevice removes both the unread read and the deadlock.
+        proc.standardError = FileHandle.nullDevice
         do {
             try proc.run()
         } catch {
             return (-1, "")
         }
+        // Watchdog so a wedged child (e.g. a hung launchctl) can't block forever.
+        let watchdog = DispatchWorkItem { if proc.isRunning { proc.terminate() } }
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + timeout, execute: watchdog)
         let data = pipe.fileHandleForReading.readDataToEndOfFile()
         proc.waitUntilExit()
+        watchdog.cancel()
         return (proc.terminationStatus, String(decoding: data, as: UTF8.self))
     }
 }
