@@ -2074,8 +2074,14 @@ final class SyncManager: ObservableObject {
     /// already in flight. This is the entry point every trigger uses so the run can later be
     /// stopped (`cancelWarm`) when the cache is cleared or the profile is unmounted.
     func startWarm(for profileId: UUID, dirs: [String]? = nil, trigger: String = "manual") {
-        warmTasks[profileId]?.cancel()  // supersede any run in flight
+        let previous = warmTasks[profileId]
+        previous?.cancel()  // supersede any run in flight
         warmTasks[profileId] = Task { [weak self] in
+            // Wait for the superseded run to fully wind down before starting. Its cleanup
+            // clears `warmProgress[profileId]`, so without this await the new run would hit
+            // `warmPinnedDirectories`' still-active coalesce guard and bail — cancelling the
+            // old warm without starting the new one (the exclude/pin "apply right away" path).
+            await previous?.value
             await self?.warmPinnedDirectories(for: profileId, dirs: dirs, trigger: trigger)
         }
     }
