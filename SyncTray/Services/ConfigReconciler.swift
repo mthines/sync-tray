@@ -12,7 +12,49 @@ enum ProfileReconcileAction: Equatable {
     case reinstall
 }
 
+/// Outcome of considering an external `*.profile.json` write against an
+/// UNKNOWN profile id — i.e. a potential CREATE, not an edit.
+enum ExternalCreateOutcome: Equatable {
+    /// Persisted AND the launchd agent installed (the profile was
+    /// `isEnabled && isValid`).
+    case createdAndInstalled
+    /// Persisted only — created but not enabled/complete enough to install.
+    /// An agent can flip `isEnabled`/fill in the remaining fields in a later
+    /// edit, which then hits the ordinary known-id `.install` reconcile.
+    case createdOnly
+    /// Not a create: decode failed upstream, or the id was already known (the
+    /// caller's existing edit path handles that case instead).
+    case ignored
+}
+
 extension SyncManager {
+    /// Decide whether an external `*.profile.json` drop bootstraps a NEW
+    /// profile, and dispatch the persist/install side effects via injected
+    /// closures — the SAME pure-decision-plus-injected-closure idiom as
+    /// `reconcileAction`/`applyWarmReconcileIfNeeded` below, so this is
+    /// spy-testable without a real `ProfileStore`/launchd.
+    ///
+    /// - `decoded == nil` (decode failed upstream) OR `isKnownId` → `.ignored`;
+    ///   the caller's existing decode-failure/known-id-edit path handles it.
+    /// - decoded, unknown id, `isEnabled && isValid` → `persist` then
+    ///   `install`, exactly once each → `.createdAndInstalled`.
+    /// - decoded, unknown id, otherwise → `persist` only → `.createdOnly`.
+    static func applyExternalCreateIfNeeded(
+        decoded: SyncProfile?,
+        isKnownId: Bool,
+        persist: (SyncProfile) -> Void,
+        install: (SyncProfile) -> Void
+    ) -> ExternalCreateOutcome {
+        guard let profile = decoded, !isKnownId else { return .ignored }
+
+        persist(profile)
+
+        guard profile.isEnabled, profile.isValid else { return .createdOnly }
+
+        install(profile)
+        return .createdAndInstalled
+    }
+
     /// Decide what reconcile work a profile edit requires, given the
     /// previously-installed profile and the new (edited) profile values.
     ///

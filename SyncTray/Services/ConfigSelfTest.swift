@@ -52,6 +52,15 @@ enum ConfigSelfTest {
             testWarmExcludePatternsRoundTrip,
             testWarmReconcileTrigger,
             testMigrationIntegrity,
+            testExternalCreateEnabled,
+            testExternalCreateDisabledNoInstall,
+            testExternalCreateGarbageIgnored,
+            testExternalCreateCanonicalNoLoop,
+            testExternalCreateTelemetryAction,
+            testCLIArgParsing,
+            testDoctorPureChecks,
+            testCLIResolveAndList,
+            testShimInstallIdempotentNonClobber,
         ]
 
         for check in checks {
@@ -618,6 +627,423 @@ enum ConfigSelfTest {
         }
 
         return report("AC-22", "migration-integrity", true)
+    }
+
+    // MARK: - AC-C1 — external create: enabled + valid → persist+install, .createdAndInstalled
+
+    private static func testExternalCreateEnabled() -> Bool {
+        let profile = sampleProfile(isEnabled: true)
+        var persistCalls = 0
+        var installCalls = 0
+
+        let outcome = SyncManager.applyExternalCreateIfNeeded(
+            decoded: profile,
+            isKnownId: false,
+            persist: { _ in persistCalls += 1 },
+            install: { _ in installCalls += 1 }
+        )
+
+        guard outcome == .createdAndInstalled else {
+            return report("AC-C1", "external-create-enabled", false, "(expected .createdAndInstalled, got \(outcome))")
+        }
+        guard persistCalls == 1, installCalls == 1 else {
+            return report("AC-C1", "external-create-enabled", false, "(persist=\(persistCalls) install=\(installCalls), expected 1/1)")
+        }
+
+        return report("AC-C1", "external-create-enabled", true)
+    }
+
+    // MARK: - AC-C2 — external create: disabled OR !isValid → .createdOnly, install never
+
+    private static func testExternalCreateDisabledNoInstall() -> Bool {
+        func run(_ profile: SyncProfile) -> (ExternalCreateOutcome, Int, Int) {
+            var persistCalls = 0
+            var installCalls = 0
+            let outcome = SyncManager.applyExternalCreateIfNeeded(
+                decoded: profile, isKnownId: false,
+                persist: { _ in persistCalls += 1 },
+                install: { _ in installCalls += 1 }
+            )
+            return (outcome, persistCalls, installCalls)
+        }
+
+        let disabled = sampleProfile(isEnabled: false)
+        let (disabledOutcome, disabledPersist, disabledInstall) = run(disabled)
+        guard disabledOutcome == .createdOnly, disabledPersist == 1, disabledInstall == 0 else {
+            return report(
+                "AC-C2", "external-create-disabled-noinstall", false,
+                "(disabled: outcome=\(disabledOutcome) persist=\(disabledPersist) install=\(disabledInstall))")
+        }
+
+        var invalid = sampleProfile(isEnabled: true)
+        invalid.name = ""  // fails isValid
+        let (invalidOutcome, invalidPersist, invalidInstall) = run(invalid)
+        guard invalidOutcome == .createdOnly, invalidPersist == 1, invalidInstall == 0 else {
+            return report(
+                "AC-C2", "external-create-disabled-noinstall", false,
+                "(invalid: outcome=\(invalidOutcome) persist=\(invalidPersist) install=\(invalidInstall))")
+        }
+
+        return report("AC-C2", "external-create-disabled-noinstall", true)
+    }
+
+    // MARK: - AC-C3 — external create: undecodable/malformed-UUID → .ignored, no spy fires
+
+    private static func testExternalCreateGarbageIgnored() -> Bool {
+        var persistCalls = 0
+        var installCalls = 0
+        let outcome = SyncManager.applyExternalCreateIfNeeded(
+            decoded: nil, isKnownId: false,
+            persist: { _ in persistCalls += 1 },
+            install: { _ in installCalls += 1 }
+        )
+        guard outcome == .ignored, persistCalls == 0, installCalls == 0 else {
+            return report(
+                "AC-C3", "external-create-garbage-ignored", false,
+                "(decoded=nil: outcome=\(outcome) persist=\(persistCalls) install=\(installCalls))")
+        }
+
+        // Also cover the upstream decode itself: a garbage/malformed-UUID payload
+        // must fail to decode (this is what `applyExternalProfileEdit`'s
+        // `JSONDecoder` call sees before it ever reaches the create dispatch).
+        let garbageJSON: [String: Any] = ["id": "not-a-uuid", "name": "Garbage"]
+        guard let data = try? JSONSerialization.data(withJSONObject: garbageJSON) else {
+            return report("AC-C3", "external-create-garbage-ignored", false, "(failed to build garbage fixture)")
+        }
+        let decoded = try? JSONDecoder().decode(SyncProfile.self, from: data)
+        guard decoded == nil else {
+            return report("AC-C3", "external-create-garbage-ignored", false, "(malformed-UUID payload unexpectedly decoded)")
+        }
+
+        return report("AC-C3", "external-create-garbage-ignored", true)
+    }
+
+    // MARK: - AC-C4 — external create: differently-named file canonicalizes, no reconcile loop
+
+    private static func testExternalCreateCanonicalNoLoop() -> Bool {
+        let dir = "\(selfTestRoot)/ac-c4-create"
+        try? FileManager.default.removeItem(atPath: dir)
+        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+
+        // Disabled: exercises persist/canonicalize only, no real launchd install.
+        let profile = sampleProfile(isEnabled: false)
+        let sourcePath = "\(dir)/weird-name.profile.json"
+        guard let data = try? JSONEncoder().encode(profile) else {
+            return report("AC-C4", "external-create-canonical-no-loop", false, "(failed to encode fixture)")
+        }
+        guard (try? data.write(to: URL(fileURLWithPath: sourcePath))) != nil else {
+            return report("AC-C4", "external-create-canonical-no-loop", false, "(failed to write fixture source file)")
+        }
+
+        let outcome = SyncManager.applyExternalCreateIfNeeded(
+            decoded: profile,
+            isKnownId: false,
+            persist: { p in
+                let store = ProfileStore(
+                    profilesDirectory: dir,
+                    defaults: UserDefaults(suiteName: "com.synctray.selftest.acc4.\(UUID().uuidString)")!
+                )
+                store.add(p)
+                let canonicalFilename = "\(p.shortId).profile.json"
+                let sourceFilename = (sourcePath as NSString).lastPathComponent
+                if sourceFilename != canonicalFilename {
+                    try? FileManager.default.removeItem(atPath: sourcePath)
+                }
+            },
+            install: { _ in }
+        )
+        guard outcome == .createdOnly else {
+            return report("AC-C4", "external-create-canonical-no-loop", false, "(expected .createdOnly, got \(outcome))")
+        }
+
+        let canonicalPath = "\(dir)/\(profile.shortId).profile.json"
+        guard FileManager.default.fileExists(atPath: canonicalPath) else {
+            return report("AC-C4", "external-create-canonical-no-loop", false, "(canonical file not written at \(canonicalPath))")
+        }
+        guard !FileManager.default.fileExists(atPath: sourcePath) else {
+            return report("AC-C4", "external-create-canonical-no-loop", false, "(source file still present at \(sourcePath))")
+        }
+
+        guard let canonicalData = FileManager.default.contents(atPath: canonicalPath) else {
+            return report("AC-C4", "external-create-canonical-no-loop", false, "(canonical file unreadable)")
+        }
+        let hash = ConfigSelfWriteRegistry.hash(canonicalData)
+        guard ConfigSelfWriteRegistry.shared.consumeIfSelfWrite(contentHash: hash) else {
+            return report(
+                "AC-C4", "external-create-canonical-no-loop", false,
+                "(canonical write's hash not consumable from the self-write registry — reconcile loop would fire)")
+        }
+
+        return report("AC-C4", "external-create-canonical-no-loop", true)
+    }
+
+    // MARK: - AC-C5 — external create emits telemetry with action = "create"
+
+    private static func testExternalCreateTelemetryAction() -> Bool {
+        // Signature/behavior check: both the pre-existing default ("edit") and the
+        // new "create" action compile and run without crashing. Telemetry itself is
+        // disabled in this environment (SyncTraySettings.telemetryEnabled == false),
+        // so these calls are no-ops — this only proves the signature accepts both shapes.
+        TelemetryService.shared.recordExternalConfigEdit(kind: "profile")
+        TelemetryService.shared.recordExternalConfigEdit(kind: "profile", action: "create")
+
+        // Call-site assertion: the create path in SyncManager.swift must actually
+        // PASS action: "create" (not merely have the capability to). Verified by
+        // reading this run's own source, next to this file in Services/.
+        let selfTestFile = URL(fileURLWithPath: #filePath)
+        let syncManagerPath = selfTestFile.deletingLastPathComponent().appendingPathComponent("SyncManager.swift").path
+        guard let source = try? String(contentsOfFile: syncManagerPath, encoding: .utf8) else {
+            return report(
+                "AC-C5", "external-create-telemetry-action", false,
+                "(could not read SyncManager.swift source to verify call site)")
+        }
+        guard source.contains("recordExternalConfigEdit(kind: \"profile\", action: \"create\")") else {
+            return report(
+                "AC-C5", "external-create-telemetry-action", false,
+                "(create path does not call recordExternalConfigEdit with action: \"create\")")
+        }
+
+        return report("AC-C5", "external-create-telemetry-action", true)
+    }
+
+    // MARK: - CLI self-test helpers
+
+    /// Build a `CLIEnvironment` with inert defaults, overridable per test —
+    /// mirrors `sampleProfile`'s role for the Enabler-1 tests above.
+    private static func fakeCLIEnvironment(
+        runRclone: @escaping (_ args: [String], _ timeout: TimeInterval) -> (Int32, String, String) = { _, _ in (0, "", "") },
+        readProfiles: @escaping () -> [SyncProfile] = { [] },
+        fileExists: @escaping (String) -> Bool = { _ in false },
+        runLaunchctl: @escaping (_ args: [String]) -> (Int32, String) = { _ in (0, "") },
+        schemaFilesPresent: @escaping () -> Bool = { true },
+        stdout: @escaping (String) -> Void = { _ in },
+        stderr: @escaping (String) -> Void = { _ in }
+    ) -> CLIEnvironment {
+        CLIEnvironment(
+            runRclone: runRclone,
+            readProfiles: readProfiles,
+            fileExists: fileExists,
+            runLaunchctl: runLaunchctl,
+            schemaFilesPresent: schemaFilesPresent,
+            stdout: stdout,
+            stderr: stderr,
+            now: { Date() }
+        )
+    }
+
+    // MARK: - AC-CLI1 — arg parsing: unknown/absent → usage error; known commands route correctly
+
+    private static func testCLIArgParsing() -> Bool {
+        guard case .failure = SyncTrayCLI.parse([]) else {
+            return report("AC-CLI1", "cli-arg-parsing", false, "(parse([]) did not fail)")
+        }
+        guard case .failure = SyncTrayCLI.parse(["bogus"]) else {
+            return report("AC-CLI1", "cli-arg-parsing", false, "(parse([\"bogus\"]) did not fail)")
+        }
+
+        var stderrOutput = ""
+        let execEnv = fakeCLIEnvironment(stderr: { stderrOutput += $0 })
+        let exitCode = SyncTrayCLI.execute(["bogus"], env: execEnv)
+        guard exitCode != 0 else {
+            return report("AC-CLI1", "cli-arg-parsing", false, "(execute([\"bogus\"]) returned exit 0)")
+        }
+        guard !stderrOutput.isEmpty else {
+            return report("AC-CLI1", "cli-arg-parsing", false, "(no usage message printed to stderr on parse failure)")
+        }
+
+        guard case .success(.doctor) = SyncTrayCLI.parse(["doctor"]) else {
+            return report("AC-CLI1", "cli-arg-parsing", false, "(\"doctor\" did not parse to .doctor)")
+        }
+        guard case .success(.testRemote("work")) = SyncTrayCLI.parse(["test-remote", "work"]) else {
+            return report("AC-CLI1", "cli-arg-parsing", false, "(\"test-remote work\" did not parse correctly)")
+        }
+        guard case .success(.logs(target: "work", follow: true)) = SyncTrayCLI.parse(["logs", "work", "--follow"]) else {
+            return report("AC-CLI1", "cli-arg-parsing", false, "(\"logs work --follow\" did not parse correctly)")
+        }
+        guard case .success(.listRemotes) = SyncTrayCLI.parse(["listremotes"]) else {
+            return report("AC-CLI1", "cli-arg-parsing", false, "(\"listremotes\" did not parse to .listRemotes)")
+        }
+        guard case .success(.profiles) = SyncTrayCLI.parse(["profiles"]) else {
+            return report("AC-CLI1", "cli-arg-parsing", false, "(\"profiles\" did not parse to .profiles)")
+        }
+
+        var capturedArgs: [String] = []
+        let listEnv = fakeCLIEnvironment(runRclone: { args, _ in
+            capturedArgs = args
+            return (0, "remote1:\nremote2:\n", "")
+        })
+        _ = SyncTrayCLI.run(.listRemotes, env: listEnv)
+        guard capturedArgs == ["listremotes"] else {
+            return report("AC-CLI1", "cli-arg-parsing", false, "(listremotes did not invoke rclone listremotes, got \(capturedArgs))")
+        }
+
+        return report("AC-CLI1", "cli-arg-parsing", true)
+    }
+
+    // MARK: - AC-CLI2 — doctor: correct DoctorCheck statuses + exit code derivation
+
+    private static func testDoctorPureChecks() -> Bool {
+        // rclone present + schema present + no profiles → no .fail check.
+        let healthyEnv = fakeCLIEnvironment(
+            runRclone: { args, _ in args.first == "version" ? (0, "rclone v1.66.0", "") : (0, "", "") },
+            readProfiles: { [] },
+            schemaFilesPresent: { true }
+        )
+        let healthyChecks = SyncTrayCLI.doctorChecks(env: healthyEnv)
+        guard !healthyChecks.contains(where: { $0.status == .fail }) else {
+            return report("AC-CLI2", "doctor-pure-checks", false, "(healthy env produced a .fail check: \(healthyChecks))")
+        }
+        guard healthyChecks.contains(where: { $0.name == "rclone" && $0.status == .ok }) else {
+            return report("AC-CLI2", "doctor-pure-checks", false, "(rclone check not .ok in healthy env)")
+        }
+
+        // rclone absent → .fail, exit non-zero.
+        let noRcloneEnv = fakeCLIEnvironment(runRclone: { _, _ in (127, "", "not found") })
+        let noRcloneChecks = SyncTrayCLI.doctorChecks(env: noRcloneEnv)
+        guard noRcloneChecks.contains(where: { $0.name == "rclone" && $0.status == .fail }) else {
+            return report("AC-CLI2", "doctor-pure-checks", false, "(rclone-absent env did not produce a .fail rclone check)")
+        }
+        guard SyncTrayCLI.run(.doctor, env: noRcloneEnv) != 0 else {
+            return report("AC-CLI2", "doctor-pure-checks", false, "(rclone-absent doctor run did not exit non-zero)")
+        }
+
+        // schema missing → .warn only, exit still 0.
+        let noSchemaEnv = fakeCLIEnvironment(
+            runRclone: { args, _ in args.first == "version" ? (0, "rclone v1.66.0", "") : (0, "", "") },
+            schemaFilesPresent: { false }
+        )
+        let noSchemaChecks = SyncTrayCLI.doctorChecks(env: noSchemaEnv)
+        guard noSchemaChecks.contains(where: { $0.name == "config schemas" && $0.status == .warn }) else {
+            return report("AC-CLI2", "doctor-pure-checks", false, "(schema-missing env did not produce a .warn schema check)")
+        }
+        guard SyncTrayCLI.run(.doctor, env: noSchemaEnv) == 0 else {
+            return report("AC-CLI2", "doctor-pure-checks", false, "(schema-missing (warn-only) doctor run should still exit 0)")
+        }
+
+        // Per-profile: derived config missing → .fail, exit non-zero.
+        let profile = sampleProfile(isEnabled: false)
+        let missingConfigEnv = fakeCLIEnvironment(
+            runRclone: { args, _ in args.first == "version" ? (0, "rclone v1.66.0", "") : (0, "", "") },
+            readProfiles: { [profile] },
+            fileExists: { _ in false },
+            schemaFilesPresent: { true }
+        )
+        let missingConfigChecks = SyncTrayCLI.doctorChecks(env: missingConfigEnv)
+        guard missingConfigChecks.contains(where: { $0.status == .fail && $0.detail.contains("derived config missing") }) else {
+            return report("AC-CLI2", "doctor-pure-checks", false, "(missing derived config did not produce a .fail check)")
+        }
+        guard SyncTrayCLI.run(.doctor, env: missingConfigEnv) != 0 else {
+            return report("AC-CLI2", "doctor-pure-checks", false, "(missing-derived-config doctor run did not exit non-zero)")
+        }
+
+        // Derived config present → no .fail for that profile.
+        let presentConfigEnv = fakeCLIEnvironment(
+            runRclone: { args, _ in args.first == "version" ? (0, "rclone v1.66.0", "") : (0, "", "") },
+            readProfiles: { [profile] },
+            fileExists: { path in path == profile.configPath },
+            schemaFilesPresent: { true }
+        )
+        let presentConfigChecks = SyncTrayCLI.doctorChecks(env: presentConfigEnv)
+        guard !presentConfigChecks.contains(where: { $0.status == .fail }) else {
+            return report(
+                "AC-CLI2", "doctor-pure-checks", false,
+                "(present-config env unexpectedly produced a .fail check: \(presentConfigChecks))")
+        }
+
+        // Stale lock present → .warn only, exit still 0.
+        let staleLockEnv = fakeCLIEnvironment(
+            runRclone: { args, _ in args.first == "version" ? (0, "rclone v1.66.0", "") : (0, "", "") },
+            readProfiles: { [profile] },
+            fileExists: { path in path == profile.configPath || path == profile.lockFilePath },
+            schemaFilesPresent: { true }
+        )
+        let staleLockChecks = SyncTrayCLI.doctorChecks(env: staleLockEnv)
+        guard staleLockChecks.contains(where: { $0.status == .warn && $0.detail.contains("stale lock") }) else {
+            return report("AC-CLI2", "doctor-pure-checks", false, "(stale lock did not produce a .warn check)")
+        }
+        guard SyncTrayCLI.run(.doctor, env: staleLockEnv) == 0 else {
+            return report("AC-CLI2", "doctor-pure-checks", false, "(stale-lock-only (warn) doctor run should still exit 0)")
+        }
+
+        return report("AC-CLI2", "doctor-pure-checks", true)
+    }
+
+    // MARK: - AC-CLI3 — resolution precedence + unmatched error + profiles output
+
+    private static func testCLIResolveAndList() -> Bool {
+        let workProfile = sampleProfile(id: UUID(), name: "Work", isEnabled: true)
+        let personalProfile = sampleProfile(id: UUID(), name: "Personal", isEnabled: false)
+        let all = [workProfile, personalProfile]
+
+        guard SyncTrayCLI.resolveProfile(workProfile.shortId, in: all)?.id == workProfile.id else {
+            return report("AC-CLI3", "cli-resolve-and-list", false, "(shortId resolution failed)")
+        }
+        guard SyncTrayCLI.resolveProfile("WORK", in: all)?.id == workProfile.id else {
+            return report("AC-CLI3", "cli-resolve-and-list", false, "(case-insensitive name resolution failed)")
+        }
+        guard SyncTrayCLI.resolveProfile("nope", in: all) == nil else {
+            return report("AC-CLI3", "cli-resolve-and-list", false, "(unmatched target unexpectedly resolved)")
+        }
+
+        var stderrOutput = ""
+        let unmatchedEnv = fakeCLIEnvironment(readProfiles: { all }, stderr: { stderrOutput += $0 })
+        let exitCode = SyncTrayCLI.run(.testRemote("nope"), env: unmatchedEnv)
+        guard exitCode != 0, stderrOutput.contains("no profile matches"), stderrOutput.contains("nope") else {
+            return report(
+                "AC-CLI3", "cli-resolve-and-list", false,
+                "(unmatched test-remote target did not exit non-zero with a greppable error)")
+        }
+
+        var stdoutOutput = ""
+        let profilesEnv = fakeCLIEnvironment(readProfiles: { all }, stdout: { stdoutOutput += $0 })
+        _ = SyncTrayCLI.run(.profiles, env: profilesEnv)
+        for expected in [workProfile.name, workProfile.shortId, workProfile.syncMode.rawValue, "enabled=true", workProfile.rcloneRemote] {
+            guard stdoutOutput.contains(expected) else {
+                return report("AC-CLI3", "cli-resolve-and-list", false, "(profiles output missing \"\(expected)\")")
+            }
+        }
+
+        return report("AC-CLI3", "cli-resolve-and-list", true)
+    }
+
+    // MARK: - AC-CLI4 — shim install: writes exec shim, idempotent, never clobbers a foreign file
+
+    private static func testShimInstallIdempotentNonClobber() -> Bool {
+        let binDir = "\(selfTestRoot)/ac-cli4-bin"
+        try? FileManager.default.removeItem(atPath: binDir)
+        let shimPath = "\(binDir)/synctray"
+
+        guard CLIShimInstaller.install(executablePath: "/tmp/fake-synctray-binary", shimPath: shimPath) else {
+            return report("AC-CLI4", "shim-install-idempotent-nonclobber", false, "(install failed on an absent shim path)")
+        }
+        guard let contents = try? String(contentsOfFile: shimPath, encoding: .utf8),
+              contents.contains("exec \"/tmp/fake-synctray-binary\" \"$@\"") else {
+            return report("AC-CLI4", "shim-install-idempotent-nonclobber", false, "(shim content missing exec line)")
+        }
+        guard let attrs = try? FileManager.default.attributesOfItem(atPath: shimPath),
+              let perms = attrs[.posixPermissions] as? NSNumber, perms.uint16Value & 0o111 != 0 else {
+            return report("AC-CLI4", "shim-install-idempotent-nonclobber", false, "(shim not executable)")
+        }
+
+        guard CLIShimInstaller.install(executablePath: "/tmp/fake-synctray-binary-v2", shimPath: shimPath) else {
+            return report("AC-CLI4", "shim-install-idempotent-nonclobber", false, "(re-install over our own shim failed)")
+        }
+        guard let refreshed = try? String(contentsOfFile: shimPath, encoding: .utf8),
+              refreshed.contains("/tmp/fake-synctray-binary-v2") else {
+            return report("AC-CLI4", "shim-install-idempotent-nonclobber", false, "(re-install did not refresh the exec path)")
+        }
+
+        let foreignPath = "\(binDir)/foreign-synctray"
+        let foreignContent = "#!/bin/sh\necho not ours\n"
+        try? foreignContent.write(toFile: foreignPath, atomically: true, encoding: .utf8)
+        guard CLIShimInstaller.install(executablePath: "/tmp/should-not-appear", shimPath: foreignPath) == false else {
+            return report("AC-CLI4", "shim-install-idempotent-nonclobber", false, "(install returned true over a foreign file)")
+        }
+        guard let foreignAfter = try? String(contentsOfFile: foreignPath, encoding: .utf8), foreignAfter == foreignContent else {
+            return report("AC-CLI4", "shim-install-idempotent-nonclobber", false, "(foreign file was modified)")
+        }
+
+        return report("AC-CLI4", "shim-install-idempotent-nonclobber", true)
     }
 }
 

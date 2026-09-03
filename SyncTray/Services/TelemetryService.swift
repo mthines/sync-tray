@@ -1290,14 +1290,19 @@ final class TelemetryService {
 
     /// Record a live external edit to a `~/.config/synctray` file (a
     /// `*.profile.json` or `settings.json`) that was applied through the
-    /// reconcile path. `kind` is bounded ("profile" | "settings"); the
-    /// attribute set never includes a filesystem path, remote name, or
-    /// credential — only the low-cardinality kind.
-    func recordExternalConfigEdit(kind: String) {
+    /// reconcile path. `kind` is bounded ("profile" | "settings"); `action`
+    /// is bounded ("edit" | "create" — defaults to "edit" so every existing
+    /// call site is unaffected). The attribute set never includes a
+    /// filesystem path, remote name, or credential — only the low-cardinality
+    /// kind/action.
+    func recordExternalConfigEdit(kind: String, action: String = "edit") {
         guard SyncTraySettings.telemetryEnabled else { return }
         ensureSetup()
 
-        let attrs: [String: AttributeValue] = ["config.edit_kind": .string(kind)]
+        let attrs: [String: AttributeValue] = [
+            "config.edit_kind": .string(kind),
+            "config.edit_action": .string(action),
+        ]
         externalConfigEditCounter?.add(value: 1, attribute: attrs)
         emitLog(severity: .info, body: "External config edit applied", attributes: attrs)
     }

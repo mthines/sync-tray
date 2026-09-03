@@ -64,12 +64,21 @@ final class ProfileStore: ObservableObject {
 
     /// Read every `*.profile.json` file in `profilesDirectory`.
     private func loadFromProfileFiles() -> [SyncProfile] {
+        Self.profilesOnDisk(in: profilesDirectory)
+    }
+
+    /// Read every `*.profile.json` file in `directory`. `nonisolated` and
+    /// callable off `@MainActor` so the headless CLI (`SyncTrayCLI`) can read
+    /// profiles directly without constructing an `@MainActor` `ProfileStore`
+    /// or touching the `ObservableObject`/watcher graph. Single source of
+    /// truth for the file read — `loadFromProfileFiles` delegates here too.
+    nonisolated static func profilesOnDisk(in directory: String) -> [SyncProfile] {
         let fm = FileManager.default
-        guard let files = try? fm.contentsOfDirectory(atPath: profilesDirectory) else { return [] }
+        guard let files = try? fm.contentsOfDirectory(atPath: directory) else { return [] }
 
         var result: [SyncProfile] = []
         for file in files.sorted() where file.hasSuffix(".profile.json") {
-            let path = (profilesDirectory as NSString).appendingPathComponent(file)
+            let path = (directory as NSString).appendingPathComponent(file)
             guard let data = fm.contents(atPath: path),
                   let profile = try? JSONDecoder().decode(SyncProfile.self, from: data) else {
                 continue
