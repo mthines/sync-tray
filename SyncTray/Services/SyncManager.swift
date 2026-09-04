@@ -565,10 +565,11 @@ final class SyncManager: ObservableObject {
     /// never a bare in-memory struct swap, so the running launchd agent is
     /// never left stale.
     ///
-    /// A decode failure (half-written file, or a profile id that doesn't
-    /// match anything SyncTray knows about) is a silent no-op: a half-written
-    /// file will complete and re-trigger; an unknown id is logged and ignored
-    /// rather than treated as a new profile (creating profiles is a UI action).
+    /// A decode failure (half-written file) is a silent no-op — a half-written
+    /// file will complete and re-trigger. A file carrying an UNKNOWN, decodable
+    /// id is not ignored: it CREATES the profile (see `applyExternalProfileCreate`
+    /// / `SyncManager.applyExternalCreateIfNeeded`), so an agent can bootstrap a
+    /// new sync purely by dropping a file.
     func applyExternalProfileEdit(fromFileAt path: String) {
         guard let data = FileManager.default.contents(atPath: path),
               let updatedProfile = try? JSONDecoder().decode(SyncProfile.self, from: data) else {
@@ -577,7 +578,7 @@ final class SyncManager: ObservableObject {
         }
 
         guard let currentProfile = profileStore.profile(for: updatedProfile.id) else {
-            SyncTraySettings.debugLog("[ConfigFileWatcher] External profile edit at \(path) references an unknown profile id; ignoring")
+            applyExternalProfileCreate(decoded: updatedProfile, sourcePath: path)
             return
         }
 
@@ -636,6 +637,48 @@ final class SyncManager: ObservableObject {
 
         updateAggregateState()
         TelemetryService.shared.recordExternalConfigEdit(kind: "profile")
+    }
+
+    /// Wires `applyExternalCreateIfNeeded`'s persist/install closures to the
+    /// production primitives — the SAME `profileStore.add`/`setupService.install`
+    /// the in-app "create profile" flow and the `.install` reconcile branch
+    /// use, so a file-bootstrapped profile can never drift from an
+    /// in-app-created one.
+    ///
+    /// `persist` also canonicalizes the file: if the dropped file's basename
+    /// isn't `{shortId}.profile.json`, the differently-named source is removed
+    /// AFTER `profileStore.add` writes the canonical file (which notes its own
+    /// content hash in `ConfigSelfWriteRegistry`) — the resulting missing-source
+    /// FSEvent is a no-op (`ConfigFileWatcher.shouldReconcile` returns false for
+    /// a missing file), so this can never loop.
+    private func applyExternalProfileCreate(decoded: SyncProfile, sourcePath: String) {
+        let outcome = Self.applyExternalCreateIfNeeded(
+            decoded: decoded,
+            isKnownId: false,
+            persist: { [weak self] profile in
+                self?.profileStore.add(profile)
+                self?.clearError(for: profile.id)
+
+                let canonicalFilename = "\(profile.shortId).profile.json"
+                let sourceFilename = (sourcePath as NSString).lastPathComponent
+                if sourceFilename != canonicalFilename {
+                    try? FileManager.default.removeItem(atPath: sourcePath)
+                }
+            },
+            install: { [weak self] profile in
+                do {
+                    try self?.setupService.install(profile: profile)
+                    self?.startWatching(profile: profile)
+                } catch {
+                    print("Failed to install newly-created external profile: \(error)")
+                }
+            }
+        )
+
+        guard outcome != .ignored else { return }
+
+        updateAggregateState()
+        TelemetryService.shared.recordExternalConfigEdit(kind: "profile", action: "create")
     }
 
     /// App-side warm reconcile: re-push the App Group data the FinderSync

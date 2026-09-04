@@ -249,10 +249,14 @@ extension SyncProfile {
         rcloneRemote = try container.decode(String.self, forKey: .rcloneRemote)
         remotePath = try container.decode(String.self, forKey: .remotePath)
         localSyncPath = try container.decode(String.self, forKey: .localSyncPath)
-        drivePathToMonitor = try container.decode(String.self, forKey: .drivePathToMonitor)
-        syncIntervalMinutes = try container.decode(Int.self, forKey: .syncIntervalMinutes)
-        additionalRcloneFlags = try container.decode(String.self, forKey: .additionalRcloneFlags)
-        isEnabled = try container.decode(Bool.self, forKey: .isEnabled)
+        // Optional-with-default so an agent (or dropped file) can author a
+        // MINIMAL profile — id/name/remote/paths are the only truly-required
+        // keys. These three mirror the memberwise-init defaults exactly, so an
+        // app-written file (which always emits them) round-trips unchanged.
+        drivePathToMonitor = try container.decodeIfPresent(String.self, forKey: .drivePathToMonitor) ?? ""
+        syncIntervalMinutes = try container.decodeIfPresent(Int.self, forKey: .syncIntervalMinutes) ?? 5
+        additionalRcloneFlags = try container.decodeIfPresent(String.self, forKey: .additionalRcloneFlags) ?? ""
+        isEnabled = try container.decodeIfPresent(Bool.self, forKey: .isEnabled) ?? false
         // Backwards compatibility: default to false if not present
         isMuted = try container.decodeIfPresent(Bool.self, forKey: .isMuted) ?? false
         // Backwards compatibility: default to bisync if not present

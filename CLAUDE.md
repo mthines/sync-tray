@@ -241,12 +241,19 @@ between files via `try Task.checkCancellation()`.
 | `LogParser.swift` | Parses plain text and JSON log lines into typed `ParsedLogEvent` |
 | `DirectoryWatcher.swift` | FSEvents-based directory monitoring with debouncing |
 | `ConfigFileWatcher.swift` | FSEvents watcher on `~/.config/synctray` for external profile/settings edits; self-write suppression via `ConfigSelfWriteRegistry` |
-| `ConfigReconciler.swift` | `SyncManager.reconcileAction` (shared launchd install/uninstall/reinstall delta logic), `warmReconcileNeeded`/`applyWarmReconcileIfNeeded` (orthogonal app-side warm delta — pinned dirs / warm-exclude globs), and `SettingsReconciler` (isolated launch-at-login apply) |
+| `ConfigReconciler.swift` | `SyncManager.reconcileAction` (shared launchd install/uninstall/reinstall delta logic), `SyncManager.applyExternalCreateIfNeeded`/`ExternalCreateOutcome` (create-from-file decision), `warmReconcileNeeded`/`applyWarmReconcileIfNeeded` (orthogonal app-side warm delta — pinned dirs / warm-exclude globs), and `SettingsReconciler` (isolated launch-at-login apply) |
 | `AppSettingsFileStore.swift` | Reads/writes `~/.config/synctray/settings.json` — an enumerated safe-key mirror of `SyncTraySettings` (no secrets, no telemetry IDs) |
 | `ConfigSchemaInstaller.swift` | Copies the committed JSON Schemas into `~/.config/synctray/schema/` at launch |
-| `ConfigSelfTest.swift` | `#if DEBUG` host self-test suite (`SyncTray --self-test`) — round-trip (incl. `warmExcludePatterns`), migration + migration-integrity, reconcile-delta, warm-reconcile-trigger, self-write, isolated-login assertions |
+| `ConfigSelfTest.swift` | `#if DEBUG` host self-test suite (`SyncTray --self-test`) — round-trip (incl. `warmExcludePatterns`), migration + migration-integrity, reconcile-delta, warm-reconcile-trigger, self-write, isolated-login, external-create, and CLI assertions |
 | `NotificationService.swift` | Batched macOS notifications with action support |
 | `TelemetryService.swift` | Opt-in OTel telemetry (traces, metrics, logs) via OTLP/HTTP |
+
+### CLI/
+
+| File | Purpose |
+|------|---------|
+| `SyncTrayCLI.swift` | Headless `synctray` CLI — `CLICommand`, `parse`/`execute`/`run` (pure over `CLIEnvironment`), `doctorChecks`, `resolveProfile`; mutating commands (`profile create`/`enable`/`disable`/`delete`, `sync`) drive `ProfileStore.writeProfileFile` + `SyncSetupService`; `runMeasured` records one `synctray.cli.invoked` event + flushes; dispatched from `SyncTrayApp.init` before SwiftUI/`SyncManager` |
+| `CLIShimInstaller.swift` | Writes/refreshes the `~/.local/bin/synctray` shim on every launch; marker-guarded so it never clobbers a non-SyncTray file |
 
 ### File-Backed Configuration
 
@@ -271,6 +278,28 @@ via `SyncManager.reconcileAction`, `ConfigReconciler.swift`). A watcher that
 only swapped the in-memory struct would leave a running launchd agent stale
 after an external edit — this is why the file, not memory, is authoritative,
 and why both paths share one decision function.
+
+**Creation via file, not just editing.** Dropping a NEW `*.profile.json` whose
+`id` is UNKNOWN to `ProfileStore` creates that profile — this is no longer
+silently ignored. `applyExternalProfileEdit` routes an unknown-but-decodable id
+to `SyncManager.applyExternalCreateIfNeeded` (`ConfigReconciler.swift`): the
+profile is always persisted; the launchd agent is installed only when it's
+`isEnabled && isValid`, so an agent can stage a profile and flip it on in a
+second edit. A dropped file whose basename isn't the canonical
+`{shortId}.profile.json` is rewritten to the canonical name and the original
+pruned (the canonical write notes its own hash in `ConfigSelfWriteRegistry`, so
+this can never loop). See `ConfigSelfTest`'s AC-C1–AC-C5 for the exact
+enabled/disabled/garbage/canonicalize/telemetry matrix.
+
+**Threat model — this is a conscious acceptance, not an oversight.** Creating and
+installing a launchd agent from a dropped file is the deliberate goal: an agent or
+a human edits files under `~/.config/synctray` to set SyncTray up. It does not
+widen the trust boundary. Every writer of `~/.config/synctray/profiles/` already
+runs as the user, and a same-user process can write a `~/Library/LaunchAgents/*.plist`
+and `launchctl load` it directly — SyncTray adds no privilege the attacker lacked.
+The profile files are also credential-free: rclone remotes and secrets live in
+`~/.config/rclone/rclone.conf`, never here, so a malicious drop can schedule an
+agent but can't exfiltrate or forge credentials through this path.
 
 **Warm reconcile is orthogonal to the launchd reconcile.** Editing an app-side
 warm field — `warmExcludePatterns` or `pinnedDirectories` — changes what the VFS
@@ -321,6 +350,112 @@ is the separate, fail-closed schema-drift gate.
 | `TelemetryOptInBanner.swift` | Dismissable banner prompting telemetry opt-in (consent-versioned) |
 | `TelemetryDetailsSheet.swift` | Full privacy disclosure sheet — reachable from wizard, banner, and settings |
 | `SetupWizardView.swift` | New-profile creation wizard, including optional `.helpImprove` epilogue step |
+
+## Agent-Editable Configuration & CLI
+
+`~/.config/synctray/` (see **File-Backed Configuration** above) and the
+headless `synctray` CLI together make SyncTray fully scriptable by an agent —
+bootstrapping a new sync, checking health, and introspecting profiles, all
+without opening the app UI.
+
+### Bootstrapping a profile by dropping a file
+
+A `*.profile.json` written into `~/.config/synctray/profiles/` with a NEW,
+well-formed `id` CREATES that profile (see **Creation via file, not just
+editing** above) — an agent no longer has to go through the UI to start a
+sync. Validate the file against `~/.config/synctray/schema/profile.schema.json`
+before writing it; the schema's top-level `description` documents the
+creation behavior. Only FIVE keys are required — `id`, `name`, `rcloneRemote`,
+`remotePath`, `localSyncPath` — so an agent can author a minimal profile and
+let every other field take its default (the decoder fills `syncMode=bisync`,
+`mountBackend=nfs`, `syncIntervalMinutes=5`, `isEnabled=false`, …, all mirrored
+from the memberwise-init defaults; an app-written file that emits every key
+still round-trips unchanged). A profile is created whenever the file decodes
+successfully and `id` is a well-formed UUID; the launchd agent installs (i.e.
+the sync actually starts running) only when the profile is also `isEnabled`
+and `isValid` (non-empty `name`/`rcloneRemote`/`remotePath`/`localSyncPath`) —
+so an agent can stage a profile disabled, then flip `isEnabled` in a follow-up
+edit once it's confident the fields are correct.
+
+### The `synctray` CLI
+
+SyncTray installs a shim at `~/.local/bin/synctray` on every launch
+(`CLIShimInstaller`, called from `AppDelegate.applicationDidFinishLaunching`)
+that `exec`s the running app's binary with whatever subcommand you pass —
+**`~/.local/bin` must be on `PATH`** for the bare `synctray` command to
+resolve (matches the existing `~/.local/bin/synctray-sync.sh` convention). The
+shim is idempotent and marker-guarded: it refreshes on every launch (so it
+survives a `brew upgrade`/app move) but is never written over a file that
+isn't SyncTray's own.
+
+**Inspect** (read-only):
+
+| Command | Purpose |
+|---------|---------|
+| `synctray doctor` | Health report: rclone found + version, config schemas installed, per-profile derived-config presence, launchd agent loaded (enabled profiles), stale lock files, remote reachability. Exits non-zero iff any check is `[fail]`; `[warn]` never fails the run. |
+| `synctray status [name\|shortId]` | One tab-separated line per profile (or a single one): `enabled=`, `agent=loaded\|unloaded\|n/a`, `running=` (lock present), `last=started\|completed\|failed\|none` (from the log tail via the shared `SyncLogPatterns`). |
+| `synctray profiles` | List every profile: name, shortId, mode, `enabled=`, `remote=` — no secrets. (`profile list` is an alias.) |
+| `synctray logs <name\|shortId> [--follow]` | Print (or `tail -f`) that profile's sync log. |
+| `synctray test-remote <name\|shortId>` | Probe one profile's remote with `rclone lsd` under a hard timeout; prints `reachable: <remote>` or the real rclone stderr. |
+| `synctray listremotes` | `rclone listremotes`, passthrough. |
+
+**Configure** (mutating — headless-capable, no running app required):
+
+| Command | Purpose |
+|---------|---------|
+| `synctray profile create --from <file>` / `... create -` | Create a profile from a `.profile.json` file (or stdin `-`). Validates by decoding (a bad file exits `65` with the decode error — the feedback an agent needs); refuses a colliding `id`/`shortId` (`1`); writes the authoritative file, then installs the launchd agent iff `isEnabled && isValid` — the SAME persist-then-install rule as the file-watcher create path (`applyExternalCreateIfNeeded`). |
+| `synctray profile enable <name\|shortId>` | Set `isEnabled=true`, rewrite the file, install the agent. |
+| `synctray profile disable <name\|shortId>` | Set `isEnabled=false`, rewrite the file, uninstall the agent. |
+| `synctray profile delete <name\|shortId>` | Uninstall the agent (detaching a mounted volume first) and remove the `.profile.json`. |
+
+**Operate:**
+
+| Command | Purpose |
+|---------|---------|
+| `synctray sync <name\|shortId>` | Run one sync now and BLOCK until it finishes, returning the script's exit code — exactly what the app's `triggerManualSync` runs (`bash <sharedScript> <configPath>`), lock-file-guarded against a concurrent scheduled run. Refuses a Stream (mount) profile (use `profile enable` to mount). |
+
+`<name|shortId>` resolution tries an exact `shortId` match first, then a
+case-insensitive `name` match; an unmatched (or ambiguous) target exits
+non-zero with a greppable `error: no profile matches "<target>"`.
+
+**The mutating commands operate through the file-backed config, so they work
+whether or not the menu-bar app is running:** they write the authoritative
+`.profile.json` and drive `SyncSetupService` install/uninstall directly (the
+launchd delta chosen by the shared `SyncManager.reconcileAction`). When the app
+IS running, its `ConfigFileWatcher` also sees the write and reconciles — the two
+converge on identical files and one loaded agent, so running both is redundant,
+not conflicting. Profile files stay credential-free (rclone secrets live in
+`~/.config/rclone/rclone.conf`), so nothing the CLI writes carries a credential.
+
+**Dispatch and safety.** `SyncTrayCLI.dispatch` is checked at the very top of
+`SyncTrayApp.init` — before `--self-test`, before `MigrationRunner`,
+`TelemetryService.configure()`, or `SyncManager()` — and `exit()`s the process
+before any of that runs. A CLI invocation NEVER opens a window and NEVER
+starts a background watcher or timer; `dispatch` returns `nil` (falling
+through to the normal app launch) for a bare launch and for `-`-prefixed args
+(`--self-test`, macOS's `-psn_…`), except `-h`/`--help`.
+
+**Measurable.** Every real invocation records exactly one `synctray.cli.invoked`
+counter + `CLI invoked` structured log (bounded command verb + `ok`/`error` +
+exit code + duration — never args, paths, profile names, or remotes) and flushes
+before exit (`runMeasured` → `TelemetryService.recordCLIInvocation` +
+`flushForExit`). It is gated on the user's telemetry opt-in, so a disabled CLI
+does no setup, no network, and prints nothing extra. The self-test path
+(`execute` with a fake `CLIEnvironment`) never touches telemetry.
+
+**Pure core / impure shell.** `SyncTrayCLI.parse`/`execute`/`run`/`doctorChecks`
+are pure over an injected `CLIEnvironment` (rclone invocation, profile reads +
+writes, install/uninstall, sync-script run, `launchctl`, stdio) — `ConfigSelfTest`'s
+AC-CLI1–AC-CLI6 drive the full dispatch/doctor/resolution/shim-install AND the
+create/enable/disable/delete/sync side-effect routing against spies, with no real
+process/filesystem/launchd touched. Every real `rclone` invocation runs through a
+hard-timeout watchdog (mirrors `RcloneLocator`'s login-shell probe), since
+SMB/WebDAV remotes can hang past their own timeouts.
+
+**Privacy.** The CLI's output goes to the invoking terminal, not telemetry —
+`test-remote`/`profiles` printing a remote name to stdout is fine; CLI mode
+never calls `TelemetryService.configure()`, so nothing from a CLI invocation
+is ever sent anywhere.
 
 ## Data Flow
 
@@ -604,7 +739,9 @@ open ~/Library/Developer/Xcode/DerivedData/SyncTray-*/Build/Products/Debug/SyncT
 | `SyncManager.swift` | Central state manager, LogWatcher/DirectoryWatcher coordination |
 | `SettingsView.swift` | Main settings UI with profile editing |
 | `ProfileStore.swift` | File-backed profile persistence — authoritative `{shortId}.profile.json` per profile, write-only blob mirror (see "File-Backed Configuration") |
-| `ConfigFileWatcher.swift` | Live-apply watcher for `~/.config/synctray` (profiles + settings) |
+| `ConfigFileWatcher.swift` | Live-apply watcher for `~/.config/synctray` (profiles + settings); routes an unknown-id `.profile.json` to create-via-file |
+| `SyncTrayCLI.swift` | Headless `synctray` CLI: inspect (`doctor`/`status`/`profiles`/`logs`/`test-remote`/`listremotes`), configure (`profile create`/`enable`/`disable`/`delete`), operate (`sync`); dispatched from `SyncTrayApp.init` (see "Agent-Editable Configuration & CLI") |
+| `CLIShimInstaller.swift` | Installs the `~/.local/bin/synctray` shim (`~/.local/bin` must be on `PATH`) |
 | `SyncLogPatterns` | Centralized log message pattern matching (includes `isOutOfSyncError`) |
 | `TelemetryService.swift` | OTel singleton — traces, metrics, logs via OTLP/HTTP |
 | `TelemetryDetailsSheet.swift` | Shared privacy disclosure sheet for wizard, banner, and settings |

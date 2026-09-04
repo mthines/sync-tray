@@ -2,7 +2,7 @@
   "$id": "https://raw.githubusercontent.com/mthines/sync-tray/main/SyncTray/Resources/Schemas/profile.schema.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "SyncTray profile file",
-  "description": "Authoritative per-profile file (~/.config/synctray/profiles/{shortId}.profile.json). Hand-editing this file and saving live-applies through SyncTray's reconcile path. Keep this file's `properties` in lockstep with SyncProfile.CodingKeys (SyncTray/Models/SyncProfile.swift) — verified by scripts/check-schema-in-sync.sh.",
+  "description": "Authoritative per-profile file (~/.config/synctray/profiles/{shortId}.profile.json). Hand-editing this file and saving live-applies through SyncTray's reconcile path. Dropping a NEW file with an unknown, well-formed `id` CREATES that profile (persisted always; the launchd agent installs only when the new profile is `isEnabled` and has all required fields filled in) — creation-via-file is supported, not just editing an existing profile. Keep this file's `properties` in lockstep with SyncProfile.CodingKeys (SyncTray/Models/SyncProfile.swift) — verified by scripts/check-schema-in-sync.sh.",
   "type": "object",
   "properties": {
     "$schema": {
@@ -122,11 +122,7 @@
     "name",
     "rcloneRemote",
     "remotePath",
-    "localSyncPath",
-    "drivePathToMonitor",
-    "syncIntervalMinutes",
-    "additionalRcloneFlags",
-    "isEnabled"
+    "localSyncPath"
   ],
   "additionalProperties": true
 }
