@@ -759,6 +759,22 @@ final class SyncSetupService {
                 # Note: No --daemon flag - launchd manages the process lifecycle.
                 RCLONE_CMD="$RCLONE_BIN $MOUNT_SUBCMD \\"$REMOTE\\" \\"$LOCAL_PATH\\" --vfs-cache-mode $VFS_CACHE_MODE --vfs-cache-max-size $VFS_CACHE_MAX_SIZE --vfs-cache-max-age $VFS_CACHE_MAX_AGE --cache-dir \\"$VFS_CACHE_PATH\\" --log-level INFO --use-json-log"
 
+                # Throughput tuning. Reading a file through the mount (streaming or offline
+                # warming) otherwise trickles: the nfsmount -> rclone-NFS-server -> VFS hop
+                # paces the backend download at the slow NFS read rate instead of racing
+                # ahead at line speed. Measured on a DS223 over SMB: a raw single stream does
+                # ~17 MB/s and 4 parallel ~37 MB/s, yet an untuned warm delivered ~1.2 MB/s.
+                #   --vfs-read-ahead / --buffer-size : download far ahead of the reader so the
+                #       cache fills at backend speed, decoupled from the NFS read latency.
+                #   --transfers : parallel VFS cache downloaders (matches the app-side warm
+                #       concurrency in VFSCacheService.defaultWarmConcurrency — keep in sync).
+                #   --vfs-read-chunk-size(-limit) : large, growing range reads = fewer round
+                #       trips on high-latency backends.
+                #   --dir-cache-time / --attr-timeout : fewer metadata round trips.
+                # Cost: --buffer-size is per open file, so an active warm of N files uses up to
+                # N x 128M RAM (transient; released when the files close).
+                RCLONE_CMD="$RCLONE_CMD --buffer-size 128M --vfs-read-ahead 256M --transfers 8 --vfs-read-chunk-size 128M --vfs-read-chunk-size-limit off --dir-cache-time 12h --attr-timeout 5s"
+
                 # Name the mounted volume after the mount-point folder so Finder
                 # shows e.g. "Temp" instead of the auto-generated NFS share name
                 # ("localhost:/synology home Reaper"). macFUSE already derives the

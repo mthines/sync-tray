@@ -320,6 +320,30 @@ final class VFSCacheService {
         return json
     }
 
+    /// Get live transfer stats from a running mount via the RC `/core/stats` endpoint.
+    ///
+    /// The response's top-level object matches `RcloneStats`, so it decodes directly and
+    /// carries the same `transferring[]` / `bytes` / `speed` / `eta` shape the sync-log
+    /// pipeline already turns into `SyncProgress`. This is the only live-progress signal a
+    /// mount emits: `rclone nfsmount` is not started with `--stats`, so the log never
+    /// contains the periodic stats JSON that sync/bisync profiles produce. Returns nil when
+    /// the mount's RC endpoint is unreachable (mount not up).
+    func getCoreStats(port: Int) async -> RcloneStats? {
+        guard port > 0, let url = URL(string: "http://localhost:\(port)/core/stats") else { return nil }
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = "{}".data(using: .utf8)
+        request.timeoutInterval = 2
+
+        guard let (data, response) = try? await URLSession.shared.data(for: request),
+              (response as? HTTPURLResponse)?.statusCode == 200,
+              let stats = try? JSONDecoder().decode(RcloneStats.self, from: data) else {
+            return nil
+        }
+        return stats
+    }
+
     /// Check if the RC API is available for a profile
     func isRCAvailable(port: Int) async -> Bool {
         let url = URL(string: "http://localhost:\(port)/core/version")!
@@ -440,8 +464,13 @@ final class VFSCacheService {
 
     /// Number of files warmed concurrently. A single read stream through the NFS→rclone→
     /// backend path is latency-bound (especially on the SFTP fallback), so several parallel
-    /// reads use far more of the available bandwidth. Matches rclone's default `--transfers`.
-    static let defaultWarmConcurrency = 4
+    /// reads use far more of the available bandwidth — and with thousands of small files the
+    /// per-file open latency (NFS lookup + VFS open + backend open) dominates, so extra
+    /// in-flight files hide it. Kept in lockstep with the mount's `--transfers 8` in
+    /// `SyncSetupService` so the app-side reader count and rclone's downloader count agree.
+    /// Measured ceiling on a DS223 over SMB is ~37 MB/s aggregate at 4+ streams (the NAS CPU,
+    /// not the LAN, is the wall), so going far higher mostly thrashes the backend.
+    static let defaultWarmConcurrency = 8
 
     /// Warm a single directory by: first calling `/vfs/refresh` (listing cache), then
     /// reading file bytes through the NFS mount to populate the rclone VFS content cache.
