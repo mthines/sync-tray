@@ -119,14 +119,27 @@ final class TelemetryService {
     private var oauthOutcomeCounter: LongCounterSdk?
     private var userRecoveryActionCounter: LongCounterSdk?
     private var settingChangedCounter: LongCounterSdk?
+    private var reinstallDetachCounter: LongCounterSdk?
+    private var reinstallDetachDurationHistogram: DoubleHistogramMeterSdk?
     private var offlineExtensionSetupCounter: LongCounterSdk?
     private var offlineCacheClearCounter: LongCounterSdk?
+    private var rcloneDiscoveryCounter: LongCounterSdk?
+    private var warmDurationHistogram: DoubleHistogramMeterSdk?
+    private var warmThroughputHistogram: DoubleHistogramMeterSdk?
+    private var warmFilesCounter: LongCounterSdk?
+    private var warmBytesCounter: LongCounterSdk?
+    private var externalConfigEditCounter: LongCounterSdk?
+    private var cliInvokedCounter: LongCounterSdk?
 
     // MARK: - Providers (kept alive for shutdown)
 
     private var meterProvider: StableMeterProviderSdk?
     private var tracerProvider: TracerProviderSdk?
     private var loggerProvider: LoggerProviderSdk?
+    /// Retained so a short-lived process (the CLI) can force-flush queued log
+    /// records before exit — `LoggerProviderSdk` exposes no flush, only the
+    /// `BatchLogRecordProcessor` does. See `flushForExit`.
+    private var logProcessor: BatchLogRecordProcessor?
 
     // MARK: - Tracer & Logger
 
@@ -220,6 +233,7 @@ final class TelemetryService {
             .with(processors: [logProcessor])
             .build()
 
+        self.logProcessor = logProcessor
         loggerProvider = loggerProviderSdk
         OpenTelemetry.registerLoggerProvider(loggerProvider: loggerProviderSdk)
         logger = loggerProviderSdk
@@ -270,6 +284,18 @@ final class TelemetryService {
             .counterBuilder(name: "synctray.mount.operations")
             .setDescription("Number of mount/unmount operations")
             .setUnit("1")
+            .build()
+
+        reinstallDetachCounter = meter
+            .counterBuilder(name: "synctray.mount.reinstall_detach")
+            .setDescription("Number of pre-uninstall volume detach attempts for mount-mode profiles (settings-save reinstall path)")
+            .setUnit("1")
+            .build()
+
+        reinstallDetachDurationHistogram = meter
+            .histogramBuilder(name: "synctray.mount.reinstall_detach.duration")
+            .setDescription("Time taken to gracefully detach a mounted volume before a profile reinstall")
+            .setUnit("s")
             .build()
 
         directoryWatchTriggerCounter = meter
@@ -389,6 +415,45 @@ final class TelemetryService {
         offlineCacheClearCounter = meter
             .counterBuilder(name: "synctray.offline.cache_clear")
             .setDescription("Cache clear operations by whether pinned folders were preserved")
+            .setUnit("1")
+            .build()
+
+        rcloneDiscoveryCounter = meter
+            .counterBuilder(name: "synctray.rclone.discovery")
+            .setDescription("rclone binary discovery outcome at launch (by source + location bucket)")
+            .setUnit("1")
+            .build()
+
+        warmDurationHistogram = meter
+            .histogramBuilder(name: "synctray.offline.warm.duration")
+            .setDescription("Duration of an offline-file warming run (seconds)")
+            .setUnit("s")
+            .build()
+        warmThroughputHistogram = meter
+            .histogramBuilder(name: "synctray.offline.warm.throughput")
+            .setDescription("Average read throughput of an offline-file warming run (MB/s) — the signal for slow-fallback diagnosis")
+            .setUnit("MBy/s")
+            .build()
+        warmFilesCounter = meter
+            .counterBuilder(name: "synctray.offline.warm.files")
+            .setDescription("Files warmed into the VFS content cache")
+            .setUnit("1")
+            .build()
+        warmBytesCounter = meter
+            .counterBuilder(name: "synctray.offline.warm.bytes")
+            .setDescription("Bytes read through the mount while warming the VFS content cache")
+            .setUnit("By")
+            .build()
+
+        externalConfigEditCounter = meter
+            .counterBuilder(name: "synctray.config.external_edit")
+            .setDescription("Live external edits to ~/.config/synctray files applied through the reconcile path, by kind (profile, settings)")
+            .setUnit("1")
+            .build()
+
+        cliInvokedCounter = meter
+            .counterBuilder(name: "synctray.cli.invoked")
+            .setDescription("Headless synctray CLI invocations, by bounded command verb and ok/error result")
             .setUnit("1")
             .build()
     }
@@ -665,6 +730,65 @@ final class TelemetryService {
             ],
             spanContext: span.context
         )
+    }
+
+    /// Record the pre-uninstall graceful volume detach performed for a mount-mode
+    /// profile (`SyncSetupService.uninstall`). This is the regression signal for the
+    /// "settings change freezes an active Stream mount" failure mode: a mounted
+    /// profile whose detach is slow or falls back to a force-unmount (or a profile
+    /// that reaches `uninstall` still mounted at all) is the same condition that
+    /// previously froze in-flight reads with no telemetry at all on this path.
+    func recordReinstallDetach(
+        profileId: UUID,
+        profileName: String,
+        wasMounted: Bool,
+        result: String,             // "not_mounted", "success", "success_forced", "failure"
+        durationSeconds: Double
+    ) {
+        guard SyncTraySettings.telemetryEnabled else { return }
+        ensureSetup()
+
+        reinstallDetachCounter?.add(value: 1, attribute: [
+            "mount.operation": .string("reinstall_detach"),
+            "mount.result": .string(result),
+            "synctray.profile.name": .string(profileName),
+        ])
+
+        if wasMounted {
+            reinstallDetachDurationHistogram?.record(value: durationSeconds, attributes: [
+                "mount.result": .string(result),
+                "synctray.profile.name": .string(profileName),
+            ])
+        }
+
+        guard let tracer = tracer else { return }
+
+        let span = tracer.spanBuilder(spanName: "synctray reinstall_detach")
+            .setSpanKind(spanKind: .internal)
+            .startSpan()
+        span.setAttribute(key: "synctray.profile.id", value: .string(profileId.uuidString))
+        span.setAttribute(key: "synctray.profile.name", value: .string(profileName))
+        span.setAttribute(key: "mount.operation", value: .string("reinstall_detach"))
+        span.setAttribute(key: "mount.result", value: .string(result))
+        span.setAttribute(key: "mount.was_mounted", value: .bool(wasMounted))
+        span.setAttribute(key: "mount.detach_duration_s", value: .double(durationSeconds))
+        span.status = result == "failure" ? .error(description: "reinstall_detach failed") : .ok
+        span.end()
+
+        if wasMounted {
+            emitLog(
+                severity: result == "failure" ? .error : (result == "success_forced" ? .warn : .info),
+                body: "Reinstall pre-detach \(result)",
+                attributes: [
+                    "synctray.profile.id": .string(profileId.uuidString),
+                    "synctray.profile.name": .string(profileName),
+                    "mount.operation": .string("reinstall_detach"),
+                    "mount.result": .string(result),
+                    "mount.detach_duration_s": .double(durationSeconds),
+                ],
+                spanContext: span.context
+            )
+        }
     }
 
     // MARK: - Directory Watch Triggers
@@ -1181,6 +1305,83 @@ final class TelemetryService {
         emitLog(severity: .info, body: "Setting changed", attributes: attrs)
     }
 
+    // MARK: - External Config Edit
+
+    /// Record a live external edit to a `~/.config/synctray` file (a
+    /// `*.profile.json` or `settings.json`) that was applied through the
+    /// reconcile path. `kind` is bounded ("profile" | "settings"); `action`
+    /// is bounded ("edit" | "create" — defaults to "edit" so every existing
+    /// call site is unaffected). The attribute set never includes a
+    /// filesystem path, remote name, or credential — only the low-cardinality
+    /// kind/action.
+    func recordExternalConfigEdit(kind: String, action: String = "edit") {
+        guard SyncTraySettings.telemetryEnabled else { return }
+        ensureSetup()
+
+        let attrs: [String: AttributeValue] = [
+            "config.edit_kind": .string(kind),
+            "config.edit_action": .string(action),
+        ]
+        externalConfigEditCounter?.add(value: 1, attribute: attrs)
+        emitLog(severity: .info, body: "External config edit applied", attributes: attrs)
+    }
+
+    // MARK: - Headless CLI
+
+    /// Record one headless `synctray` CLI invocation. Privacy: only the bounded
+    /// command verb (allowlisted by the caller; an unrecognised one is mapped to
+    /// `(other)` before it reaches here), a coarse `ok`/`error` result, the exit
+    /// code, and the wall-clock duration are recorded — never args, profile
+    /// names, filesystem paths, or remote names. Called once per CLI run, right
+    /// before the process flushes and exits (see `flushForExit`).
+    func recordCLIInvocation(command: String, exitCode: Int32, durationSeconds: Double) {
+        guard SyncTraySettings.telemetryEnabled else { return }
+        ensureSetup()
+
+        let ok = exitCode == 0
+        let attrs: [String: AttributeValue] = [
+            "cli.command": .string(command),
+            "cli.result": .string(ok ? "ok" : "error"),
+        ]
+        cliInvokedCounter?.add(value: 1, attribute: attrs)
+        emitLog(
+            severity: ok ? .info : .warn,
+            body: "CLI invoked",
+            attributes: [
+                "cli.command": .string(command),
+                "cli.result": .string(ok ? "ok" : "error"),
+                "cli.exit_code": .int(Int(exitCode)),
+                "cli.duration_seconds": .double(durationSeconds),
+            ]
+        )
+    }
+
+    /// Flush every signal for a short-lived process (the CLI) that is about to
+    /// `exit()`. Unlike `shutdown()` — the app's terminate path, which prints a
+    /// diagnostic line and ends the sync spans — this is SILENT (no stdout, so
+    /// it never pollutes CLI output) and also flushes the logger, so a CLI run's
+    /// `synctray.cli.invoked` counter AND its "CLI invoked" log both reach the
+    /// collector before the process dies. No-op when telemetry is disabled.
+    func flushForExit(timeout: TimeInterval = 3) {
+        guard SyncTraySettings.telemetryEnabled else { return }
+        // The OTLP exporters run on a default URLSession with no custom request
+        // timeout, so a synchronous `forceFlush()` can block ~60s against an
+        // unreachable/black-holed collector. That is unacceptable for a CLI meant
+        // for fast agent scripting, so flush on a background queue and wait only a
+        // short, bounded deadline. Telemetry is best-effort: if the flush hasn't
+        // landed by the deadline, the process exits anyway and the event is lost —
+        // far better than hanging the command.
+        let group = DispatchGroup()
+        group.enter()
+        DispatchQueue.global(qos: .utility).async {
+            _ = self.meterProvider?.forceFlush()
+            self.logProcessor?.forceFlush()
+            self.tracerProvider?.forceFlush()
+            group.leave()
+        }
+        _ = group.wait(timeout: .now() + timeout)
+    }
+
     // MARK: - Offline Extension Setup Funnel
 
     /// Record a step in the Finder-extension enable funnel — the one manual step a fresh
@@ -1559,6 +1760,34 @@ final class TelemetryService {
         emitLog(severity: .info, body: "App launched", attributes: [:])
 
         recordDeploymentIfChanged()
+        recordRcloneDiscovery()
+    }
+
+    /// Record where (and whether) the rclone binary was found at launch. This gives
+    /// measurable coverage of the install-location fix for issue #53: a rise in the
+    /// `nix_system` / `nix_per_user` / `login_shell` buckets confirms nix-darwin users are
+    /// now discovered, and the `not_found` source flags installs still missing rclone.
+    ///
+    /// Only the low-cardinality source and location bucket are emitted — never the raw path,
+    /// so no username or custom directory leaks (privacy rule).
+    private func recordRcloneDiscovery() {
+        // Resolution can spawn a login shell (blocking up to the 5s watchdog), and
+        // recordAppLaunch() runs on the main thread at startup. Run it off-main so it
+        // never hangs launch — the same reason AppSettingsView.detectRcloneVersion
+        // resolves rclone inside a detached task (CLAUDE.md Critical Rules #1 and #2).
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let result = RcloneLocator.resolveDetailed()
+            let attributes: [String: AttributeValue] = [
+                "rclone.discovery_source": .string(result.source.rawValue),
+                "rclone.location": .string(result.location),
+            ]
+            self?.rcloneDiscoveryCounter?.add(value: 1, attribute: attributes)
+            self?.emitLog(
+                severity: result.path == nil ? .warn : .info,
+                body: result.path == nil ? "rclone not found" : "rclone discovered",
+                attributes: attributes
+            )
+        }
     }
 
     /// Detect that this install is now running a different `service.version`
@@ -1742,6 +1971,99 @@ final class TelemetryService {
     }
 
     /// Emit a structured OTel log record, optionally correlated to a span.
+    // MARK: - Offline warming
+
+    /// Opaque handle returned by `beginWarm` and passed back to `endWarm`, carrying the
+    /// span and the low-cardinality labels for the end-of-run metrics.
+    struct WarmSpanToken {
+        let span: (any Span)?
+        let profileName: String
+        let concurrency: Int
+        let trigger: String
+    }
+
+    /// Start a `synctray warm` span for an offline-file warming run. No-op (returns an
+    /// empty token) when telemetry is disabled.
+    func beginWarm(
+        profileId: UUID,
+        profileName: String,
+        directoryCount: Int,
+        concurrency: Int,
+        trigger: String
+    ) -> WarmSpanToken {
+        guard SyncTraySettings.telemetryEnabled else {
+            return WarmSpanToken(span: nil, profileName: profileName, concurrency: concurrency, trigger: trigger)
+        }
+        ensureSetup()
+
+        let attrs: [String: AttributeValue] = [
+            "synctray.profile.id": .string(profileId.uuidString),
+            "synctray.profile.name": .string(profileName),
+            "warm.directory_count": .int(directoryCount),
+            "warm.concurrency": .int(concurrency),
+            "warm.trigger": .string(trigger),
+        ]
+
+        let span = tracer?.spanBuilder(spanName: "synctray warm")
+            .setSpanKind(spanKind: .internal)
+            .startSpan()
+        if let span {
+            for (key, value) in attrs { span.setAttribute(key: key, value: value) }
+        }
+
+        emitLog(severity: .info, body: "Offline warm started", attributes: attrs, spanContext: span?.context)
+        return WarmSpanToken(span: span, profileName: profileName, concurrency: concurrency, trigger: trigger)
+    }
+
+    /// End the warm span and record duration / throughput / file / byte metrics.
+    ///
+    /// - Parameter outcome: how the run ended — `"completed"` (ran to the end) or
+    ///   `"cancelled"` (superseded, cache cleared, or profile unmounted mid-warm). Recorded
+    ///   as a `warm.outcome` label on every metric and on the span/log so an interrupted
+    ///   warm is distinguishable from a finished one.
+    func endWarm(
+        _ token: WarmSpanToken,
+        filesWarmed: Int,
+        bytesWarmed: Int64,
+        durationSeconds: Double,
+        outcome: String = "completed"
+    ) {
+        guard SyncTraySettings.telemetryEnabled else { return }
+
+        let throughputMBps = durationSeconds > 0
+            ? (Double(bytesWarmed) / durationSeconds) / (1024 * 1024)
+            : 0
+
+        // Low-cardinality labels for the metrics (never files/bytes — those are the values).
+        let labels: [String: AttributeValue] = [
+            "synctray.profile.name": .string(token.profileName),
+            "warm.trigger": .string(token.trigger),
+            "warm.outcome": .string(outcome),
+        ]
+        warmDurationHistogram?.record(value: durationSeconds, attributes: labels)
+        warmThroughputHistogram?.record(value: throughputMBps, attributes: labels)
+        warmFilesCounter?.add(value: filesWarmed, attribute: labels)
+        warmBytesCounter?.add(value: Int(bytesWarmed), attribute: labels)
+
+        let endAttrs: [String: AttributeValue] = [
+            "synctray.profile.name": .string(token.profileName),
+            "warm.trigger": .string(token.trigger),
+            "warm.outcome": .string(outcome),
+            "warm.concurrency": .int(token.concurrency),
+            "warm.files": .int(filesWarmed),
+            "warm.bytes": .int(Int(bytesWarmed)),
+            "warm.duration_seconds": .double(durationSeconds),
+            "warm.throughput_mbps": .double(throughputMBps),
+        ]
+        if let span = token.span {
+            for (key, value) in endAttrs { span.setAttribute(key: key, value: value) }
+            span.status = .ok
+            span.end()
+        }
+        let body = outcome == "cancelled" ? "Offline warm cancelled" : "Offline warm completed"
+        emitLog(severity: .info, body: body, attributes: endAttrs, spanContext: token.span?.context)
+    }
+
     private func emitLog(
         severity: Severity,
         body: String,
@@ -1810,6 +2132,13 @@ final class TelemetryService {
         }
         if SyncLogPatterns.isTransientAllFilesChangedError(msg) {
             return "transient_all_files_changed"
+        }
+        if msg.contains("lack of support for") && msg.contains("exclusive") {
+            // rclone raises this when a backend (observed on WebDAV) can't honor an
+            // exclusive/atomic create that bisync's conflict-safety check requires.
+            // This is a backend capability gap, not a transient or generic failure,
+            // so it gets its own bucket instead of falling into "other".
+            return "exclusive_mode_unsupported"
         }
         if msg.contains("not found") || msg.contains("no such") {
             return "file_not_found"

@@ -8,11 +8,38 @@ struct SyncTrayApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
 
     init() {
+        // Headless `synctray` CLI subcommands (doctor, test-remote, logs,
+        // listremotes, profiles) are dispatched and exited BEFORE anything
+        // else — never launches the SwiftUI app, never starts watchers/
+        // timers/telemetry. `dispatch` returns nil for `--self-test` and a
+        // normal (no-argument) launch, so both fall through unaffected.
+        if let exitCode = SyncTrayCLI.dispatch(arguments: CommandLine.arguments) {
+            exit(exitCode)
+        }
+
+        // `--self-test` runs the host self-test suite (schema/round-trip/
+        // migration/reconcile/self-write/isolated-login/CLI assertions) and
+        // exits immediately — never launches the SwiftUI app. Checked before
+        // any other init work so the self-test never touches real user data.
+        // ConfigSelfTest is #if DEBUG only (no XCTest target; see CLAUDE.md).
+        #if DEBUG
+        if CommandLine.arguments.contains("--self-test") {
+            let exitCode = ConfigSelfTest.run()
+            exit(exitCode)
+        }
+        #endif
+
         // Run any pending data migrations before loading profiles
         MigrationRunner.runPendingMigrations()
 
         // Initialize telemetry (no-op if disabled)
         TelemetryService.shared.configure()
+
+        // Ship the committed JSON Schemas into ~/.config/synctray/schema/ so
+        // ~/.config/synctray is a valid, agent-editable surface from the very
+        // first launch. Also ensures the config directory itself exists
+        // before SyncManager starts its config watcher.
+        ConfigSchemaInstaller.writeSchemas()
 
         // Create the sync manager
         let manager = SyncManager()
@@ -147,6 +174,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUserNoti
         // Make the Finder extension "just work" after an install/upgrade — no manual
         // Finder restart required.
         refreshFinderSyncExtensionIfNeeded()
+
+        // Install/refresh the `synctray` CLI shim (~/.local/bin/synctray) so the
+        // headless CLI is reachable by name. Best-effort, off the main thread —
+        // never clobbers a file that isn't ours (see CLIShimInstaller).
+        DispatchQueue.global(qos: .utility).async {
+            CLIShimInstaller.install()
+        }
 
         // Record app launch telemetry
         TelemetryService.shared.recordAppLaunch()

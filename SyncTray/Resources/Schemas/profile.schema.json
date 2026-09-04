@@ -1,0 +1,128 @@
+{
+  "$id": "https://raw.githubusercontent.com/mthines/sync-tray/main/SyncTray/Resources/Schemas/profile.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "SyncTray profile file",
+  "description": "Authoritative per-profile file (~/.config/synctray/profiles/{shortId}.profile.json). Hand-editing this file and saving live-applies through SyncTray's reconcile path. Dropping a NEW file with an unknown, well-formed `id` CREATES that profile (persisted always; the launchd agent installs only when the new profile is `isEnabled` and has all required fields filled in) — creation-via-file is supported, not just editing an existing profile. Keep this file's `properties` in lockstep with SyncProfile.CodingKeys (SyncTray/Models/SyncProfile.swift) — verified by scripts/check-schema-in-sync.sh.",
+  "type": "object",
+  "properties": {
+    "$schema": {
+      "type": "string",
+      "description": "Reference to this schema file. Written automatically; safe to ignore."
+    },
+    "id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "Stable profile identifier. Do not change — a changed id is treated as a different profile."
+    },
+    "name": {
+      "type": "string",
+      "description": "Display name shown in the SyncTray UI."
+    },
+    "rcloneRemote": {
+      "type": "string",
+      "description": "rclone remote name, e.g. \"synology-kaiju:\"."
+    },
+    "remotePath": {
+      "type": "string",
+      "description": "Path on the remote, e.g. \"Kaiju\"."
+    },
+    "localSyncPath": {
+      "type": "string",
+      "description": "Local folder path synced with the remote."
+    },
+    "drivePathToMonitor": {
+      "type": "string",
+      "description": "External drive mount point to monitor (empty if not on an external drive)."
+    },
+    "syncIntervalMinutes": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Minutes between scheduled syncs (sync/bisync modes)."
+    },
+    "additionalRcloneFlags": {
+      "type": "string",
+      "description": "Extra flags appended to the rclone command."
+    },
+    "isEnabled": {
+      "type": "boolean",
+      "description": "Whether the scheduled sync/mount agent is installed. Toggling this installs or uninstalls the launchd agent."
+    },
+    "isMuted": {
+      "type": "boolean",
+      "description": "Whether file-change notifications are muted for this profile."
+    },
+    "syncMode": {
+      "type": "string",
+      "enum": ["bisync", "sync", "mount"],
+      "description": "Two-way sync, one-way sync, or streaming mount."
+    },
+    "syncDirection": {
+      "type": "string",
+      "enum": ["localToRemote", "remoteToLocal"],
+      "description": "Direction for one-way sync mode."
+    },
+    "fallbackRemote": {
+      "type": "string",
+      "description": "Fallback rclone remote used when the primary is unreachable (empty = no fallback)."
+    },
+    "fallbackRemotePath": {
+      "type": "string",
+      "description": "Path on the fallback remote (empty = same as remotePath)."
+    },
+    "fallbackRequiresCacheRebuild": {
+      "type": "boolean",
+      "description": "Whether primary/fallback use different rclone wire types, forcing a full REMOTE swap on failover instead of an env-var override."
+    },
+    "mountBackend": {
+      "type": "string",
+      "enum": ["nfs", "macfuse"],
+      "description": "Mount backend: kext-free NFS (default) or classic macFUSE."
+    },
+    "vfsCacheMode": {
+      "type": "string",
+      "description": "rclone VFS cache mode for mount profiles."
+    },
+    "vfsCacheMaxSize": {
+      "type": "string",
+      "description": "Maximum VFS cache size, e.g. \"10G\"."
+    },
+    "vfsCacheMaxAge": {
+      "type": "string",
+      "description": "How long a cached file is kept since last access, e.g. \"168h\"."
+    },
+    "vfsCachePath": {
+      "type": "string",
+      "description": "VFS cache directory path."
+    },
+    "allowNonEmptyMount": {
+      "type": "boolean",
+      "description": "Allow mounting onto a non-empty folder (macFUSE backend only)."
+    },
+    "mountAtStartup": {
+      "type": "boolean",
+      "description": "Whether this mount profile auto-mounts at login/app launch."
+    },
+    "pinnedDirectories": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Directories kept warm in the VFS cache for offline access (mount mode)."
+    },
+    "warmExcludePatterns": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Glob patterns excluded from offline warming (mount mode). Applied app-side by the warmer; not emitted into the derived {shortId}.json script config."
+    },
+    "rcPort": {
+      "type": "integer",
+      "description": "Port for rclone's RC (remote control) API (mount mode)."
+    }
+  },
+  "required": [
+    "id",
+    "name",
+    "rcloneRemote",
+    "remotePath",
+    "localSyncPath"
+  ],
+  "additionalProperties": true
+}

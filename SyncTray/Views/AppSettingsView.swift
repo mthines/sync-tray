@@ -121,6 +121,7 @@ struct AppSettingsView: View {
                     TelemetryService.shared.recordSettingChanged(name: "telemetry", enabled: false)
                     SyncTraySettings.telemetryEnabled = newValue
                 }
+                syncManager.refreshSettingsFile()
             }
 
             Button("Learn more") {
@@ -149,6 +150,7 @@ struct AppSettingsView: View {
         .onChange(of: autoFixSyncIssues) { newValue in
             SyncTraySettings.autoFixSyncIssues = newValue
             TelemetryService.shared.recordSettingChanged(name: "auto_fix", enabled: newValue)
+            syncManager.refreshSettingsFile()
         }
     }
 
@@ -166,6 +168,7 @@ struct AppSettingsView: View {
         .onChange(of: debugLogging) { newValue in
             SyncTraySettings.debugLoggingEnabled = newValue
             TelemetryService.shared.recordSettingChanged(name: "debug_logging", enabled: newValue)
+            syncManager.refreshSettingsFile()
         }
     }
 
@@ -231,9 +234,10 @@ struct AppSettingsView: View {
     }
 
     private func detectRcloneVersion() async -> String {
-        // RcloneConfigService.getRcloneVersion() resolves rclone via a list of
-        // candidate absolute paths (/opt/homebrew/bin, /usr/local/bin, /usr/bin)
-        // so it works correctly in macOS GUI apps that inherit a minimal PATH.
+        // RcloneConfigService.getRcloneVersion() resolves rclone via RcloneLocator,
+        // which probes Homebrew, nix-darwin, and other known locations and falls back
+        // to the login-shell PATH — so it works in macOS GUI apps that inherit a
+        // minimal PATH.
         await Task.detached(priority: .utility) {
             guard let raw = RcloneConfigService.shared.getRcloneVersion() else {
                 return "Not found"

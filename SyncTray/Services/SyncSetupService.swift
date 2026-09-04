@@ -50,8 +50,7 @@ final class SyncSetupService {
     // MARK: - Rclone Path Helper
 
     private func findRclonePath() -> String? {
-        let paths = ["/usr/local/bin/rclone", "/opt/homebrew/bin/rclone", "/usr/bin/rclone"]
-        return paths.first { FileManager.default.fileExists(atPath: $0) }
+        RcloneLocator.resolve()
     }
 
     // MARK: - Public Methods (Profile-based)
@@ -192,6 +191,40 @@ final class SyncSetupService {
 
     /// Uninstall the sync configuration for a profile
     func uninstall(profile: SyncProfile) throws {
+        // For mount-mode profiles, detach the volume gracefully BEFORE unloading the
+        // launchd agent. `rclone nfsmount`/`rclone mount` does not exit when its
+        // volume is torn down by killing the process out from under it (see
+        // `unmount(profile:)` below) — it can leave a stale mount-table entry
+        // pointing at a dead server, so any in-flight file access (e.g. an active
+        // Stream read) hangs until the entry is cleaned up. This path is reachable
+        // any time a mounted profile is uninstalled — including the settings-save
+        // reinstall flow (`ProfileDetailView.reinstallSync`), which previously went
+        // straight to `launchctl unload` with no detach step at all and could freeze
+        // an in-progress stream read for as long as the stale mount lingered.
+        if profile.isMountMode {
+            let detachStart = Date()
+            let wasMounted = isMounted(profile: profile)
+            var detachResult = "not_mounted"
+            if wasMounted {
+                let result = runCommand("/usr/sbin/diskutil", arguments: ["unmount", profile.localSyncPath])
+                if result.exitCode == 0 {
+                    detachResult = "success"
+                } else {
+                    let forceResult = runCommand(
+                        "/usr/sbin/diskutil", arguments: ["unmount", "force", profile.localSyncPath])
+                    detachResult = forceResult.exitCode == 0 ? "success_forced" : "failure"
+                }
+            }
+            let detachDuration = Date().timeIntervalSince(detachStart)
+            TelemetryService.shared.recordReinstallDetach(
+                profileId: profile.id,
+                profileName: profile.name,
+                wasMounted: wasMounted,
+                result: detachResult,
+                durationSeconds: detachDuration
+            )
+        }
+
         // Unload the launchd agent first
         _ = runCommand("/bin/launchctl", arguments: ["unload", profile.plistPath])
 
@@ -531,14 +564,30 @@ final class SyncSetupService {
                 exit 1
             fi
 
-            # Find rclone binary (check multiple locations)
+            # Find rclone binary. Cover the common package-manager locations,
+            # including nix-darwin's system and per-user profiles which live outside
+            # Homebrew's dirs (issue #53). $USER can be unset under launchd, so derive
+            # it. Fall back to a PATH lookup for any other install layout.
+            RCLONE_USER="${USER:-$(id -un)}"
             RCLONE_BIN=""
-            for path in /usr/local/bin/rclone /opt/homebrew/bin/rclone /usr/bin/rclone; do
+            RCLONE_CANDIDATES=(
+                /opt/homebrew/bin/rclone
+                /usr/local/bin/rclone
+                /run/current-system/sw/bin/rclone
+                "/etc/profiles/per-user/$RCLONE_USER/bin/rclone"
+                "$HOME/.nix-profile/bin/rclone"
+                /usr/bin/rclone
+            )
+            for path in "${RCLONE_CANDIDATES[@]}"; do
                 if [[ -x "$path" ]]; then
                     RCLONE_BIN="$path"
                     break
                 fi
             done
+
+            if [[ -z "$RCLONE_BIN" ]]; then
+                RCLONE_BIN=$(command -v rclone 2>/dev/null || true)
+            fi
 
             if [[ -z "$RCLONE_BIN" ]]; then
                 echo "$(date '+%Y-%m-%d %H:%M:%S') - Error: rclone not found" >> "$LOG_FILE"
@@ -630,9 +679,17 @@ final class SyncSetupService {
                     # Re-check cert setting for the fallback remote
                     NO_CHECK_CERT=$(check_no_cert "$FALLBACK_REMOTE")
 
-                    if [[ -z "$FALLBACK_PATH" && "$FALLBACK_REQUIRES_CACHE_REBUILD" != "true" && "$FALLBACK_REQUIRES_CACHE_REBUILD" != "True" ]]; then
-                        # Same wire type, same path: use env var overrides to swap transport.
-                        # This preserves bisync cache since the remote name stays the same.
+                    # Mount mode ALWAYS uses env-var overrides, even across wire types.
+                    # The VFS cache is keyed by remote name ({cache}/vfs/{name}/…), so keeping
+                    # the primary name shares one cache across primary and fallback instead of
+                    # re-downloading into a second vfs/{fallback} tree. The full-swap branch below
+                    # exists only to protect bisync's listing cache from NFD/NFC divergence, which
+                    # a mount has no equivalent of. FALLBACK_PATH is ignored here on purpose: the
+                    # cache subtree keys on the remote path too, so the fallback must resolve the
+                    # SAME path as the primary (the profile editor blocks a mismatched mount path).
+                    if [[ "$SYNC_MODE" == "mount" || ( -z "$FALLBACK_PATH" && "$FALLBACK_REQUIRES_CACHE_REBUILD" != "true" && "$FALLBACK_REQUIRES_CACHE_REBUILD" != "True" ) ]]; then
+                        # Same remote name preserved: use env var overrides to swap transport.
+                        # This preserves the VFS/bisync cache since the remote name stays the same.
                         UPPER_NAME=$(echo "$REMOTE_NAME" | tr '[:lower:]' '[:upper:]' | tr '-' '_')
                         eval "$($RCLONE_BIN config dump 2>/dev/null | python3 -c "
             import json, sys
@@ -701,6 +758,22 @@ final class SyncSetupService {
                 # (--vfs-cache-max-size / --vfs-cache-max-age) behaves identically.
                 # Note: No --daemon flag - launchd manages the process lifecycle.
                 RCLONE_CMD="$RCLONE_BIN $MOUNT_SUBCMD \\"$REMOTE\\" \\"$LOCAL_PATH\\" --vfs-cache-mode $VFS_CACHE_MODE --vfs-cache-max-size $VFS_CACHE_MAX_SIZE --vfs-cache-max-age $VFS_CACHE_MAX_AGE --cache-dir \\"$VFS_CACHE_PATH\\" --log-level INFO --use-json-log"
+
+                # Throughput tuning. Reading a file through the mount (streaming or offline
+                # warming) otherwise trickles: the nfsmount -> rclone-NFS-server -> VFS hop
+                # paces the backend download at the slow NFS read rate instead of racing
+                # ahead at line speed. Measured on a DS223 over SMB: a raw single stream does
+                # ~17 MB/s and 4 parallel ~37 MB/s, yet an untuned warm delivered ~1.2 MB/s.
+                #   --vfs-read-ahead / --buffer-size : download far ahead of the reader so the
+                #       cache fills at backend speed, decoupled from the NFS read latency.
+                #   --transfers : parallel VFS cache downloaders (matches the app-side warm
+                #       concurrency in VFSCacheService.defaultWarmConcurrency — keep in sync).
+                #   --vfs-read-chunk-size(-limit) : large, growing range reads = fewer round
+                #       trips on high-latency backends.
+                #   --dir-cache-time / --attr-timeout : fewer metadata round trips.
+                # Cost: --buffer-size is per open file, so an active warm of N files uses up to
+                # N x 128M RAM (transient; released when the files close).
+                RCLONE_CMD="$RCLONE_CMD --buffer-size 128M --vfs-read-ahead 256M --transfers 8 --vfs-read-chunk-size 128M --vfs-read-chunk-size-limit off --dir-cache-time 12h --attr-timeout 5s"
 
                 # Name the mounted volume after the mount-point folder so Finder
                 # shows e.g. "Temp" instead of the auto-generated NFS share name
@@ -849,8 +922,11 @@ final class SyncSetupService {
         return primaryConfig.provider.rcloneType != fallbackConfig.provider.rcloneType
     }
 
-    /// Generate profile-specific JSON config
-    private func generateProfileConfig(for profile: SyncProfile) -> String {
+    /// Generate profile-specific JSON config.
+    /// Not private — `ConfigSelfTest` calls this directly to verify the
+    /// derived config's key set stays frozen (AC-2) without going through
+    /// the side-effecting `install(profile:)` (which touches launchd).
+    func generateProfileConfig(for profile: SyncProfile) -> String {
         let config: [String: Any] = [
             "profileId": profile.id.uuidString,
             "name": profile.name,
@@ -930,7 +1006,7 @@ final class SyncSetupService {
                     <key>EnvironmentVariables</key>
                     <dict>
                         <key>PATH</key>
-                        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+                        <string>/opt/homebrew/bin:/usr/local/bin:/run/current-system/sw/bin:/etc/profiles/per-user/\(NSUserName())/bin:\(NSHomeDirectory())/.nix-profile/bin:/usr/bin:/bin</string>
                     </dict>
                 </dict>
                 </plist>
@@ -967,7 +1043,7 @@ final class SyncSetupService {
                     <key>EnvironmentVariables</key>
                     <dict>
                         <key>PATH</key>
-                        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+                        <string>/opt/homebrew/bin:/usr/local/bin:/run/current-system/sw/bin:/etc/profiles/per-user/\(NSUserName())/bin:\(NSHomeDirectory())/.nix-profile/bin:/usr/bin:/bin</string>
                     </dict>
                 </dict>
                 </plist>

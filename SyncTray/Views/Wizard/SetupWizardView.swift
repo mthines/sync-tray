@@ -38,6 +38,15 @@ struct SetupWizardView: View {
     @State private var pendingLocalPath: String = ""
     @State private var pendingLocalItemCount: Int = 0
 
+    /// rclone availability for the welcome step. Resolved once off-main (locating
+    /// rclone can now spawn a login shell via RcloneLocator), never from a view body.
+    private enum RcloneAvailability: Equatable {
+        case checking
+        case installed(version: String)
+        case missing
+    }
+    @State private var rcloneAvailability: RcloneAvailability = .checking
+
     // Services
     private let configService = RcloneConfigService.shared
 
@@ -223,7 +232,11 @@ struct SetupWizardView: View {
             }
             .padding(.vertical)
 
-            if !configService.isRcloneInstalled() {
+            switch rcloneAvailability {
+            case .checking:
+                Label("Checking for rclone…", systemImage: "hourglass")
+                    .foregroundColor(.secondary)
+            case .missing:
                 GroupBox {
                     VStack(alignment: .leading, spacing: 8) {
                         Label("rclone not found", systemImage: "exclamationmark.triangle.fill")
@@ -238,9 +251,12 @@ struct SetupWizardView: View {
                             .padding(6)
                             .background(Color.black.opacity(0.1))
                             .cornerRadius(4)
+
+                        Button("Check again") { checkRcloneInstallation() }
+                            .font(.caption)
                     }
                 }
-            } else if let version = configService.getRcloneVersion() {
+            case .installed(let version):
                 Label(version, systemImage: "checkmark.circle.fill")
                     .foregroundColor(.green)
             }
@@ -703,7 +719,9 @@ struct SetupWizardView: View {
     private var canAdvance: Bool {
         switch currentStep {
         case .welcome:
-            return configService.isRcloneInstalled()
+            // Read the resolved state; never spawn a lookup from this computed property.
+            if case .installed = rcloneAvailability { return true }
+            return false
         case .provider:
             return true
         case .credentials:
@@ -727,8 +745,24 @@ struct SetupWizardView: View {
 
     // MARK: - Actions
 
+    /// Resolve rclone availability off the main thread and publish it to the welcome
+    /// step. Locating rclone can spawn a login shell (RcloneLocator), and `getRcloneVersion`
+    /// spawns `rclone version`, so neither may run on the main thread (CLAUDE.md Critical
+    /// Rules #1 and #2). Runs on appear and whenever the user returns to the welcome step.
     private func checkRcloneInstallation() {
-        // Already handled in welcome step view
+        rcloneAvailability = .checking
+        Task.detached(priority: .userInitiated) {
+            let service = RcloneConfigService.shared
+            let resolved: RcloneAvailability
+            if service.isRcloneInstalled() {
+                let version = service.getRcloneVersion()?
+                    .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                resolved = .installed(version: version.isEmpty ? "rclone" : version)
+            } else {
+                resolved = .missing
+            }
+            await MainActor.run { self.rcloneAvailability = resolved }
+        }
     }
 
     private func advanceToNextStep(_ nextStep: WizardStep) {

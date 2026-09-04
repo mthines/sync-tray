@@ -175,6 +175,26 @@ struct ProfileDetailView: View {
         !rcloneRemote.isEmpty && !localSyncPath.isEmpty && !remotePath.isEmpty
     }
 
+    /// Trim surrounding whitespace and leading/trailing slashes so "/volume1/Kaiju/" and
+    /// "volume1/Kaiju" compare equal — path-convention noise, not a real directory change.
+    private func normalizedRemotePath(_ path: String) -> String {
+        path.trimmingCharacters(in: .whitespaces)
+            .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+    }
+
+    /// A Stream (mount) profile shares ONE VFS cache across primary and fallback, keyed by
+    /// `{cache}/vfs/{remoteName}/{remotePath}`. A different fallback path splits that cache
+    /// into a second tree and re-downloads everything. Block the save so the user reconfigures
+    /// the fallback remote to expose the same path instead. Bisync/sync are unaffected — they
+    /// legitimately use a different path (and rebuild their listing pair) on failover.
+    private var mountFallbackCacheConflict: Bool {
+        syncMode == .mount
+            && fallbackEnabled
+            && fallbackUseDifferentPath
+            && !fallbackRemotePath.isEmpty
+            && normalizedRemotePath(fallbackRemotePath) != normalizedRemotePath(remotePath)
+    }
+
     private var isInstalled: Bool {
         setupService.isInstalled(profile: profile)
     }
@@ -1125,6 +1145,17 @@ struct ProfileDetailView: View {
                 }
             }
 
+            // Live streaming download progress (mount mode). A mount is never `.syncing`,
+            // so the sync-progress block above never fires for it; this surfaces the same
+            // bar + per-file list from the mount's RC /core/stats poll while it's actively
+            // downloading, and disappears when idle.
+            if profile.isMountMode,
+               syncManager.mountState(for: profile.id) == .mounted,
+               let progress = syncManager.profileProgress[profile.id],
+               !progress.transferringFiles.isEmpty {
+                SyncProgressDetailView(progress: progress)
+            }
+
             // Last sync error from rclone (hide during active resync operations)
             if isInstalled, !isRunningResync, let lastError = syncManager.lastError(for: profile.id) {
                 VStack(alignment: .leading, spacing: 8) {
@@ -1649,7 +1680,9 @@ struct ProfileDetailView: View {
 
                 // Proactive suggestion banner — shown when protocols differ and the toggle is OFF,
                 // so users discover they likely need to enable a different path without surprise mutations.
-                if let proactiveSuggestion = proactiveFallbackSuggestion {
+                // Suppressed for mount mode: a Stream profile shares one cache and must resolve the
+                // SAME path on both remotes, so nudging toward a different path would only mislead.
+                if syncMode != .mount, let proactiveSuggestion = proactiveFallbackSuggestion {
                     HStack(alignment: .top, spacing: 8) {
                         Image(systemName: "lightbulb.fill")
                             .foregroundStyle(.yellow)
@@ -1771,6 +1804,22 @@ struct ProfileDetailView: View {
                     .padding(8)
                     .background(Color.blue.opacity(0.1), in: .rect(cornerRadius: 6))
                 }
+
+                // Stream (mount) profiles share ONE VFS cache across primary and fallback,
+                // keyed by remote name + path. A different fallback path splits the cache and
+                // re-downloads everything, so it is blocked (Save is disabled while this shows).
+                if mountFallbackCacheConflict {
+                    HStack(alignment: .top, spacing: 6) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .foregroundStyle(.orange)
+                            .font(.caption)
+                        Text("Stream profiles share one offline cache across both remotes, so the fallback must expose the same path (\"\(remotePath)\"). A different path would duplicate the cache and re-download every file. Configure the fallback remote to resolve that path, or turn this off.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    .padding(8)
+                    .background(Color.orange.opacity(0.1), in: .rect(cornerRadius: 6))
+                }
             }
         }
         .padding(12)
@@ -1873,7 +1922,7 @@ struct ProfileDetailView: View {
                 saveProfile()
             }
             .keyboardShortcut(.defaultAction)
-            .disabled(!hasChanges)
+            .disabled(!hasChanges || mountFallbackCacheConflict)
             .buttonStyle(.borderedProminent)
         }
     }
@@ -1945,27 +1994,21 @@ struct ProfileDetailView: View {
     }
 
     private func saveProfile() {
+        // Backstop for the disabled Save button: never persist a Stream profile whose
+        // fallback resolves to a different remote path — it would duplicate the VFS cache.
+        guard !mountFallbackCacheConflict else {
+            installError = "Stream fallback must use the same remote path as the primary so the cache is shared. Configure the fallback remote to resolve \"\(remotePath)\", or turn off \"Fallback uses a different path\"."
+            return
+        }
+
         let updatedProfile = buildProfileFromForm()
         let currentProfile = profile
 
-        // Check if sync-related settings changed (require reinstall)
-        let needsReinstall = isInstalled && (
-            currentProfile.rcloneRemote != updatedProfile.rcloneRemote ||
-            currentProfile.remotePath != updatedProfile.remotePath ||
-            currentProfile.localSyncPath != updatedProfile.localSyncPath ||
-            currentProfile.syncIntervalMinutes != updatedProfile.syncIntervalMinutes ||
-            currentProfile.additionalRcloneFlags != updatedProfile.additionalRcloneFlags ||
-            currentProfile.syncMode != updatedProfile.syncMode ||
-            currentProfile.syncDirection != updatedProfile.syncDirection ||
-            currentProfile.fallbackRemote != updatedProfile.fallbackRemote ||
-            currentProfile.fallbackRemotePath != updatedProfile.fallbackRemotePath ||
-            currentProfile.mountBackend != updatedProfile.mountBackend ||
-            currentProfile.vfsCacheMode != updatedProfile.vfsCacheMode ||
-            currentProfile.vfsCacheMaxSize != updatedProfile.vfsCacheMaxSize ||
-            currentProfile.vfsCacheMaxAge != updatedProfile.vfsCacheMaxAge ||
-            currentProfile.vfsCachePath != updatedProfile.vfsCachePath ||
-            currentProfile.mountAtStartup != updatedProfile.mountAtStartup
-        )
+        // Delegates to the SAME delta helper `applyExternalProfileEdit` uses,
+        // so the Save button and an external file edit can never drift on
+        // "what work does this change need" (see plan Decisions).
+        let needsReinstall = isInstalled
+            && SyncManager.reconcileAction(from: currentProfile, to: updatedProfile) == .reinstall
 
         profileStore.update(updatedProfile)
 
@@ -2029,15 +2072,7 @@ struct ProfileDetailView: View {
             let process = Process()
             let pipe = Pipe()
 
-            let rclonePaths = ["/opt/homebrew/bin/rclone", "/usr/local/bin/rclone", "/usr/bin/rclone"]
-            var rclonePath: String?
-
-            for path in rclonePaths {
-                if FileManager.default.fileExists(atPath: path) {
-                    rclonePath = path
-                    break
-                }
-            }
+            let rclonePath = RcloneLocator.resolve()
 
             guard let path = rclonePath else {
                 DispatchQueue.main.async {
@@ -2092,15 +2127,7 @@ struct ProfileDetailView: View {
             let process = Process()
             let pipe = Pipe()
 
-            let rclonePaths = ["/opt/homebrew/bin/rclone", "/usr/local/bin/rclone", "/usr/bin/rclone"]
-            var rclonePath: String?
-
-            for path in rclonePaths {
-                if FileManager.default.fileExists(atPath: path) {
-                    rclonePath = path
-                    break
-                }
-            }
+            let rclonePath = RcloneLocator.resolve()
 
             guard let path = rclonePath else {
                 DispatchQueue.main.async {
@@ -2445,6 +2472,16 @@ struct ProfileDetailView: View {
 
         guard let primary = primaryType, let fallback = fallbackType else { return }
 
+        // Mount mode shares one VFS cache across both remotes, so the fallback must resolve
+        // the SAME path as the primary. Never auto-enable a different path here — that path
+        // would fragment the cache and the save is blocked. The fallback remote itself must be
+        // configured so the primary's path resolves.
+        if syncMode == .mount {
+            fallbackUseDifferentPath = false
+            fallbackRemotePath = ""
+            return
+        }
+
         if primary != fallback {
             // Protocols differ — enable the toggle by default
             if !fallbackUseDifferentPath {
@@ -2540,8 +2577,7 @@ struct ProfileDetailView: View {
     private func runRcloneLsd(remote: String, path: String) async -> LsdResult {
         await withCheckedContinuation { continuation in
             DispatchQueue.global(qos: .userInitiated).async {
-                let rclonePaths = ["/opt/homebrew/bin/rclone", "/usr/local/bin/rclone", "/usr/bin/rclone"]
-                guard let rclone = rclonePaths.first(where: { FileManager.default.fileExists(atPath: $0) }) else {
+                guard let rclone = RcloneLocator.resolve() else {
                     continuation.resume(returning: .unreachable)
                     return
                 }
@@ -2699,15 +2735,7 @@ struct ProfileDetailView: View {
             let errorPipe = Pipe()
 
             // Find rclone
-            let rclonePaths = ["/opt/homebrew/bin/rclone", "/usr/local/bin/rclone", "/usr/bin/rclone"]
-            var rclonePath: String?
-
-            for path in rclonePaths {
-                if fileManager.fileExists(atPath: path) {
-                    rclonePath = path
-                    break
-                }
-            }
+            let rclonePath = RcloneLocator.resolve()
 
             guard let path = rclonePath else {
                 let errMsg = "Error: rclone not found. Install with: brew install rclone"
@@ -3381,15 +3409,7 @@ struct ProfileDetailView: View {
             let errorPipe = Pipe()
 
             // Find rclone
-            let rclonePaths = ["/opt/homebrew/bin/rclone", "/usr/local/bin/rclone", "/usr/bin/rclone"]
-            var rclonePath: String?
-
-            for path in rclonePaths {
-                if fileManager.fileExists(atPath: path) {
-                    rclonePath = path
-                    break
-                }
-            }
+            let rclonePath = RcloneLocator.resolve()
 
             guard let path = rclonePath else {
                 let errMsg = "Error: rclone not found. Install with: brew install rclone"
@@ -3928,8 +3948,7 @@ struct RemoteFolderBrowserSheet: View {
         let remote = bareRemote
         let path = currentPath
         DispatchQueue.global(qos: .userInitiated).async {
-            let rclonePaths = ["/opt/homebrew/bin/rclone", "/usr/local/bin/rclone", "/usr/bin/rclone"]
-            guard let rclone = rclonePaths.first(where: { FileManager.default.fileExists(atPath: $0) }) else {
+            guard let rclone = RcloneLocator.resolve() else {
                 DispatchQueue.main.async { self.isLoading = false; self.errorMessage = "rclone not found" }
                 return
             }
