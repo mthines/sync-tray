@@ -175,6 +175,26 @@ struct ProfileDetailView: View {
         !rcloneRemote.isEmpty && !localSyncPath.isEmpty && !remotePath.isEmpty
     }
 
+    /// Trim surrounding whitespace and leading/trailing slashes so "/volume1/Kaiju/" and
+    /// "volume1/Kaiju" compare equal — path-convention noise, not a real directory change.
+    private func normalizedRemotePath(_ path: String) -> String {
+        path.trimmingCharacters(in: .whitespaces)
+            .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+    }
+
+    /// A Stream (mount) profile shares ONE VFS cache across primary and fallback, keyed by
+    /// `{cache}/vfs/{remoteName}/{remotePath}`. A different fallback path splits that cache
+    /// into a second tree and re-downloads everything. Block the save so the user reconfigures
+    /// the fallback remote to expose the same path instead. Bisync/sync are unaffected — they
+    /// legitimately use a different path (and rebuild their listing pair) on failover.
+    private var mountFallbackCacheConflict: Bool {
+        syncMode == .mount
+            && fallbackEnabled
+            && fallbackUseDifferentPath
+            && !fallbackRemotePath.isEmpty
+            && normalizedRemotePath(fallbackRemotePath) != normalizedRemotePath(remotePath)
+    }
+
     private var isInstalled: Bool {
         setupService.isInstalled(profile: profile)
     }
@@ -1649,7 +1669,9 @@ struct ProfileDetailView: View {
 
                 // Proactive suggestion banner — shown when protocols differ and the toggle is OFF,
                 // so users discover they likely need to enable a different path without surprise mutations.
-                if let proactiveSuggestion = proactiveFallbackSuggestion {
+                // Suppressed for mount mode: a Stream profile shares one cache and must resolve the
+                // SAME path on both remotes, so nudging toward a different path would only mislead.
+                if syncMode != .mount, let proactiveSuggestion = proactiveFallbackSuggestion {
                     HStack(alignment: .top, spacing: 8) {
                         Image(systemName: "lightbulb.fill")
                             .foregroundStyle(.yellow)
@@ -1771,6 +1793,22 @@ struct ProfileDetailView: View {
                     .padding(8)
                     .background(Color.blue.opacity(0.1), in: .rect(cornerRadius: 6))
                 }
+
+                // Stream (mount) profiles share ONE VFS cache across primary and fallback,
+                // keyed by remote name + path. A different fallback path splits the cache and
+                // re-downloads everything, so it is blocked (Save is disabled while this shows).
+                if mountFallbackCacheConflict {
+                    HStack(alignment: .top, spacing: 6) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .foregroundStyle(.orange)
+                            .font(.caption)
+                        Text("Stream profiles share one offline cache across both remotes, so the fallback must expose the same path (\"\(remotePath)\"). A different path would duplicate the cache and re-download every file. Configure the fallback remote to resolve that path, or turn this off.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    .padding(8)
+                    .background(Color.orange.opacity(0.1), in: .rect(cornerRadius: 6))
+                }
             }
         }
         .padding(12)
@@ -1873,7 +1911,7 @@ struct ProfileDetailView: View {
                 saveProfile()
             }
             .keyboardShortcut(.defaultAction)
-            .disabled(!hasChanges)
+            .disabled(!hasChanges || mountFallbackCacheConflict)
             .buttonStyle(.borderedProminent)
         }
     }
@@ -1945,6 +1983,13 @@ struct ProfileDetailView: View {
     }
 
     private func saveProfile() {
+        // Backstop for the disabled Save button: never persist a Stream profile whose
+        // fallback resolves to a different remote path — it would duplicate the VFS cache.
+        guard !mountFallbackCacheConflict else {
+            installError = "Stream fallback must use the same remote path as the primary so the cache is shared. Configure the fallback remote to resolve \"\(remotePath)\", or turn off \"Fallback uses a different path\"."
+            return
+        }
+
         let updatedProfile = buildProfileFromForm()
         let currentProfile = profile
 
@@ -2415,6 +2460,16 @@ struct ProfileDetailView: View {
         let fallbackType = rcloneType(for: fallbackRemote)
 
         guard let primary = primaryType, let fallback = fallbackType else { return }
+
+        // Mount mode shares one VFS cache across both remotes, so the fallback must resolve
+        // the SAME path as the primary. Never auto-enable a different path here — that path
+        // would fragment the cache and the save is blocked. The fallback remote itself must be
+        // configured so the primary's path resolves.
+        if syncMode == .mount {
+            fallbackUseDifferentPath = false
+            fallbackRemotePath = ""
+            return
+        }
 
         if primary != fallback {
             // Protocols differ — enable the toggle by default

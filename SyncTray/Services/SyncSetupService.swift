@@ -679,9 +679,17 @@ final class SyncSetupService {
                     # Re-check cert setting for the fallback remote
                     NO_CHECK_CERT=$(check_no_cert "$FALLBACK_REMOTE")
 
-                    if [[ -z "$FALLBACK_PATH" && "$FALLBACK_REQUIRES_CACHE_REBUILD" != "true" && "$FALLBACK_REQUIRES_CACHE_REBUILD" != "True" ]]; then
-                        # Same wire type, same path: use env var overrides to swap transport.
-                        # This preserves bisync cache since the remote name stays the same.
+                    # Mount mode ALWAYS uses env-var overrides, even across wire types.
+                    # The VFS cache is keyed by remote name ({cache}/vfs/{name}/…), so keeping
+                    # the primary name shares one cache across primary and fallback instead of
+                    # re-downloading into a second vfs/{fallback} tree. The full-swap branch below
+                    # exists only to protect bisync's listing cache from NFD/NFC divergence, which
+                    # a mount has no equivalent of. FALLBACK_PATH is ignored here on purpose: the
+                    # cache subtree keys on the remote path too, so the fallback must resolve the
+                    # SAME path as the primary (the profile editor blocks a mismatched mount path).
+                    if [[ "$SYNC_MODE" == "mount" || ( -z "$FALLBACK_PATH" && "$FALLBACK_REQUIRES_CACHE_REBUILD" != "true" && "$FALLBACK_REQUIRES_CACHE_REBUILD" != "True" ) ]]; then
+                        # Same remote name preserved: use env var overrides to swap transport.
+                        # This preserves the VFS/bisync cache since the remote name stays the same.
                         UPPER_NAME=$(echo "$REMOTE_NAME" | tr '[:lower:]' '[:upper:]' | tr '-' '_')
                         eval "$($RCLONE_BIN config dump 2>/dev/null | python3 -c "
             import json, sys

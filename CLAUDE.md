@@ -537,6 +537,23 @@ poisoning from byte-level filename encoding differences (macOS SMB normalises to
 NFD; SFTP passes NFC verbatim — same human-readable name, different byte
 sequence).
 
+**Mount mode is the exception: it ALWAYS keeps the primary remote name (env-var
+overrides), even across wire types.** The VFS cache is keyed by
+`{vfsCachePath}/vfs/{remote-name}/{remote-path}/…`, so a full remote swap would
+land the fallback's cache in a second `vfs/{fallback}/` tree and re-download every
+file (observed: `vfs/synology` 640K vs `vfs/synology-sftp` 6.7G for one profile).
+The full-swap branch exists only to protect bisync's *listing* cache from NFD/NFC
+divergence, which a live mount has no equivalent of. So the script and
+`SyncManager.resolveActiveRemote` both guard the full-swap branch with
+`syncMode != mount`; a mount failover overrides only the connection params and
+keeps the primary `remote:path` reference. Because the cache subtree also keys on
+the remote **path**, the fallback must resolve the *same* path as the primary — so
+the profile editor blocks saving a Stream profile whose `fallbackRemotePath`
+differs from `remotePath` (`mountFallbackCacheConflict` in `ProfileDetailView`),
+and a genuinely different path is a config error to fix on the fallback remote, not
+a supported layout. `fallbackRemotePath` therefore stays meaningful only for
+bisync/sync profiles.
+
 The branching condition is determined at profile install/save time by comparing
 `provider.rcloneType` for the primary and fallback remotes (read via
 `RcloneConfigService.readRemoteConfig`), stored as `fallbackRequiresCacheRebuild`

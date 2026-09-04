@@ -899,7 +899,13 @@ final class SyncManager: ObservableObject {
             return (primaryRemotePath, [:])
         }
 
-        if profile.fallbackRequiresCacheRebuild || !profile.fallbackRemotePath.isEmpty {
+        // Mount mode always preserves the primary remote name (env-var overrides), so the
+        // VFS cache — keyed by {cache}/vfs/{name}/… — is shared across primary and fallback
+        // rather than duplicated into a second vfs/{fallback} tree. The full-swap branch is
+        // for bisync's listing cache only; a mount has no equivalent to protect. Mirrors the
+        // `SYNC_MODE == "mount"` guard in the sync script.
+        if profile.syncMode != .mount,
+           profile.fallbackRequiresCacheRebuild || !profile.fallbackRemotePath.isEmpty {
             // Different wire type OR explicit path: swap full remote reference.
             // bisync uses a separate listing pair — consistent with the script.
             let effectiveFallbackPath = profile.fallbackRemotePath.isEmpty
@@ -907,7 +913,7 @@ final class SyncManager: ObservableObject {
             return ("\(profile.fallbackRemote):\(effectiveFallbackPath)", [:])
         }
 
-        // Same wire type, same path: use env-var overrides to preserve bisync cache.
+        // Same remote name preserved: use env-var overrides to preserve the cache.
         let primaryRemoteName = profile.rcloneRemote.hasSuffix(":")
             ? String(profile.rcloneRemote.dropLast()) : profile.rcloneRemote
         let upperName = primaryRemoteName.uppercased().replacingOccurrences(of: "-", with: "_")
