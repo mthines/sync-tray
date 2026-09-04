@@ -2565,11 +2565,19 @@ final class SyncManager: ObservableObject {
         let downloaded = transferring.reduce(Int64(0)) { $0 + max(0, $1.bytes ?? 0) }
         let total = transferring.reduce(Int64(0)) { $0 + max(0, $1.size ?? 0) }
 
+        // Speed and ETA come from the in-flight transfers too, never from `stats.speed`/
+        // `stats.eta`: those are cumulative averages since mount start, so on a long-lived
+        // mount they'd show a misleadingly slow rate and inflated ETA next to the live bar.
+        // Aggregate speed is the sum of the active per-file rates; the batch finishes when
+        // its slowest concurrent transfer does, so ETA is the longest remaining per-file ETA.
+        let speed = transferring.compactMap { $0.speed ?? $0.speedAvg }.reduce(0, +)
+        let eta = transferring.compactMap { $0.eta }.max()
+
         profileProgress[profileId] = SyncProgress(
             bytesTransferred: downloaded,
             totalBytes: total,
-            eta: stats?.eta,
-            speed: stats?.speed,
+            eta: eta,
+            speed: speed > 0 ? speed : nil,
             transfersDone: 0,
             totalTransfers: 0,  // suppress the "Files: 0 / N" line; the per-file rows tell the story
             transferringFiles: transferring
