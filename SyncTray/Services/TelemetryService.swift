@@ -21,6 +21,13 @@ import OpenTelemetryProtocolExporterHttp
 /// Both are resource attributes, so every signal (trace, metric, log) is automatically
 /// correlated to the same physical machine.
 ///
+/// ## Source correlation
+/// - `vcs.repository.url.full` — canonical https URL of the origin remote
+/// - `vcs.ref.head.revision` — full commit SHA the binary was built from
+///
+/// Injected at build time by the `Embed Git Metadata` phase. Together they let a
+/// backend resolve any signal to the exact source revision that produced it.
+///
 /// ## Swift SDK note
 /// opentelemetry-swift 1.17.1 requires a wildcard `registerView(name: ".*")` for the
 /// stable metrics API. Without it, instruments silently record to no-op storage.
@@ -1858,6 +1865,25 @@ final class TelemetryService {
             ResourceAttributes.osVersion.rawValue: .string(osVersion),
         ]
 
+        if let hostArch = hostArch() {
+            attrs["host.arch"] = .string(hostArch)
+        }
+
+        // Source provenance. Lets a backend walk from a log line or span straight
+        // to the code that emitted it, which is the difference between "the watcher
+        // is recovering" and "the watcher is recovering at LogWatcher.swift:201".
+        // Both are injected into Info.plist by the `Embed Git Metadata` build phase
+        // and are absent when building from a non-git source tree.
+        if let repositoryURL = infoPlistBuildValue("VCSRepositoryURL") {
+            attrs["vcs.repository.url.full"] = .string(repositoryURL)
+        }
+        if let revision = infoPlistBuildValue("GitCommitSHAFull") {
+            // `vcs.ref.head.revision` is the current semconv name and what Dash0's
+            // VCS correlation keys on; the older `vcs.repository.ref.revision` is
+            // deprecated.
+            attrs["vcs.ref.head.revision"] = .string(revision)
+        }
+
         // Distinguish development builds from real user installs so dev/test
         // telemetry lands in its own Dash0 environment. A DEBUG build is, by
         // definition, a development build; a Release build ships to users.
@@ -1903,18 +1929,45 @@ final class TelemetryService {
         return version
     }
 
-    /// Git short SHA injected into Info.plist by the `Embed Git Commit SHA`
-    /// build phase. Returns nil when absent or left as the unsubstituted
-    /// build-setting placeholder (e.g. building from a non-git source tree).
-    ///
-    /// The `GitCommitSHA` key name is shared across three files and must stay in
-    /// sync: this reader, `SyncTray/Info.plist`, and the `Embed Git Commit SHA`
-    /// build phase in the Xcode project (the writer).
+    /// Git short SHA injected into Info.plist by the `Embed Git Metadata` build phase.
     private func gitCommitSHA() -> String? {
-        guard let raw = Bundle.main.infoDictionary?["GitCommitSHA"] as? String else { return nil }
+        infoPlistBuildValue("GitCommitSHA")
+    }
+
+    /// Read a build-time-injected Info.plist value.
+    ///
+    /// Returns nil when the key is absent, empty, or still holds the unsubstituted
+    /// build-setting placeholder (e.g. building from a non-git source tree, where
+    /// the `Embed Git Metadata` phase logs a warning and leaves the value alone).
+    ///
+    /// Every key read here is shared across three files and must stay in sync: this
+    /// reader, `SyncTray/Info.plist`, and the `Embed Git Metadata` build phase in the
+    /// Xcode project (the writer). Current keys: `GitCommitSHA`, `GitCommitSHAFull`,
+    /// `VCSRepositoryURL`.
+    private func infoPlistBuildValue(_ key: String) -> String? {
+        guard let raw = Bundle.main.infoDictionary?[key] as? String else { return nil }
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty, !trimmed.hasPrefix("$(") else { return nil }
         return trimmed
+    }
+
+    /// CPU architecture of the running slice, for Apple Silicon vs Intel comparison.
+    ///
+    /// Resolved at compile time rather than via `uname`, so a universal binary
+    /// reports the slice actually executing rather than the host's native arch.
+    ///
+    /// Returns nil outside arm64/amd64 rather than an `"unknown"` placeholder — that
+    /// value would sit outside the `host.arch` semconv enum and isn't documented as a
+    /// possible value in CLAUDE.md / telemetry.md, so it's omitted from the resource
+    /// entirely rather than shipped as an undocumented, non-standard string.
+    private func hostArch() -> String? {
+        #if arch(arm64)
+        return "arm64"
+        #elseif arch(x86_64)
+        return "amd64"
+        #else
+        return nil
+        #endif
     }
 
     /// Emit a structured OTel log record, optionally correlated to a span.

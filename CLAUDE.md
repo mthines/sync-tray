@@ -778,12 +778,18 @@ Anonymous, opt-in telemetry using OpenTelemetry (opentelemetry-swift 1.17.1). Al
 - `enduser.id` — HMAC-SHA256 of hardware UUID (stable across reinstalls, not reversible)
 
 ### Deployment correlation
-- `service.version` — `<marketing>+<build>.g<gitSHA>` (e.g. `0.34.0+1.gabc1234`); the git SHA is injected by the `Embed Git Commit SHA` Xcode build phase. Primary key Dash0 uses to correlate telemetry to a release.
+- `service.version` — `<marketing>+<build>.g<gitSHA>` (e.g. `0.34.0+1.gabc1234`); the git SHA is injected by the `Embed Git Metadata` Xcode build phase. Primary key Dash0 uses to correlate telemetry to a release.
 - `deployment.environment.name` — `development` (DEBUG) / `production` (Release), overridable via `OTEL_RESOURCE_ATTRIBUTES`.
 - `App upgraded` log on version change between launches → Dash0 dashboard annotations.
 
+### Source correlation
+- `vcs.repository.url.full` — canonical https URL of the `origin` remote, normalised at build time (scp-style SSH converted, embedded credentials stripped, trailing `.git` dropped).
+- `vcs.ref.head.revision` — full commit SHA the binary was built from.
+- Both are injected into `Info.plist` by the `Embed Git Metadata` build phase alongside `GitCommitSHA`, and are simply absent when building from a non-git source tree. Together they let a backend resolve any signal to the exact source revision that produced it — the attribute Dash0 and agentic tooling look for to jump from a log line to the code.
+- `host.arch` — `arm64` / `amd64`, resolved at compile time so a universal binary reports the executing slice; omitted entirely on any other architecture rather than sending an undocumented value.
+
 ### Privacy
-No file paths, remote names, or credentials in telemetry. File operations tracked by normalized extension only. Error messages categorized into low-cardinality types. Profile names are user-chosen display names, not paths.
+No file paths, sync remote names, or credentials in telemetry. File operations tracked by normalized extension only. Error messages categorized into low-cardinality types. Profile names are user-chosen display names, not paths. Carve-out: `vcs.repository.url.full` (the source repo's origin URL, credentials stripped at build time) is exempt — it identifies the codebase, not a user's sync destination.
 
 ### Configuration
 Priority: process env vars > `~/.config/synctray/.env` > Info.plist. Key vars: `OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_EXPORTER_OTLP_HEADERS`, `DASH0_AUTH_TOKEN`.

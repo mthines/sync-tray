@@ -330,7 +330,7 @@
 				A15000000000000000000001 /* Sources */,
 				A12000000000000000000001 /* Frameworks */,
 				A19000000000000000000001 /* Resources */,
-				A1B000000000000000000001 /* Embed Git Commit SHA */,
+				A1B000000000000000000001 /* Embed Git Metadata */,
 				FS000000000000000000C001 /* Embed App Extensions */,
 			);
 			buildRules = (
@@ -427,7 +427,7 @@
 /* End PBXResourcesBuildPhase section */
 
 /* Begin PBXShellScriptBuildPhase section */
-		A1B000000000000000000001 /* Embed Git Commit SHA */ = {
+		A1B000000000000000000001 /* Embed Git Metadata */ = {
 			isa = PBXShellScriptBuildPhase;
 			alwaysOutOfDate = 1;
 			buildActionMask = 2147483647;
@@ -437,14 +437,14 @@
 			);
 			inputPaths = (
 			);
-			name = "Embed Git Commit SHA";
+			name = "Embed Git Metadata";
 			outputFileListPaths = (
 			);
 			outputPaths = (
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 			shellPath = /bin/sh;
-			shellScript = "# Inject the git short SHA into the built Info.plist so telemetry can\n# report a deployment-precise service.version (see TelemetryService.appVersion).\nSHA=$(git -C \"${SRCROOT}\" rev-parse --short HEAD 2>/dev/null)\nif [ -z \"$SHA\" ]; then\n  echo \"warning: no git commit SHA available; GitCommitSHA left unset\"\n  exit 0\nfi\nPLIST=\"${TARGET_BUILD_DIR}/${INFOPLIST_PATH}\"\nif [ ! -f \"$PLIST\" ]; then\n  echo \"warning: Info.plist not found at $PLIST; skipping GitCommitSHA injection\"\n  exit 0\nfi\n/usr/libexec/PlistBuddy -c \"Set :GitCommitSHA $SHA\" \"$PLIST\" 2>/dev/null || /usr/libexec/PlistBuddy -c \"Add :GitCommitSHA string $SHA\" \"$PLIST\"\n";
+			shellScript = "# Inject git provenance into the built Info.plist.\n#\n# Two consumers:\n#   1. service.version  — deployment-precise version string (TelemetryService.appVersion)\n#   2. vcs.repository.* — resource attributes that let an observability backend\n#      walk from a log line or span straight to the source revision it came from\n#      (TelemetryService.buildResource)\nPLIST=\"${TARGET_BUILD_DIR}/${INFOPLIST_PATH}\"\nif [ ! -f \"$PLIST\" ]; then\n  echo \"warning: Info.plist not found at $PLIST; skipping git metadata injection\"\n  exit 0\nfi\n\nplist_set() {\n  /usr/libexec/PlistBuddy -c \"Set :$1 $2\" \"$PLIST\" 2>/dev/null \\\n    || /usr/libexec/PlistBuddy -c \"Add :$1 string $2\" \"$PLIST\"\n}\n\nSHA=$(git -C \"${SRCROOT}\" rev-parse --short HEAD 2>/dev/null)\nif [ -n \"$SHA\" ]; then\n  plist_set GitCommitSHA \"$SHA\"\nelse\n  echo \"warning: no git commit SHA available; GitCommitSHA left unset\"\nfi\n\nSHA_FULL=$(git -C \"${SRCROOT}\" rev-parse HEAD 2>/dev/null)\nif [ -n \"$SHA_FULL\" ]; then\n  plist_set GitCommitSHAFull \"$SHA_FULL\"\nfi\n\n# Normalise the origin remote to a canonical https URL: convert the scp-style\n# SSH form, strip any embedded credentials, and drop the trailing .git so the\n# value is exactly what a human would paste into a browser. Credentials must\n# never reach telemetry, so the strip is not optional.\nREMOTE=$(git -C \"${SRCROOT}\" remote get-url origin 2>/dev/null)\nif [ -n \"$REMOTE\" ]; then\n  REMOTE=$(printf '%s' \"$REMOTE\" | sed -E \\\n    -e 's#^git@([^:]+):#https://\\1/#' \\\n    -e 's#^([a-zA-Z]+)://[^/@]*@#\\1://#' \\\n    -e 's#^ssh://#https://#' \\\n    -e 's#^http://#https://#' \\\n    -e 's#\\.git$##')\n  plist_set VCSRepositoryURL \"$REMOTE\"\nelse\n  echo \"warning: no git origin remote; VCSRepositoryURL left unset\"\nfi\n";
 		};
 /* End PBXShellScriptBuildPhase section */
 
