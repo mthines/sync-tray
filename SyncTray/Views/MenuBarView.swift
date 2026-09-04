@@ -181,6 +181,16 @@ struct MenuBarView: View {
                         }
                     }
                 }
+
+                // Live streaming download progress — the same transfer bar + per-file list
+                // sync modes show, driven by the mount's RC /core/stats poll. Only appears
+                // while a mounted Stream profile is actively downloading; hidden when idle.
+                if profile.isMountMode,
+                   syncManager.mountState(for: profile.id) == .mounted,
+                   let progress = syncManager.profileProgress[profile.id],
+                   !progress.transferringFiles.isEmpty {
+                    SyncProgressDetailView(progress: progress)
+                }
             }
         }
     }

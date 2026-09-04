@@ -1145,6 +1145,17 @@ struct ProfileDetailView: View {
                 }
             }
 
+            // Live streaming download progress (mount mode). A mount is never `.syncing`,
+            // so the sync-progress block above never fires for it; this surfaces the same
+            // bar + per-file list from the mount's RC /core/stats poll while it's actively
+            // downloading, and disappears when idle.
+            if profile.isMountMode,
+               syncManager.mountState(for: profile.id) == .mounted,
+               let progress = syncManager.profileProgress[profile.id],
+               !progress.transferringFiles.isEmpty {
+                SyncProgressDetailView(progress: progress)
+            }
+
             // Last sync error from rclone (hide during active resync operations)
             if isInstalled, !isRunningResync, let lastError = syncManager.lastError(for: profile.id) {
                 VStack(alignment: .leading, spacing: 8) {

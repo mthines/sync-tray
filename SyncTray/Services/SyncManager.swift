@@ -73,6 +73,10 @@ final class SyncManager: ObservableObject {
 
     private var heartbeatTimer: DispatchSourceTimer?
     private var mountStateMonitorTimer: DispatchSourceTimer?
+    private var mountProgressTimer: DispatchSourceTimer?
+    // Mount-mode profiles whose `profileProgress` is currently driven by the RC poll, so
+    // it can be cleared when a mount goes idle or unmounts.
+    private var mountProgressActive: Set<UUID> = []
     private var primaryRecoveryTimer: DispatchSourceTimer?
     // Profiles with an in-flight primary-recovery remount, so we don't stack remounts.
     private var recoveringToPrimary: Set<UUID> = []
@@ -162,6 +166,7 @@ final class SyncManager: ObservableObject {
         TelemetryService.shared.recordAllProfileConfigurations(self.profileStore.profiles)
         startSessionHeartbeat()
         startMountStateMonitor()
+        startMountProgressMonitor()
         startPrimaryRecoveryMonitor()
         mountProfilesAtStartup()
         setupFinderSyncIPC()
@@ -181,6 +186,10 @@ final class SyncManager: ObservableObject {
         // Cancel mount-state monitor
         mountStateMonitorTimer?.cancel()
         mountStateMonitorTimer = nil
+
+        // Cancel mount-progress monitor
+        mountProgressTimer?.cancel()
+        mountProgressTimer = nil
 
         // Cancel primary-recovery monitor
         primaryRecoveryTimer?.cancel()
@@ -2496,6 +2505,84 @@ final class SyncManager: ObservableObject {
         }
         mountStateMonitorTimer = timer
         timer.resume()
+    }
+
+    /// Poll each mounted Stream profile's rclone RC `/core/stats` endpoint for live
+    /// download activity and surface it through `profileProgress`, so streaming shows the
+    /// same transfer bar and per-file list that sync/bisync profiles show. A mount emits no
+    /// `--stats` log JSON, so this RC poll is its only live-progress signal. The handler
+    /// no-ops (no network) when nothing is mounted, so the 2s cadence is cheap at rest.
+    private func startMountProgressMonitor() {
+        mountProgressTimer?.cancel()
+        let timer = DispatchSource.makeTimerSource(queue: .global(qos: .utility))
+        timer.schedule(deadline: .now() + 2, repeating: 2)  // match sync/bisync --stats 2s
+        timer.setEventHandler { [weak self] in
+            DispatchQueue.main.async { self?.pollMountProgress() }
+        }
+        mountProgressTimer = timer
+        timer.resume()
+    }
+
+    private func pollMountProgress() {
+        let mounted = Set(profileStore.enabledProfiles.filter {
+            $0.isMountMode && profileMountStates[$0.id] == .mounted
+        }.map { $0.id })
+
+        // A profile we were showing progress for is no longer mounted → clear it.
+        for id in mountProgressActive.subtracting(mounted) {
+            profileProgress[id] = nil
+        }
+        mountProgressActive.formIntersection(mounted)
+
+        guard !mounted.isEmpty else { return }
+        for profile in profileStore.enabledProfiles where mounted.contains(profile.id) {
+            let port = profile.rcPort
+            let id = profile.id
+            Task { [weak self] in
+                let stats = await self?.cacheService.getCoreStats(port: port)
+                self?.applyMountProgress(stats, for: id)
+            }
+        }
+    }
+
+    /// Map a mount's live RC `/core/stats` into `profileProgress`. Only the *active*
+    /// transfers drive the bar: the aggregate byte counters `/core/stats` returns are
+    /// cumulative since mount start (they'd read near 100% forever), so the "downloading
+    /// now" bar is summed from the in-flight `transferring[]` entries instead. When nothing
+    /// is transferring the entry is cleared so an idle mount stays quiet.
+    private func applyMountProgress(_ stats: RcloneStats?, for profileId: UUID) {
+        guard profileMountStates[profileId] == .mounted,
+              let transferring = stats?.transferring, !transferring.isEmpty else {
+            if mountProgressActive.contains(profileId) {
+                profileProgress[profileId] = nil
+                mountProgressActive.remove(profileId)
+            }
+            return
+        }
+
+        // rclone reports an unknown transfer size as a negative value; clamp so it never
+        // drags the aggregate total below the bytes already read.
+        let downloaded = transferring.reduce(Int64(0)) { $0 + max(0, $1.bytes ?? 0) }
+        let total = transferring.reduce(Int64(0)) { $0 + max(0, $1.size ?? 0) }
+
+        // Speed and ETA come from the in-flight transfers too, never from `stats.speed`/
+        // `stats.eta`: those are cumulative averages since mount start, so on a long-lived
+        // mount they'd show a misleadingly slow rate and inflated ETA next to the live bar.
+        // Aggregate speed is the sum of the active per-file rates; the batch finishes when
+        // its slowest concurrent transfer does, so ETA is the longest remaining per-file ETA.
+        let speed = transferring.compactMap { $0.speed ?? $0.speedAvg }.reduce(0, +)
+        let eta = transferring.compactMap { $0.eta }.max()
+
+        profileProgress[profileId] = SyncProgress(
+            bytesTransferred: downloaded,
+            totalBytes: total,
+            eta: eta,
+            speed: speed > 0 ? speed : nil,
+            transfersDone: 0,
+            totalTransfers: 0,  // suppress the "Files: 0 / N" line; the per-file rows tell the story
+            transferringFiles: transferring
+        )
+        mountProgressActive.insert(profileId)
     }
 
     /// Periodically check whether a mounted Stream profile that fell back to its
