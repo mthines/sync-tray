@@ -145,13 +145,13 @@ For operations with real duration (like syncs), use the `activeSyncSpans` patter
   the executing slice, not the host's native arch); omitted on any other architecture
   rather than sending an undocumented value
 - `vcs.repository.url.full` = canonical https URL of the `origin` remote (see below)
-- `vcs.repository.ref.revision` = full commit SHA the binary was built from (see below)
+- `vcs.ref.head.revision` = full commit SHA the binary was built from (see below)
 
 `enduser.id` is the primary user correlation key — it survives app reinstalls because
 it's derived from the machine's hardware UUID via a one-way hash.
 
 ### Source correlation
-`vcs.repository.url.full` and `vcs.repository.ref.revision` let a backend resolve any
+`vcs.repository.url.full` and `vcs.ref.head.revision` let a backend resolve any
 signal to the exact source revision that produced it — the pair Dash0 and agentic
 tooling look for to jump from a log line straight to the code that emitted it.
 

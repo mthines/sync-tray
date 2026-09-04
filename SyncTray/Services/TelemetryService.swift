@@ -23,7 +23,7 @@ import OpenTelemetryProtocolExporterHttp
 ///
 /// ## Source correlation
 /// - `vcs.repository.url.full` — canonical https URL of the origin remote
-/// - `vcs.repository.ref.revision` — full commit SHA the binary was built from
+/// - `vcs.ref.head.revision` — full commit SHA the binary was built from
 ///
 /// Injected at build time by the `Embed Git Metadata` phase. Together they let a
 /// backend resolve any signal to the exact source revision that produced it.
@@ -1649,7 +1649,10 @@ final class TelemetryService {
             attrs["vcs.repository.url.full"] = .string(repositoryURL)
         }
         if let revision = infoPlistBuildValue("GitCommitSHAFull") {
-            attrs["vcs.repository.ref.revision"] = .string(revision)
+            // `vcs.ref.head.revision` is the current semconv name and what Dash0's
+            // VCS correlation keys on; the older `vcs.repository.ref.revision` is
+            // deprecated.
+            attrs["vcs.ref.head.revision"] = .string(revision)
         }
 
         // Distinguish development builds from real user installs so dev/test

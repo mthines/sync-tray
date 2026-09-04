@@ -565,7 +565,7 @@ Anonymous, opt-in telemetry using OpenTelemetry (opentelemetry-swift 1.17.1). Al
 
 ### Source correlation
 - `vcs.repository.url.full` — canonical https URL of the `origin` remote, normalised at build time (scp-style SSH converted, embedded credentials stripped, trailing `.git` dropped).
-- `vcs.repository.ref.revision` — full commit SHA the binary was built from.
+- `vcs.ref.head.revision` — full commit SHA the binary was built from.
 - Both are injected into `Info.plist` by the `Embed Git Metadata` build phase alongside `GitCommitSHA`, and are simply absent when building from a non-git source tree. Together they let a backend resolve any signal to the exact source revision that produced it — the attribute Dash0 and agentic tooling look for to jump from a log line to the code.
 - `host.arch` — `arm64` / `amd64`, resolved at compile time so a universal binary reports the executing slice; omitted entirely on any other architecture rather than sending an undocumented value.
 
