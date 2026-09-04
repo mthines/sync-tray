@@ -77,7 +77,8 @@ Access cloud files without downloading them. Files appear in a folder on your Ma
 - No local storage used (beyond cache)
 - Ideal for large media libraries or archives
 - Configurable VFS cache with a retention window ("keep cached for N days")
-- Right-click a folder in Finder → **Available Offline** to keep it downloaded for offline use
+- **Live download progress**: streaming a file shows the same transfer bar and per-file list that sync/bisync profiles show, in the menu bar and the profile detail
+- **Offline files**: keep chosen folders downloaded so they open with no connection (see [Offline Files](#offline-files))
 
 <p align="center">
   <img src="/docs/assets/profile-stream.png" alt="Stream (Mount) Configuration" height="600">
@@ -93,6 +94,7 @@ Access cloud files without downloading them. Files appear in a folder on your Ma
 
 - Menu bar icon shows current state (idle, syncing, error, drive not mounted)
 - **Real-time progress** during sync: bytes transferred, percentage, ETA
+- Works for Stream (Mount) profiles too — streaming a file surfaces live download progress polled from rclone's RC API
 - Per-profile status indicators
 
 During sync, see detailed transfer progress:
@@ -146,6 +148,16 @@ Configure an alternative remote that activates automatically when the primary is
 - **Bisync cache preservation**: When the fallback uses the same directory structure, env var overrides swap the transport without invalidating rclone's bisync cache
 - **Flexible path mapping**: Supports fallback remotes with different path structures (e.g., SMB share root vs SFTP filesystem path)
 
+### Offline Files
+
+For Stream (Mount) profiles, keep chosen folders downloaded so they open instantly without a connection.
+
+- **Mark a folder offline** two ways: right-click it in Finder → **Available Offline**, or use the **Offline Files** section of the profile editor
+- **Live warming progress**: making a folder available offline downloads it with parallel transfers and shows per-file progress; interrupted runs cancel and restart cleanly on cache clear, unmount, or edit
+- **Don't Download excludes**: skip files you never want offline with wildcard patterns, including `**` folder globs
+- **Cache management**: clear the VFS cache with an option to keep pinned (offline) folders
+- The Finder right-click menu needs a one-time approval under System Settings → General → Login Items & Extensions → Extensions; the app's Offline Files section links you there
+
 ### One-Click Actions
 
 - **Sync Now**: Trigger immediate sync for all enabled profiles
@@ -168,6 +180,8 @@ rclone config
 ```
 
 See [rclone's documentation](https://rclone.org/docs/) for detailed setup guides for each provider.
+
+SyncTray auto-detects rclone from Homebrew, `/usr/local/bin`, `/usr/bin`, and nix installs (nix-darwin, per-user, and profile paths), so a non-Homebrew rclone works without extra configuration.
 
 ### Mount Mode Setup
 
@@ -363,16 +377,65 @@ SyncTray uses rclone bisync with smart conflict handling:
 - Conflicts create backup copies with `-sync-conflict-` suffix
 - Check the log file for conflict details
 
+### File-Backed Configuration
+
+`~/.config/synctray/` is the editable, authoritative home for SyncTray's config. A human or a script can hand-edit these files and the running app applies the change live, no restart needed.
+
+| Path | Contents |
+| ---- | -------- |
+| `profiles/{id}.profile.json` | The full profile: paths, remote, sync mode, offline folders, enable/mute state |
+| `settings.json` | App settings: launch at login, telemetry, debug logging, auto-fix |
+| `schema/*.schema.json` | JSON Schemas for validating the files above |
+
+- **Live apply**: a file watcher (~1s debounce) reconciles every external edit through the same path as the app's Save button — an enabled/disabled toggle installs or removes the launchd agent, a warm-field edit re-warms offline folders.
+- **Create by dropping a file**: write a new `*.profile.json` with a fresh `id` and SyncTray creates that profile. Only five keys are required — `id`, `name`, `rcloneRemote`, `remotePath`, `localSyncPath` — every other field takes its default. The launchd agent installs only once the profile is also `isEnabled` and valid, so you can stage a profile disabled, then flip it on in a second edit.
+- **Credential-free**: rclone secrets live in `~/.config/rclone/rclone.conf`, never in these files. Validate a profile against `schema/profile.schema.json` before writing it.
+
+### The `synctray` CLI
+
+SyncTray installs a `synctray` shim at `~/.local/bin/synctray` on every launch. Add `~/.local/bin` to your `PATH` to run it. The mutating commands work through the file-backed config, so they run whether or not the menu bar app is open.
+
+**Inspect** (read-only):
+
+| Command | Purpose |
+| ------- | ------- |
+| `synctray doctor` | Health report: rclone version, schemas installed, per-profile agent state, stale locks, remote reachability. Exits non-zero on any failure. |
+| `synctray status [name\|id]` | One line per profile: enabled, agent loaded, running, last result. |
+| `synctray profiles` | List every profile with mode, enabled state, and remote (no secrets). |
+| `synctray logs <name\|id> [--follow]` | Print or tail a profile's sync log. |
+| `synctray test-remote <name\|id>` | Probe a profile's remote with a hard timeout. |
+| `synctray listremotes` | Passthrough to `rclone listremotes`. |
+
+**Configure** (mutating, headless-capable):
+
+| Command | Purpose |
+| ------- | ------- |
+| `synctray profile create --from <file>` | Create a profile from a `.profile.json` file (or `-` for stdin). |
+| `synctray profile enable <name\|id>` | Enable a profile and install its agent. |
+| `synctray profile disable <name\|id>` | Disable a profile and uninstall its agent. |
+| `synctray profile delete <name\|id>` | Uninstall the agent (detaching a mount first) and remove the profile. |
+
+**Operate:**
+
+| Command | Purpose |
+| ------- | ------- |
+| `synctray sync <name\|id>` | Run one sync now and block until it finishes, returning the script's exit code. |
+
+A `<name\|id>` resolves by exact short id first, then case-insensitive name; an unmatched target exits non-zero.
+
 ## File Locations
 
 SyncTray creates these files (per profile):
 
-| Location                                              | Purpose               |
-| ----------------------------------------------------- | --------------------- |
-| `~/.local/bin/synctray-sync.sh`                       | Shared sync script    |
-| `~/.config/synctray/profiles/{id}.json`               | Profile configuration |
-| `~/.local/log/synctray-sync-{id}.log`                 | Sync log output       |
-| `~/Library/LaunchAgents/com.synctray.sync.{id}.plist` | Background scheduler  |
+| Location                                              | Purpose                                    |
+| ----------------------------------------------------- | ------------------------------------------ |
+| `~/.local/bin/synctray`                               | Headless CLI shim                          |
+| `~/.local/bin/synctray-sync.sh`                       | Shared sync script                         |
+| `~/.config/synctray/profiles/{id}.profile.json`       | Authoritative profile (editable)           |
+| `~/.config/synctray/profiles/{id}.json`              | Derived script-only config                 |
+| `~/.config/synctray/settings.json`                    | App settings (editable)                    |
+| `~/.local/log/synctray-sync-{id}.log`                 | Sync log output                            |
+| `~/Library/LaunchAgents/com.synctray.sync.{id}.plist` | Background scheduler                        |
 
 ## Troubleshooting
 
@@ -408,9 +471,11 @@ xattr -cr /Applications/SyncTray.app
 - Only files actually transferred appear (unchanged files are skipped)
 - Check that `--use-json-log` is being used (automatic with SyncTray)
 
-### Mount mode: "macFUSE not installed" or mount fails
+### Mount mode: mount fails
 
-Mount mode requires macFUSE to create virtual filesystems:
+Mount mode is kext-free by default (NFS backend) and needs nothing beyond rclone. If a mount fails, check that rclone is installed and the remote is reachable (`synctray doctor`).
+
+If you switched a profile to the **macFUSE** backend, that backend needs macFUSE and the official rclone binary:
 
 ```bash
 brew install --cask macfuse
@@ -419,9 +484,10 @@ brew install --cask macfuse
 After installation:
 
 1. Reboot your Mac
-2. Go to System Settings → Security & Privacy
-3. Approve the macFUSE kernel extension
-4. Try mounting again
+2. Go to System Settings → Privacy & Security
+3. Approve the macFUSE system extension
+4. Replace Homebrew's rclone with the official binary (see [Mount Mode Setup](#mount-mode-setup))
+5. Try mounting again
 
 ### Mount mode: Stale mount or "Device busy" error
 
@@ -455,10 +521,12 @@ xcodebuild -scheme SyncTray -configuration Debug build
 ### Architecture
 
 - **SyncManager**: Orchestrates sync operations and state
-- **ProfileStore**: Persists profiles to UserDefaults
+- **ProfileStore**: File-backed profile persistence (`~/.config/synctray/profiles/`)
+- **ConfigFileWatcher**: Live-applies external edits to the config directory
 - **LogWatcher**: Real-time log monitoring via DispatchSource
 - **LogParser**: Parses rclone JSON logs
 - **SyncSetupService**: Generates scripts and launchd plists
+- **SyncTrayCLI**: Headless `synctray` command
 - **NotificationService**: Smart batched notifications
 
 ### Commit Convention
