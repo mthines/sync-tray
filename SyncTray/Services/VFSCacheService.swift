@@ -469,8 +469,9 @@ final class VFSCacheService {
     /// fast, low-latency link and hide per-file open latency with many small files — but on a
     /// contended wireless/mesh backhaul (or a spinning-disk cache) extra streams contend and
     /// collapse aggregate throughput, so such profiles set `downloadConnections` to 1–2.
-    /// This constant preserves the historical default (8) for the no-argument path.
-    static let defaultWarmConcurrency = 8
+    /// This constant is the no-argument fallback and matches `SyncProfile`'s default of 2;
+    /// every real warm passes the profile's `downloadConnections` explicitly.
+    static let defaultWarmConcurrency = 2
 
     /// Warm a single directory by: first calling `/vfs/refresh` (listing cache), then
     /// reading file bytes through the NFS mount to populate the rclone VFS content cache.

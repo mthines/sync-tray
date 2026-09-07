@@ -59,7 +59,7 @@ struct ProfileDetailView: View {
     @State private var vfsCachePath: String = ""
     @State private var allowNonEmptyMount: Bool = false
     @State private var mountAtStartup: Bool = true
-    @State private var downloadConnections: Int = 8
+    @State private var downloadConnections: Int = 2
 
     // UI State
     @State private var showAdvanced: Bool = false

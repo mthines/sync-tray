@@ -556,10 +556,10 @@ final class SyncSetupService {
             VFS_CACHE_MAX_SIZE=$(parse_json "vfsCacheMaxSize" "10G")
             VFS_CACHE_MAX_AGE=$(parse_json "vfsCacheMaxAge" "168h")
             VFS_CACHE_PATH=$(parse_json "vfsCachePath" "$HOME/.cache/rclone")
-            # Parallel downloaders. Defaults to 8 (the value hardcoded before the field
-            # existed) so a legacy config with no key is unchanged. Set lower (1–2) on a
-            # Wi-Fi/mesh link where extra streams contend and collapse aggregate throughput.
-            DOWNLOAD_CONNECTIONS=$(parse_json "downloadConnections" "8")
+            # Parallel downloaders. Defaults to 2 — a safe value on a contended Wi-Fi/mesh
+            # link (or spinning-disk cache) where extra streams contend and collapse
+            # aggregate throughput. Raise it (up to 16) for a fast wired link.
+            DOWNLOAD_CONNECTIONS=$(parse_json "downloadConnections" "2")
             ALLOW_NON_EMPTY=$(parse_json "allowNonEmptyMount" "false")
             RC_PORT=$(parse_json "rcPort" "0")
 
