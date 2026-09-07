@@ -967,6 +967,7 @@ final class TelemetryService {
                 "config.has_pinned_directories": .bool(!profile.pinnedDirectories.isEmpty),
                 "config.pinned_directory_count": .int(profile.pinnedDirectories.count),
                 "config.allow_non_empty_mount": .bool(profile.allowNonEmptyMount),
+                "config.download_connections": .int(profile.isMountMode ? profile.downloadConnections : 0),
             ]
         )
     }

@@ -556,6 +556,10 @@ final class SyncSetupService {
             VFS_CACHE_MAX_SIZE=$(parse_json "vfsCacheMaxSize" "10G")
             VFS_CACHE_MAX_AGE=$(parse_json "vfsCacheMaxAge" "168h")
             VFS_CACHE_PATH=$(parse_json "vfsCachePath" "$HOME/.cache/rclone")
+            # Parallel downloaders. Defaults to 2 — a safe value on a contended Wi-Fi/mesh
+            # link (or spinning-disk cache) where extra streams contend and collapse
+            # aggregate throughput. Raise it (up to 16) for a fast wired link.
+            DOWNLOAD_CONNECTIONS=$(parse_json "downloadConnections" "2")
             ALLOW_NON_EMPTY=$(parse_json "allowNonEmptyMount" "false")
             RC_PORT=$(parse_json "rcPort" "0")
 
@@ -766,14 +770,16 @@ final class SyncSetupService {
                 # ~17 MB/s and 4 parallel ~37 MB/s, yet an untuned warm delivered ~1.2 MB/s.
                 #   --vfs-read-ahead / --buffer-size : download far ahead of the reader so the
                 #       cache fills at backend speed, decoupled from the NFS read latency.
-                #   --transfers : parallel VFS cache downloaders (matches the app-side warm
-                #       concurrency in VFSCacheService.defaultWarmConcurrency — keep in sync).
+                #   --transfers : parallel VFS cache downloaders, from the profile's
+                #       downloadConnections setting (kept in lockstep with the app-side warm
+                #       concurrency in VFSCacheService — both read the same per-profile value).
+                #       Fewer streams win on a contended wireless/mesh link; more on fast wired.
                 #   --vfs-read-chunk-size(-limit) : large, growing range reads = fewer round
                 #       trips on high-latency backends.
                 #   --dir-cache-time / --attr-timeout : fewer metadata round trips.
                 # Cost: --buffer-size is per open file, so an active warm of N files uses up to
                 # N x 128M RAM (transient; released when the files close).
-                RCLONE_CMD="$RCLONE_CMD --buffer-size 128M --vfs-read-ahead 256M --transfers 8 --vfs-read-chunk-size 128M --vfs-read-chunk-size-limit off --dir-cache-time 12h --attr-timeout 5s"
+                RCLONE_CMD="$RCLONE_CMD --buffer-size 128M --vfs-read-ahead 256M --transfers $DOWNLOAD_CONNECTIONS --vfs-read-chunk-size 128M --vfs-read-chunk-size-limit off --dir-cache-time 12h --attr-timeout 5s"
 
                 # Name the mounted volume after the mount-point folder so Finder
                 # shows e.g. "Temp" instead of the auto-generated NFS share name
@@ -952,6 +958,7 @@ final class SyncSetupService {
             "allowNonEmptyMount": profile.allowNonEmptyMount,
             "pinnedDirectories": profile.pinnedDirectories,
             "rcPort": profile.rcPort,
+            "downloadConnections": profile.downloadConnections,
         ]
 
         if let data = try? JSONSerialization.data(

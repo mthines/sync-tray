@@ -462,15 +462,16 @@ final class VFSCacheService {
         return WarmEstimate(files: files, bytes: bytes)
     }
 
-    /// Number of files warmed concurrently. A single read stream through the NFS→rclone→
-    /// backend path is latency-bound (especially on the SFTP fallback), so several parallel
-    /// reads use far more of the available bandwidth — and with thousands of small files the
-    /// per-file open latency (NFS lookup + VFS open + backend open) dominates, so extra
-    /// in-flight files hide it. Kept in lockstep with the mount's `--transfers 8` in
-    /// `SyncSetupService` so the app-side reader count and rclone's downloader count agree.
-    /// Measured ceiling on a DS223 over SMB is ~37 MB/s aggregate at 4+ streams (the NAS CPU,
-    /// not the LAN, is the wall), so going far higher mostly thrashes the backend.
-    static let defaultWarmConcurrency = 8
+    /// Fallback number of files warmed concurrently, used only when a caller doesn't pass an
+    /// explicit count. The live value comes from the profile's `downloadConnections`, which
+    /// `SyncManager.warmPinnedDirectories` passes in and which also sets the mount's
+    /// `--transfers` (kept in lockstep). Several parallel reads can use more bandwidth on a
+    /// fast, low-latency link and hide per-file open latency with many small files — but on a
+    /// contended wireless/mesh backhaul (or a spinning-disk cache) extra streams contend and
+    /// collapse aggregate throughput, so such profiles set `downloadConnections` to 1–2.
+    /// This constant is the no-argument fallback and matches `SyncProfile`'s default of 2;
+    /// every real warm passes the profile's `downloadConnections` explicitly.
+    static let defaultWarmConcurrency = 2
 
     /// Warm a single directory by: first calling `/vfs/refresh` (listing cache), then
     /// reading file bytes through the NFS mount to populate the rclone VFS content cache.

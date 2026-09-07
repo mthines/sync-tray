@@ -40,6 +40,14 @@ struct SyncProfile: Identifiable, Codable, Equatable {
     /// Excluded files are skipped by the warmer so they never download into the offline cache.
     var warmExcludePatterns: [String]
     var rcPort: Int                     // Port for rclone RC (remote control) API (mount mode)
+    /// Number of files rclone downloads in parallel — drives the mount's `--transfers`
+    /// AND the app-side offline-warm concurrency (`VFSCacheService`), kept in lockstep.
+    /// Higher saturates a fast wired link; 1–2 is faster on Wi-Fi / a mesh backhaul / a
+    /// slow remote, where extra parallel transfers contend for a shared half-duplex link
+    /// (and thrash a spinning-disk cache) and collapse aggregate throughput. Clamped to
+    /// 1...16. Defaults to 2 — a safe value for the common case (a NAS reached over Wi-Fi
+    /// or a mesh, and/or a spinning-disk cache); users on a fast wired link raise it.
+    var downloadConnections: Int
 
     /// Short ID for file naming (first 8 chars of UUID)
     var shortId: String {
@@ -182,7 +190,8 @@ struct SyncProfile: Identifiable, Codable, Equatable {
         mountAtStartup: Bool = true,
         pinnedDirectories: [String] = [],
         warmExcludePatterns: [String] = [],
-        rcPort: Int = 0
+        rcPort: Int = 0,
+        downloadConnections: Int = 2
     ) {
         self.id = id
         self.name = name
@@ -209,6 +218,7 @@ struct SyncProfile: Identifiable, Codable, Equatable {
         self.pinnedDirectories = pinnedDirectories
         self.warmExcludePatterns = warmExcludePatterns
         self.rcPort = rcPort > 0 ? rcPort : SyncProfile.defaultRCPort(for: id)
+        self.downloadConnections = min(16, max(1, downloadConnections))
     }
 
     /// Generate a deterministic RC port from the profile UUID (range: 5800-5899)
@@ -240,6 +250,7 @@ extension SyncProfile {
         case vfsCacheMode, vfsCacheMaxSize, vfsCacheMaxAge, vfsCachePath, allowNonEmptyMount
         case mountAtStartup
         case pinnedDirectories, warmExcludePatterns, rcPort
+        case downloadConnections
     }
 
     init(from decoder: Decoder) throws {
@@ -293,6 +304,12 @@ extension SyncProfile {
         // Backwards compatibility: generate default RC port if not present
         let decodedRCPort = try container.decodeIfPresent(Int.self, forKey: .rcPort) ?? 0
         rcPort = decodedRCPort > 0 ? decodedRCPort : SyncProfile.defaultRCPort(for: id)
+        // Backwards compatibility: parallel downloads default to 2 (a safe value on a
+        // contended Wi-Fi/mesh link or spinning-disk cache). Clamped to the supported
+        // 1...16 range so a hand-edited profile file can never inject an out-of-range
+        // --transfers.
+        let decodedConnections = try container.decodeIfPresent(Int.self, forKey: .downloadConnections) ?? 2
+        downloadConnections = min(16, max(1, decodedConnections))
     }
 }
 

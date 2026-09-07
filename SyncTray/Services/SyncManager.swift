@@ -2348,7 +2348,7 @@ final class SyncManager: ObservableObject {
             profileId: profileId,
             profileName: profile.name,
             directoryCount: targets.count,
-            concurrency: VFSCacheService.defaultWarmConcurrency,
+            concurrency: profile.downloadConnections,
             trigger: trigger
         )
 
@@ -2369,7 +2369,7 @@ final class SyncManager: ObservableObject {
 
         for dir in targets {
             if Task.isCancelled { break }  // cache cleared or profile unmounted mid-run
-            await cacheService.warmDirectory(dir, for: profile, isStillPinned: { [weak self] in
+            await cacheService.warmDirectory(dir, for: profile, concurrency: profile.downloadConnections, isStillPinned: { [weak self] in
                 await self?.isDirectoryPinned(dir, profileId: profileId) ?? false
             }, onStart: { [weak self] name in
                 await MainActor.run {

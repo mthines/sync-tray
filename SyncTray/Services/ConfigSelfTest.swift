@@ -184,6 +184,12 @@ enum ConfigSelfTest {
             return report("AC-3", "reconcile-delta", false, "(mountAtStartup change expected .reinstall)")
         }
 
+        var connectionsChanged = base
+        connectionsChanged.downloadConnections = base.downloadConnections == 1 ? 2 : 1
+        guard SyncManager.reconcileAction(from: base, to: connectionsChanged) == .reinstall else {
+            return report("AC-3", "reconcile-delta", false, "(downloadConnections change expected .reinstall)")
+        }
+
         var nameChanged = base
         nameChanged.name = "\(base.name) (renamed)"
         guard SyncManager.reconcileAction(from: base, to: nameChanged) == .none else {

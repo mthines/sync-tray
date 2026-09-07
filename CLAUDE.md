@@ -63,7 +63,7 @@ force a plist regeneration on save (part of `needsReinstall`).
 of truth.** `SyncSetupService.generateProfileConfig` writes this file (read by the
 sync script via `parse_json`); it is *separate* from the full `SyncProfile` that
 `ProfileStore` persists to `UserDefaults`. Any mount setting the script consumes
-(`mountBackend`, `vfsCacheMaxAge`, `vfsCacheMode`, …) **must be emitted by
+(`mountBackend`, `vfsCacheMaxAge`, `vfsCacheMode`, `downloadConnections`, …) **must be emitted by
 `generateProfileConfig`** — a field present in the model, UI, and `Codable` but
 missing from this writer silently never reaches the script, which then falls back to
 its default. (This was the cause of the "NFS selected but macFUSE still runs" bug:
@@ -75,6 +75,19 @@ VFS cache until this long has passed *since it was last accessed* (the timer res
 on each open); `--vfs-cache-max-size` still bounds total cache size with LRU
 eviction. There is no rclone-native per-file "pin" — `pinnedDirectories` are kept
 warm app-side via the RC API + reads (see Offline Files).
+
+**Download connections (`downloadConnections`, default 2, range 1–16):** a per-profile
+"Download Connections" control (Advanced Options, mount mode only) that sets how many
+files download in parallel. It drives BOTH the mount's `--transfers` and the app-side
+offline-warm concurrency (`VFSCacheService`) from a single value — the two are kept in
+lockstep. Higher saturates a fast wired link; **1–2 is faster on a contended
+wireless/mesh backhaul or a spinning-disk cache**, where extra parallel transfers fight
+each other for airtime/seeks and *collapse* aggregate throughput (measured on one Wi-Fi
+mesh: 1 stream ≈ 4.7 MB/s, 8 streams ≈ 0.46 MB/s). The default is **2** — a safe value
+for the common NAS-over-Wi-Fi case; a profile omitting the key (any profile from before
+this field existed) decodes to 2, and users on a fast wired link raise it. Changing it
+is in `reconcileAction`'s reinstall set, so it remounts the stream to apply the new
+`--transfers`; a hand-edited value is clamped to 1–16 by the decoder.
 
 **NFS backend caveats:** writes require `--vfs-cache-mode` ≥ `writes` (default is
 `full`, so this is satisfied). The NFS client couples access/modification times,

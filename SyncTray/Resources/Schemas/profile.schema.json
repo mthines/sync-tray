@@ -115,6 +115,13 @@
     "rcPort": {
       "type": "integer",
       "description": "Port for rclone's RC (remote control) API (mount mode)."
+    },
+    "downloadConnections": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 16,
+      "default": 2,
+      "description": "How many files rclone downloads in parallel — sets the mount's --transfers and the app-side offline-warm concurrency. Higher saturates a fast wired link; 1–2 is faster on Wi-Fi/mesh or a slow remote, where parallel transfers contend and collapse throughput. Clamped to 1–16; omitted defaults to 2."
     }
   },
   "required": [
