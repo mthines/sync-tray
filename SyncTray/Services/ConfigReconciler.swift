@@ -85,6 +85,7 @@ extension SyncManager {
             current.vfsCacheMaxSize != updated.vfsCacheMaxSize ||
             current.vfsCacheMaxAge != updated.vfsCacheMaxAge ||
             current.vfsCachePath != updated.vfsCachePath ||
+            current.downloadConnections != updated.downloadConnections ||
             current.mountAtStartup != updated.mountAtStartup
 
         return needsReinstall ? .reinstall : .none

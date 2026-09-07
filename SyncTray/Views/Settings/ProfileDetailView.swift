@@ -59,6 +59,7 @@ struct ProfileDetailView: View {
     @State private var vfsCachePath: String = ""
     @State private var allowNonEmptyMount: Bool = false
     @State private var mountAtStartup: Bool = true
+    @State private var downloadConnections: Int = 8
 
     // UI State
     @State private var showAdvanced: Bool = false
@@ -168,7 +169,8 @@ struct ProfileDetailView: View {
         vfsCacheMaxAge != profile.vfsCacheMaxAge ||
         vfsCachePath != profile.vfsCachePath ||
         allowNonEmptyMount != profile.allowNonEmptyMount ||
-        mountAtStartup != profile.mountAtStartup
+        mountAtStartup != profile.mountAtStartup ||
+        downloadConnections != profile.downloadConnections
     }
 
     private var canInstall: Bool {
@@ -1880,6 +1882,31 @@ struct ProfileDetailView: View {
                     .textFieldStyle(.roundedBorder)
             }
 
+            // Parallel download connections — drives the mount's --transfers and the
+            // offline-warm concurrency. Only meaningful in mount mode (offline files +
+            // streaming), so it's shown there only.
+            if syncMode == .mount {
+                Divider()
+
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Download Connections")
+                        .font(.subheadline.weight(.medium))
+                    Text("How many files download in parallel when caching offline folders "
+                        + "and streaming. Higher saturates a fast wired network; 1–2 is faster "
+                        + "on Wi-Fi, a mesh, or a slow remote, where too many parallel transfers "
+                        + "fight each other (and thrash a spinning-disk cache). Changing this "
+                        + "remounts the stream.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Stepper(value: $downloadConnections, in: 1...16) {
+                        Text("\(downloadConnections) \(downloadConnections == 1 ? "connection" : "connections")")
+                            .font(.subheadline.monospacedDigit())
+                    }
+                    .frame(width: 220, alignment: .leading)
+                }
+            }
+
             Divider()
 
             // Reconfigure Remote
@@ -1958,6 +1985,7 @@ struct ProfileDetailView: View {
         vfsCachePath = profile.vfsCachePath
         allowNonEmptyMount = profile.allowNonEmptyMount
         mountAtStartup = profile.mountAtStartup
+        downloadConnections = profile.downloadConnections
 
         // Show text input if the path contains "/" (nested path) or is a custom path
         // that won't be in the folder picker dropdown
@@ -1990,6 +2018,7 @@ struct ProfileDetailView: View {
         updatedProfile.vfsCachePath = vfsCachePath
         updatedProfile.allowNonEmptyMount = allowNonEmptyMount
         updatedProfile.mountAtStartup = mountAtStartup
+        updatedProfile.downloadConnections = downloadConnections
         return updatedProfile
     }
 
