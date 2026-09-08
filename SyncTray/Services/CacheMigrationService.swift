@@ -54,10 +54,29 @@ struct CacheMigrationFileSystem {
                 try fm.copyItem(atPath: from, toPath: to)
             },
             copyFileDataOnly: { from, to in
-                guard let data = fm.contents(atPath: from) else {
+                // Stream in fixed-size chunks rather than `fm.contents(atPath:)`
+                // + a single `Data.write` — the whole-file-in-memory approach
+                // previously spiked RSS to the size of the largest cached
+                // file (finding 8), and a VFS cache routinely holds files
+                // well beyond what's safe to hold in memory at once. Mirrors
+                // the chunked-read pattern `VFSCacheService.warmDirectory`
+                // already uses for the same reason.
+                guard fm.createFile(atPath: to, contents: nil) else {
                     throw CacheMigrationIOError.dataReadFailed
                 }
-                try data.write(to: URL(fileURLWithPath: to))
+                guard let reader = FileHandle(forReadingAtPath: from) else {
+                    throw CacheMigrationIOError.dataReadFailed
+                }
+                defer { try? reader.close() }
+                guard let writer = FileHandle(forWritingAtPath: to) else {
+                    throw CacheMigrationIOError.dataReadFailed
+                }
+                defer { try? writer.close() }
+                let chunkSize = 4 * 1024 * 1024
+                while true {
+                    guard let chunk = try reader.read(upToCount: chunkSize), !chunk.isEmpty else { break }
+                    try writer.write(contentsOf: chunk)
+                }
             },
             moveItem: { from, to in
                 try fm.moveItem(atPath: from, toPath: to)
@@ -114,6 +133,34 @@ enum CacheMigrationIOError: Error {
     case dataReadFailed
 }
 
+// MARK: - Cross-thread cancellation bridging
+
+/// `Task.isCancelled` only reflects the CURRENT task's cancellation state.
+/// Read from inside a plain `DispatchQueue.global(...).async` closure — which
+/// is NOT itself a `Task` — it always returns `false`, even after the
+/// enclosing `Task` has been cancelled (finding 2: this left the Cancel
+/// button and the supersede-in-flight path permanently inert, since the
+/// migration engine's `isCancelled` closure ran inside exactly such a
+/// closure). This box lets an outer, genuinely cancellable `Task` hand its
+/// cancellation across that thread boundary to a synchronous background
+/// closure the engine polls.
+final class CacheMigrationCancellationFlag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var cancelled = false
+
+    func markCancelled() {
+        lock.lock()
+        cancelled = true
+        lock.unlock()
+    }
+
+    var isCancelled: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return cancelled
+    }
+}
+
 // MARK: - Preflight
 
 struct CacheMigrationPreflight: Equatable {
@@ -137,6 +184,11 @@ enum CacheMigrationFailure: String, Equatable {
     case countMismatch
     case ioError
     case destinationUnwritable
+    /// The mount could not be gracefully detached before the move — the
+    /// orchestration must abort rather than relocate files out from under a
+    /// still-writing `rclone nfsmount` (finding 7: a swallowed detach
+    /// failure previously let the move proceed anyway).
+    case mountDetachFailed
 }
 
 struct CacheMigrationOutcome: Equatable {
@@ -190,12 +242,6 @@ struct CacheMigrationEngine {
         let files = sourceFiles(for: plan)
         guard !files.isEmpty else { return .failure(.nothingToMove) }
 
-        if !fs.directoryExists(plan.destinationRoot) {
-            guard (try? fs.createDirectory(plan.destinationRoot)) != nil else {
-                return .failure(.destinationUnwritable)
-            }
-        }
-
         let totalBytes = files.reduce(Int64(0)) { $0 + $1.size }
         var bytesToCopy: Int64 = 0
         for file in files {
@@ -206,9 +252,14 @@ struct CacheMigrationEngine {
             bytesToCopy += file.size
         }
 
+        // Determine same-volume BEFORE creating anything at the destination.
+        // Creating the destination root first would materialize an
+        // unmounted `/Volumes/...` path as a plain directory on the BOOT
+        // disk, which then reads back as "same volume" as the source —
+        // silently skipping the free-space preflight below (finding 9).
         let sourceVolume = fs.volumeIdentifier(plan.sourceRoot)
         let sameVolume = sourceVolume != nil && sourceVolume == fs.volumeIdentifier(plan.destinationRoot)
-        let usesFastPath = sameVolume && plan.excludedRelativePaths.isEmpty
+        let usesFastPath = sameVolume && plan.excludedRelativePaths.isEmpty && !Self.hasNestedSubtrees(plan.subtrees)
 
         if !usesFastPath {
             guard let available = fs.availableCapacity(plan.destinationRoot) else {
@@ -217,6 +268,12 @@ struct CacheMigrationEngine {
             let required = bytesToCopy + Self.freeSpaceHeadroomBytes
             guard available >= required else {
                 return .failure(.insufficientSpace(requiredBytes: required, availableBytes: available))
+            }
+        }
+
+        if !fs.directoryExists(plan.destinationRoot) {
+            guard (try? fs.createDirectory(plan.destinationRoot)) != nil else {
+                return .failure(.destinationUnwritable)
             }
         }
 
@@ -229,11 +286,31 @@ struct CacheMigrationEngine {
     }
 
     /// Relocate `plan`'s subtrees: the same-volume whole-directory rename
-    /// fast path when nothing is excluded, otherwise a per-file
-    /// copy → verify → delete walk.
+    /// fast path when nothing is excluded AND no two subtrees nest,
+    /// otherwise a per-file copy → verify → delete walk.
+    ///
+    /// Nested subtrees (a co-migrating ancestor + descendant profile sharing
+    /// the same bytes on disk, R15) can't both use a whole-directory
+    /// `moveItem`: whichever subtree moves second finds its destination
+    /// already partially created by the first (finding 5) and
+    /// `FileManager.moveItem` refuses to move onto an existing target. The
+    /// per-file walk already dedups nested subtrees correctly (`sourceFiles`),
+    /// so it's the only path that is safe for them.
     func run(_ plan: CacheMigrationPlan, _ preflight: CacheMigrationPreflight) -> CacheMigrationOutcome {
-        let usesFastPath = preflight.sameVolume && plan.excludedRelativePaths.isEmpty
+        let usesFastPath = preflight.sameVolume && plan.excludedRelativePaths.isEmpty && !Self.hasNestedSubtrees(plan.subtrees)
         return usesFastPath ? fastPathMove(plan, preflight) : moveFiles(plan, preflight)
+    }
+
+    /// True when two subtrees of the SAME kind nest (one's relative path is
+    /// a strict descendant of another's) — the case a whole-directory
+    /// `moveItem` fast path cannot handle safely.
+    private static func hasNestedSubtrees(_ subtrees: [CacheSubtree]) -> Bool {
+        for a in subtrees {
+            for b in subtrees where b.kind == a.kind && b.relativePath != a.relativePath {
+                if b.relativePath.hasPrefix(a.relativePath + "/") { return true }
+            }
+        }
+        return false
     }
 
     /// Same-volume, no-exclusions fast path: atomically rename each subtree
@@ -306,18 +383,42 @@ struct CacheMigrationEngine {
             }
         }
 
-        fs.removeEmptyDirectories(plan.sourceRoot)
-
         guard reconcile(filesMoved: filesMoved, bytesMoved: bytesMoved, against: preflight) else {
             let rolledBack = rollback(destPaths: movedDestPaths, plan: plan)
             return CacheMigrationOutcome(result: .failed(.countMismatch, rolledBack: rolledBack), filesMoved: filesMoved, bytesMoved: bytesMoved, sameVolume: preflight.sameVolume)
         }
+
+        // Only prune empty source directories once the move is CONFIRMED
+        // complete — pruning before reconcile would remove the parent
+        // directories a rollback needs to restore into (finding 10).
+        // Scoped to just the `vfs`/`vfsMeta` trees, never the whole shared
+        // cache root: `vfsCachePath` commonly defaults to the SAME parent
+        // rclone's bisync cache lives under (`~/.cache/rclone/bisync/`), so
+        // an unscoped prune could remove an unrelated bisync profile's
+        // state directories.
+        for kind in CacheTreeKind.allCases {
+            fs.removeEmptyDirectories("\(plan.sourceRoot)/\(kind.rawValue)")
+        }
+
         return CacheMigrationOutcome(result: .completed, filesMoved: filesMoved, bytesMoved: bytesMoved, sameVolume: preflight.sameVolume)
     }
 
     /// Copy → compare the destination byte size to the source → only then
     /// delete the source (R19). Never deletes the source before the sizes match.
     private func moveFile(from sourcePath: String, to destPath: String, expectedSize: Int64) -> Result<Void, CacheMigrationFailure> {
+        // Create the destination's parent directory first — neither
+        // `copyItem` nor the data-only fallback creates intermediate
+        // directories, so on a fresh destination root every cross-volume
+        // file would otherwise fail on the very first copy (finding 1).
+        let destParent = (destPath as NSString).deletingLastPathComponent
+        if !fs.directoryExists(destParent) {
+            do {
+                try fs.createDirectory(destParent)
+            } catch {
+                return .failure(.ioError)
+            }
+        }
+
         do {
             try fs.copyFile(sourcePath, destPath)
         } catch {
@@ -357,9 +458,24 @@ struct CacheMigrationEngine {
             guard destPath.hasPrefix(plan.destinationRoot + "/") else { ok = false; continue }
             let relative = String(destPath.dropFirst(plan.destinationRoot.count + 1))
             let sourcePath = (plan.sourceRoot as NSString).appendingPathComponent(relative)
+            let sourceParent = (sourcePath as NSString).deletingLastPathComponent
+            if !fs.directoryExists(sourceParent) {
+                try? fs.createDirectory(sourceParent)
+            }
             do {
                 try fs.copyFile(destPath, sourcePath)
-                guard fs.fileSize(sourcePath) == fs.fileSize(destPath) else { ok = false; continue }
+                // Both sizes must be PRESENT and equal. `Int64? == Int64?`
+                // is `true` when both sides are `nil` (e.g. the copy silently
+                // no-op'd against a still-missing source) — comparing the
+                // optionals directly would then treat a copy that produced
+                // NOTHING as a verified match and delete the last remaining
+                // copy at `destPath` (finding 4).
+                guard let sourceSize = fs.fileSize(sourcePath),
+                      let destSize = fs.fileSize(destPath),
+                      sourceSize == destSize else {
+                    ok = false
+                    continue
+                }
                 try fs.removeItem(destPath)
             } catch {
                 ok = false
@@ -407,6 +523,7 @@ enum CacheMigrationRunner {
         coMigrate: Set<UUID>,
         fs: CacheMigrationFileSystem,
         isCancelled: @escaping () -> Bool = { false },
+        onPreflight: (_ preflight: CacheMigrationPreflight) -> Void = { _ in },
         onProgress: @escaping (_ filesDone: Int, _ bytesDone: Int64, _ currentFile: String) -> Void = { _, _, _ in }
     ) -> (plan: CacheMigrationPlan?, outcome: CacheMigrationOutcome) {
         switch CacheMigrationPlanner.plan(moving: moving, allProfiles: allProfiles, to: destination, coMigrate: coMigrate) {
@@ -422,6 +539,12 @@ enum CacheMigrationRunner {
                     result: .preflightRejected(rejection), filesMoved: 0, bytesMoved: 0, sameVolume: false
                 ))
             case .success(let preflight):
+                // Publish the computed totals BEFORE the file loop starts, so a
+                // caller tracking progress (SyncManager.cacheMigrationProgress)
+                // has files/bytes TOTALS from the first tick instead of only
+                // after the whole run finishes (finding 14: an indeterminate
+                // progress bar for the entire run).
+                onPreflight(preflight)
                 return (plan, engine.run(plan, preflight))
             }
         }

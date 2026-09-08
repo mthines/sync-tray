@@ -2175,7 +2175,15 @@ final class TelemetryService {
         ]
         if let span = token.span {
             for (key, value) in endAttrs { span.setAttribute(key: key, value: value) }
-            span.status = .ok
+            // Mirrors the established `result == "failure" ? .error(...) : .ok`
+            // pattern (`recordReinstallDetach`) — "completed" and the
+            // user-initiated "cancelled" are the only non-error outcomes;
+            // every failure/rejection label is a real error (finding 13:
+            // this was previously an unconditional `.ok`, so a failed move
+            // still showed green in span-based dashboards/alerts).
+            span.status = (outcome == "completed" || outcome == "cancelled")
+                ? .ok
+                : .error(description: "cache_migration \(outcome)")
             span.end()
         }
         let body = outcome == "completed" ? "Cache migration completed" : "Cache migration ended"

@@ -807,7 +807,30 @@ extension CLIEnvironment {
 
         let wasInstalled = SyncSetupService.shared.isInstalled(profile: profile)
         if wasInstalled {
-            try? SyncSetupService.shared.uninstall(profile: profile)
+            var detachFailed = false
+            do {
+                try SyncSetupService.shared.uninstall(profile: profile)
+            } catch {
+                detachFailed = true
+            }
+            // `uninstall` does NOT throw when a mount-mode profile's
+            // graceful+forced `diskutil unmount` both fail — it logs
+            // `mount.result: failure` telemetry and proceeds to unload the
+            // agent and delete the profile's files anyway. A bare `try?`
+            // here previously swallowed both that non-throwing failure AND
+            // a real thrown error, letting the move proceed against a
+            // still-mounted, still-writable volume (finding 7 — same root
+            // cause as the app's `SyncManager.migrateCacheDirectory`).
+            if profile.isMountMode && SyncSetupService.shared.isMounted(profile: profile) {
+                detachFailed = true
+            }
+            guard !detachFailed else {
+                // `uninstall` already ran (it doesn't throw on a detach
+                // failure) and deleted the plist/config, so reinstall before
+                // aborting rather than leaving the profile agent-less.
+                try? SyncSetupService.shared.install(profile: profile)
+                return .failed("mountDetachFailed")
+            }
         }
 
         let fs = CacheMigrationFileSystem.production()
@@ -818,6 +841,23 @@ extension CLIEnvironment {
         let finalResult: CacheMigrationCLIResult
         switch result.outcome.result {
         case .completed:
+            var updated = profile
+            updated.vfsCachePath = destination
+            _ = ProfileStore.writeProfileFile(updated, in: SyncProfile.configDirectory)
+            if let plan = result.plan {
+                for id in plan.profileIdsToRewrite where id != profile.id {
+                    if var sibling = allProfiles.first(where: { $0.id == id }) {
+                        sibling.vfsCachePath = destination
+                        _ = ProfileStore.writeProfileFile(sibling, in: SyncProfile.configDirectory)
+                    }
+                }
+            }
+            finalResult = .completed(files: result.outcome.filesMoved, bytes: result.outcome.bytesMoved, sameVolume: result.outcome.sameVolume)
+        case .preflightRejected(.nothingToMove):
+            // Nothing was cached at the source — there is nothing to lose by
+            // persisting the new directory choice (finding 11, CLI half —
+            // same fix as `SyncManager.migrateCacheDirectory`). R20 only
+            // guards against persisting an INCOMPLETE cache.
             var updated = profile
             updated.vfsCachePath = destination
             _ = ProfileStore.writeProfileFile(updated, in: SyncProfile.configDirectory)

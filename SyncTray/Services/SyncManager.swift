@@ -2381,23 +2381,49 @@ final class SyncManager: ObservableObject {
             return Task { CacheMigrationOutcome(result: .cancelled, filesMoved: 0, bytesMoved: 0, sameVolume: false) }
         }
         let allProfiles = profileStore.profiles
-        var asDestination = original
-        asDestination.vfsCachePath = destinationRoot
+        // A copy pinned to `sourceRoot` (NOT `original.vfsCachePath` directly —
+        // a cancelled run never persists, so it should already equal
+        // `sourceRoot`, but this stays correct even if a caller passes a
+        // slightly different root than what's currently on disk).
+        var asSource = original
+        asSource.vfsCachePath = sourceRoot
+        let cancellationFlag = CacheMigrationCancellationFlag()
 
         let task = Task { [weak self] () -> CacheMigrationOutcome in
             let fs = CacheMigrationFileSystem.production()
-            let outcome = await withCheckedContinuation { continuation in
-                DispatchQueue.global(qos: .utility).async {
-                    let result = CacheMigrationRunner.migrate(
-                        moving: asDestination,
-                        allProfiles: allProfiles,
-                        destination: sourceRoot,
-                        coMigrate: coMigrate,
-                        fs: fs,
-                        isCancelled: { Task.isCancelled }
-                    )
-                    continuation.resume(returning: result.outcome)
+            let outcome = await withTaskCancellationHandler {
+                await withCheckedContinuation { continuation in
+                    DispatchQueue.global(qos: .utility).async {
+                        // Re-derive the ORIGINAL forward plan (source → destination)
+                        // and reverse it, rather than re-planning FROM
+                        // `destinationRoot`: a cancelled run never persists, so
+                        // every co-migrated sibling's `vfsCachePath` is STILL
+                        // `sourceRoot` — classifying overlap against
+                        // `destinationRoot` would match none of them, stranding
+                        // their relocated bytes at the destination with no
+                        // rollback (finding 6). `.reversed()` keeps the EXACT
+                        // same subtree set the forward run used, just swapped.
+                        switch CacheMigrationPlanner.plan(moving: asSource, allProfiles: allProfiles, to: destinationRoot, coMigrate: coMigrate) {
+                        case .failure(let rejection):
+                            continuation.resume(returning: CacheMigrationOutcome(
+                                result: .preflightRejected(.plan(rejection)), filesMoved: 0, bytesMoved: 0, sameVolume: false
+                            ))
+                        case .success(let forwardPlan):
+                            let reversePlan = forwardPlan.reversed()
+                            let engine = CacheMigrationEngine(fs: fs, isCancelled: { cancellationFlag.isCancelled })
+                            switch engine.preflight(reversePlan) {
+                            case .failure(let rejection):
+                                continuation.resume(returning: CacheMigrationOutcome(
+                                    result: .preflightRejected(rejection), filesMoved: 0, bytesMoved: 0, sameVolume: false
+                                ))
+                            case .success(let preflight):
+                                continuation.resume(returning: engine.run(reversePlan, preflight))
+                            }
+                        }
+                    }
                 }
+            } onCancel: {
+                cancellationFlag.markCancelled()
             }
             await MainActor.run { self?.cacheMigrationProgress[profileId] = nil }
             return outcome
@@ -2428,22 +2454,48 @@ final class SyncManager: ObservableObject {
         // R4 — detach/uninstall the moving profile (and any co-migrating
         // installed profile) BEFORE the move, so nothing writes into the
         // cache mid-move. `setupService.uninstall` already performs the
-        // graceful volume detach for a mount-mode profile.
+        // graceful volume detach for a mount-mode profile — but it does NOT
+        // throw when that detach genuinely fails (`diskutil unmount` and its
+        // `force` retry both non-zero): it logs `mount.result: failure`
+        // telemetry and proceeds anyway to unload the agent and delete the
+        // profile's files. A `try?` here previously swallowed both a real
+        // thrown error AND that non-throwing failure, letting the move
+        // proceed against a still-mounted, still-writable volume (finding
+        // 7). Guard against both explicitly.
         let profilesToReinstall = ([movingProfile] + coMigrate.compactMap { profileStore.profile(for: $0) })
             .filter { setupService.isInstalled(profile: $0) }
+        var detachFailed = false
         for profile in profilesToReinstall {
-            try? setupService.uninstall(profile: profile)
+            do {
+                try setupService.uninstall(profile: profile)
+            } catch {
+                detachFailed = true
+                break
+            }
+            if profile.isMountMode && setupService.isMounted(profile: profile) {
+                // `uninstall` returned normally but the volume is still
+                // attached — the graceful/forced `diskutil unmount` both
+                // failed. Abort rather than move files out from under it.
+                detachFailed = true
+                break
+            }
         }
 
         defer {
             // Re-install on EVERY exit path — completed, failed, cancelled,
-            // or a thrown error above — so a profile is never left with no
-            // launchd agent (`optimize-approach(plan)` proposal P2).
+            // a detach failure, or a thrown error above — so a profile is
+            // never left with no launchd agent (`optimize-approach(plan)`
+            // proposal P2).
             for profile in profilesToReinstall {
                 let latest = self.profileStore.profile(for: profile.id) ?? profile
                 try? self.setupService.install(profile: latest)
             }
             updateAppGroupMountPaths()
+        }
+
+        guard !detachFailed else {
+            cacheMigrationProgress[profileId] = nil
+            return CacheMigrationOutcome(result: .failed(.mountDetachFailed, rolledBack: false), filesMoved: 0, bytesMoved: 0, sameVolume: false)
         }
 
         var progress = CacheMigrationProgress()
@@ -2455,29 +2507,43 @@ final class SyncManager: ObservableObject {
         )
 
         let fs = CacheMigrationFileSystem.production()
+        let cancellationFlag = CacheMigrationCancellationFlag()
 
-        let result: (plan: CacheMigrationPlan?, outcome: CacheMigrationOutcome) = await withCheckedContinuation { continuation in
-            DispatchQueue.global(qos: .utility).async { [weak self] in
-                let runResult = CacheMigrationRunner.migrate(
-                    moving: movingProfile,
-                    allProfiles: allProfiles,
-                    destination: destination,
-                    coMigrate: coMigrate,
-                    fs: fs,
-                    isCancelled: { Task.isCancelled },
-                    onProgress: { filesDone, bytesDone, currentFile in
-                        DispatchQueue.main.async {
-                            guard let self, var p = self.cacheMigrationProgress[profileId] else { return }
-                            p.phase = .moving
-                            p.filesDone = filesDone
-                            p.bytesDone = bytesDone
-                            p.currentFile = currentFile
-                            self.cacheMigrationProgress[profileId] = p
+        let result: (plan: CacheMigrationPlan?, outcome: CacheMigrationOutcome) = await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                DispatchQueue.global(qos: .utility).async { [weak self] in
+                    let runResult = CacheMigrationRunner.migrate(
+                        moving: movingProfile,
+                        allProfiles: allProfiles,
+                        destination: destination,
+                        coMigrate: coMigrate,
+                        fs: fs,
+                        isCancelled: { cancellationFlag.isCancelled },
+                        onPreflight: { preflight in
+                            DispatchQueue.main.async {
+                                guard let self, var p = self.cacheMigrationProgress[profileId] else { return }
+                                p.filesTotal = preflight.totalFiles
+                                p.bytesTotal = preflight.totalBytes
+                                p.sameVolume = preflight.sameVolume
+                                self.cacheMigrationProgress[profileId] = p
+                            }
+                        },
+                        onProgress: { filesDone, bytesDone, currentFile in
+                            DispatchQueue.main.async {
+                                guard let self, var p = self.cacheMigrationProgress[profileId] else { return }
+                                p.phase = .moving
+                                p.filesDone = filesDone
+                                p.bytesDone = bytesDone
+                                p.currentFile = currentFile
+                                self.cacheMigrationProgress[profileId] = p
+                            }
                         }
-                    }
-                )
-                continuation.resume(returning: runResult)
+                    )
+                    continuation.resume(returning: runResult)
+                }
             }
+        } onCancel: {
+            cancellationFlag.markCancelled()
         }
         let plan = result.plan
         let outcome = result.outcome
@@ -2489,6 +2555,23 @@ final class SyncManager: ObservableObject {
 
         switch outcome.result {
         case .completed where CacheMigrationPersistDecision.shouldPersist(outcome):
+            progress.phase = .completed
+            var updated = movingProfile
+            updated.vfsCachePath = destination
+            profileStore.update(updated)
+            if let plan {
+                for id in plan.profileIdsToRewrite where id != profileId {
+                    if var sibling = profileStore.profile(for: id) {
+                        sibling.vfsCachePath = destination
+                        profileStore.update(sibling)
+                    }
+                }
+            }
+        case .preflightRejected(.nothingToMove):
+            // Nothing was cached at the source — there is nothing to lose by
+            // persisting, so the user's directory choice must not be
+            // silently dropped (finding 11). R20 only guards against
+            // persisting an INCOMPLETE cache; an empty one carries no such risk.
             progress.phase = .completed
             var updated = movingProfile
             updated.vfsCachePath = destination
@@ -2525,6 +2608,14 @@ final class SyncManager: ObservableObject {
     private func cacheMigrationOutcomeLabel(_ result: CacheMigrationOutcome.Result) -> String {
         switch result {
         case .completed: return "completed"
+        // `.nothingToMove` is persisted exactly like `.completed` above (see
+        // the switch in `migrateCacheDirectory`) — labeling it "completed"
+        // here too keeps telemetry's success/failure split consistent with
+        // what actually happened to the profile, and lets
+        // `TelemetryService.endCacheMigration`'s span status use a simple
+        // `outcome == "completed"` check instead of re-deriving this same
+        // persist decision a third time (finding 13).
+        case .preflightRejected(.nothingToMove): return "completed"
         case .cancelled: return "cancelled"
         case .failed(let reason, let rolledBack): return rolledBack ? "\(reason.rawValue)_rolled_back" : reason.rawValue
         case .preflightRejected: return "preflight_rejected"
