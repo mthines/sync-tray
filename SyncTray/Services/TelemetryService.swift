@@ -130,6 +130,11 @@ final class TelemetryService {
     private var warmBytesCounter: LongCounterSdk?
     private var externalConfigEditCounter: LongCounterSdk?
     private var cliInvokedCounter: LongCounterSdk?
+    private var cacheMigrationCounter: LongCounterSdk?
+    private var cacheMigrationDurationHistogram: DoubleHistogramMeterSdk?
+    private var cacheMigrationThroughputHistogram: DoubleHistogramMeterSdk?
+    private var cacheMigrationFilesCounter: LongCounterSdk?
+    private var cacheMigrationBytesCounter: LongCounterSdk?
 
     // MARK: - Providers (kept alive for shutdown)
 
@@ -455,6 +460,32 @@ final class TelemetryService {
             .counterBuilder(name: "synctray.cli.invoked")
             .setDescription("Headless synctray CLI invocations, by bounded command verb and ok/error result")
             .setUnit("1")
+            .build()
+
+        cacheMigrationCounter = meter
+            .counterBuilder(name: "synctray.cache.migration.count")
+            .setDescription("Cache-directory migrations by outcome (completed, cancelled, failed, preflight_rejected) and same-volume vs cross-volume")
+            .setUnit("1")
+            .build()
+        cacheMigrationDurationHistogram = meter
+            .histogramBuilder(name: "synctray.cache.migration.duration")
+            .setDescription("Duration of a cache-directory migration run (seconds)")
+            .setUnit("s")
+            .build()
+        cacheMigrationThroughputHistogram = meter
+            .histogramBuilder(name: "synctray.cache.migration.throughput")
+            .setDescription("Average copy throughput of a cross-volume cache-directory migration (MB/s)")
+            .setUnit("MBy/s")
+            .build()
+        cacheMigrationFilesCounter = meter
+            .counterBuilder(name: "synctray.cache.migration.files")
+            .setDescription("Files relocated during a cache-directory migration")
+            .setUnit("1")
+            .build()
+        cacheMigrationBytesCounter = meter
+            .counterBuilder(name: "synctray.cache.migration.bytes")
+            .setDescription("Bytes relocated during a cache-directory migration")
+            .setUnit("By")
             .build()
     }
 
@@ -2062,6 +2093,92 @@ final class TelemetryService {
             span.end()
         }
         let body = outcome == "cancelled" ? "Offline warm cancelled" : "Offline warm completed"
+        emitLog(severity: .info, body: body, attributes: endAttrs, spanContext: token.span?.context)
+    }
+
+    // MARK: - Cache-directory migration
+
+    /// Opaque handle returned by `beginCacheMigration`, carrying the span and
+    /// the low-cardinality label for the end-of-run metrics. NEVER carries a
+    /// path, a remote name, or any path-valued field — only the profile id
+    /// and its (user-chosen, low-cardinality) display name, same as `WarmSpanToken`.
+    struct CacheMigrationSpanToken {
+        let span: (any Span)?
+        let profileName: String
+    }
+
+    /// Start a `synctray cache_migration` span. No-op (returns an empty
+    /// token) when telemetry is disabled.
+    func beginCacheMigration(profileId: UUID, profileName: String) -> CacheMigrationSpanToken {
+        guard SyncTraySettings.telemetryEnabled else {
+            return CacheMigrationSpanToken(span: nil, profileName: profileName)
+        }
+        ensureSetup()
+
+        let attrs: [String: AttributeValue] = [
+            "synctray.profile.id": .string(profileId.uuidString),
+            "synctray.profile.name": .string(profileName),
+        ]
+
+        let span = tracer?.spanBuilder(spanName: "synctray cache_migration")
+            .setSpanKind(spanKind: .internal)
+            .startSpan()
+        if let span {
+            for (key, value) in attrs { span.setAttribute(key: key, value: value) }
+        }
+
+        emitLog(severity: .info, body: "Cache migration started", attributes: attrs, spanContext: span?.context)
+        return CacheMigrationSpanToken(span: span, profileName: profileName)
+    }
+
+    /// End the cache-migration span and record duration / throughput / file /
+    /// byte metrics plus the outcome counter.
+    ///
+    /// - Parameter outcome: `"completed"`, `"cancelled"`, a
+    ///   `CacheMigrationFailure` raw value (optionally `_rolled_back`
+    ///   suffixed), or `"preflight_rejected"`.
+    func endCacheMigration(
+        _ token: CacheMigrationSpanToken,
+        filesMoved: Int,
+        bytesMoved: Int64,
+        durationSeconds: Double,
+        sameVolume: Bool,
+        outcome: String
+    ) {
+        guard SyncTraySettings.telemetryEnabled else { return }
+
+        // Same-volume relocation is a rename, not a byte-for-byte copy — a
+        // throughput figure for it would be meaningless, so it's left at 0.
+        let throughputMBps = (durationSeconds > 0 && !sameVolume)
+            ? (Double(bytesMoved) / durationSeconds) / (1024 * 1024)
+            : 0
+
+        let labels: [String: AttributeValue] = [
+            "synctray.profile.name": .string(token.profileName),
+            "cache_migration.outcome": .string(outcome),
+            "cache_migration.same_volume": .bool(sameVolume),
+        ]
+        cacheMigrationCounter?.add(value: 1, attribute: labels)
+        cacheMigrationDurationHistogram?.record(value: durationSeconds, attributes: labels)
+        cacheMigrationThroughputHistogram?.record(value: throughputMBps, attributes: labels)
+        cacheMigrationFilesCounter?.add(value: filesMoved, attribute: labels)
+        cacheMigrationBytesCounter?.add(value: Int(bytesMoved), attribute: labels)
+
+        let endAttrs: [String: AttributeValue] = [
+            "synctray.profile.name": .string(token.profileName),
+            "cache_migration.outcome": .string(outcome),
+            "cache_migration.same_volume": .bool(sameVolume),
+            "cache_migration.files": .int(filesMoved),
+            "cache_migration.bytes": .int(Int(bytesMoved)),
+            "cache_migration.duration_seconds": .double(durationSeconds),
+            "cache_migration.throughput_mbps": .double(throughputMBps),
+        ]
+        if let span = token.span {
+            for (key, value) in endAttrs { span.setAttribute(key: key, value: value) }
+            span.status = .ok
+            span.end()
+        }
+        let body = outcome == "completed" ? "Cache migration completed" : "Cache migration ended"
         emitLog(severity: .info, body: body, attributes: endAttrs, spanContext: token.span?.context)
     }
 

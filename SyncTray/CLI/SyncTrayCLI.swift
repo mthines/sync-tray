@@ -18,7 +18,15 @@ enum CLICommand: Equatable {
     case profileCreate(CreateSource)
     case profileDelete(String)
     case profileSetEnabled(target: String, enabled: Bool)
+    case cacheMove(target: String, destination: String, includeOverlapping: Bool)
     case help
+}
+
+/// Outcome of `CLIEnvironment.migrateCache`, mapped to `runCacheMove`'s exit code.
+enum CacheMigrationCLIResult: Equatable {
+    case completed(files: Int, bytes: Int64, sameVolume: Bool)
+    case rejected(String)
+    case failed(String)
 }
 
 /// A `parse` failure — carries the usage message printed to stderr.
@@ -68,6 +76,11 @@ struct CLIEnvironment {
     /// Run the shared sync script against a profile's derived config path,
     /// blocking until it exits. Returns the script's exit code.
     var runSyncScript: (_ configPath: String) -> Int32
+    /// Move a Stream profile's VFS cache (content + metadata) to
+    /// `destination`, blocking until it finishes. `includeOverlapping`
+    /// authorizes co-migrating an overlapping sibling profile (R28's
+    /// non-interactive refusal is enforced by the caller of this closure).
+    var migrateCache: (_ profile: SyncProfile, _ destination: String, _ includeOverlapping: Bool) -> CacheMigrationCLIResult
     /// Read all of stdin (for `profile create -`). `nil` on read failure.
     var readStdin: () -> String?
     /// Read a file's contents as UTF-8 text. `nil` if missing/unreadable.
@@ -110,7 +123,9 @@ enum SyncTrayCLI {
       profile delete <name|id>     Delete a profile and its launchd agent
 
     Operate:
-      sync <name|id>               Run a sync now and wait for it to finish
+      sync <name|id>                          Run a sync now and wait for it to finish
+      cache move <name|id> --to <path> [--include-overlapping]
+                                              Move a Stream profile's VFS cache and wait for it to finish
 
     Profiles author JSON against schema/profile.schema.json under the config
     directory; the same file an agent can drop in or edit directly.
@@ -168,6 +183,10 @@ enum SyncTrayCLI {
             let knownSubs: Set<String> = ["create", "delete", "enable", "disable", "list"]
             return knownSubs.contains(sub) ? "profile-\(sub)" : "(other)"
         }
+        if first == "cache" {
+            let sub = argv.dropFirst().first(where: { !$0.hasPrefix("-") }) ?? ""
+            return sub == "move" ? "cache-move" : "(other)"
+        }
         return known.contains(first) ? first : "(other)"
     }
 
@@ -213,6 +232,9 @@ enum SyncTrayCLI {
 
         case "profile":
             return parseProfile(rest)
+
+        case "cache":
+            return parseCache(rest)
 
         case "help", "-h", "--help":
             return .success(.help)
@@ -260,6 +282,24 @@ enum SyncTrayCLI {
         }
     }
 
+    /// Parse the `cache move` group.
+    private static func parseCache(_ rest: [String]) -> Result<CLICommand, CLIUsageError> {
+        let usageError = CLIUsageError(message: "usage: synctray cache move <name|shortId> --to <path> [--include-overlapping]")
+        guard rest.first == "move" else {
+            return .failure(usageError)
+        }
+        let args = Array(rest.dropFirst())
+        guard let target = args.first(where: { !$0.hasPrefix("--") }) else {
+            return .failure(usageError)
+        }
+        guard let toIdx = args.firstIndex(of: "--to"), toIdx + 1 < args.count else {
+            return .failure(usageError)
+        }
+        let destination = args[toIdx + 1]
+        let includeOverlapping = args.contains("--include-overlapping")
+        return .success(.cacheMove(target: target, destination: destination, includeOverlapping: includeOverlapping))
+    }
+
     /// Parse + dispatch, printing usage via `env.stderr` on a parse failure.
     /// The single entry point both `dispatch` (real env) and the self-test
     /// (fake env) exercise for the unknown/absent-subcommand case.
@@ -295,6 +335,8 @@ enum SyncTrayCLI {
             return runProfileDelete(target, env: env)
         case .profileSetEnabled(let target, let enabled):
             return runProfileSetEnabled(target, enabled: enabled, env: env)
+        case .cacheMove(let target, let destination, let includeOverlapping):
+            return runCacheMove(target, destination: destination, includeOverlapping: includeOverlapping, env: env)
         case .help:
             env.stdout(Self.usage + "\n")
             return 0
@@ -657,6 +699,32 @@ enum SyncTrayCLI {
         env.stdout("\(enabled ? "enabled" : "disabled") \(profile.name) (\(profile.shortId))\n")
         return 0
     }
+
+    // MARK: - cache move
+
+    private static func runCacheMove(_ target: String, destination: String, includeOverlapping: Bool, env: CLIEnvironment) -> Int32 {
+        guard let profile = resolveProfile(target, in: env.readProfiles()) else {
+            env.stderr("error: no profile matches \"\(target)\"\n")
+            return 1
+        }
+        guard profile.isMountMode else {
+            env.stderr("error: \"\(profile.name)\" is not a Stream (mount) profile\n")
+            return 1
+        }
+
+        switch env.migrateCache(profile, destination, includeOverlapping) {
+        case .completed(let files, let bytes, let sameVolume):
+            let size = ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)
+            env.stdout("moved \(files) file(s), \(size)" + (sameVolume ? " (same volume)\n" : "\n"))
+            return 0
+        case .rejected(let reason):
+            env.stderr("error: \(reason)\n")
+            return 1
+        case .failed(let reason):
+            env.stderr("error: \(reason)\n")
+            return 1
+        }
+    }
 }
 
 // MARK: - Production environment
@@ -698,6 +766,9 @@ extension CLIEnvironment {
                 )
                 return exit
             },
+            migrateCache: { profile, destination, includeOverlapping in
+                CLIEnvironment.migrateCacheProcess(profile: profile, destination: destination, includeOverlapping: includeOverlapping)
+            },
             readStdin: {
                 let data = FileHandle.standardInput.readDataToEndOfFile()
                 return String(data: data, encoding: .utf8)
@@ -707,6 +778,72 @@ extension CLIEnvironment {
             stderr: { FileHandle.standardError.write(Data($0.utf8)) },
             now: { Date() }
         )
+    }
+
+    /// Real implementation of `migrateCache`: refuses an unresolved overlap
+    /// unless `includeOverlapping`, detaches/reinstalls around the move (the
+    /// SAME `SyncSetupService.uninstall`/`install` pair the app uses), then
+    /// persists the moved profile(s) via `ProfileStore.writeProfileFile` —
+    /// the SAME writer the app and the other CLI mutating commands use, so
+    /// the on-disk file stays byte-for-byte consistent either way.
+    fileprivate static func migrateCacheProcess(
+        profile: SyncProfile,
+        destination: String,
+        includeOverlapping: Bool
+    ) -> CacheMigrationCLIResult {
+        let allProfiles = ProfileStore.profilesOnDisk(in: SyncProfile.configDirectory)
+
+        var overlapIds: Set<UUID> = []
+        if case .failure(.unresolvedOverlap(let ids)) = CacheMigrationPlanner.plan(
+            moving: profile, allProfiles: allProfiles, to: destination, coMigrate: []
+        ) {
+            overlapIds = Set(ids)
+        }
+        guard includeOverlapping || overlapIds.isEmpty else {
+            let names = allProfiles.filter { overlapIds.contains($0.id) }.map { $0.name }.joined(separator: ", ")
+            return .rejected("cache directory is shared with: \(names) — pass --include-overlapping to move them too")
+        }
+        let coMigrate = includeOverlapping ? overlapIds : []
+
+        let wasInstalled = SyncSetupService.shared.isInstalled(profile: profile)
+        if wasInstalled {
+            try? SyncSetupService.shared.uninstall(profile: profile)
+        }
+
+        let fs = CacheMigrationFileSystem.production()
+        let result = CacheMigrationRunner.migrate(
+            moving: profile, allProfiles: allProfiles, destination: destination, coMigrate: coMigrate, fs: fs
+        )
+
+        let finalResult: CacheMigrationCLIResult
+        switch result.outcome.result {
+        case .completed:
+            var updated = profile
+            updated.vfsCachePath = destination
+            _ = ProfileStore.writeProfileFile(updated, in: SyncProfile.configDirectory)
+            if let plan = result.plan {
+                for id in plan.profileIdsToRewrite where id != profile.id {
+                    if var sibling = allProfiles.first(where: { $0.id == id }) {
+                        sibling.vfsCachePath = destination
+                        _ = ProfileStore.writeProfileFile(sibling, in: SyncProfile.configDirectory)
+                    }
+                }
+            }
+            finalResult = .completed(files: result.outcome.filesMoved, bytes: result.outcome.bytesMoved, sameVolume: result.outcome.sameVolume)
+        case .cancelled:
+            finalResult = .failed("cancelled")
+        case .failed(let reason, _):
+            finalResult = .failed(reason.rawValue)
+        case .preflightRejected(let rejection):
+            finalResult = .rejected("\(rejection)")
+        }
+
+        if wasInstalled {
+            let latest = ProfileStore.profilesOnDisk(in: SyncProfile.configDirectory).first(where: { $0.id == profile.id }) ?? profile
+            try? SyncSetupService.shared.install(profile: latest)
+        }
+
+        return finalResult
     }
 
     /// Run rclone at its located path with a hard process-level watchdog —

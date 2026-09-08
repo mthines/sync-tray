@@ -37,15 +37,25 @@ final class VFSCacheService {
 
     // MARK: - Cache Directory Scanning
 
+    /// Single home for the on-disk VFS cache subtree key: the remote name with
+    /// its trailing colon stripped, joined with the profile's remote path.
+    /// `cacheDirectory(for:)` below and `CacheMigrationPlanner` BOTH call this,
+    /// so they cannot disagree about which subtree a profile owns (a drift
+    /// there would relocate the wrong subtree during a cache move).
+    nonisolated static func cacheRelativePath(for profile: SyncProfile) -> String {
+        let remoteName = profile.rcloneRemote.replacingOccurrences(of: ":", with: "")
+        return profile.remotePath.isEmpty ? remoteName : "\(remoteName)/\(profile.remotePath)"
+    }
+
     /// Get the VFS cache directory path for a profile's remote
     func cacheDirectory(for profile: SyncProfile) -> String? {
-        let baseCachePath = profile.vfsCachePath
+        let baseCachePath = (profile.vfsCachePath as NSString).expandingTildeInPath
         let fm = FileManager.default
         guard fm.fileExists(atPath: baseCachePath) else { return nil }
 
         // rclone stores VFS cache in: {cache-dir}/vfs/{remote-name}/
         // The remote name has the colon stripped
-        let vfsDir = (baseCachePath as NSString).appendingPathComponent("vfs")
+        let vfsDir = (baseCachePath as NSString).appendingPathComponent(CacheTreeKind.content.rawValue)
         guard fm.fileExists(atPath: vfsDir) else { return nil }
 
         // Try to find the remote's cache directory
@@ -55,7 +65,7 @@ final class VFSCacheService {
         if fm.fileExists(atPath: remoteDir) {
             // If remotePath is set, check subdirectory
             if !profile.remotePath.isEmpty {
-                let fullPath = (remoteDir as NSString).appendingPathComponent(profile.remotePath)
+                let fullPath = (vfsDir as NSString).appendingPathComponent(Self.cacheRelativePath(for: profile))
                 if fm.fileExists(atPath: fullPath) {
                     return fullPath
                 }
@@ -64,6 +74,19 @@ final class VFSCacheService {
         }
 
         return nil
+    }
+
+    /// `{root}/vfsMeta/<key>` — the sibling of `cacheDirectory(for:)`. Under
+    /// `--vfs-cache-mode full` this mirror tree stores each cached file's
+    /// downloaded byte-range list; relocating `vfs` without it makes rclone
+    /// treat the cache as unpopulated and re-download everything.
+    func metaCacheDirectory(for profile: SyncProfile) -> String? {
+        let baseCachePath = (profile.vfsCachePath as NSString).expandingTildeInPath
+        let fm = FileManager.default
+        guard fm.fileExists(atPath: baseCachePath) else { return nil }
+        let metaDir = (baseCachePath as NSString).appendingPathComponent(CacheTreeKind.meta.rawValue)
+        let fullPath = (metaDir as NSString).appendingPathComponent(Self.cacheRelativePath(for: profile))
+        return fm.fileExists(atPath: fullPath) ? fullPath : nil
     }
 
     /// Ask the running mount for the authoritative on-disk cache location and totals via

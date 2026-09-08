@@ -130,6 +130,61 @@ extension SyncManager {
     }
 }
 
+/// What a Save that changed a Stream profile's Cache Directory must ask the
+/// user. Pure — no I/O.
+enum CachePathChangeIntent: Equatable {
+    case none
+    case promptMove(CacheMovePrompt)
+}
+
+struct CacheMovePrompt: Equatable {
+    let profileId: UUID
+    let sourceRoot: String
+    let destinationRoot: String
+    /// Other mount-mode profiles sharing the SAME bytes on disk (nested
+    /// either direction, or an identical key) — declining to co-migrate one
+    /// of these costs it real cached data, so the prompt names them.
+    let overlappingProfileIds: [UUID]
+    /// Other mount-mode profiles that merely share the cache ROOT — safe to
+    /// leave behind, offered as an independent, optional co-migration (R14).
+    let sameRootProfileIds: [UUID]
+}
+
+extension SyncManager {
+    /// Decide what a Save that changed a Stream profile's Cache Directory
+    /// should ask the user — beside `reconcileAction`, the SAME
+    /// pure-decision idiom. `nonisolated` because the headless CLI's
+    /// `cache move` overlap check also needs to reason about this without a
+    /// MainActor context (`@MainActor` isolation is inherited by `static`
+    /// members unless explicitly opted out).
+    ///
+    /// Returns `.none` when the path didn't actually change, or the profile
+    /// isn't mount mode (only Stream profiles have a VFS cache to move).
+    nonisolated static func cachePathChangeIntent(
+        from current: SyncProfile,
+        to updated: SyncProfile,
+        allProfiles: [SyncProfile]
+    ) -> CachePathChangeIntent {
+        guard updated.isMountMode else { return .none }
+
+        let sourceRoot = CacheMigrationPlanner.normalizeRoot(current.vfsCachePath)
+        let destinationRoot = CacheMigrationPlanner.normalizeRoot(updated.vfsCachePath)
+        guard sourceRoot != destinationRoot else { return .none }
+
+        let (overlapping, sameRoot) = CacheMigrationPlanner.classifySiblings(
+            of: current, sourceRoot: sourceRoot, allProfiles: allProfiles
+        )
+
+        return .promptMove(CacheMovePrompt(
+            profileId: current.id,
+            sourceRoot: sourceRoot,
+            destinationRoot: destinationRoot,
+            overlappingProfileIds: overlapping.map { $0.id },
+            sameRootProfileIds: sameRoot.map { $0.id }
+        ))
+    }
+}
+
 /// Applies a `settings.json` edit, ISOLATING the launch-at-login
 /// (`SMAppService`) call from every other safe-key application so a thrown
 /// error there can never corrupt state already applied by this reconcile —
