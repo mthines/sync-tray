@@ -864,12 +864,12 @@ enum ConfigSelfTest {
             uninstallProfile: uninstallProfile,
             deleteProfileFile: deleteProfileFile,
             runSyncScript: runSyncScript,
+            migrateCache: migrateCache,
             readStdin: readStdin,
             readFile: readFile,
             stdout: stdout,
             stderr: stderr,
-            now: { Date() },
-            migrateCache: migrateCache
+            now: { Date() }
         )
     }
 

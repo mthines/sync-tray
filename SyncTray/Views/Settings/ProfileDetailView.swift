@@ -127,6 +127,10 @@ struct ProfileDetailView: View {
     @State private var pendingLocalSyncPath: String = ""
     @State private var pendingLocalSyncItemCount: Int = 0
 
+    // Cache-directory move prompt (Save changed Cache Directory on a Stream profile)
+    @State private var cacheMovePrompt: CacheMovePrompt?
+    @State private var showingCacheMoveSheet: Bool = false
+
     private let setupService = SyncSetupService.shared
 
     // MARK: - Computed Properties
@@ -368,6 +372,18 @@ struct ProfileDetailView: View {
         .sheet(item: $editRemoteTarget) { target in
             AddRemoteSheet(editing: target.remoteName) { _ in
                 loadRcloneRemotes()
+            }
+        }
+        .sheet(isPresented: $showingCacheMoveSheet, onDismiss: { cacheMovePrompt = nil }) {
+            if let prompt = cacheMovePrompt {
+                CacheMoveSheet(
+                    mode: .pendingSave(prompt: prompt),
+                    profileStore: profileStore,
+                    syncManager: syncManager,
+                    onLeaveBehind: { finalizeCachePathChange(prompt: prompt, deleteOldCache: false) },
+                    onStartFresh: { finalizeCachePathChange(prompt: prompt, deleteOldCache: true) },
+                    onDismiss: { showingCacheMoveSheet = false }
+                )
             }
         }
         .alert("Delete Remote?", isPresented: $showingDeleteRemoteConfirm) {
@@ -2033,6 +2049,25 @@ struct ProfileDetailView: View {
         let updatedProfile = buildProfileFromForm()
         let currentProfile = profile
 
+        // A Stream profile whose Cache Directory changed needs a decision about
+        // the files already cached at the old location before anything reinstalls —
+        // hand off to the move sheet instead of saving vfsCachePath immediately.
+        let cacheIntent = SyncManager.cachePathChangeIntent(
+            from: currentProfile, to: updatedProfile, allProfiles: profileStore.profiles
+        )
+        if case .promptMove(let prompt) = cacheIntent {
+            // Persist every OTHER field change now, holding vfsCachePath at its
+            // CURRENT value — the sheet (Move / Leave behind / Start fresh)
+            // performs the final vfsCachePath write and any reinstall.
+            var deferredProfile = updatedProfile
+            deferredProfile.vfsCachePath = currentProfile.vfsCachePath
+            profileStore.update(deferredProfile)
+            syncManager.clearError(for: profile.id)
+            cacheMovePrompt = prompt
+            showingCacheMoveSheet = true
+            return
+        }
+
         // Delegates to the SAME delta helper `applyExternalProfileEdit` uses,
         // so the Save button and an external file edit can never drift on
         // "what work does this change need" (see plan Decisions).
@@ -2047,6 +2082,45 @@ struct ProfileDetailView: View {
         // Only reinstall if sync-related settings changed
         if needsReinstall {
             reinstallSync()
+        }
+    }
+
+    /// "Leave them behind" / "Start fresh" — persist the NEW `vfsCachePath`
+    /// (no move engine run) and reinstall. "Move existing cached files" does
+    /// NOT come through here: `CacheMoveSheet` calls
+    /// `SyncManager.startCacheMigration`, whose own orchestration already
+    /// uninstalls, moves, persists `vfsCachePath` on success, and reinstalls
+    /// on every exit path — a second reinstall here would be redundant.
+    private func finalizeCachePathChange(prompt: CacheMovePrompt, deleteOldCache: Bool) {
+        guard var latest = profileStore.profile(for: prompt.profileId) else { return }
+        if deleteOldCache {
+            deleteOldCacheSubtree(of: latest)
+        }
+        latest.vfsCachePath = prompt.destinationRoot
+        profileStore.update(latest)
+        if isInstalled {
+            reinstallSync()
+        }
+        showingCacheMoveSheet = false
+        cacheMovePrompt = nil
+    }
+
+    /// "Start fresh" — delete BOTH the `vfs` and `vfsMeta` subtree at the
+    /// profile's OLD cache root. Deliberately separate from
+    /// `VFSCacheService.clearCache` (which only clears `vfs` — a known,
+    /// recorded-out-of-scope gap, see plan Out of Scope) so the freed space
+    /// is fully accounted for. Values are captured on the main thread first;
+    /// the actual removal runs off it per CLAUDE.md Critical Rule 1, since a
+    /// populated cache can be many gigabytes.
+    private func deleteOldCacheSubtree(of profile: SyncProfile) {
+        let root = CacheMigrationPlanner.normalizeRoot(profile.vfsCachePath)
+        let key = VFSCacheService.cacheRelativePath(for: profile)
+        DispatchQueue.global(qos: .utility).async {
+            let fm = FileManager.default
+            for kind in CacheTreeKind.allCases {
+                let path = "\(root)/\(kind.rawValue)/\(key)"
+                try? fm.removeItem(atPath: path)
+            }
         }
     }
 
