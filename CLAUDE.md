@@ -111,6 +111,70 @@ sudo cp rclone /usr/local/bin/
 sudo chmod +x /usr/local/bin/rclone
 ```
 
+#### Cache Directory Migration
+
+`rclone mount`/`nfsmount` keeps **two fixed-name sibling trees** under
+`--cache-dir` (`vfsCachePath`): `{root}/vfs/{key}` holds the cached file
+**data**, and `{root}/vfsMeta/{key}` is a mirror tree of per-file JSON
+sidecars — under `--vfs-cache-mode full` (SyncTray's default) this includes
+the **downloaded byte-range list**, so `vfsMeta` is load-bearing, not
+incidental: relocating `vfs` without it makes rclone treat the cache as
+unpopulated and re-download everything. `{key}` is the remote name (colon
+stripped) joined with the remote path, e.g. `synology/Kaiju/KAIJU`; the
+single home for deriving it is `VFSCacheService.cacheRelativePath(for:)`,
+called by both `cacheDirectory(for:)` and `CacheMigrationPlanner` so they
+cannot disagree about which subtree a profile owns.
+
+Changing a Stream profile's Cache Directory only re-points rclone by
+default — the already-downloaded bytes at the old location are abandoned.
+**Cache Directory Migration** physically relocates both trees (copy →
+verify byte size → delete per file, with a same-volume atomic-rename fast
+path, a free-space preflight, live progress, cancellation, resume, and
+auto-rollback on an integrity failure) so a warm cache survives a directory
+change. Two profiles can address the **same on-disk bytes** when one
+remote path nests inside another's (e.g. `Kaiju/KAIJU` and
+`Kaiju/KAIJU/Reaper` sharing a cache root) — `CacheMigrationPlanner`
+classifies siblings into **overlapping** (same bytes; an unresolved
+overlap rejects the move) vs merely **same-root** (disjoint bytes; offered
+as an optional, separate co-migration).
+
+Three entry points, all going through `SyncManager.startCacheMigration` /
+`migrateCacheDirectory`:
+
+- **Save-time prompt** — changing Cache Directory and pressing Save in
+  `ProfileDetailView` opens `CacheMoveSheet`, offering *Move existing
+  cached files* / *Leave them behind* / *Start fresh (clear the old
+  cache)*; the move (with progress and cancel) runs BEFORE the profile
+  remounts. `SyncManager.cachePathChangeIntent` (`ConfigReconciler.swift`,
+  `nonisolated static` — the headless CLI reasons about the same overlap
+  classification without a MainActor context) decides whether Save needs
+  to prompt at all.
+- **Offline Files "Move Cache…"** — `OfflineFilesSection` opens the same
+  sheet in destination-picker mode, without editing the profile form.
+- **CLI** — `synctray cache move <name|shortId> --to <path>
+  [--include-overlapping]`, blocking until done; refuses an unresolved
+  overlap unless `--include-overlapping` is passed (there's nobody to
+  prompt non-interactively).
+
+The orchestration (`SyncManager.migrateCacheDirectory`) cancels any
+in-flight offline warm for the affected profiles first (a warm actively
+reads through the mount — racing a move is a corruption path), uses the
+existing `SyncSetupService.uninstall` graceful volume detach before moving,
+runs the engine off the main actor, persists the new `vfsCachePath`
+**only** on a `.completed` outcome (so a `.profile.json` never names an
+incomplete cache), then re-installs on **every** exit path — completed,
+failed, cancelled, or a thrown error — and re-pushes the FinderSync App
+Group data. An external `~/.config/synctray/profiles/*.profile.json` edit
+of `vfsCachePath` deliberately does NOT trigger a migration (there's no one
+to prompt and a multi-hour unattended relocation from a file write would be
+a hostile surprise) — it keeps today's re-point-only `.reinstall` behavior.
+
+New source files: `SyncTray/Services/CacheMigrationPlanner.swift` (pure —
+subtree/overlap/exclusion planning, no I/O), `SyncTray/Services/CacheMigrationService.swift`
+(the injected-filesystem copy → verify → delete engine), `SyncTray/Models/CacheMigrationProgress.swift`
+(published per-profile progress), and `SyncTray/Views/Settings/CacheMoveSheet.swift`
+(the shared sheet for both UI entry points).
+
 ### How It Works
 1. User configures a profile: local path, rclone remote, and sync interval
 2. SyncTray generates a shell script and launchd plist for scheduled syncs
@@ -242,6 +306,7 @@ between files via `try Task.checkCancellation()`.
 | `SyncState.swift` | Sync state enum, progress struct, file change model, `ActiveTransport`, `SyncLogPatterns` for log parsing |
 | `RcloneLogEntry.swift` | JSON models for parsing rclone `--use-json-log` output |
 | `Settings.swift` | Global app settings (debug logging toggle, auto-fix sync issues toggle) |
+| `CacheMigrationProgress.swift` | Published per-profile progress for a cache-directory move (`CacheMigrationProgress`, shared `TransferFormat` byte/rate/elapsed helpers) |
 
 ### Services/
 
@@ -260,6 +325,8 @@ between files via `try Task.checkCancellation()`.
 | `ConfigSelfTest.swift` | `#if DEBUG` host self-test suite (`SyncTray --self-test`) — round-trip (incl. `warmExcludePatterns`), migration + migration-integrity, reconcile-delta, warm-reconcile-trigger, self-write, isolated-login, external-create, and CLI assertions |
 | `NotificationService.swift` | Batched macOS notifications with action support |
 | `TelemetryService.swift` | Opt-in OTel telemetry (traces, metrics, logs) via OTLP/HTTP |
+| `CacheMigrationPlanner.swift` | Pure cache-directory-move planning — `CacheTreeKind` (`vfs`/`vfsMeta`), subtree/overlap/exclusion resolution, no I/O |
+| `CacheMigrationService.swift` | The cache-move engine — injected `CacheMigrationFileSystem`, free-space preflight, copy → verify → delete per file with a same-volume rename fast path, cancellation, resume, rollback |
 
 ### CLI/
 
@@ -426,6 +493,7 @@ isn't SyncTray's own.
 | Command | Purpose |
 |---------|---------|
 | `synctray sync <name\|shortId>` | Run one sync now and BLOCK until it finishes, returning the script's exit code — exactly what the app's `triggerManualSync` runs (`bash <sharedScript> <configPath>`), lock-file-guarded against a concurrent scheduled run. Refuses a Stream (mount) profile (use `profile enable` to mount). |
+| `synctray cache move <name\|shortId> --to <path> [--include-overlapping]` | Relocate a Stream profile's rclone VFS cache (both the `vfs` content tree and the `vfsMeta` byte-range-list tree) to `<path>` and BLOCK until it finishes, returning non-zero on rejection or failure. Detaches/reinstalls around the move like the app does. Refuses a non-mount profile, and refuses an overlapping sibling profile (same on-disk bytes) unless `--include-overlapping` is passed — there's nobody to prompt non-interactively. See "Cache Directory Migration" above. |
 
 `<name|shortId>` resolution tries an exact `shortId` match first, then a
 case-insensitive `name` match; an unmatched (or ambiguous) target exits
@@ -817,3 +885,5 @@ Priority: process env vars > `~/.config/synctray/.env` > Info.plist. Key vars: `
 | `~/Library/LaunchAgents/com.synctray.sync.{shortId}.plist` | launchd schedule |
 | `~/.local/log/synctray-sync-{shortId}.log` | Sync logs |
 | `/tmp/synctray-sync-{shortId}.lock` | Lock file (prevents concurrent syncs) |
+| `{vfsCachePath}/vfs/{remote}/{path}/…` | Mount mode only — VFS cached file **data** |
+| `{vfsCachePath}/vfsMeta/{remote}/{path}/…` | Mount mode only — VFS metadata sidecars, including the `--vfs-cache-mode full` downloaded byte-range list. Load-bearing for Cache Directory Migration: moving `vfs` without `vfsMeta` makes rclone re-download everything. |
