@@ -130,6 +130,15 @@ struct ProfileDetailView: View {
     // Cache-directory move prompt (Save changed Cache Directory on a Stream profile)
     @State private var cacheMovePrompt: CacheMovePrompt?
     @State private var showingCacheMoveSheet: Bool = false
+    // Whether the fields `saveProfile()` deferred-persisted alongside the
+    // cache-path change (everything except vfsCachePath) still need a
+    // reinstall to take effect. Set when the prompt is opened; cleared by
+    // whichever path actually performs that reinstall (an explicit
+    // Leave-behind/Start-fresh choice in `finalizeCachePathChange`, or a
+    // move actually starting in `CacheMoveSheet`) so the sheet's
+    // `onDismiss` only reinstalls for a bare dismissal (Cancel/close) that
+    // leaves those other fields un-applied (finding 12).
+    @State private var cacheMoveOtherFieldsNeedReinstall = false
 
     private let setupService = SyncSetupService.shared
 
@@ -374,7 +383,18 @@ struct ProfileDetailView: View {
                 loadRcloneRemotes()
             }
         }
-        .sheet(isPresented: $showingCacheMoveSheet, onDismiss: { cacheMovePrompt = nil }) {
+        .sheet(isPresented: $showingCacheMoveSheet, onDismiss: {
+            // A bare dismissal (Cancel / close box) never ran Move, Leave
+            // behind, or Start fresh — the other-field changes `saveProfile()`
+            // deferred-persisted are still sitting un-applied on disk, so
+            // apply them here. Any path that DID resolve the prompt already
+            // cleared the flag itself, making this a no-op then (finding 12).
+            if cacheMoveOtherFieldsNeedReinstall {
+                reinstallSync()
+                cacheMoveOtherFieldsNeedReinstall = false
+            }
+            cacheMovePrompt = nil
+        }) {
             if let prompt = cacheMovePrompt {
                 CacheMoveSheet(
                     mode: .pendingSave(prompt: prompt),
@@ -382,6 +402,7 @@ struct ProfileDetailView: View {
                     syncManager: syncManager,
                     onLeaveBehind: { finalizeCachePathChange(prompt: prompt, deleteOldCache: false) },
                     onStartFresh: { finalizeCachePathChange(prompt: prompt, deleteOldCache: true) },
+                    onMoveStarted: { cacheMoveOtherFieldsNeedReinstall = false },
                     onDismiss: { showingCacheMoveSheet = false }
                 )
             }
@@ -2061,9 +2082,17 @@ struct ProfileDetailView: View {
             // performs the final vfsCachePath write and any reinstall.
             var deferredProfile = updatedProfile
             deferredProfile.vfsCachePath = currentProfile.vfsCachePath
+            // Whether those deferred (non-cache-path) fields actually need a
+            // reinstall to take effect, computed against the SAME delta
+            // helper used below — if the sheet is simply dismissed without
+            // resolving the cache-path change (Cancel), `onDismiss` still
+            // needs to apply them (finding 12).
+            let deferredNeedsReinstall = isInstalled
+                && SyncManager.reconcileAction(from: currentProfile, to: deferredProfile) == .reinstall
             profileStore.update(deferredProfile)
             syncManager.clearError(for: profile.id)
             cacheMovePrompt = prompt
+            cacheMoveOtherFieldsNeedReinstall = deferredNeedsReinstall
             showingCacheMoveSheet = true
             return
         }
@@ -2094,32 +2123,89 @@ struct ProfileDetailView: View {
     private func finalizeCachePathChange(prompt: CacheMovePrompt, deleteOldCache: Bool) {
         guard var latest = profileStore.profile(for: prompt.profileId) else { return }
         if deleteOldCache {
-            deleteOldCacheSubtree(of: latest)
+            deleteOldCacheSubtree(of: latest, excluding: prompt.overlappingProfileIds)
         }
         latest.vfsCachePath = prompt.destinationRoot
         profileStore.update(latest)
         if isInstalled {
             reinstallSync()
         }
+        // This reinstall (or the no-op fallthrough below when `!isInstalled`)
+        // already applies BOTH the cache-path edit AND every other field
+        // change `saveProfile()` deferred-persisted before opening this
+        // sheet — clear the flag so the sheet's `onDismiss` doesn't run a
+        // second, redundant reinstall for those same other fields (finding 12).
+        cacheMoveOtherFieldsNeedReinstall = false
         showingCacheMoveSheet = false
         cacheMovePrompt = nil
     }
 
     /// "Start fresh" — delete BOTH the `vfs` and `vfsMeta` subtree at the
-    /// profile's OLD cache root. Deliberately separate from
-    /// `VFSCacheService.clearCache` (which only clears `vfs` — a known,
-    /// recorded-out-of-scope gap, see plan Out of Scope) so the freed space
-    /// is fully accounted for. Values are captured on the main thread first;
-    /// the actual removal runs off it per CLAUDE.md Critical Rule 1, since a
-    /// populated cache can be many gigabytes.
-    private func deleteOldCacheSubtree(of profile: SyncProfile) {
+    /// profile's OLD cache root, EXCLUDING any overlapping sibling's nested
+    /// subtree — an overlapping profile addresses the SAME bytes on disk
+    /// (R15/R28), so a blanket delete of the moving profile's whole subtree
+    /// would also destroy that sibling's entire cache when the sibling is
+    /// nested inside it (finding 3). When the moving profile's OWN key is
+    /// nested inside an overlapping sibling's (the reverse direction),
+    /// nothing is deleted at all — the whole subtree is shared territory.
+    /// Deliberately separate from `VFSCacheService.clearCache` (which only
+    /// clears `vfs` — a known, recorded-out-of-scope gap, see plan Out of
+    /// Scope) so the freed space is fully accounted for. Values are captured
+    /// on the main thread first; the actual removal runs off it per
+    /// CLAUDE.md Critical Rule 1, since a populated cache can be many
+    /// gigabytes.
+    private func deleteOldCacheSubtree(of profile: SyncProfile, excluding overlappingIds: [UUID]) {
         let root = CacheMigrationPlanner.normalizeRoot(profile.vfsCachePath)
         let key = VFSCacheService.cacheRelativePath(for: profile)
+        let overlappingKeys: [String] = overlappingIds.compactMap { id in
+            profileStore.profile(for: id).map { VFSCacheService.cacheRelativePath(for: $0) }
+        }
+
+        // This profile's own key is nested inside (or equal to) an
+        // overlapping sibling's key — the WHOLE subtree at `key` is that
+        // sibling's territory too. Deleting any of it costs the sibling
+        // real cached data, so delete nothing.
+        guard !overlappingKeys.contains(where: { key == $0 || key.hasPrefix($0 + "/") }) else { return }
+
+        // Siblings whose key is nested INSIDE this profile's own key get
+        // their relative sub-path preserved during the walk below.
+        let preserveRelativePaths: [String] = overlappingKeys.compactMap { sibling in
+            guard sibling.hasPrefix(key + "/") else { return nil }
+            return String(sibling.dropFirst(key.count + 1))
+        }
+
         DispatchQueue.global(qos: .utility).async {
             let fm = FileManager.default
             for kind in CacheTreeKind.allCases {
                 let path = "\(root)/\(kind.rawValue)/\(key)"
-                try? fm.removeItem(atPath: path)
+                Self.removeCacheSubtree(at: path, base: path, preserving: preserveRelativePaths, fm: fm)
+            }
+        }
+    }
+
+    /// Recursively remove everything under `dir`, EXCEPT an entry whose path
+    /// relative to `base` is one of `preserving` (or lives inside one) — the
+    /// same preserve-a-subtree walk `VFSCacheService.clearUnpinned` uses for
+    /// pinned directories, applied here to an overlapping sibling's nested
+    /// cache instead.
+    private static func removeCacheSubtree(at dir: String, base: String, preserving: [String], fm: FileManager) {
+        guard !preserving.isEmpty else {
+            try? fm.removeItem(atPath: dir)
+            return
+        }
+        guard let entries = try? fm.contentsOfDirectory(atPath: dir) else { return }
+        for entry in entries {
+            let full = (dir as NSString).appendingPathComponent(entry)
+            let rel = String(full.dropFirst(base.count + 1))
+            if preserving.contains(where: { rel == $0 || rel.hasPrefix($0 + "/") }) {
+                continue  // the preserved subtree itself, or a file inside it
+            }
+            var isDir: ObjCBool = false
+            fm.fileExists(atPath: full, isDirectory: &isDir)
+            if isDir.boolValue && preserving.contains(where: { $0.hasPrefix(rel + "/") }) {
+                removeCacheSubtree(at: full, base: base, preserving: preserving, fm: fm)  // ancestor of a preserved subtree
+            } else {
+                try? fm.removeItem(atPath: full)
             }
         }
     }

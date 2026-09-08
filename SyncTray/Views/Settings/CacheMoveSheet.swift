@@ -26,6 +26,13 @@ struct CacheMoveSheet: View {
     var onLeaveBehind: (() -> Void)?
     /// Save should delete the OLD cache subtree, then persist the NEW `vfsCachePath`.
     var onStartFresh: (() -> Void)?
+    /// Called the instant a move actually starts (`startMove()`), regardless
+    /// of entry point — tells the Save-time caller that the deferred
+    /// other-field changes are about to be applied by the move's own
+    /// uninstall→…→install cycle, so its `onDismiss` reinstall backstop
+    /// must not also fire for those same fields (finding 12). `nil` is a
+    /// legitimate no-op for `.pickDestination`, which has no deferred fields.
+    var onMoveStarted: (() -> Void)?
     var onDismiss: () -> Void
 
     private enum Step: Equatable {
@@ -51,6 +58,7 @@ struct CacheMoveSheet: View {
         syncManager: SyncManager,
         onLeaveBehind: (() -> Void)? = nil,
         onStartFresh: (() -> Void)? = nil,
+        onMoveStarted: (() -> Void)? = nil,
         onDismiss: @escaping () -> Void
     ) {
         self.mode = mode
@@ -58,6 +66,7 @@ struct CacheMoveSheet: View {
         self.syncManager = syncManager
         self.onLeaveBehind = onLeaveBehind
         self.onStartFresh = onStartFresh
+        self.onMoveStarted = onMoveStarted
         self.onDismiss = onDismiss
 
         switch mode {
@@ -256,6 +265,7 @@ struct CacheMoveSheet: View {
     private func startMove() {
         errorMessage = nil
         step = .moving
+        onMoveStarted?()
         let coMigrate = Set(overlappingIds)
         let task = syncManager.startCacheMigration(for: movingProfileId, destination: destination, coMigrate: coMigrate)
         Task {
@@ -280,9 +290,19 @@ struct CacheMoveSheet: View {
         case .failed(let reason, let rolledBack):
             errorMessage = "Move failed (\(reason.rawValue))" + (rolledBack ? " — already-moved files were rolled back." : ".")
             step = .choosing
+        case .preflightRejected(.nothingToMove):
+            // Nothing was cached at the source — SyncManager already treats
+            // this as a persist-worthy success (finding 11), so the sheet
+            // must not present it as an error the user has to retry.
+            step = .done("Nothing was cached yet — the new location is saved.")
         case .preflightRejected(let rejection):
+            // Route back to a step where `destination` is actually editable.
+            // `.choosing` (pendingSave) has no destination field at all, so
+            // routing a rejection there for the standalone picker flow was a
+            // dead end — the user could only retry the SAME rejected
+            // destination (finding 11).
             errorMessage = "Can't move: \(rejection)"
-            step = .choosing
+            step = isPendingSaveMode ? .choosing : .pickingDestination
         }
     }
 
