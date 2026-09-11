@@ -1999,13 +1999,52 @@ enum ConfigSelfTest {
         // fail (it only logs `mount.result: failure` telemetry and
         // proceeds). A bare `try?` around `uninstall` alone can therefore
         // never observe that failure mode — the guard must ALSO re-check
-        // `isMounted` after a normal-returning `uninstall` and abort the
-        // move rather than relocate files out from under a still-attached,
-        // still-writable volume.
+        // the mount state after a normal-returning `uninstall` and abort
+        // the move rather than relocate files out from under a
+        // still-attached, still-writable volume.
+        //
+        // Behavioral half (finding 9): a pure substring check on
+        // `migrateBody` cannot tell an INVERTED or unreachable guard from a
+        // correct one — `detachFailed = true`, `.failed(.mountDetachFailed`,
+        // and a bounded-recheck call could all still be PRESENT somewhere
+        // in the body even if the boolean logic gating them were backwards.
+        // Drive the actual, extracted decision function directly instead.
+        guard SyncManager.cacheMigrationDetachSucceeded(threw: false, stillMountedAfterRecheck: false) == true else {
+            return report("AC-CM14", "cache-migration-orchestration-hardening", false, "(a clean detach with no throw and no lingering mount was classified as FAILED)")
+        }
+        guard SyncManager.cacheMigrationDetachSucceeded(threw: true, stillMountedAfterRecheck: false) == false else {
+            return report("AC-CM14", "cache-migration-orchestration-hardening", false, "(uninstall throwing was classified as a SUCCESSFUL detach)")
+        }
+        guard SyncManager.cacheMigrationDetachSucceeded(threw: false, stillMountedAfterRecheck: true) == false else {
+            return report("AC-CM14", "cache-migration-orchestration-hardening", false, "(a volume still mounted after the bounded recheck was classified as a SUCCESSFUL detach)")
+        }
+        guard SyncManager.cacheMigrationDetachSucceeded(threw: true, stillMountedAfterRecheck: true) == false else {
+            return report("AC-CM14", "cache-migration-orchestration-hardening", false, "(throw AND still-mounted together were classified as a SUCCESSFUL detach)")
+        }
+
+        // Source half: `migrateCacheDirectory` must actually ROUTE its
+        // abort decision through the function above (rather than
+        // re-deriving its own inline boolean that could drift from it), and
+        // must use the BOUNDED recheck rather than a single `isMounted`
+        // sample (finding 4).
         guard migrateBody.contains("detachFailed = true"),
-              migrateBody.contains("setupService.isMounted(profile: profile)"),
+              migrateBody.contains("Self.cacheMigrationDetachSucceeded(threw:"),
+              migrateBody.contains("setupService.isMountedAfterBoundedRecheck(profile: profile)"),
               migrateBody.contains(".failed(.mountDetachFailed") else {
-            return report("AC-CM14", "cache-migration-orchestration-hardening", false, "(migrateCacheDirectory does not abort on a mount that failed to detach)")
+            return report("AC-CM14", "cache-migration-orchestration-hardening", false, "(migrateCacheDirectory no longer routes its abort decision through cacheMigrationDetachSucceeded / isMountedAfterBoundedRecheck)")
+        }
+
+        // Finding 4, telemetry half — a detach-failure abort must still
+        // emit a begin/end telemetry pair instead of returning silently.
+        guard let telemetryStart = migrateBody.range(of: "beginCacheMigration("),
+              let detachGuard = migrateBody.range(of: "guard !detachFailed else {"),
+              telemetryStart.lowerBound < detachGuard.lowerBound else {
+            return report("AC-CM14", "cache-migration-orchestration-hardening", false, "(beginCacheMigration no longer runs BEFORE the detach-failure abort guard)")
+        }
+        let detachAbortWindowEnd = migrateBody.index(detachGuard.upperBound, offsetBy: 600, limitedBy: migrateBody.endIndex) ?? migrateBody.endIndex
+        let detachAbortWindow = migrateBody[detachGuard.upperBound..<detachAbortWindowEnd]
+        guard detachAbortWindow.contains("endCacheMigration(") else {
+            return report("AC-CM14", "cache-migration-orchestration-hardening", false, "(the detach-failure abort path never calls endCacheMigration — it would emit no telemetry at all)")
         }
 
         return report("AC-CM14", "cache-migration-orchestration-hardening", true)
@@ -2065,18 +2104,40 @@ enum ConfigSelfTest {
         return report("AC-CM15", "cache-migration-ui-fixes", true)
     }
 
-    // MARK: - AC-CM16 — telemetry span status reflects the real outcome (finding 13)
+    // MARK: - AC-CM16 — telemetry span status reflects the real outcome (findings 9, 13)
 
     private static func testCacheMigrationTelemetrySpanStatus() -> Bool {
+        // Behavioral half (finding 9): drive the ACTUAL pure decision
+        // `endCacheMigration` delegates to, rather than pinning that line's
+        // literal Swift expression text — a substring check would keep
+        // passing even if the guard were inverted or the "cancelled"
+        // exemption were dropped, as long as SOME `.error(description:
+        // "cache_migration` text remained anywhere in the function.
+        let nonErrorOutcomes = ["completed", "cancelled"]
+        for outcome in nonErrorOutcomes {
+            guard TelemetryService.CacheMigrationSpanStatus.isError(outcome: outcome) == false else {
+                return report("AC-CM16", "cache-migration-telemetry-span-status", false, "(\"\(outcome)\" was classified as an error)")
+            }
+        }
+        let errorOutcomes = ["verifyMismatch", "countMismatch", "ioError_rolled_back", "mountDetachFailed", "preflight_rejected"]
+        for outcome in errorOutcomes {
+            guard TelemetryService.CacheMigrationSpanStatus.isError(outcome: outcome) == true else {
+                return report("AC-CM16", "cache-migration-telemetry-span-status", false, "(\"\(outcome)\" was NOT classified as an error — a failed move would show green)")
+            }
+        }
+
+        // Source half: `endCacheMigration` must actually ROUTE THROUGH the
+        // decision above rather than re-deriving its own inline comparison
+        // (which would let the two silently diverge).
         guard let source = readSourceFile("Services/TelemetryService.swift") else {
             return report("AC-CM16", "cache-migration-telemetry-span-status", false, "(could not read TelemetryService.swift source)")
         }
         guard let body = extractFunctionBody(startingAt: "func endCacheMigration(", in: source) else {
             return report("AC-CM16", "cache-migration-telemetry-span-status", false, "(could not locate endCacheMigration)")
         }
-        guard body.contains("span.status = (outcome == \"completed\" || outcome == \"cancelled\")"),
+        guard body.contains("CacheMigrationSpanStatus.isError(outcome: outcome)"),
               body.contains(".error(description: \"cache_migration") else {
-            return report("AC-CM16", "cache-migration-telemetry-span-status", false, "(endCacheMigration no longer sets an error status for a failed/rejected outcome — was previously unconditionally .ok)")
+            return report("AC-CM16", "cache-migration-telemetry-span-status", false, "(endCacheMigration no longer routes span status through CacheMigrationSpanStatus.isError)")
         }
         return report("AC-CM16", "cache-migration-telemetry-span-status", true)
     }

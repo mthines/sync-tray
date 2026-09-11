@@ -389,8 +389,22 @@ struct ProfileDetailView: View {
             // deferred-persisted are still sitting un-applied on disk, so
             // apply them here. Any path that DID resolve the prompt already
             // cleared the flag itself, making this a no-op then (finding 12).
+            //
+            // MUST reinstall from the ALREADY-PERSISTED profile in
+            // `profileStore`, never from the live form via a bare
+            // `reinstallSync()` — `buildProfileFromForm()` still reads
+            // whatever the user typed into the Cache Directory field, which
+            // this whole sheet exists to gate. Calling the form-driven
+            // overload here previously installed AND persisted the exact
+            // cache-path change Cancel is supposed to refuse (finding 1 — a
+            // regression introduced by the finding-12 fix itself). The
+            // persisted profile already has every OTHER field applied with
+            // `vfsCachePath` still at its OLD value (`saveProfile()`
+            // deliberately held it there before opening this sheet).
             if cacheMoveOtherFieldsNeedReinstall {
-                reinstallSync()
+                if let persisted = profileStore.profile(for: profile.id) {
+                    reinstallSync(using: persisted)
+                }
                 cacheMoveOtherFieldsNeedReinstall = false
             }
             cacheMovePrompt = nil
@@ -2384,12 +2398,19 @@ struct ProfileDetailView: View {
         }
     }
 
-    private func installSync() {
+    /// - Parameter overrideProfile: when non-nil, install exactly this
+    ///   profile instead of rebuilding one from the live form. Required by
+    ///   the cache-move-cancel backstop (finding 1): the form's
+    ///   `vfsCachePath` field can hold an unresolved, un-gated edit, so that
+    ///   path must reinstall the ALREADY-PERSISTED profile, never derive one
+    ///   from form state.
+    private func installSync(using overrideProfile: SyncProfile? = nil) {
         isInstalling = true
         installError = nil
 
-        // Build profile from current form state (no need to save first)
-        let currentProfile = buildProfileFromForm()
+        // Build profile from current form state (no need to save first) —
+        // unless an explicit override was supplied.
+        let currentProfile = overrideProfile ?? buildProfileFromForm()
 
         TelemetryService.shared.recordProfileLifecycleOperation(
             profileId: currentProfile.id, profileName: currentProfile.name,
@@ -2818,7 +2839,11 @@ struct ProfileDetailView: View {
         return base
     }
 
-    private func reinstallSync() {
+    /// - Parameter overrideProfile: forwarded to `installSync(using:)` — see
+    ///   its doc comment. The uninstall half already reads the
+    ///   currently-persisted profile from `profileStore`, so only the
+    ///   install half needed a form-bypass.
+    private func reinstallSync(using overrideProfile: SyncProfile? = nil) {
         guard let currentProfile = profileStore.profile(for: profile.id) else { return }
 
         TelemetryService.shared.recordProfileLifecycleOperation(
@@ -2831,7 +2856,7 @@ struct ProfileDetailView: View {
         } catch {
             // Ignore uninstall errors
         }
-        installSync()
+        installSync(using: overrideProfile)
     }
 
     private func runResync(loadAgentOnCompletion: Bool = false) {

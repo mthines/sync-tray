@@ -23,7 +23,14 @@ struct CacheMigrationFileSystem {
     /// `attributesOfFileSystem(forPath:)`/`.systemNumber` APIs (stable since
     /// the earliest Foundation) rather than `URLResourceKey.volumeIdentifierKey`,
     /// since this host has no compiler to catch a resource-key typo.
-    static func production() -> CacheMigrationFileSystem {
+    ///
+    /// - Parameter isCancelled: polled inside the chunked data-only copy
+    ///   fallback (finding 6) so a Cancel can interrupt a single very large
+    ///   file instead of only taking effect at the next file boundary.
+    ///   `fs.copyFile` (`FileManager.copyItem`, the primary, faster path)
+    ///   is a single opaque system call and cannot be interrupted mid-transfer
+    ///   this way — that residual gap is documented at the call site.
+    static func production(isCancelled: @escaping () -> Bool = { false }) -> CacheMigrationFileSystem {
         let fm = FileManager.default
         return CacheMigrationFileSystem(
             directoryExists: { path in
@@ -74,6 +81,7 @@ struct CacheMigrationFileSystem {
                 defer { try? writer.close() }
                 let chunkSize = 4 * 1024 * 1024
                 while true {
+                    if isCancelled() { throw CacheMigrationIOError.cancelled }
                     guard let chunk = try reader.read(upToCount: chunkSize), !chunk.isEmpty else { break }
                     try writer.write(contentsOf: chunk)
                 }
@@ -131,6 +139,12 @@ struct CacheMigrationFileSystem {
 
 enum CacheMigrationIOError: Error {
     case dataReadFailed
+    /// Thrown from `copyFileDataOnly`'s chunk loop when the caller's
+    /// `isCancelled` flips mid-transfer (finding 6) — distinguished from
+    /// `dataReadFailed` so `moveFile` can report a clean cancellation
+    /// instead of a genuine I/O failure (no rollback of files this run
+    /// already completed).
+    case cancelled
 }
 
 // MARK: - Cross-thread cancellation bridging
@@ -177,6 +191,12 @@ enum CacheMigrationPreflightRejection: Equatable {
     case destinationUnwritable
     case insufficientSpace(requiredBytes: Int64, availableBytes: Int64)
     case plan(CacheMigrationRejection)
+    /// `isCancelled` fired before or during the source-tree enumeration
+    /// (finding 6) — `CacheMigrationRunner.migrate` normalizes this back to
+    /// the top-level `CacheMigrationOutcome.Result.cancelled` every caller
+    /// already handles correctly, rather than a distinct rejection reason
+    /// callers would each need a new switch case for.
+    case cancelled
 }
 
 enum CacheMigrationFailure: String, Equatable {
@@ -205,14 +225,25 @@ struct CacheMigrationOutcome: Equatable {
 }
 
 /// Pure decision: should a migration outcome cause `vfsCachePath` to be
-/// persisted? Only `.completed` may persist (R20) — extracted as a standalone
-/// function so this invariant is testable without a real
-/// `ProfileStore`/`SyncManager`. `SyncManager.migrateCacheDirectory` guards
-/// its own persist branch on this same function.
+/// persisted? `.completed` obviously may (R20). `.preflightRejected(.nothingToMove)`
+/// ALSO may: an empty source cache carries none of the "incomplete data"
+/// risk R20 guards against, so silently dropping the user's directory
+/// choice would serve no purpose. This is now the SINGLE, real gate every
+/// call site routes through — `SyncManager.migrateCacheDirectory` and the
+/// CLI's `migrateCacheProcess` both ask this function instead of each
+/// re-deriving the same case list themselves (finding 3: previously this
+/// function covered only `.completed` while both call sites separately,
+/// identically hand-copied a SECOND persist branch for `.nothingToMove`,
+/// making the doc comment's "single persist gate" claim false and the
+/// `case .completed where shouldPersist(outcome)` guard at the call site
+/// dead — always true given the pattern already matched `.completed`).
 enum CacheMigrationPersistDecision {
     static func shouldPersist(_ outcome: CacheMigrationOutcome) -> Bool {
-        if case .completed = outcome.result { return true }
-        return false
+        switch outcome.result {
+        case .completed: return true
+        case .preflightRejected(.nothingToMove): return true
+        default: return false
+        }
     }
 }
 
@@ -239,8 +270,12 @@ struct CacheMigrationEngine {
     /// Compute totals, the same-volume verdict, and the resume-skip set;
     /// reject on insufficient space before a single byte is copied (R2).
     func preflight(_ plan: CacheMigrationPlan) -> Result<CacheMigrationPreflight, CacheMigrationPreflightRejection> {
-        let files = sourceFiles(for: plan)
-        guard !files.isEmpty else { return .failure(.nothingToMove) }
+        // Checked up front AND between subtrees inside `sourceFiles` (finding
+        // 6) — the full-tree enumeration that backs the "Preparing…" phase
+        // previously never polled cancellation at all, so Cancel stayed
+        // inert until the walk finished on its own.
+        if isCancelled() { return .failure(.cancelled) }
+        guard let files = sourceFiles(for: plan) else { return .failure(.cancelled) }
 
         let totalBytes = files.reduce(Int64(0)) { $0 + $1.size }
         var bytesToCopy: Int64 = 0
@@ -276,6 +311,16 @@ struct CacheMigrationEngine {
                 return .failure(.destinationUnwritable)
             }
         }
+
+        // `.nothingToMove` is returned ONLY after the destination has been
+        // proven writable (space checked, directory created or already
+        // present) — never before. Two call sites (`SyncManager`,
+        // `SyncTrayCLI`) treat `.nothingToMove` as persistable exactly like
+        // `.completed` (finding 11 from the prior fix round); persisting
+        // `vfsCachePath` onto a destination that was never proven to exist
+        // or be writable would be exactly the incomplete-cache risk R20
+        // guards against (finding 2).
+        guard !files.isEmpty else { return .failure(.nothingToMove) }
 
         return .success(CacheMigrationPreflight(
             totalFiles: files.count,
@@ -344,7 +389,9 @@ struct CacheMigrationEngine {
     /// Per-file copy → verify → delete walk, used whenever the fast path
     /// isn't safe (cross-volume, or a descendant is excluded from the move).
     private func moveFiles(_ plan: CacheMigrationPlan, _ preflight: CacheMigrationPreflight) -> CacheMigrationOutcome {
-        let files = sourceFiles(for: plan)
+        guard let files = sourceFiles(for: plan) else {
+            return CacheMigrationOutcome(result: .cancelled, filesMoved: 0, bytesMoved: 0, sameVolume: preflight.sameVolume)
+        }
         var filesMoved = 0
         var bytesMoved: Int64 = 0
         var movedDestPaths: [String] = []
@@ -377,6 +424,12 @@ struct CacheMigrationEngine {
                 bytesMoved += file.size
                 movedDestPaths.append(destPath)
                 onProgress(filesMoved, bytesMoved, file.relativePath)
+            case .cancelled:
+                // Cancelled mid-transfer of THIS file (finding 6) — the
+                // partial destination was already removed by `moveFile`.
+                // Files this run already completed successfully are NOT
+                // rolled back, matching the between-file cancel guarantee.
+                return CacheMigrationOutcome(result: .cancelled, filesMoved: filesMoved, bytesMoved: bytesMoved, sameVolume: preflight.sameVolume)
             case .failure(let reason):
                 let rolledBack = rollback(destPaths: movedDestPaths, plan: plan)
                 return CacheMigrationOutcome(result: .failed(reason, rolledBack: rolledBack), filesMoved: filesMoved, bytesMoved: bytesMoved, sameVolume: preflight.sameVolume)
@@ -403,9 +456,20 @@ struct CacheMigrationEngine {
         return CacheMigrationOutcome(result: .completed, filesMoved: filesMoved, bytesMoved: bytesMoved, sameVolume: preflight.sameVolume)
     }
 
+    /// The outcome of moving a single file. A plain `Result<Void,
+    /// CacheMigrationFailure>` cannot represent "cancelled mid-transfer"
+    /// (finding 6) distinctly from a genuine I/O failure, so this adds a
+    /// third case: `.cancelled` must NOT trigger a rollback of files this
+    /// run already completed, while `.failure` must.
+    private enum FileMoveResult {
+        case success
+        case cancelled
+        case failure(CacheMigrationFailure)
+    }
+
     /// Copy → compare the destination byte size to the source → only then
     /// delete the source (R19). Never deletes the source before the sizes match.
-    private func moveFile(from sourcePath: String, to destPath: String, expectedSize: Int64) -> Result<Void, CacheMigrationFailure> {
+    private func moveFile(from sourcePath: String, to destPath: String, expectedSize: Int64) -> FileMoveResult {
         // Create the destination's parent directory first — neither
         // `copyItem` nor the data-only fallback creates intermediate
         // directories, so on a fresh destination root every cross-volume
@@ -424,6 +488,13 @@ struct CacheMigrationEngine {
         } catch {
             do {
                 try fs.copyFileDataOnly(sourcePath, destPath)
+            } catch CacheMigrationIOError.cancelled {
+                // Cancelled mid-transfer (finding 6) — remove the in-flight
+                // destination partial so no half-file lingers, mirroring the
+                // between-file cancel guarantee, and report a clean
+                // cancellation rather than an I/O failure.
+                try? fs.removeItem(destPath)
+                return .cancelled
             } catch {
                 return .failure(.ioError)
             }
@@ -439,7 +510,7 @@ struct CacheMigrationEngine {
         } catch {
             return .failure(.ioError)
         }
-        return .success(())
+        return .success
     }
 
     /// Final count/byte cross-check against the preflight totals (R19's
@@ -487,10 +558,23 @@ struct CacheMigrationEngine {
     /// Collect every source file across the plan's subtrees exactly once,
     /// even when two subtrees nest (a co-migrating parent + child share
     /// bytes on disk — R15's "no double-move, no double-count").
-    private func sourceFiles(for plan: CacheMigrationPlan) -> [(relativePath: String, size: Int64)] {
+    ///
+    /// Returns `nil` when `isCancelled` fires BETWEEN subtrees (finding 6) —
+    /// a partial file list must never silently stand in for the real
+    /// totals, since `preflight`'s space check and `moveFiles`'s
+    /// `reconcile` both trust this list completely; a caller that got a
+    /// truncated array back would compute a wrong total and could turn a
+    /// deliberate cancel into a spurious `.countMismatch` failure. There is
+    /// no polling point WITHIN a single subtree's `enumerateFiles` call — it
+    /// returns one fully-materialized array — so a cancel requested mid-walk
+    /// of one very large subtree still only takes effect at the next
+    /// subtree boundary; this is a smaller, documented version of the same
+    /// residual gap `copyFile`'s non-interruptible primary copy path has.
+    private func sourceFiles(for plan: CacheMigrationPlan) -> [(relativePath: String, size: Int64)]? {
         var seen = Set<String>()
         var files: [(relativePath: String, size: Int64)] = []
         for subtree in plan.subtrees {
+            if isCancelled() { return nil }
             let subtreeRoot = subtreePath(subtree, root: plan.sourceRoot)
             guard fs.directoryExists(subtreeRoot) else { continue }
             for entry in fs.enumerateFiles(subtreeRoot) {
@@ -534,6 +618,14 @@ enum CacheMigrationRunner {
         case .success(let plan):
             let engine = CacheMigrationEngine(fs: fs, isCancelled: isCancelled, onProgress: onProgress)
             switch engine.preflight(plan) {
+            case .failure(.cancelled):
+                // Normalize to the SAME top-level `.cancelled` result the
+                // per-file cancel path already produces (finding 6), rather
+                // than a distinct `.preflightRejected` reason every caller
+                // would need its own new switch case for — `shouldPersist`,
+                // the progress-phase switches, and the telemetry label all
+                // already treat `.cancelled` correctly.
+                return (plan, CacheMigrationOutcome(result: .cancelled, filesMoved: 0, bytesMoved: 0, sameVolume: false))
             case .failure(let rejection):
                 return (plan, CacheMigrationOutcome(
                     result: .preflightRejected(rejection), filesMoved: 0, bytesMoved: 0, sameVolume: false

@@ -2432,6 +2432,16 @@ final class SyncManager: ObservableObject {
         return task
     }
 
+    /// Pure: did a single profile's pre-move detach succeed? Extracted out
+    /// of `migrateCacheDirectory`'s control flow so this exact decision is
+    /// behaviorally testable without a real `SyncManager`/`SyncSetupService`
+    /// (finding 9 — the prior self-test coverage only checked that certain
+    /// substrings were PRESENT somewhere in the function body, which cannot
+    /// detect an inverted or unreachable guard around this decision).
+    nonisolated static func cacheMigrationDetachSucceeded(threw: Bool, stillMountedAfterRecheck: Bool) -> Bool {
+        !threw && !stillMountedAfterRecheck
+    }
+
     /// The full orchestration: cancel any in-flight warm for the affected
     /// profiles (R5), detach/uninstall before the move (R4), run the engine
     /// off the main actor (R10), persist `vfsCachePath` ONLY on `.completed`
@@ -2446,10 +2456,19 @@ final class SyncManager: ObservableObject {
             return CacheMigrationOutcome(result: .cancelled, filesMoved: 0, bytesMoved: 0, sameVolume: false)
         }
         let allProfiles = profileStore.profiles
+        let startedAt = Date()
 
         // R5 — cancel any warm reading through the mount BEFORE any file is touched.
         let affectedIds = [profileId] + coMigrate
         for id in affectedIds { cancelWarm(for: id) }
+
+        // Started BEFORE the detach loop (not after it, as before) so a
+        // detach-failure abort below still emits a span/metrics instead of
+        // silently producing no telemetry at all (finding 4).
+        let telemetry = TelemetryService.shared.beginCacheMigration(
+            profileId: profileId,
+            profileName: movingProfile.name
+        )
 
         // R4 — detach/uninstall the moving profile (and any co-migrating
         // installed profile) BEFORE the move, so nothing writes into the
@@ -2461,7 +2480,11 @@ final class SyncManager: ObservableObject {
         // profile's files. A `try?` here previously swallowed both a real
         // thrown error AND that non-throwing failure, letting the move
         // proceed against a still-mounted, still-writable volume (finding
-        // 7). Guard against both explicitly.
+        // 7). Guard against both explicitly. The post-uninstall recheck
+        // uses `isMountedAfterBoundedRecheck` rather than a single
+        // `isMounted` sample, since a stale mount-table entry or a
+        // `KeepAlive` remount race can otherwise false-positive and abort
+        // the WHOLE migration on one bad sample (finding 4).
         let profilesToReinstall = ([movingProfile] + coMigrate.compactMap { profileStore.profile(for: $0) })
             .filter { setupService.isInstalled(profile: $0) }
         var detachFailed = false
@@ -2472,7 +2495,8 @@ final class SyncManager: ObservableObject {
                 detachFailed = true
                 break
             }
-            if profile.isMountMode && setupService.isMounted(profile: profile) {
+            let stillMounted = profile.isMountMode && setupService.isMountedAfterBoundedRecheck(profile: profile)
+            guard Self.cacheMigrationDetachSucceeded(threw: false, stillMountedAfterRecheck: stillMounted) else {
                 // `uninstall` returned normally but the volume is still
                 // attached — the graceful/forced `diskutil unmount` both
                 // failed. Abort rather than move files out from under it.
@@ -2495,19 +2519,23 @@ final class SyncManager: ObservableObject {
 
         guard !detachFailed else {
             cacheMigrationProgress[profileId] = nil
-            return CacheMigrationOutcome(result: .failed(.mountDetachFailed, rolledBack: false), filesMoved: 0, bytesMoved: 0, sameVolume: false)
+            let outcome = CacheMigrationOutcome(result: .failed(.mountDetachFailed, rolledBack: false), filesMoved: 0, bytesMoved: 0, sameVolume: false)
+            TelemetryService.shared.endCacheMigration(
+                telemetry,
+                filesMoved: 0,
+                bytesMoved: 0,
+                durationSeconds: Date().timeIntervalSince(startedAt),
+                sameVolume: false,
+                outcome: cacheMigrationOutcomeLabel(outcome.result)
+            )
+            return outcome
         }
 
         var progress = CacheMigrationProgress()
         cacheMigrationProgress[profileId] = progress
 
-        let telemetry = TelemetryService.shared.beginCacheMigration(
-            profileId: profileId,
-            profileName: movingProfile.name
-        )
-
-        let fs = CacheMigrationFileSystem.production()
         let cancellationFlag = CacheMigrationCancellationFlag()
+        let fs = CacheMigrationFileSystem.production(isCancelled: { cancellationFlag.isCancelled })
 
         let result: (plan: CacheMigrationPlan?, outcome: CacheMigrationOutcome) = await withTaskCancellationHandler {
             await withCheckedContinuation { continuation in

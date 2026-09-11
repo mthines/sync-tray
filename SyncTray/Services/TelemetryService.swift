@@ -2107,6 +2107,20 @@ final class TelemetryService {
         let profileName: String
     }
 
+    /// Pure: does a cache-migration outcome LABEL represent a genuine error
+    /// for span-status purposes? Extracted out of `endCacheMigration` so
+    /// this decision is behaviorally testable directly, rather than only by
+    /// pinning `endCacheMigration`'s literal Swift expression text (finding
+    /// 9) — "completed" and the user-initiated "cancelled" are the only
+    /// non-error outcomes; every failure/rejection label (a
+    /// `CacheMigrationFailure` raw value, optionally `_rolled_back`-suffixed,
+    /// or "preflight_rejected") is an error.
+    enum CacheMigrationSpanStatus {
+        static func isError(outcome: String) -> Bool {
+            outcome != "completed" && outcome != "cancelled"
+        }
+    }
+
     /// Start a `synctray cache_migration` span. No-op (returns an empty
     /// token) when telemetry is disabled.
     func beginCacheMigration(profileId: UUID, profileName: String) -> CacheMigrationSpanToken {
@@ -2180,10 +2194,13 @@ final class TelemetryService {
             // user-initiated "cancelled" are the only non-error outcomes;
             // every failure/rejection label is a real error (finding 13:
             // this was previously an unconditional `.ok`, so a failed move
-            // still showed green in span-based dashboards/alerts).
-            span.status = (outcome == "completed" || outcome == "cancelled")
-                ? .ok
-                : .error(description: "cache_migration \(outcome)")
+            // still showed green in span-based dashboards/alerts). Routed
+            // through the pure `CacheMigrationSpanStatus.isError` decision
+            // so the self-test can exercise this logic directly (finding 9)
+            // instead of pinning this line's literal Swift text.
+            span.status = CacheMigrationSpanStatus.isError(outcome: outcome)
+                ? .error(description: "cache_migration \(outcome)")
+                : .ok
             span.end()
         }
         let body = outcome == "completed" ? "Cache migration completed" : "Cache migration ended"
