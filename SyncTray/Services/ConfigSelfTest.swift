@@ -2302,8 +2302,14 @@ enum ConfigSelfTest {
         // resolved success, not routed through the generic rejection path
         // (which a user would have to retry against an unchangeable
         // destination in pendingSave mode).
-        guard cacheMoveSheetSource.contains("case .preflightRejected(.nothingToMove):") else {
-            return report("AC-CM15", "cache-migration-ui-fixes", false, "(CacheMoveSheet no longer special-cases .nothingToMove as success)")
+        // It must share the `.completed` arm outright, not merely have an
+        // arm of its own: an empty source is a success that still has to
+        // continue into any accepted same-root co-migration. A separate
+        // `.nothingToMove` arm skipped those siblings entirely, showing a
+        // green "the new location is saved" while every ticked sibling
+        // stayed behind, unmoved and still pointing at the old root.
+        guard cacheMoveSheetSource.contains("case .completed, .preflightRejected(.nothingToMove):") else {
+            return report("AC-CM15", "cache-migration-ui-fixes", false, "(CacheMoveSheet no longer routes .nothingToMove through the same success arm as .completed)")
         }
 
         return report("AC-CM15", "cache-migration-ui-fixes", true)

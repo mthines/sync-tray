@@ -278,23 +278,29 @@ struct CacheMoveSheet: View {
 
     private func handle(outcome: CacheMigrationOutcome) {
         switch outcome.result {
-        case .completed:
+        // `.nothingToMove` is a SUCCESS, not a rejection — the source cache
+        // was empty, so re-pointing the profile is the whole job (it is one
+        // of the two outcomes `CacheMigrationPersistDecision` persists). It
+        // therefore has to continue into the same-root co-migration exactly
+        // as `.completed` does: those siblings are independent profiles with
+        // their own, possibly non-empty caches, and skipping them left the
+        // user with a green "the new location is saved" while every ticked
+        // sibling stayed behind, unmoved and still pointing at the old root.
+        case .completed, .preflightRejected(.nothingToMove):
+            let doneSummary = outcome.result == .completed
+                ? summary(for: outcome)
+                : "Nothing was cached yet — the new location is saved."
             let extraTargets = sameRootIds.filter { coMigrateSameRoot.contains($0) }
             guard !extraTargets.isEmpty else {
-                step = .done(summary(for: outcome))
+                step = .done(doneSummary)
                 return
             }
-            moveSameRootProfiles(extraTargets, thenSummarize: summary(for: outcome))
+            moveSameRootProfiles(extraTargets, thenSummarize: doneSummary)
         case .cancelled:
             step = .cancelledChoice
         case .failed(let reason, let rolledBack):
             errorMessage = "Move failed (\(reason.rawValue))" + (rolledBack ? " — already-moved files were rolled back." : ".")
             step = .choosing
-        case .preflightRejected(.nothingToMove):
-            // Nothing was cached at the source — SyncManager already treats
-            // this as a persist-worthy success (finding 11), so the sheet
-            // must not present it as an error the user has to retry.
-            step = .done("Nothing was cached yet — the new location is saved.")
         case .preflightRejected(let rejection):
             // Route back to a step where `destination` is actually editable.
             // `.choosing` (pendingSave) has no destination field at all, so

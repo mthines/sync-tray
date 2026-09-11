@@ -2389,27 +2389,59 @@ final class SyncManager: ObservableObject {
         asSource.vfsCachePath = sourceRoot
         let cancellationFlag = CacheMigrationCancellationFlag()
 
-        // R4/R5 for the REVERSE move, which the forward bracket does not
-        // cover: `migrateCacheDirectory`'s `defer` has already re-installed
-        // the agent by the time the user is offered "Resume or roll back?",
-        // so the mount is live again on `sourceRoot` — precisely the tree a
-        // rollback writes into. Cancel any warm and re-detach first, exactly
-        // as the forward move does.
         let affectedIds = [profileId] + coMigrate
-        for id in affectedIds { cancelWarm(for: id) }
-        let detach = detachForCacheMigration([asSource] + coMigrate.compactMap { profileStore.profile(for: $0) })
-        guard !detach.failed else {
-            // Still mounted after a graceful and a forced unmount — moving
-            // files back under a live mount is worse than leaving them at
-            // the destination, where the (unpersisted) profile simply does
-            // not point yet. Re-install and report, changing nothing.
-            reinstallAfterCacheMigration(detach.toReinstall)
-            cacheMigrationProgress[profileId] = nil
-            return Task { CacheMigrationOutcome(result: .failed(.mountDetachFailed, rolledBack: false), filesMoved: 0, bytesMoved: 0, sameVolume: false) }
-        }
-        let profilesToReinstall = detach.toReinstall
+        let rollbackProfiles = [asSource] + coMigrate.compactMap { profileStore.profile(for: $0) }
 
         let task = Task { [weak self] () -> CacheMigrationOutcome in
+            // R4/R5 for the REVERSE move, which the forward bracket does not
+            // cover: `migrateCacheDirectory`'s `defer` has already re-installed
+            // the agent by the time the user is offered "Resume or roll back?",
+            // so the mount is live again on `sourceRoot` — precisely the tree a
+            // rollback writes into. Cancel any warm and re-detach first, exactly
+            // as the forward move does.
+            //
+            // This runs on the main actor (it touches `setupService` and the
+            // profile store) but from INSIDE the Task, not before it. Doing it
+            // synchronously in `rollbackCacheMigration`'s own body blocked the
+            // Roll Back button handler through a `diskutil unmount` plus a
+            // bounded remount recheck — so the sheet could not even paint its
+            // progress step until the detach finished. The forward path never
+            // had that problem because its detach already sits inside an async
+            // `migrateCacheDirectory`.
+            let startedAt = Date()
+            let telemetry = TelemetryService.shared.beginCacheMigration(
+                profileId: profileId, profileName: asSource.name
+            )
+            let detach: (toReinstall: [SyncProfile], failed: Bool) = await MainActor.run {
+                guard let self else { return (toReinstall: [], failed: true) }
+                for id in affectedIds { self.cancelWarm(for: id) }
+                return self.detachForCacheMigration(rollbackProfiles)
+            }
+            guard !detach.failed else {
+                // Still mounted after a graceful and a forced unmount — moving
+                // files back under a live mount is worse than leaving them at
+                // the destination, where the (unpersisted) profile simply does
+                // not point yet. Re-install and report, changing nothing.
+                await MainActor.run {
+                    self?.reinstallAfterCacheMigration(detach.toReinstall)
+                    self?.cacheMigrationProgress[profileId] = nil
+                }
+                let aborted = CacheMigrationOutcome(result: .failed(.mountDetachFailed, rolledBack: false), filesMoved: 0, bytesMoved: 0, sameVolume: false)
+                // Emitted for the same reason the forward path opens its span
+                // before the detach loop: an abort that produces no telemetry
+                // at all is indistinguishable from a rollback that never ran.
+                TelemetryService.shared.endCacheMigration(
+                    telemetry,
+                    filesMoved: 0,
+                    bytesMoved: 0,
+                    durationSeconds: Date().timeIntervalSince(startedAt),
+                    sameVolume: false,
+                    outcome: "mountDetachFailed"
+                )
+                return aborted
+            }
+            let profilesToReinstall = detach.toReinstall
+
             let fs = CacheMigrationFileSystem.production()
             let outcome = await withTaskCancellationHandler {
                 await withCheckedContinuation { continuation in
@@ -2455,6 +2487,14 @@ final class SyncManager: ObservableObject {
                 self?.reinstallAfterCacheMigration(profilesToReinstall)
                 self?.cacheMigrationProgress[profileId] = nil
             }
+            TelemetryService.shared.endCacheMigration(
+                telemetry,
+                filesMoved: outcome.filesMoved,
+                bytesMoved: outcome.bytesMoved,
+                durationSeconds: Date().timeIntervalSince(startedAt),
+                sameVolume: outcome.sameVolume,
+                outcome: SyncManager.cacheMigrationOutcomeLabel(outcome.result)
+            )
             return outcome
         }
         cacheMigrationTasks[profileId] = task
@@ -2594,7 +2634,7 @@ final class SyncManager: ObservableObject {
                 bytesMoved: 0,
                 durationSeconds: Date().timeIntervalSince(startedAt),
                 sameVolume: false,
-                outcome: cacheMigrationOutcomeLabel(outcome.result)
+                outcome: Self.cacheMigrationOutcomeLabel(outcome.result)
             )
             return outcome
         }
@@ -2691,13 +2731,15 @@ final class SyncManager: ObservableObject {
             bytesMoved: outcome.bytesMoved,
             durationSeconds: progress.elapsed,
             sameVolume: outcome.sameVolume,
-            outcome: cacheMigrationOutcomeLabel(outcome.result)
+            outcome: Self.cacheMigrationOutcomeLabel(outcome.result)
         )
 
         return outcome
     }
 
-    private func cacheMigrationOutcomeLabel(_ result: CacheMigrationOutcome.Result) -> String {
+    /// Pure — `nonisolated` so the rollback Task can label its own
+    /// outcome without an extra main-actor hop just to read a switch.
+    nonisolated private static func cacheMigrationOutcomeLabel(_ result: CacheMigrationOutcome.Result) -> String {
         switch result {
         case .completed: return "completed"
         // `.nothingToMove` is persisted exactly like `.completed` above (see
