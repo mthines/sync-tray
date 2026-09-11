@@ -210,7 +210,13 @@ jobs:
 
       - name: Build (Debug)
         run: |
+          # Keep a green build's output short, but NEVER swallow a red one's
+          # diagnostics: `| tail -30` used to truncate the log to the trailing
+          # "BUILD FAILED / the following build commands failed" summary, which
+          # names the failing compile units but not a single `error:` line —
+          # leaving a compile failure undiagnosable from CI alone.
           set -o pipefail
+          rc=0
           xcodebuild -project SyncTray.xcodeproj \
             -scheme SyncTray \
             -destination 'platform=macOS' \
@@ -219,7 +225,19 @@ jobs:
             build \
             ONLY_ACTIVE_ARCH=YES \
             CODE_SIGNING_ALLOWED=NO \
-            | tail -30
+            > "$RUNNER_TEMP/xcodebuild.log" 2>&1 || rc=$?
+
+          if [ "$rc" -ne 0 ]; then
+            echo "::group::Compiler diagnostics"
+            grep -E '(error|warning): ' "$RUNNER_TEMP/xcodebuild.log" | head -200 || true
+            echo "::endgroup::"
+            echo "::group::Build log tail"
+            tail -80 "$RUNNER_TEMP/xcodebuild.log"
+            echo "::endgroup::"
+            exit "$rc"
+          fi
+
+          tail -30 "$RUNNER_TEMP/xcodebuild.log"
 
   # ===========================================================================
   # version — calculate the next version from conventional commits and create
