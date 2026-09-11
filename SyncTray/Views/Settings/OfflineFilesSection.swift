@@ -16,6 +16,7 @@ struct OfflineFilesSection: View {
     @State private var isLoading: Bool = false
     @State private var isClearing: Bool = false
     @State private var showClearConfirm: Bool = false
+    @State private var showingCacheMoveSheet: Bool = false
     @State private var rcAvailable: Bool = false
     // Default true so the "enable me" card doesn't flash before the async check runs.
     @State private var extensionEnabled: Bool = true
@@ -160,6 +161,17 @@ struct OfflineFilesSection: View {
         } message: {
             Text(browseWarning ?? "")
         }
+        .sheet(isPresented: $showingCacheMoveSheet) {
+            CacheMoveSheet(
+                mode: .pickDestination(profile: liveProfile),
+                profileStore: profileStore,
+                syncManager: syncManager,
+                onDismiss: {
+                    showingCacheMoveSheet = false
+                    refreshCacheInfo()
+                }
+            )
+        }
     }
 
     // MARK: - Enable-extension prompt
@@ -303,6 +315,12 @@ struct OfflineFilesSection: View {
                         }
                         .controlSize(.small)
                         .disabled(isClearing)
+
+                        Button(action: { showingCacheMoveSheet = true }) {
+                            Label("Move Cache…", systemImage: "arrow.triangle.2.circlepath")
+                                .font(.caption)
+                        }
+                        .controlSize(.small)
                     }
                 }
             } else {

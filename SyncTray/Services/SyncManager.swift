@@ -56,6 +56,15 @@ final class SyncManager: ObservableObject {
     /// clearing the cache mid-warm just re-downloads the files the warmer is still reading.
     private var warmTasks: [UUID: Task<Void, Never>] = [:]
 
+    /// Live progress of an in-flight cache-directory move, keyed by the
+    /// profile whose Cache Directory is changing. Drives `CacheMoveSheet`'s
+    /// progress UI.
+    @Published private(set) var cacheMigrationProgress: [UUID: CacheMigrationProgress] = [:]
+
+    /// In-flight cache-migration tasks, so a second start supersedes and
+    /// cancel can stop one.
+    private var cacheMigrationTasks: [UUID: Task<CacheMigrationOutcome, Never>] = [:]
+
     let profileStore: ProfileStore
 
     private var logWatchers: [UUID: LogWatcher] = [:]
@@ -2317,6 +2326,439 @@ final class SyncManager: ObservableObject {
     /// are about to be evicted (or read through a mount that's going away).
     func cancelWarm(for profileId: UUID) {
         warmTasks[profileId]?.cancel()
+    }
+
+    // MARK: - Cache Directory Migration
+
+    /// Cancel an in-flight cache-directory migration for a profile. The
+    /// engine stops at the next file boundary; its own cleanup removes any
+    /// in-flight destination partial and returns `.cancelled` — nothing here
+    /// needs to clean up files.
+    func cancelCacheMigration(for profileId: UUID) {
+        cacheMigrationTasks[profileId]?.cancel()
+    }
+
+    /// Move a Stream profile's rclone VFS cache (content + metadata) from its
+    /// current `vfsCachePath` to `destination` as a tracked, cancellable
+    /// task, superseding any run already in flight for this profile. Every
+    /// entry point (the Save-time prompt, the Offline Files "Move Cache…"
+    /// action) routes through this so cancel/progress work identically.
+    @discardableResult
+    func startCacheMigration(
+        for profileId: UUID,
+        destination: String,
+        coMigrate: Set<UUID> = []
+    ) -> Task<CacheMigrationOutcome, Never> {
+        cacheMigrationTasks[profileId]?.cancel()
+        let task = Task { [weak self] () -> CacheMigrationOutcome in
+            guard let self else {
+                return CacheMigrationOutcome(result: .cancelled, filesMoved: 0, bytesMoved: 0, sameVolume: false)
+            }
+            return await self.migrateCacheDirectory(for: profileId, destination: destination, coMigrate: coMigrate)
+        }
+        cacheMigrationTasks[profileId] = task
+        return task
+    }
+
+    /// After a user-cancelled migration, move whatever already landed at
+    /// `destinationRoot` back to `sourceRoot` — the "Roll Back" option in
+    /// `CacheMoveSheet` (paired with "Resume", which is just calling
+    /// `startCacheMigration` again; the engine's resume-skip makes that
+    /// idempotent). Operates on a LOCAL, never-persisted copy of the profile
+    /// carrying `destinationRoot` as its `vfsCachePath` so the SAME
+    /// planner/engine path applies in reverse — `profileStore` is never
+    /// touched, since the original profile's `vfsCachePath` is still correct
+    /// (a cancelled run is never persisted).
+    @discardableResult
+    func rollbackCacheMigration(
+        for profileId: UUID,
+        sourceRoot: String,
+        destinationRoot: String,
+        coMigrate: Set<UUID> = []
+    ) -> Task<CacheMigrationOutcome, Never> {
+        cacheMigrationTasks[profileId]?.cancel()
+        guard let original = profileStore.profile(for: profileId) else {
+            return Task { CacheMigrationOutcome(result: .cancelled, filesMoved: 0, bytesMoved: 0, sameVolume: false) }
+        }
+        let allProfiles = profileStore.profiles
+        // A copy pinned to `sourceRoot` (NOT `original.vfsCachePath` directly —
+        // a cancelled run never persists, so it should already equal
+        // `sourceRoot`, but this stays correct even if a caller passes a
+        // slightly different root than what's currently on disk).
+        var asSource = original
+        asSource.vfsCachePath = sourceRoot
+        let cancellationFlag = CacheMigrationCancellationFlag()
+
+        let affectedIds = [profileId] + coMigrate
+        let rollbackProfiles = [asSource] + coMigrate.compactMap { profileStore.profile(for: $0) }
+
+        let task = Task { [weak self] () -> CacheMigrationOutcome in
+            // R4/R5 for the REVERSE move, which the forward bracket does not
+            // cover: `migrateCacheDirectory`'s `defer` has already re-installed
+            // the agent by the time the user is offered "Resume or roll back?",
+            // so the mount is live again on `sourceRoot` — precisely the tree a
+            // rollback writes into. Cancel any warm and re-detach first, exactly
+            // as the forward move does.
+            //
+            // This runs on the main actor (it touches `setupService` and the
+            // profile store) but from INSIDE the Task, not before it. Doing it
+            // synchronously in `rollbackCacheMigration`'s own body blocked the
+            // Roll Back button handler through a `diskutil unmount` plus a
+            // bounded remount recheck — so the sheet could not even paint its
+            // progress step until the detach finished. The forward path never
+            // had that problem because its detach already sits inside an async
+            // `migrateCacheDirectory`.
+            let startedAt = Date()
+            let telemetry = TelemetryService.shared.beginCacheMigration(
+                profileId: profileId, profileName: asSource.name
+            )
+            let detach: (toReinstall: [SyncProfile], failed: Bool) = await MainActor.run {
+                guard let self else { return (toReinstall: [], failed: true) }
+                for id in affectedIds { self.cancelWarm(for: id) }
+                return self.detachForCacheMigration(rollbackProfiles)
+            }
+            guard !detach.failed else {
+                // Still mounted after a graceful and a forced unmount — moving
+                // files back under a live mount is worse than leaving them at
+                // the destination, where the (unpersisted) profile simply does
+                // not point yet. Re-install and report, changing nothing.
+                await MainActor.run {
+                    self?.reinstallAfterCacheMigration(detach.toReinstall)
+                    self?.cacheMigrationProgress[profileId] = nil
+                }
+                let aborted = CacheMigrationOutcome(result: .failed(.mountDetachFailed, rolledBack: false), filesMoved: 0, bytesMoved: 0, sameVolume: false)
+                // Emitted for the same reason the forward path opens its span
+                // before the detach loop: an abort that produces no telemetry
+                // at all is indistinguishable from a rollback that never ran.
+                TelemetryService.shared.endCacheMigration(
+                    telemetry,
+                    filesMoved: 0,
+                    bytesMoved: 0,
+                    durationSeconds: Date().timeIntervalSince(startedAt),
+                    sameVolume: false,
+                    // Derived, not hand-copied: a literal here would agree
+                    // today only because `CacheMigrationFailure` takes its
+                    // default rawValue, and hand-copying a shared decision
+                    // is exactly what let the persist gate drift from its
+                    // own call sites earlier in this branch.
+                    outcome: SyncManager.cacheMigrationOutcomeLabel(aborted.result)
+                )
+                return aborted
+            }
+            let profilesToReinstall = detach.toReinstall
+
+            let fs = CacheMigrationFileSystem.production()
+            let outcome = await withTaskCancellationHandler {
+                await withCheckedContinuation { continuation in
+                    DispatchQueue.global(qos: .utility).async {
+                        // Re-derive the ORIGINAL forward plan (source → destination)
+                        // and reverse it, rather than re-planning FROM
+                        // `destinationRoot`: a cancelled run never persists, so
+                        // every co-migrated sibling's `vfsCachePath` is STILL
+                        // `sourceRoot` — classifying overlap against
+                        // `destinationRoot` would match none of them, stranding
+                        // their relocated bytes at the destination with no
+                        // rollback (finding 6). `.reversed()` keeps the EXACT
+                        // same subtree set the forward run used, just swapped.
+                        switch CacheMigrationPlanner.plan(moving: asSource, allProfiles: allProfiles, to: destinationRoot, coMigrate: coMigrate) {
+                        case .failure(let rejection):
+                            continuation.resume(returning: CacheMigrationOutcome(
+                                result: .preflightRejected(.plan(rejection)), filesMoved: 0, bytesMoved: 0, sameVolume: false
+                            ))
+                        case .success(let forwardPlan):
+                            let reversePlan = forwardPlan.reversed()
+                            let engine = CacheMigrationEngine(fs: fs, isCancelled: { cancellationFlag.isCancelled })
+                            switch engine.preflight(reversePlan) {
+                            case .failure(let rejection):
+                                continuation.resume(returning: CacheMigrationOutcome(
+                                    result: .preflightRejected(rejection), filesMoved: 0, bytesMoved: 0, sameVolume: false
+                                ))
+                            case .success(let preflight):
+                                continuation.resume(returning: engine.run(reversePlan, preflight))
+                            }
+                        }
+                    }
+                }
+            } onCancel: {
+                cancellationFlag.markCancelled()
+            }
+            // Re-install on EVERY exit path, mirroring the forward move's
+            // `defer` — a rollback that completed, failed, or was cancelled
+            // must never leave the profile with no launchd agent. `defer`
+            // can't be used here because the re-install has to hop back to
+            // the main actor, so it sits on the single path out of the
+            // `await` above.
+            await MainActor.run {
+                self?.reinstallAfterCacheMigration(profilesToReinstall)
+                self?.cacheMigrationProgress[profileId] = nil
+            }
+            TelemetryService.shared.endCacheMigration(
+                telemetry,
+                filesMoved: outcome.filesMoved,
+                bytesMoved: outcome.bytesMoved,
+                durationSeconds: Date().timeIntervalSince(startedAt),
+                sameVolume: outcome.sameVolume,
+                outcome: SyncManager.cacheMigrationOutcomeLabel(outcome.result)
+            )
+            return outcome
+        }
+        cacheMigrationTasks[profileId] = task
+        return task
+    }
+
+    /// Pure: did a single profile's pre-move detach succeed? Extracted out
+    /// of `migrateCacheDirectory`'s control flow so this exact decision is
+    /// behaviorally testable without a real `SyncManager`/`SyncSetupService`
+    /// (finding 9 — the prior self-test coverage only checked that certain
+    /// substrings were PRESENT somewhere in the function body, which cannot
+    /// detect an inverted or unreachable guard around this decision).
+    nonisolated static func cacheMigrationDetachSucceeded(threw: Bool, stillMountedAfterRecheck: Bool) -> Bool {
+        !threw && !stillMountedAfterRecheck
+    }
+
+    /// R4 — detach and unload every currently-installed profile among
+    /// `profiles`, so nothing writes into either cache tree while files are
+    /// being relocated.
+    ///
+    /// Shared by the forward move AND the rollback. The rollback needs it
+    /// just as badly: by the time the user sees the "Resume or roll back?"
+    /// choice, `migrateCacheDirectory`'s `defer` has already re-installed
+    /// the agent, and the mount is back up using `sourceRoot` as its
+    /// `--cache-dir` — which is exactly where a rollback writes. Relocating
+    /// files into a live `rclone nfsmount`'s cache directory is the same
+    /// corruption path the pre-move warm cancellation exists to avoid, so
+    /// Roll Back must re-detach rather than assume the forward bracket
+    /// still covers it.
+    ///
+    /// `setupService.uninstall` does the graceful volume detach but does NOT
+    /// throw when that detach genuinely fails (`diskutil unmount` and its
+    /// `force` retry both non-zero) — it logs `mount.result: failure` and
+    /// proceeds to unload the agent anyway. So both a thrown error and that
+    /// non-throwing failure are checked explicitly (finding 7), the latter
+    /// via `isMountedAfterBoundedRecheck` rather than one `isMounted`
+    /// sample, since a stale mount-table entry or a `KeepAlive` remount race
+    /// would otherwise abort the whole run on a single bad reading
+    /// (finding 4).
+    ///
+    /// - Returns: the profiles that were unloaded and therefore MUST be
+    ///   passed to `reinstallAfterCacheMigration` on every exit path, and
+    ///   whether the detach failed (in which case the caller must abort
+    ///   without touching a file).
+    private func detachForCacheMigration(_ profiles: [SyncProfile]) -> (toReinstall: [SyncProfile], failed: Bool) {
+        let installed = profiles.filter { setupService.isInstalled(profile: $0) }
+        for profile in installed {
+            do {
+                try setupService.uninstall(profile: profile)
+            } catch {
+                return (installed, true)
+            }
+            let stillMounted = profile.isMountMode && setupService.isMountedAfterBoundedRecheck(profile: profile)
+            guard Self.cacheMigrationDetachSucceeded(threw: false, stillMountedAfterRecheck: stillMounted) else {
+                // `uninstall` returned normally but the volume is still
+                // attached — the graceful/forced `diskutil unmount` both
+                // failed. Abort rather than move files out from under it.
+                return (installed, true)
+            }
+        }
+        return (installed, false)
+    }
+
+    /// Re-install everything `detachForCacheMigration` unloaded and re-push
+    /// the FinderSync App Group data (R7). Always installs from the CURRENT
+    /// persisted profile, so a `vfsCachePath` the move just persisted is the
+    /// one the re-installed agent mounts with.
+    private func reinstallAfterCacheMigration(_ profiles: [SyncProfile]) {
+        for profile in profiles {
+            let latest = profileStore.profile(for: profile.id) ?? profile
+            try? setupService.install(profile: latest)
+        }
+        updateAppGroupMountPaths()
+    }
+
+    /// The full orchestration: cancel any in-flight warm for the affected
+    /// profiles (R5), detach/uninstall before the move (R4), run the engine
+    /// off the main actor (R10), persist `vfsCachePath` ONLY on `.completed`
+    /// (R20), then re-install on EVERY exit path and re-push the FinderSync
+    /// App Group data (R7).
+    private func migrateCacheDirectory(
+        for profileId: UUID,
+        destination: String,
+        coMigrate: Set<UUID>
+    ) async -> CacheMigrationOutcome {
+        guard let movingProfile = profileStore.profile(for: profileId) else {
+            return CacheMigrationOutcome(result: .cancelled, filesMoved: 0, bytesMoved: 0, sameVolume: false)
+        }
+        let allProfiles = profileStore.profiles
+        let startedAt = Date()
+
+        // R5 — cancel any warm reading through the mount BEFORE any file is touched.
+        let affectedIds = [profileId] + coMigrate
+        for id in affectedIds { cancelWarm(for: id) }
+
+        // Started BEFORE the detach loop (not after it, as before) so a
+        // detach-failure abort below still emits a span/metrics instead of
+        // silently producing no telemetry at all (finding 4).
+        let telemetry = TelemetryService.shared.beginCacheMigration(
+            profileId: profileId,
+            profileName: movingProfile.name
+        )
+
+        // R4 — detach/uninstall the moving profile (and any co-migrating
+        // installed profile) BEFORE the move, so nothing writes into the
+        // cache mid-move. `setupService.uninstall` already performs the
+        // graceful volume detach for a mount-mode profile — but it does NOT
+        // throw when that detach genuinely fails (`diskutil unmount` and its
+        // `force` retry both non-zero): it logs `mount.result: failure`
+        // telemetry and proceeds anyway to unload the agent and delete the
+        // profile's files. A `try?` here previously swallowed both a real
+        // thrown error AND that non-throwing failure, letting the move
+        // proceed against a still-mounted, still-writable volume (finding
+        // 7). Guard against both explicitly. The post-uninstall recheck
+        // uses `isMountedAfterBoundedRecheck` rather than a single
+        // `isMounted` sample, since a stale mount-table entry or a
+        // `KeepAlive` remount race can otherwise false-positive and abort
+        // the WHOLE migration on one bad sample (finding 4).
+        let detach = detachForCacheMigration([movingProfile] + coMigrate.compactMap { profileStore.profile(for: $0) })
+        let profilesToReinstall = detach.toReinstall
+        let detachFailed = detach.failed
+
+        defer {
+            // Re-install on EVERY exit path — completed, failed, cancelled,
+            // a detach failure, or a thrown error above — so a profile is
+            // never left with no launchd agent (`optimize-approach(plan)`
+            // proposal P2).
+            reinstallAfterCacheMigration(profilesToReinstall)
+        }
+
+        guard !detachFailed else {
+            cacheMigrationProgress[profileId] = nil
+            let outcome = CacheMigrationOutcome(result: .failed(.mountDetachFailed, rolledBack: false), filesMoved: 0, bytesMoved: 0, sameVolume: false)
+            TelemetryService.shared.endCacheMigration(
+                telemetry,
+                filesMoved: 0,
+                bytesMoved: 0,
+                durationSeconds: Date().timeIntervalSince(startedAt),
+                sameVolume: false,
+                outcome: Self.cacheMigrationOutcomeLabel(outcome.result)
+            )
+            return outcome
+        }
+
+        var progress = CacheMigrationProgress()
+        cacheMigrationProgress[profileId] = progress
+
+        let cancellationFlag = CacheMigrationCancellationFlag()
+        let fs = CacheMigrationFileSystem.production(isCancelled: { cancellationFlag.isCancelled })
+
+        let result: (plan: CacheMigrationPlan?, outcome: CacheMigrationOutcome) = await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                DispatchQueue.global(qos: .utility).async { [weak self] in
+                    let runResult = CacheMigrationRunner.migrate(
+                        moving: movingProfile,
+                        allProfiles: allProfiles,
+                        destination: destination,
+                        coMigrate: coMigrate,
+                        fs: fs,
+                        isCancelled: { cancellationFlag.isCancelled },
+                        onPreflight: { preflight in
+                            DispatchQueue.main.async {
+                                guard let self, var p = self.cacheMigrationProgress[profileId] else { return }
+                                p.filesTotal = preflight.totalFiles
+                                p.bytesTotal = preflight.totalBytes
+                                p.sameVolume = preflight.sameVolume
+                                self.cacheMigrationProgress[profileId] = p
+                            }
+                        },
+                        onProgress: { filesDone, bytesDone, currentFile in
+                            DispatchQueue.main.async {
+                                guard let self, var p = self.cacheMigrationProgress[profileId] else { return }
+                                p.phase = .moving
+                                p.filesDone = filesDone
+                                p.bytesDone = bytesDone
+                                p.currentFile = currentFile
+                                self.cacheMigrationProgress[profileId] = p
+                            }
+                        }
+                    )
+                    continuation.resume(returning: runResult)
+                }
+            }
+        } onCancel: {
+            cancellationFlag.markCancelled()
+        }
+        let plan = result.plan
+        let outcome = result.outcome
+        progress = cacheMigrationProgress[profileId] ?? progress
+        progress.filesTotal = max(progress.filesTotal, outcome.filesMoved)
+        progress.bytesTotal = max(progress.bytesTotal, outcome.bytesMoved)
+        progress.sameVolume = outcome.sameVolume
+        progress.finishedAt = Date()
+
+        // `shouldPersist` is the ACTUAL gate, not a `where` clause on a
+        // `.completed` pattern that had already decided the answer. It
+        // covers both persisting outcomes — a completed move, and
+        // `.nothingToMove` (an empty source is nothing to lose, so the
+        // user's directory choice must not be silently dropped; R20 only
+        // guards against persisting an INCOMPLETE cache). The two branches
+        // were previously hand-copied, which is how they drifted apart from
+        // the gate in the first place.
+        if CacheMigrationPersistDecision.shouldPersist(outcome) {
+            progress.phase = .completed
+            // Re-read each profile from the store instead of writing back
+            // `movingProfile`. That snapshot was taken before a move that
+            // can run for hours; writing it back wholesale would silently
+            // revert any edit the UI or `ConfigFileWatcher` made in the
+            // meantime. `vfsCachePath` is the only field this migration
+            // owns. (The sibling loop already worked this way — the moving
+            // profile itself was the outlier.)
+            var idsToRewrite = plan?.profileIdsToRewrite ?? []
+            if !idsToRewrite.contains(profileId) { idsToRewrite.append(profileId) }
+            for id in idsToRewrite {
+                guard var latest = profileStore.profile(for: id) else { continue }
+                latest.vfsCachePath = destination
+                profileStore.update(latest)
+            }
+        } else {
+            switch outcome.result {
+            case .cancelled:
+                progress.phase = .cancelled
+            case .failed(let reason, _):
+                progress.phase = .failed(reason.rawValue)
+            default:
+                progress.phase = .failed("rejected")
+            }
+        }
+        cacheMigrationProgress[profileId] = progress
+
+        TelemetryService.shared.endCacheMigration(
+            telemetry,
+            filesMoved: outcome.filesMoved,
+            bytesMoved: outcome.bytesMoved,
+            durationSeconds: progress.elapsed,
+            sameVolume: outcome.sameVolume,
+            outcome: Self.cacheMigrationOutcomeLabel(outcome.result)
+        )
+
+        return outcome
+    }
+
+    /// Pure — `nonisolated` so the rollback Task can label its own
+    /// outcome without an extra main-actor hop just to read a switch.
+    nonisolated private static func cacheMigrationOutcomeLabel(_ result: CacheMigrationOutcome.Result) -> String {
+        switch result {
+        case .completed: return "completed"
+        // `.nothingToMove` is persisted exactly like `.completed` above (see
+        // the switch in `migrateCacheDirectory`) — labeling it "completed"
+        // here too keeps telemetry's success/failure split consistent with
+        // what actually happened to the profile, and lets
+        // `TelemetryService.endCacheMigration`'s span status use a simple
+        // `outcome == "completed"` check instead of re-deriving this same
+        // persist decision a third time (finding 13).
+        case .preflightRejected(.nothingToMove): return "completed"
+        case .cancelled: return "cancelled"
+        case .failed(let reason, let rolledBack): return rolledBack ? "\(reason.rawValue)_rolled_back" : reason.rawValue
+        case .preflightRejected: return "preflight_rejected"
+        }
     }
 
     /// Warm (download into the VFS content cache) a profile's pinned folders, publishing

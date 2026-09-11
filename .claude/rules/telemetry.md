@@ -229,6 +229,11 @@ rollout. No event is emitted on a fresh install.
 | `synctray.offline.warm.throughput` | Histogram | Average read throughput of a warming run, MB/s — the primary signal for slow-fallback diagnosis (the SFTP fallback caps aggregate throughput) |
 | `synctray.offline.warm.files` | Counter | Files warmed into the VFS content cache (`warm.outcome`: completed/cancelled) |
 | `synctray.offline.warm.bytes` | Counter | Bytes read through the mount while warming (`warm.outcome`: completed/cancelled) |
+| `synctray.cache.migration.count` | Counter | Cache-directory migrations by outcome (`cache_migration.outcome`: completed/cancelled/a `CacheMigrationFailure` value/preflight_rejected) and `cache_migration.same_volume` |
+| `synctray.cache.migration.duration` | Histogram | Duration of a cache-directory migration run, seconds |
+| `synctray.cache.migration.throughput` | Histogram | Average copy throughput of a CROSS-volume cache-directory migration, MB/s (0 for a same-volume rename — a byte-for-byte throughput figure would be meaningless for a rename) |
+| `synctray.cache.migration.files` | Counter | Files relocated during a cache-directory migration |
+| `synctray.cache.migration.bytes` | Counter | Bytes relocated during a cache-directory migration |
 
 ### Spans
 | Span | Kind | Description |
@@ -238,6 +243,7 @@ rollout. No event is emitted on a fresh install.
 | `synctray unmount` | INTERNAL | Unmount operation |
 | `synctray reinstall_detach` | INTERNAL | Pre-uninstall graceful volume detach for a mount-mode profile (fires on every `uninstall`, including settings-save reinstall) |
 | `synctray warm` | INTERNAL | Offline-file warming run for a profile's pinned folders (start→complete/cancel). Carries `warm.trigger`, `warm.outcome` (completed/cancelled), `warm.concurrency`, `warm.files`, `warm.bytes`, `warm.duration_seconds`, `warm.throughput_mbps`. Exports on end, so an in-progress warm shows only the "Offline warm started" log, not the span. Cancelled when the cache is cleared, the profile is unmounted, or a newer run supersedes it. |
+| `synctray cache_migration` | INTERNAL | Cache-directory move for a Stream profile (start→complete/cancel/fail). Carries `cache_migration.outcome`, `cache_migration.same_volume`, `cache_migration.files`, `cache_migration.bytes`, `cache_migration.duration_seconds`, `cache_migration.throughput_mbps`. Never carries a cache path, source/destination directory, or remote name — only the profile id and its display name, same carve-out as every other span here. |
 
 ### Logs
 All key lifecycle events are emitted as structured OTel logs:
@@ -273,6 +279,7 @@ All key lifecycle events are emitted as structured OTel logs:
 - Reinstall pre-detach: graceful volume detach before a mount-mode profile's `uninstall` (settings-save reinstall, manual uninstall, or delete), only logged when the profile was mounted — `success` at info, `success_forced` at warn (diskutil needed `unmount force`), `failure` at error (still mounted after both attempts — the freeze condition this replaces)
 - CLI invoked: one `CLI invoked` record per headless `synctray` run (`cli.command`, `cli.result`, `cli.exit_code`, `cli.duration_seconds`) — info on success, warn on a non-zero exit. Bounded verb only; never args, paths, profile names, or remotes. Emitted by `TelemetryService.recordCLIInvocation`, gated on the telemetry opt-in, flushed by `flushForExit` (a SILENT force-flush of all three signals — unlike `shutdown()`, it prints nothing, so CLI stdout stays clean)
 - Offline warm started/completed/cancelled: a pinned-folder warming run began (`Offline warm started`, with `warm.trigger`, `warm.directory_count`, `warm.concurrency`) or ended (`Offline warm completed` or `Offline warm cancelled`, with `warm.outcome`, `warm.files`, `warm.bytes`, `warm.duration_seconds`, `warm.throughput_mbps`). A run is cancelled when the cache is cleared, the profile is unmounted, or a newer run supersedes it. Use `synctray.offline.warm.throughput` to spot the slow-fallback case; filter `warm.outcome=completed` to exclude interrupted runs from throughput analysis.
+- Cache migration started/completed: `Cache migration started` when a Stream profile's cache-directory move begins; `Cache migration completed` (outcome `completed`) or `Cache migration ended` (any other outcome — `cancelled`, a `CacheMigrationFailure` value, optionally `_rolled_back`-suffixed, or `preflight_rejected`) when it ends, carrying `cache_migration.outcome`, `cache_migration.same_volume`, `cache_migration.files`, `cache_migration.bytes`, `cache_migration.duration_seconds`, `cache_migration.throughput_mbps`. Never a cache path, directory, or remote name.
 
 ## Swift SDK Gotcha: Wildcard View Required
 

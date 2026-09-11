@@ -127,6 +127,19 @@ struct ProfileDetailView: View {
     @State private var pendingLocalSyncPath: String = ""
     @State private var pendingLocalSyncItemCount: Int = 0
 
+    // Cache-directory move prompt (Save changed Cache Directory on a Stream profile)
+    @State private var cacheMovePrompt: CacheMovePrompt?
+    @State private var showingCacheMoveSheet: Bool = false
+    // Whether the fields `saveProfile()` deferred-persisted alongside the
+    // cache-path change (everything except vfsCachePath) still need a
+    // reinstall to take effect. Set when the prompt is opened; cleared by
+    // whichever path actually performs that reinstall (an explicit
+    // Leave-behind/Start-fresh choice in `finalizeCachePathChange`, or a
+    // move actually starting in `CacheMoveSheet`) so the sheet's
+    // `onDismiss` only reinstalls for a bare dismissal (Cancel/close) that
+    // leaves those other fields un-applied (finding 12).
+    @State private var cacheMoveOtherFieldsNeedReinstall = false
+
     private let setupService = SyncSetupService.shared
 
     // MARK: - Computed Properties
@@ -368,6 +381,44 @@ struct ProfileDetailView: View {
         .sheet(item: $editRemoteTarget) { target in
             AddRemoteSheet(editing: target.remoteName) { _ in
                 loadRcloneRemotes()
+            }
+        }
+        .sheet(isPresented: $showingCacheMoveSheet, onDismiss: {
+            // A bare dismissal (Cancel / close box) never ran Move, Leave
+            // behind, or Start fresh — the other-field changes `saveProfile()`
+            // deferred-persisted are still sitting un-applied on disk, so
+            // apply them here. Any path that DID resolve the prompt already
+            // cleared the flag itself, making this a no-op then (finding 12).
+            //
+            // MUST reinstall from the ALREADY-PERSISTED profile in
+            // `profileStore`, never from the live form via a bare
+            // `reinstallSync()` — `buildProfileFromForm()` still reads
+            // whatever the user typed into the Cache Directory field, which
+            // this whole sheet exists to gate. Calling the form-driven
+            // overload here previously installed AND persisted the exact
+            // cache-path change Cancel is supposed to refuse (finding 1 — a
+            // regression introduced by the finding-12 fix itself). The
+            // persisted profile already has every OTHER field applied with
+            // `vfsCachePath` still at its OLD value (`saveProfile()`
+            // deliberately held it there before opening this sheet).
+            if cacheMoveOtherFieldsNeedReinstall {
+                if let persisted = profileStore.profile(for: profile.id) {
+                    reinstallSync(using: persisted)
+                }
+                cacheMoveOtherFieldsNeedReinstall = false
+            }
+            cacheMovePrompt = nil
+        }) {
+            if let prompt = cacheMovePrompt {
+                CacheMoveSheet(
+                    mode: .pendingSave(prompt: prompt),
+                    profileStore: profileStore,
+                    syncManager: syncManager,
+                    onLeaveBehind: { finalizeCachePathChange(prompt: prompt, deleteOldCache: false) },
+                    onStartFresh: { finalizeCachePathChange(prompt: prompt, deleteOldCache: true) },
+                    onMoveStarted: { cacheMoveOtherFieldsNeedReinstall = false },
+                    onDismiss: { showingCacheMoveSheet = false }
+                )
             }
         }
         .alert("Delete Remote?", isPresented: $showingDeleteRemoteConfirm) {
@@ -2033,6 +2084,33 @@ struct ProfileDetailView: View {
         let updatedProfile = buildProfileFromForm()
         let currentProfile = profile
 
+        // A Stream profile whose Cache Directory changed needs a decision about
+        // the files already cached at the old location before anything reinstalls —
+        // hand off to the move sheet instead of saving vfsCachePath immediately.
+        let cacheIntent = SyncManager.cachePathChangeIntent(
+            from: currentProfile, to: updatedProfile, allProfiles: profileStore.profiles
+        )
+        if case .promptMove(let prompt) = cacheIntent {
+            // Persist every OTHER field change now, holding vfsCachePath at its
+            // CURRENT value — the sheet (Move / Leave behind / Start fresh)
+            // performs the final vfsCachePath write and any reinstall.
+            var deferredProfile = updatedProfile
+            deferredProfile.vfsCachePath = currentProfile.vfsCachePath
+            // Whether those deferred (non-cache-path) fields actually need a
+            // reinstall to take effect, computed against the SAME delta
+            // helper used below — if the sheet is simply dismissed without
+            // resolving the cache-path change (Cancel), `onDismiss` still
+            // needs to apply them (finding 12).
+            let deferredNeedsReinstall = isInstalled
+                && SyncManager.reconcileAction(from: currentProfile, to: deferredProfile) == .reinstall
+            profileStore.update(deferredProfile)
+            syncManager.clearError(for: profile.id)
+            cacheMovePrompt = prompt
+            cacheMoveOtherFieldsNeedReinstall = deferredNeedsReinstall
+            showingCacheMoveSheet = true
+            return
+        }
+
         // Delegates to the SAME delta helper `applyExternalProfileEdit` uses,
         // so the Save button and an external file edit can never drift on
         // "what work does this change need" (see plan Decisions).
@@ -2047,6 +2125,102 @@ struct ProfileDetailView: View {
         // Only reinstall if sync-related settings changed
         if needsReinstall {
             reinstallSync()
+        }
+    }
+
+    /// "Leave them behind" / "Start fresh" — persist the NEW `vfsCachePath`
+    /// (no move engine run) and reinstall. "Move existing cached files" does
+    /// NOT come through here: `CacheMoveSheet` calls
+    /// `SyncManager.startCacheMigration`, whose own orchestration already
+    /// uninstalls, moves, persists `vfsCachePath` on success, and reinstalls
+    /// on every exit path — a second reinstall here would be redundant.
+    private func finalizeCachePathChange(prompt: CacheMovePrompt, deleteOldCache: Bool) {
+        guard var latest = profileStore.profile(for: prompt.profileId) else { return }
+        if deleteOldCache {
+            deleteOldCacheSubtree(of: latest, excluding: prompt.overlappingProfileIds)
+        }
+        latest.vfsCachePath = prompt.destinationRoot
+        profileStore.update(latest)
+        if isInstalled {
+            reinstallSync()
+        }
+        // This reinstall (or the no-op fallthrough below when `!isInstalled`)
+        // already applies BOTH the cache-path edit AND every other field
+        // change `saveProfile()` deferred-persisted before opening this
+        // sheet — clear the flag so the sheet's `onDismiss` doesn't run a
+        // second, redundant reinstall for those same other fields (finding 12).
+        cacheMoveOtherFieldsNeedReinstall = false
+        showingCacheMoveSheet = false
+        cacheMovePrompt = nil
+    }
+
+    /// "Start fresh" — delete BOTH the `vfs` and `vfsMeta` subtree at the
+    /// profile's OLD cache root, EXCLUDING any overlapping sibling's nested
+    /// subtree — an overlapping profile addresses the SAME bytes on disk
+    /// (R15/R28), so a blanket delete of the moving profile's whole subtree
+    /// would also destroy that sibling's entire cache when the sibling is
+    /// nested inside it (finding 3). When the moving profile's OWN key is
+    /// nested inside an overlapping sibling's (the reverse direction),
+    /// nothing is deleted at all — the whole subtree is shared territory.
+    /// Deliberately separate from `VFSCacheService.clearCache` (which only
+    /// clears `vfs` — a known, recorded-out-of-scope gap, see plan Out of
+    /// Scope) so the freed space is fully accounted for. Values are captured
+    /// on the main thread first; the actual removal runs off it per
+    /// CLAUDE.md Critical Rule 1, since a populated cache can be many
+    /// gigabytes.
+    private func deleteOldCacheSubtree(of profile: SyncProfile, excluding overlappingIds: [UUID]) {
+        let root = CacheMigrationPlanner.normalizeRoot(profile.vfsCachePath)
+        let key = VFSCacheService.cacheRelativePath(for: profile)
+        let overlappingKeys: [String] = overlappingIds.compactMap { id in
+            profileStore.profile(for: id).map { VFSCacheService.cacheRelativePath(for: $0) }
+        }
+
+        // This profile's own key is nested inside (or equal to) an
+        // overlapping sibling's key — the WHOLE subtree at `key` is that
+        // sibling's territory too. Deleting any of it costs the sibling
+        // real cached data, so delete nothing.
+        guard !overlappingKeys.contains(where: { key == $0 || key.hasPrefix($0 + "/") }) else { return }
+
+        // Siblings whose key is nested INSIDE this profile's own key get
+        // their relative sub-path preserved during the walk below.
+        let preserveRelativePaths: [String] = overlappingKeys.compactMap { sibling in
+            guard sibling.hasPrefix(key + "/") else { return nil }
+            return String(sibling.dropFirst(key.count + 1))
+        }
+
+        DispatchQueue.global(qos: .utility).async {
+            let fm = FileManager.default
+            for kind in CacheTreeKind.allCases {
+                let path = "\(root)/\(kind.rawValue)/\(key)"
+                Self.removeCacheSubtree(at: path, base: path, preserving: preserveRelativePaths, fm: fm)
+            }
+        }
+    }
+
+    /// Recursively remove everything under `dir`, EXCEPT an entry whose path
+    /// relative to `base` is one of `preserving` (or lives inside one) — the
+    /// same preserve-a-subtree walk `VFSCacheService.clearUnpinned` uses for
+    /// pinned directories, applied here to an overlapping sibling's nested
+    /// cache instead.
+    private static func removeCacheSubtree(at dir: String, base: String, preserving: [String], fm: FileManager) {
+        guard !preserving.isEmpty else {
+            try? fm.removeItem(atPath: dir)
+            return
+        }
+        guard let entries = try? fm.contentsOfDirectory(atPath: dir) else { return }
+        for entry in entries {
+            let full = (dir as NSString).appendingPathComponent(entry)
+            let rel = String(full.dropFirst(base.count + 1))
+            if preserving.contains(where: { rel == $0 || rel.hasPrefix($0 + "/") }) {
+                continue  // the preserved subtree itself, or a file inside it
+            }
+            var isDir: ObjCBool = false
+            fm.fileExists(atPath: full, isDirectory: &isDir)
+            if isDir.boolValue && preserving.contains(where: { $0.hasPrefix(rel + "/") }) {
+                removeCacheSubtree(at: full, base: base, preserving: preserving, fm: fm)  // ancestor of a preserved subtree
+            } else {
+                try? fm.removeItem(atPath: full)
+            }
         }
     }
 
@@ -2224,12 +2398,31 @@ struct ProfileDetailView: View {
         }
     }
 
+    /// Install from the live form — the ordinary path.
+    ///
+    /// A distinct zero-argument overload rather than a default argument on
+    /// `installSync(using:)`: this function is passed by REFERENCE
+    /// (`Button(action: installSync)`), and a Swift function reference does
+    /// NOT apply default arguments, so a single defaulted-parameter version
+    /// has type `(SyncProfile?) -> Void` at those call sites and fails to
+    /// convert to the `() -> Void` a `Button` action wants.
     private func installSync() {
+        installSync(using: nil)
+    }
+
+    /// - Parameter overrideProfile: when non-nil, install exactly this
+    ///   profile instead of rebuilding one from the live form. Required by
+    ///   the cache-move-cancel backstop (finding 1): the form's
+    ///   `vfsCachePath` field can hold an unresolved, un-gated edit, so that
+    ///   path must reinstall the ALREADY-PERSISTED profile, never derive one
+    ///   from form state.
+    private func installSync(using overrideProfile: SyncProfile?) {
         isInstalling = true
         installError = nil
 
-        // Build profile from current form state (no need to save first)
-        let currentProfile = buildProfileFromForm()
+        // Build profile from current form state (no need to save first) —
+        // unless an explicit override was supplied.
+        let currentProfile = overrideProfile ?? buildProfileFromForm()
 
         TelemetryService.shared.recordProfileLifecycleOperation(
             profileId: currentProfile.id, profileName: currentProfile.name,
@@ -2658,7 +2851,11 @@ struct ProfileDetailView: View {
         return base
     }
 
-    private func reinstallSync() {
+    /// - Parameter overrideProfile: forwarded to `installSync(using:)` — see
+    ///   its doc comment. The uninstall half already reads the
+    ///   currently-persisted profile from `profileStore`, so only the
+    ///   install half needed a form-bypass.
+    private func reinstallSync(using overrideProfile: SyncProfile? = nil) {
         guard let currentProfile = profileStore.profile(for: profile.id) else { return }
 
         TelemetryService.shared.recordProfileLifecycleOperation(
@@ -2671,7 +2868,7 @@ struct ProfileDetailView: View {
         } catch {
             // Ignore uninstall errors
         }
-        installSync()
+        installSync(using: overrideProfile)
     }
 
     private func runResync(loadAgentOnCompletion: Bool = false) {

@@ -9,7 +9,9 @@
 /* Begin PBXBuildFile section */
 		1D86AAFD8D8099734E2357A8 /* SyncMode.swift in Sources */ = {isa = PBXBuildFile; fileRef = 406416A46963E44FF701814B /* SyncMode.swift */; };
 		58578B4CF51E7600D4E39636 /* ProviderFieldsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 77CC26F6DC209C0F0B6626D7 /* ProviderFieldsView.swift */; };
+		6E46DC7E3B954257AB1518D0 /* CacheMigrationPlanner.swift in Sources */ = {isa = PBXBuildFile; fileRef = F8DCCC96421D65D187C3C59F /* CacheMigrationPlanner.swift */; };
 		7D9FBA7536F4EB2EDCAEE043 /* RcloneConfigService.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0DC6141FBB853681643F593 /* RcloneConfigService.swift */; };
+		80A56C81D9C62272D0FBA2F6 /* CacheMoveSheet.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0E078DEC9D7F0C241D48DD14 /* CacheMoveSheet.swift */; };
 		97D529370EB9EC5B06EFB9EE /* CLIShimInstaller.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6E8B026F33644146D215E2A3 /* CLIShimInstaller.swift */; };
 		A11111110000000000000001 /* SyncTrayApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000001 /* SyncTrayApp.swift */; };
 		A11111110000000000000002 /* SyncState.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000002 /* SyncState.swift */; };
@@ -37,6 +39,7 @@
 		A8048FF52AC46AD7139A2000 /* ConfigFileWatcher.swift in Sources */ = {isa = PBXBuildFile; fileRef = 75E6545555EB74D6B9B97A02 /* ConfigFileWatcher.swift */; };
 		AB12CD34EF56789012340001 /* AddRemoteSheet.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB12CD34EF56789012340002 /* AddRemoteSheet.swift */; };
 		AF1148C620DEEB255ED5697E /* profile.schema.json in Resources */ = {isa = PBXBuildFile; fileRef = 0A584CD77E2D28463C2BCE08 /* profile.schema.json */; };
+		C72A75499AA71D2236AA288C /* CacheMigrationProgress.swift in Sources */ = {isa = PBXBuildFile; fileRef = DFEE308C253708BD60348055 /* CacheMigrationProgress.swift */; };
 		CD8DBB07353E3912253F60F6 /* settings.schema.json in Resources */ = {isa = PBXBuildFile; fileRef = 58F65D759543D11557E77A58 /* settings.schema.json */; };
 		D1AA48876BFD939152611C3A /* RemoteProvider.swift in Sources */ = {isa = PBXBuildFile; fileRef = A50EAC070BD6E49AA1131944 /* RemoteProvider.swift */; };
 		D347B9A6D156102131579DED /* SetupWizardView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8DF29F3BB633D9E3DD12136A /* SetupWizardView.swift */; };
@@ -46,6 +49,7 @@
 		E1A0B1C2D3E4F56789AB0007 /* TelemetryDetailsSheet.swift in Sources */ = {isa = PBXBuildFile; fileRef = E1A0B1C2D3E4F56789AB0008 /* TelemetryDetailsSheet.swift */; };
 		E912A1B4B43D4029246920EE /* RcloneLocator.swift in Sources */ = {isa = PBXBuildFile; fileRef = D767944E8289869D576524AC /* RcloneLocator.swift */; };
 		E98B9E367273424F260154CC /* ConfigReconciler.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5AD2D42E871A6CC074379689 /* ConfigReconciler.swift */; };
+		EF980FBC32B46CA1A4645855 /* CacheMigrationService.swift in Sources */ = {isa = PBXBuildFile; fileRef = CE2089D1111CD3C727D2BF40 /* CacheMigrationService.swift */; };
 		F2B3C4D5E6F7089012AB0001 /* MigrationRunner.swift in Sources */ = {isa = PBXBuildFile; fileRef = F2B3C4D5E6F7089012AB0002 /* MigrationRunner.swift */; };
 		F9268603C9EA887930F58C52 /* ConfigSchemaInstaller.swift in Sources */ = {isa = PBXBuildFile; fileRef = C537381AA63EEF38035C8CA0 /* ConfigSchemaInstaller.swift */; };
 		F99405AC91359147E15ABEFD /* SyncTrayCLI.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5FF13407D6D0E3A3B55ED862 /* SyncTrayCLI.swift */; };
@@ -86,6 +90,7 @@
 
 /* Begin PBXFileReference section */
 		0A584CD77E2D28463C2BCE08 /* profile.schema.json */ = {isa = PBXFileReference; includeInIndex = 1; path = profile.schema.json; sourceTree = "<group>"; };
+		0E078DEC9D7F0C241D48DD14 /* CacheMoveSheet.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = CacheMoveSheet.swift; sourceTree = "<group>"; };
 		406416A46963E44FF701814B /* SyncMode.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = SyncMode.swift; sourceTree = "<group>"; };
 		48C81844C44AA7C559B6730B /* AppSettingsFileStore.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = AppSettingsFileStore.swift; sourceTree = "<group>"; };
 		58F65D759543D11557E77A58 /* settings.schema.json */ = {isa = PBXFileReference; includeInIndex = 1; path = settings.schema.json; sourceTree = "<group>"; };
@@ -126,12 +131,15 @@
 		AB12CD34EF56789012340002 /* AddRemoteSheet.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = AddRemoteSheet.swift; sourceTree = "<group>"; };
 		C0DC6141FBB853681643F593 /* RcloneConfigService.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = RcloneConfigService.swift; sourceTree = "<group>"; };
 		C537381AA63EEF38035C8CA0 /* ConfigSchemaInstaller.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = ConfigSchemaInstaller.swift; sourceTree = "<group>"; };
+		CE2089D1111CD3C727D2BF40 /* CacheMigrationService.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = CacheMigrationService.swift; sourceTree = "<group>"; };
 		D767944E8289869D576524AC /* RcloneLocator.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = RcloneLocator.swift; sourceTree = "<group>"; };
+		DFEE308C253708BD60348055 /* CacheMigrationProgress.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = CacheMigrationProgress.swift; sourceTree = "<group>"; };
 		E1A0B1C2D3E4F56789AB0002 /* VFSCacheService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VFSCacheService.swift; sourceTree = "<group>"; };
 		E1A0B1C2D3E4F56789AB0004 /* OfflineFilesSection.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OfflineFilesSection.swift; sourceTree = "<group>"; };
 		E1A0B1C2D3E4F56789AB0006 /* TelemetryOptInBanner.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TelemetryOptInBanner.swift; sourceTree = "<group>"; };
 		E1A0B1C2D3E4F56789AB0008 /* TelemetryDetailsSheet.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TelemetryDetailsSheet.swift; sourceTree = "<group>"; };
 		F2B3C4D5E6F7089012AB0002 /* MigrationRunner.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MigrationRunner.swift; sourceTree = "<group>"; };
+		F8DCCC96421D65D187C3C59F /* CacheMigrationPlanner.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = CacheMigrationPlanner.swift; sourceTree = "<group>"; };
 		FS000000000000000000A001 /* FinderSyncExtension.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FinderSyncExtension.swift; sourceTree = "<group>"; };
 		FS000000000000000000A002 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		FS000000000000000000A003 /* SyncTrayFinderSync.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = SyncTrayFinderSync.appex; sourceTree = BUILT_PRODUCTS_DIR; };
@@ -228,6 +236,7 @@
 				A10000000000000000000012 /* SyncProfile.swift */,
 				406416A46963E44FF701814B /* SyncMode.swift */,
 				A50EAC070BD6E49AA1131944 /* RemoteProvider.swift */,
+				DFEE308C253708BD60348055 /* CacheMigrationProgress.swift */,
 			);
 			path = Models;
 			sourceTree = "<group>";
@@ -252,6 +261,8 @@
 				C537381AA63EEF38035C8CA0 /* ConfigSchemaInstaller.swift */,
 				5AD2D42E871A6CC074379689 /* ConfigReconciler.swift */,
 				7F52EB2FA3D07D3E970F226D /* ConfigSelfTest.swift */,
+				F8DCCC96421D65D187C3C59F /* CacheMigrationPlanner.swift */,
+				CE2089D1111CD3C727D2BF40 /* CacheMigrationService.swift */,
 			);
 			path = Services;
 			sourceTree = "<group>";
@@ -296,6 +307,7 @@
 				E1A0B1C2D3E4F56789AB0004 /* OfflineFilesSection.swift */,
 				E1A0B1C2D3E4F56789AB0006 /* TelemetryOptInBanner.swift */,
 				E1A0B1C2D3E4F56789AB0008 /* TelemetryDetailsSheet.swift */,
+				0E078DEC9D7F0C241D48DD14 /* CacheMoveSheet.swift */,
 			);
 			path = Settings;
 			sourceTree = "<group>";
@@ -495,6 +507,10 @@
 				FC6298CE8767141C78EB8D75 /* ConfigSelfTest.swift in Sources */,
 				F99405AC91359147E15ABEFD /* SyncTrayCLI.swift in Sources */,
 				97D529370EB9EC5B06EFB9EE /* CLIShimInstaller.swift in Sources */,
+				6E46DC7E3B954257AB1518D0 /* CacheMigrationPlanner.swift in Sources */,
+				EF980FBC32B46CA1A4645855 /* CacheMigrationService.swift in Sources */,
+				C72A75499AA71D2236AA288C /* CacheMigrationProgress.swift in Sources */,
+				80A56C81D9C62272D0FBA2F6 /* CacheMoveSheet.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

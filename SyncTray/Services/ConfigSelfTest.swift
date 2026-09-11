@@ -63,6 +63,23 @@ enum ConfigSelfTest {
             testDoctorPureChecks,
             testCLIResolveAndList,
             testShimInstallIdempotentNonClobber,
+            testCacheMigrationTreeKinds,
+            testCacheMigrationKeyDerivation,
+            testCacheMigrationOverlap,
+            testCacheMigrationVolumeRouting,
+            testCacheMigrationSpacePreflight,
+            testCacheMigrationVerifyOrder,
+            testCacheMigrationPersistOnSuccess,
+            testCacheMigrationCancelResume,
+            testCacheMigrationInstallOnEveryPath,
+            testCacheMigrationWarmCancelledFirst,
+            testCacheMigrationDestinationParentCreated,
+            testCacheMigrationRollbackOptionalGuard,
+            testCacheMigrationNestedSubtreesUseFilePath,
+            testCacheMigrationOrchestrationHardening,
+            testCacheMigrationUIFixes,
+            testCacheMigrationTelemetrySpanStatus,
+            testCacheMigrationCLI,
         ]
 
         for check in checks {
@@ -837,7 +854,10 @@ enum ConfigSelfTest {
         readStdin: @escaping () -> String? = { nil },
         readFile: @escaping (String) -> String? = { _ in nil },
         stdout: @escaping (String) -> Void = { _ in },
-        stderr: @escaping (String) -> Void = { _ in }
+        stderr: @escaping (String) -> Void = { _ in },
+        migrateCache: @escaping (SyncProfile, String, Bool) -> CacheMigrationCLIResult = { _, _, _ in
+            .completed(files: 0, bytes: 0, sameVolume: true)
+        }
     ) -> CLIEnvironment {
         CLIEnvironment(
             runRclone: runRclone,
@@ -850,6 +870,7 @@ enum ConfigSelfTest {
             uninstallProfile: uninstallProfile,
             deleteProfileFile: deleteProfileFile,
             runSyncScript: runSyncScript,
+            migrateCache: migrateCache,
             readStdin: readStdin,
             readFile: readFile,
             stdout: stdout,
@@ -1207,6 +1228,1222 @@ enum ConfigSelfTest {
         }
 
         return report("AC-CLI4", "shim-install-idempotent-nonclobber", true)
+    }
+
+    // MARK: - Cache-directory migration fixtures
+
+    /// Thrown by `FakeCacheFS.copyFile`/`copyFileDataOnly` when the
+    /// destination's parent directory hasn't been created yet — this is
+    /// deliberately a HARD requirement, not an auto-created convenience,
+    /// because `FileManager.copyItem`/`data.write(to:)` on the real
+    /// filesystem behave exactly this way (neither creates intermediate
+    /// directories). An earlier version of this fake auto-inserted the
+    /// parent into `directories` as a copy side effect, which masked a real
+    /// production bug — `moveFile` copying into a destination root that was
+    /// never created (finding 1) — because the fake "succeeded" regardless
+    /// of whether production had done the creation. See AC-CM11.
+    private enum FakeCacheFSError: Error { case missingParentDirectory }
+
+    /// Inert fake filesystem for driving `CacheMigrationEngine` without any
+    /// real I/O: a `[String: Int64]` path→size map that only records calls.
+    /// NEVER re-implements copy/verify/delete ordering — that is the engine's
+    /// job, and a fake that re-encodes it could only confirm itself
+    /// (`global::aw-lessons::mock-that-reimplements-the-thing-under-test`,
+    /// seen 7×, structural).
+    private final class FakeCacheFS {
+        var files: [String: Int64] = [:]        // path -> size (doubles as "exists")
+        var directories: Set<String> = []
+        var removedPaths: [String] = []
+        var copiedPaths: [(String, String)] = []
+        var movedPaths: [(String, String)] = []
+        var volumeOf: [String: String] = [:]     // path prefix -> volume id ("default-volume" if unset)
+        var availableCapacityBytes: Int64 = Int64.max
+        var writeMismatchAt: Set<String> = []    // dest paths whose copy lands at the WRONG size
+        /// Copy TARGET paths whose copy silently produces no file at all —
+        /// the "the copy no-op'd" half of the both-sizes-missing footgun
+        /// AC-CM12 drives through `rollback` (finding 4). Distinct from
+        /// `writeMismatchAt`, which writes a file at the WRONG size.
+        var copyProducesNothingAt: Set<String> = []
+        /// Path -> how many more `fileSize` calls succeed before it starts
+        /// returning `nil` — simulates a file that EXISTS but cannot be
+        /// stat'd, which no combination of `files`/`directories` can express
+        /// (both derive from the same map). AC-CM12 needs it to make
+        /// `rollback`'s destination stat fail while the forward move's own
+        /// stats still succeed. A test that sets a budget should assert it
+        /// reached 0, so a refactor changing the call count fails loudly
+        /// instead of silently skipping the scenario.
+        var statBudget: [String: Int] = [:]
+        /// Every root `removeEmptyDirectories` was called with, in call
+        /// order — records the argument so a test can assert BOTH the
+        /// scope (per-`vfs`/`vfsMeta` subtree, never the bare cache root)
+        /// and the ordering (only after a confirmed-complete move) of the
+        /// prune step (finding 10). The original fake discarded the
+        /// argument entirely (`{ _ in }`), so no assertion could ever have
+        /// caught either regression.
+        var removeEmptyDirectoriesCalls: [String] = []
+
+        func system() -> CacheMigrationFileSystem {
+            CacheMigrationFileSystem(
+                directoryExists: { [weak self] path in self?.directories.contains(path) ?? false },
+                fileExists: { [weak self] path in self?.files[path] != nil },
+                enumerateFiles: { [weak self] root in
+                    guard let self else { return [] }
+                    let prefix = root + "/"
+                    // Sorted: `files` is a Dictionary, so an unsorted map
+                    // would hand the engine a nondeterministic file ORDER and
+                    // any test that depends on which file fails first would
+                    // flake.
+                    return self.files
+                        .filter { $0.key.hasPrefix(prefix) }
+                        .sorted { $0.key < $1.key }
+                        .map { (relativePath: String($0.key.dropFirst(prefix.count)), size: $0.value) }
+                },
+                fileSize: { [weak self] path in
+                    guard let self else { return nil }
+                    if let remaining = self.statBudget[path] {
+                        guard remaining > 0 else { return nil }
+                        self.statBudget[path] = remaining - 1
+                    }
+                    return self.files[path]
+                },
+                createDirectory: { [weak self] path in
+                    self?.directories.insert(path)
+                },
+                copyFile: { [weak self] from, to in
+                    guard let self else { return }
+                    let parent = (to as NSString).deletingLastPathComponent
+                    guard self.directories.contains(parent) else {
+                        throw FakeCacheFSError.missingParentDirectory
+                    }
+                    self.copiedPaths.append((from, to))
+                    // A copy that throws nothing but writes nothing — the
+                    // scenario `rollback`'s `guard let` has to fail closed on.
+                    guard !self.copyProducesNothingAt.contains(to) else { return }
+                    let sourceSize = self.files[from] ?? 0
+                    self.files[to] = self.writeMismatchAt.contains(to) ? sourceSize + 1 : sourceSize
+                },
+                copyFileDataOnly: { [weak self] from, to in
+                    guard let self else { return }
+                    let parent = (to as NSString).deletingLastPathComponent
+                    guard self.directories.contains(parent) else {
+                        throw FakeCacheFSError.missingParentDirectory
+                    }
+                    self.copiedPaths.append((from, to))
+                    self.files[to] = self.files[from] ?? 0
+                },
+                moveItem: { [weak self] from, to in
+                    guard let self else { return }
+                    self.movedPaths.append((from, to))
+                    let prefix = from + "/"
+                    let toMove = self.files.filter { $0.key == from || $0.key.hasPrefix(prefix) }
+                    for (path, size) in toMove {
+                        let suffix = String(path.dropFirst(from.count))
+                        self.files[to + suffix] = size
+                        self.files.removeValue(forKey: path)
+                    }
+                    self.directories.remove(from)
+                    self.directories.insert(to)
+                },
+                removeItem: { [weak self] path in
+                    self?.removedPaths.append(path)
+                    self?.files.removeValue(forKey: path)
+                },
+                removeEmptyDirectories: { [weak self] path in
+                    self?.removeEmptyDirectoriesCalls.append(path)
+                },
+                volumeIdentifier: { [weak self] path in
+                    guard let self else { return nil }
+                    for (prefix, id) in self.volumeOf where path.hasPrefix(prefix) {
+                        return id
+                    }
+                    return "default-volume"
+                },
+                availableCapacity: { [weak self] _ in self?.availableCapacityBytes }
+            )
+        }
+    }
+
+    /// Builds an inert `CacheMigrationFileSystem` plus its call-recording
+    /// handle — mirrors `fakeCLIEnvironment`'s "spy closures, dumb state" style.
+    private static func fakeCacheMigrationFileSystem() -> (fs: CacheMigrationFileSystem, recorder: FakeCacheFS) {
+        let recorder = FakeCacheFS()
+        return (recorder.system(), recorder)
+    }
+
+    /// Reads a source file elsewhere in the SyncTray target, addressed
+    /// relative to the `SyncTray/` directory root (e.g.
+    /// `"Views/Settings/ProfileDetailView.swift"`). Generalizes the
+    /// `#filePath` sibling-source-read technique AC-C5 established (which
+    /// only reached same-directory siblings) so the review-fix assertions
+    /// below can verify call sites this host has no compiler to check any
+    /// other way — SwiftUI view state and MainActor orchestration aren't
+    /// reachable through the `CacheMigrationFileSystem` injection seam the
+    /// rest of this suite drives.
+    private static func readSourceFile(_ relativePathFromSyncTrayRoot: String) -> String? {
+        let selfTestFile = URL(fileURLWithPath: #filePath)
+        // ConfigSelfTest.swift lives at SyncTray/Services/ConfigSelfTest.swift.
+        let syncTrayRoot = selfTestFile.deletingLastPathComponent().deletingLastPathComponent()
+        let target = syncTrayRoot.appendingPathComponent(relativePathFromSyncTrayRoot).path
+        return try? String(contentsOfFile: target, encoding: .utf8)
+    }
+
+    /// Extracts a function/method body by scanning forward from the first
+    /// line containing `marker` to the next line that is EXACTLY a
+    /// 4-space-indented closing brace (`    }`) — the same range
+    /// `checks.yaml` extracts via `awk '/marker/,/^    \}$/'`, reimplemented
+    /// here in Swift so a self-test assertion can search the SAME bounded
+    /// text a `checks.yaml` grep would. Only valid for a method at ONE
+    /// level of nesting (a type's direct member) — every call site below is.
+    private static func extractFunctionBody(startingAt marker: String, in source: String) -> String? {
+        let lines = source.components(separatedBy: "\n")
+        guard let startIdx = lines.firstIndex(where: { $0.contains(marker) }) else { return nil }
+        var result: [String] = []
+        for line in lines[startIdx...] {
+            result.append(line)
+            if line == "    }", result.count > 1 { break }
+        }
+        return result.joined(separator: "\n")
+    }
+
+    /// A mount-mode profile with deterministic remote/key fields, for the
+    /// cache-migration tests below.
+    private static func mountProfile(id: UUID = UUID(), name: String = "Stream", remotePath: String, vfsCachePath: String) -> SyncProfile {
+        var profile = sampleProfile(id: id, name: name)
+        profile.syncMode = .mount
+        profile.rcloneRemote = "synology:"
+        profile.remotePath = remotePath
+        profile.vfsCachePath = vfsCachePath
+        return profile
+    }
+
+    // MARK: - AC-CM1 — tree kinds: vfs + vfsMeta, one CacheSubtree pair per migrating profile
+
+    private static func testCacheMigrationTreeKinds() -> Bool {
+        guard Set(CacheTreeKind.allCases.map { $0.rawValue }) == Set(["vfs", "vfsMeta"]) else {
+            return report("AC-CM1", "cache-migration-tree-kinds", false, "(CacheTreeKind.allCases != [vfs, vfsMeta])")
+        }
+        let profile = mountProfile(remotePath: "Kaiju", vfsCachePath: "/tmp/cm1-src")
+        guard case .success(let plan) = CacheMigrationPlanner.plan(
+            moving: profile, allProfiles: [profile], to: "/tmp/cm1-dest", coMigrate: []
+        ) else {
+            return report("AC-CM1", "cache-migration-tree-kinds", false, "(plan failed)")
+        }
+        let kinds = Set(plan.subtrees.map { $0.kind })
+        guard kinds == Set(CacheTreeKind.allCases) else {
+            return report("AC-CM1", "cache-migration-tree-kinds", false, "(plan subtrees missing a kind: \(kinds))")
+        }
+        return report("AC-CM1", "cache-migration-tree-kinds", true)
+    }
+
+    // MARK: - AC-CM2 — single key home: cacheDirectory(for:) and the planner agree
+
+    private static func testCacheMigrationKeyDerivation() -> Bool {
+        var profile = mountProfile(remotePath: "Kaiju/KAIJU", vfsCachePath: "~/.cache/rclone")
+        profile.rcloneRemote = "synology:"
+
+        let key = VFSCacheService.cacheRelativePath(for: profile)
+        guard key == "synology/Kaiju/KAIJU" else {
+            return report("AC-CM2", "cache-migration-key-derivation", false, "(cacheRelativePath produced \(key))")
+        }
+
+        let normalized = CacheMigrationPlanner.normalizeRoot("~/.cache/rclone/")
+        let expanded = ("~/.cache/rclone" as NSString).expandingTildeInPath
+        guard normalized == expanded else {
+            return report("AC-CM2", "cache-migration-key-derivation", false, "(normalizeRoot did not expand ~: \(normalized) vs \(expanded))")
+        }
+
+        guard case .success(let plan) = CacheMigrationPlanner.plan(
+            moving: profile, allProfiles: [profile], to: "/tmp/cm2-dest", coMigrate: []
+        ) else {
+            return report("AC-CM2", "cache-migration-key-derivation", false, "(plan failed)")
+        }
+        guard plan.subtrees.allSatisfy({ $0.relativePath == key }) else {
+            return report("AC-CM2", "cache-migration-key-derivation", false, "(planner used a different key than cacheRelativePath)")
+        }
+        return report("AC-CM2", "cache-migration-key-derivation", true)
+    }
+
+    // MARK: - AC-CM3 — overlap classification: nested sibling excluded/co-migrated/disjoint
+
+    private static func testCacheMigrationOverlap() -> Bool {
+        let sharedRoot = "/tmp/cm3-src"
+        let parent = mountProfile(name: "Parent", remotePath: "Kaiju/KAIJU", vfsCachePath: sharedRoot)
+        let child = mountProfile(name: "Child", remotePath: "Kaiju/KAIJU/Reaper", vfsCachePath: sharedRoot)
+        let disjoint = mountProfile(name: "Disjoint", remotePath: "OtherShare", vfsCachePath: sharedRoot)
+        let all = [parent, child, disjoint]
+
+        switch CacheMigrationPlanner.plan(moving: parent, allProfiles: all, to: "/tmp/cm3-dest", coMigrate: []) {
+        case .failure(.unresolvedOverlap(let ids)):
+            guard ids == [child.id] else {
+                return report("AC-CM3", "cache-migration-overlap", false, "(unresolvedOverlap named \(ids), expected [child])")
+            }
+        default:
+            return report("AC-CM3", "cache-migration-overlap", false, "(nested, non-co-migrated sibling did not reject with unresolvedOverlap)")
+        }
+
+        guard case .success(let plan) = CacheMigrationPlanner.plan(
+            moving: parent, allProfiles: all, to: "/tmp/cm3-dest", coMigrate: [child.id]
+        ) else {
+            return report("AC-CM3", "cache-migration-overlap", false, "(co-migrated plan rejected)")
+        }
+        guard plan.profileIdsToRewrite.contains(child.id) else {
+            return report("AC-CM3", "cache-migration-overlap", false, "(co-migrated child missing from profileIdsToRewrite)")
+        }
+        guard plan.subtrees.contains(where: { $0.relativePath == VFSCacheService.cacheRelativePath(for: child) }) else {
+            return report("AC-CM3", "cache-migration-overlap", false, "(co-migrated child's subtree missing from plan)")
+        }
+        guard plan.sameRootProfiles == [disjoint.id] else {
+            return report("AC-CM3", "cache-migration-overlap", false, "(sameRootProfiles \(plan.sameRootProfiles) != [disjoint])")
+        }
+        return report("AC-CM3", "cache-migration-overlap", true)
+    }
+
+    // MARK: - AC-CM4 — volume routing: same-volume moveItem, cross-volume per-file copy
+
+    private static func testCacheMigrationVolumeRouting() -> Bool {
+        let profile = mountProfile(remotePath: "Kaiju", vfsCachePath: "/tmp/cm4-src")
+        guard case .success(let plan) = CacheMigrationPlanner.plan(
+            moving: profile, allProfiles: [profile], to: "/tmp/cm4-dest", coMigrate: []
+        ) else {
+            return report("AC-CM4", "cache-migration-volume-routing", false, "(plan failed)")
+        }
+        let key = VFSCacheService.cacheRelativePath(for: profile)
+        let sourceContent = "/tmp/cm4-src/vfs/\(key)"
+        let sourceMeta = "/tmp/cm4-src/vfsMeta/\(key)"
+
+        let (sameSystem, sameFake) = fakeCacheMigrationFileSystem()
+        sameFake.directories.insert(sourceContent)
+        sameFake.directories.insert(sourceMeta)
+        sameFake.files["\(sourceContent)/file.bin"] = 10
+        sameFake.files["\(sourceMeta)/file.bin"] = 1
+        let engine1 = CacheMigrationEngine(fs: sameSystem)
+        guard case .success(let pf1) = engine1.preflight(plan), pf1.sameVolume else {
+            return report("AC-CM4", "cache-migration-volume-routing", false, "(same-volume fake did not preflight as sameVolume)")
+        }
+        let outcome1 = engine1.run(plan, pf1)
+        guard outcome1.result == .completed, sameFake.movedPaths.count == 2, sameFake.copiedPaths.isEmpty else {
+            return report("AC-CM4", "cache-migration-volume-routing", false, "(same-volume run did not use moveItem exclusively: moved=\(sameFake.movedPaths.count) copied=\(sameFake.copiedPaths.count))")
+        }
+
+        let (crossSystem, crossFake) = fakeCacheMigrationFileSystem()
+        crossFake.directories.insert(sourceContent)
+        crossFake.directories.insert(sourceMeta)
+        crossFake.files["\(sourceContent)/file.bin"] = 10
+        crossFake.files["\(sourceMeta)/file.bin"] = 1
+        crossFake.volumeOf["/tmp/cm4-dest"] = "other-volume"
+        let engine2 = CacheMigrationEngine(fs: crossSystem)
+        guard case .success(let pf2) = engine2.preflight(plan), !pf2.sameVolume else {
+            return report("AC-CM4", "cache-migration-volume-routing", false, "(cross-volume fake preflighted as sameVolume)")
+        }
+        let outcome2 = engine2.run(plan, pf2)
+        guard outcome2.result == .completed, crossFake.movedPaths.isEmpty, crossFake.copiedPaths.count == 2 else {
+            return report("AC-CM4", "cache-migration-volume-routing", false, "(cross-volume run used moveItem: moved=\(crossFake.movedPaths.count) copied=\(crossFake.copiedPaths.count))")
+        }
+
+        return report("AC-CM4", "cache-migration-volume-routing", true)
+    }
+
+    // MARK: - AC-CM5 — free-space preflight, both directions
+
+    private static func testCacheMigrationSpacePreflight() -> Bool {
+        let profile = mountProfile(remotePath: "Kaiju", vfsCachePath: "/tmp/cm5-src")
+        guard case .success(let plan) = CacheMigrationPlanner.plan(
+            moving: profile, allProfiles: [profile], to: "/tmp/cm5-dest", coMigrate: []
+        ) else {
+            return report("AC-CM5", "cache-migration-space-preflight", false, "(plan failed)")
+        }
+        let key = VFSCacheService.cacheRelativePath(for: profile)
+        let sourceContent = "/tmp/cm5-src/vfs/\(key)"
+        let sourceMeta = "/tmp/cm5-src/vfsMeta/\(key)"
+
+        let (system, fake) = fakeCacheMigrationFileSystem()
+        fake.directories.insert(sourceContent)
+        fake.directories.insert(sourceMeta)
+        fake.files["\(sourceContent)/big.bin"] = 1_000_000_000
+        fake.volumeOf["/tmp/cm5-dest"] = "other-volume"
+        let engine = CacheMigrationEngine(fs: system)
+
+        fake.availableCapacityBytes = 500_000_000
+        switch engine.preflight(plan) {
+        case .failure(.insufficientSpace(let required, let available)):
+            guard required > available, available == 500_000_000 else {
+                return report("AC-CM5", "cache-migration-space-preflight", false, "(unexpected required/available: \(required)/\(available))")
+            }
+        default:
+            return report("AC-CM5", "cache-migration-space-preflight", false, "(low-capacity fake did not reject insufficientSpace)")
+        }
+        guard !fake.files.keys.contains(where: { $0.hasPrefix("/tmp/cm5-dest") }) else {
+            return report("AC-CM5", "cache-migration-space-preflight", false, "(a destination file was created despite the rejection)")
+        }
+        // Finding 9 — the destination ROOT directory itself must not be
+        // created before a rejection is determined either. Materializing it
+        // first would make a not-yet-mounted `/Volumes/...` destination
+        // read back as a plain directory on the BOOT disk on the very next
+        // `volumeIdentifier`/`availableCapacity` probe — silently skipping
+        // this exact space check on a retry.
+        guard !fake.directories.contains("/tmp/cm5-dest") else {
+            return report("AC-CM5", "cache-migration-space-preflight", false, "(the destination root itself was created despite the insufficientSpace rejection)")
+        }
+
+        fake.availableCapacityBytes = 0
+        guard case .failure(.insufficientSpace) = engine.preflight(plan) else {
+            return report("AC-CM5", "cache-migration-space-preflight", false, "(zero-capacity fake did not reject insufficientSpace)")
+        }
+
+        fake.availableCapacityBytes = Int64.max
+        guard case .success = engine.preflight(plan) else {
+            return report("AC-CM5", "cache-migration-space-preflight", false, "(ample-capacity fake still rejected)")
+        }
+
+        return report("AC-CM5", "cache-migration-space-preflight", true)
+    }
+
+    // MARK: - AC-CM6 — verify-before-delete order, both a mismatch and a clean copy
+
+    private static func testCacheMigrationVerifyOrder() -> Bool {
+        let profile = mountProfile(remotePath: "Kaiju", vfsCachePath: "/tmp/cm6-src")
+        guard case .success(let plan) = CacheMigrationPlanner.plan(
+            moving: profile, allProfiles: [profile], to: "/tmp/cm6-dest", coMigrate: []
+        ) else {
+            return report("AC-CM6", "cache-migration-verify-order", false, "(plan failed)")
+        }
+        let key = VFSCacheService.cacheRelativePath(for: profile)
+        let sourceContent = "/tmp/cm6-src/vfs/\(key)"
+        let sourceMeta = "/tmp/cm6-src/vfsMeta/\(key)"
+        let badPath = "\(sourceContent)/bad.bin"
+        let destBad = "/tmp/cm6-dest/vfs/\(key)/bad.bin"
+
+        let (mismatchSystem, mismatchFake) = fakeCacheMigrationFileSystem()
+        mismatchFake.directories.insert(sourceContent)
+        mismatchFake.directories.insert(sourceMeta)
+        mismatchFake.files[badPath] = 42
+        mismatchFake.volumeOf["/tmp/cm6-dest"] = "other-volume"
+        mismatchFake.writeMismatchAt.insert(destBad)
+        let engine1 = CacheMigrationEngine(fs: mismatchSystem)
+        guard case .success(let pf1) = engine1.preflight(plan) else {
+            return report("AC-CM6", "cache-migration-verify-order", false, "(preflight failed for mismatch fixture)")
+        }
+        let outcome1 = engine1.run(plan, pf1)
+        guard case .failed(.verifyMismatch, _) = outcome1.result else {
+            return report("AC-CM6", "cache-migration-verify-order", false, "(size mismatch did not produce .verifyMismatch: \(outcome1.result))")
+        }
+        guard mismatchFake.files[badPath] == 42 else {
+            return report("AC-CM6", "cache-migration-verify-order", false, "(source file was removed despite a verify mismatch)")
+        }
+        guard mismatchFake.files[destBad] == nil else {
+            return report("AC-CM6", "cache-migration-verify-order", false, "(destination partial was not removed after a verify mismatch)")
+        }
+        // Finding 10 — pruning empty source directories must never run on a
+        // FAILED move: the parent directories a rollback needs to restore
+        // into must still be there.
+        guard mismatchFake.removeEmptyDirectoriesCalls.isEmpty else {
+            return report("AC-CM6", "cache-migration-verify-order", false, "(prune ran despite a verify-mismatch failure: \(mismatchFake.removeEmptyDirectoriesCalls))")
+        }
+
+        let goodPath = "\(sourceContent)/good.bin"
+        let (goodSystem, goodFake) = fakeCacheMigrationFileSystem()
+        goodFake.directories.insert(sourceContent)
+        goodFake.directories.insert(sourceMeta)
+        goodFake.files[goodPath] = 7
+        goodFake.volumeOf["/tmp/cm6-dest"] = "other-volume"
+        let engine2 = CacheMigrationEngine(fs: goodSystem)
+        guard case .success(let pf2) = engine2.preflight(plan) else {
+            return report("AC-CM6", "cache-migration-verify-order", false, "(preflight failed for good fixture)")
+        }
+        let outcome2 = engine2.run(plan, pf2)
+        guard outcome2.result == .completed else {
+            return report("AC-CM6", "cache-migration-verify-order", false, "(clean copy did not complete: \(outcome2.result))")
+        }
+        guard goodFake.removedPaths.contains(goodPath) else {
+            return report("AC-CM6", "cache-migration-verify-order", false, "(source file was never removed)")
+        }
+        // Finding 10, positive half — on a CONFIRMED-complete move, prune
+        // must run exactly once per `vfs`/`vfsMeta` subtree at the source
+        // ROOT, and never against the bare, unscoped cache root — a
+        // profile's `vfsCachePath` commonly shares its parent directory
+        // with rclone's own bisync cache, so an unscoped prune could delete
+        // an unrelated profile's state.
+        let expectedPruneRoots = Set(CacheTreeKind.allCases.map { "/tmp/cm6-src/\($0.rawValue)" })
+        guard Set(goodFake.removeEmptyDirectoriesCalls) == expectedPruneRoots else {
+            return report("AC-CM6", "cache-migration-verify-order", false, "(prune did not run once per vfs/vfsMeta subtree: \(goodFake.removeEmptyDirectoriesCalls))")
+        }
+        guard !goodFake.removeEmptyDirectoriesCalls.contains("/tmp/cm6-src") else {
+            return report("AC-CM6", "cache-migration-verify-order", false, "(prune ran against the bare, unscoped cache root)")
+        }
+
+        return report("AC-CM6", "cache-migration-verify-order", true)
+    }
+
+    // MARK: - AC-CM7 — persist on a completed move OR an empty source, never otherwise
+
+    private static func testCacheMigrationPersistOnSuccess() -> Bool {
+        // The gate persists on exactly TWO outcomes: a completed move, and
+        // `.nothingToMove` — an empty/absent source cache is nothing to lose,
+        // so re-pointing the profile at the new root is the whole job and
+        // refusing to persist would leave the user's Save silently ignored.
+        //
+        // This test previously asserted `!shouldPersist(.nothingToMove)`,
+        // written against the single-case version of the gate and never
+        // updated when `.nothingToMove` was added to it. It therefore failed
+        // deterministically, which nothing caught because `--self-test` was
+        // not wired into CI — it is now (the `test` job's "Self-test" step).
+        let persisting: [(String, CacheMigrationOutcome)] = [
+            ("completed", CacheMigrationOutcome(result: .completed, filesMoved: 3, bytesMoved: 300, sameVolume: true)),
+            ("nothingToMove", CacheMigrationOutcome(result: .preflightRejected(.nothingToMove), filesMoved: 0, bytesMoved: 0, sameVolume: false)),
+        ]
+        for (label, outcome) in persisting where !CacheMigrationPersistDecision.shouldPersist(outcome) {
+            return report("AC-CM7", "cache-migration-persist-on-success", false, "(\(label) did not persist)")
+        }
+
+        // Everything else must leave `vfsCachePath` alone, so a `.profile.json`
+        // can never name a cache directory the bytes did not actually reach.
+        let notPersisting: [(String, CacheMigrationOutcome)] = [
+            ("cancelled", CacheMigrationOutcome(result: .cancelled, filesMoved: 1, bytesMoved: 10, sameVolume: true)),
+            ("failed/verifyMismatch", CacheMigrationOutcome(result: .failed(.verifyMismatch, rolledBack: true), filesMoved: 0, bytesMoved: 0, sameVolume: true)),
+            ("failed/ioError", CacheMigrationOutcome(result: .failed(.ioError, rolledBack: false), filesMoved: 2, bytesMoved: 20, sameVolume: false)),
+            ("rejected/destinationUnwritable", CacheMigrationOutcome(result: .preflightRejected(.destinationUnwritable), filesMoved: 0, bytesMoved: 0, sameVolume: false)),
+            ("rejected/insufficientSpace", CacheMigrationOutcome(result: .preflightRejected(.insufficientSpace(requiredBytes: 10, availableBytes: 1)), filesMoved: 0, bytesMoved: 0, sameVolume: false)),
+            ("rejected/cancelled", CacheMigrationOutcome(result: .preflightRejected(.cancelled), filesMoved: 0, bytesMoved: 0, sameVolume: false)),
+        ]
+        for (label, outcome) in notPersisting where CacheMigrationPersistDecision.shouldPersist(outcome) {
+            return report("AC-CM7", "cache-migration-persist-on-success", false, "(\(label) persisted)")
+        }
+        return report("AC-CM7", "cache-migration-persist-on-success", true)
+    }
+
+    // MARK: - AC-CM8 — cancel at a file boundary; resume skips a matching destination
+
+    private static func testCacheMigrationCancelResume() -> Bool {
+        let profile = mountProfile(remotePath: "Kaiju", vfsCachePath: "/tmp/cm8-src")
+        guard case .success(let plan) = CacheMigrationPlanner.plan(
+            moving: profile, allProfiles: [profile], to: "/tmp/cm8-dest", coMigrate: []
+        ) else {
+            return report("AC-CM8", "cache-migration-cancel-resume", false, "(plan failed)")
+        }
+        let key = VFSCacheService.cacheRelativePath(for: profile)
+        let sourceContent = "/tmp/cm8-src/vfs/\(key)"
+        let sourceMeta = "/tmp/cm8-src/vfsMeta/\(key)"
+
+        let (cancelSystem, cancelFake) = fakeCacheMigrationFileSystem()
+        cancelFake.directories.insert(sourceContent)
+        cancelFake.directories.insert(sourceMeta)
+        cancelFake.files["\(sourceContent)/a.bin"] = 5
+        cancelFake.volumeOf["/tmp/cm8-dest"] = "other-volume"
+        // Cancellation is polled in TWO places and both are asserted here.
+        // First: `preflight` itself, whose full-tree enumeration can take a
+        // while and must not run to completion after Cancel. An engine that
+        // is already cancelled therefore never returns a preflight at all —
+        // which is why this fixture cannot use a permanently-true flag to
+        // reach the file loop below, as it previously tried to.
+        let alwaysCancelled = CacheMigrationEngine(fs: cancelSystem, isCancelled: { true })
+        guard case .failure(.cancelled) = alwaysCancelled.preflight(plan) else {
+            return report("AC-CM8", "cache-migration-cancel-resume", false, "(preflight does not poll cancellation)")
+        }
+
+        // Second: the file loop. Let preflight succeed, then cancel, so the
+        // run is stopped at a file boundary with the source left intact.
+        var cancelAfterPreflight = false
+        let engine1 = CacheMigrationEngine(fs: cancelSystem, isCancelled: { cancelAfterPreflight })
+        guard case .success(let pf1) = engine1.preflight(plan) else {
+            return report("AC-CM8", "cache-migration-cancel-resume", false, "(preflight failed for cancel fixture)")
+        }
+        cancelAfterPreflight = true
+        let outcome1 = engine1.run(plan, pf1)
+        guard outcome1.result == .cancelled, outcome1.filesMoved == 0 else {
+            return report("AC-CM8", "cache-migration-cancel-resume", false, "(isCancelled=true did not stop the run: \(outcome1.result))")
+        }
+        guard cancelFake.files["\(sourceContent)/a.bin"] == 5 else {
+            return report("AC-CM8", "cache-migration-cancel-resume", false, "(source removed despite cancellation)")
+        }
+
+        let (resumeSystem, resumeFake) = fakeCacheMigrationFileSystem()
+        resumeFake.directories.insert(sourceContent)
+        resumeFake.directories.insert(sourceMeta)
+        resumeFake.files["\(sourceContent)/a.bin"] = 5
+        resumeFake.files["/tmp/cm8-dest/vfs/\(key)/a.bin"] = 5  // already moved by a prior, interrupted run
+        resumeFake.volumeOf["/tmp/cm8-dest"] = "other-volume"
+        let engine2 = CacheMigrationEngine(fs: resumeSystem)
+        guard case .success(let pf2) = engine2.preflight(plan) else {
+            return report("AC-CM8", "cache-migration-cancel-resume", false, "(preflight failed for resume fixture)")
+        }
+        let outcome2 = engine2.run(plan, pf2)
+        guard outcome2.result == .completed, resumeFake.copiedPaths.isEmpty else {
+            return report("AC-CM8", "cache-migration-cancel-resume", false, "(resume re-copied an already-matching destination file: \(resumeFake.copiedPaths))")
+        }
+        guard resumeFake.files["\(sourceContent)/a.bin"] == nil else {
+            return report("AC-CM8", "cache-migration-cancel-resume", false, "(resumed source file was not cleaned up)")
+        }
+
+        // Finding 5 — a RESUMED file is just as moved as one this run copied:
+        // its source copy is gone, so the destination holds the only copy and
+        // a later rollback must restore it. Tracking `movedDestPaths` only in
+        // the copy arm left every resumed file stranded at the destination
+        // while `rollback` still returned true, so a "reverted" source tree
+        // came back silently incomplete. Resume one file, then fail the next,
+        // and require the resumed one back at the source.
+        let (rollbackSystem, rollbackFake) = fakeCacheMigrationFileSystem()
+        let resumedSource = "\(sourceContent)/a.bin"
+        let resumedDest = "/tmp/cm8-dest/vfs/\(key)/a.bin"
+        let failingSource = "\(sourceMeta)/b.bin"
+        let failingDest = "/tmp/cm8-dest/vfsMeta/\(key)/b.bin"
+        rollbackFake.directories.insert(sourceContent)
+        rollbackFake.directories.insert(sourceMeta)
+        rollbackFake.files[resumedSource] = 5
+        rollbackFake.files[resumedDest] = 5      // already relocated by the interrupted run
+        rollbackFake.files[failingSource] = 9
+        rollbackFake.volumeOf["/tmp/cm8-dest"] = "other-volume"
+        rollbackFake.writeMismatchAt.insert(failingDest)
+        let engine3 = CacheMigrationEngine(fs: rollbackSystem)
+        guard case .success(let pf3) = engine3.preflight(plan) else {
+            return report("AC-CM8", "cache-migration-cancel-resume", false, "(preflight failed for resume-rollback fixture)")
+        }
+        let outcome3 = engine3.run(plan, pf3)
+        guard case .failed(.verifyMismatch, let resumeRolledBack) = outcome3.result else {
+            return report("AC-CM8", "cache-migration-cancel-resume", false, "(resume-rollback fixture did not fail on the second file: \(outcome3.result))")
+        }
+        guard rollbackFake.files[resumedSource] == 5 else {
+            return report("AC-CM8", "cache-migration-cancel-resume", false, "(rollback stranded the RESUMED file at the destination — its source was not restored)")
+        }
+        guard rollbackFake.files[resumedDest] == nil, resumeRolledBack else {
+            return report("AC-CM8", "cache-migration-cancel-resume", false, "(resumed file's destination copy survived a completed rollback, or rollback reported failure: rolledBack=\(resumeRolledBack))")
+        }
+
+        return report("AC-CM8", "cache-migration-cancel-resume", true)
+    }
+
+    // MARK: - AC-CM9 — install runs on every exit path via the launchd bracket
+
+    private static func testCacheMigrationInstallOnEveryPath() -> Bool {
+        var events: [String] = []
+        let profileId = UUID()
+        CacheMigrationBracket.run(
+            affectedProfileIds: [profileId],
+            installedProfileIds: [profileId],
+            cancelWarm: { _ in },
+            uninstall: { events.append("uninstall:\($0)") },
+            install: { events.append("install:\($0)") },
+            body: { events.append("move") }
+        )
+        guard events == ["uninstall:\(profileId)", "move", "install:\(profileId)"] else {
+            return report("AC-CM9", "cache-migration-install-on-every-path", false, "(unexpected order: \(events))")
+        }
+
+        var events2: [String] = []
+        let outcome = CacheMigrationBracket.run(
+            affectedProfileIds: [],
+            installedProfileIds: [profileId],
+            cancelWarm: { _ in },
+            uninstall: { events2.append("uninstall:\($0)") },
+            install: { events2.append("install:\($0)") },
+            body: { () -> String in
+                events2.append("move-failed")
+                return "failed"
+            }
+        )
+        guard outcome == "failed", events2 == ["uninstall:\(profileId)", "move-failed", "install:\(profileId)"] else {
+            return report("AC-CM9", "cache-migration-install-on-every-path", false, "(install did not run after a failed body: \(events2))")
+        }
+
+        // Finding 15 — `CacheMigrationBracket` is a spy-tested STAND-IN,
+        // deliberately never called by `migrateCacheDirectory` itself (see
+        // that function's doc comment) because `checks.yaml`'s AC-9 already
+        // asserts the literal call sequence in ITS body. That leaves a real
+        // ordering regression in the actual orchestration free to pass
+        // every assertion above, since none of them read `SyncManager.swift`
+        // at all — a fake-that-can't-fail
+        // (`global::aw-lessons::mock-that-reimplements-the-thing-under-test`).
+        // Assert the SAME ordering against the real source too.
+        guard let source = readSourceFile("Services/SyncManager.swift"),
+              let body = extractFunctionBody(startingAt: "private func migrateCacheDirectory(", in: source),
+              let rollbackBody = extractFunctionBody(startingAt: "func rollbackCacheMigration(", in: source),
+              let detachBody = extractFunctionBody(startingAt: "private func detachForCacheMigration(", in: source),
+              let reinstallBody = extractFunctionBody(startingAt: "private func reinstallAfterCacheMigration(", in: source) else {
+            return report("AC-CM9", "cache-migration-install-on-every-path", false, "(could not read the real migration bracket source)")
+        }
+        // The two halves of the bracket live in shared helpers now, so the
+        // forward move and the rollback cannot implement it differently.
+        // Assert the helpers really do the work, then that both call sites
+        // detach before they re-install.
+        guard detachBody.contains("setupService.uninstall"),
+              reinstallBody.contains("setupService.install"),
+              reinstallBody.contains("updateAppGroupMountPaths()") else {
+            return report("AC-CM9", "cache-migration-install-on-every-path", false, "(the shared detach/reinstall helpers no longer uninstall/install)")
+        }
+        guard let uninstallRange = body.range(of: "detachForCacheMigration("),
+              let installRange = body.range(of: "reinstallAfterCacheMigration(") else {
+            return report("AC-CM9", "cache-migration-install-on-every-path", false, "(migrateCacheDirectory no longer brackets the move)")
+        }
+        guard uninstallRange.lowerBound < installRange.lowerBound, body.contains("defer {") else {
+            return report("AC-CM9", "cache-migration-install-on-every-path", false, "(migrateCacheDirectory does not detach before re-installing via a defer)")
+        }
+
+        // The ROLLBACK needs the same bracket. It had none: by the time the
+        // user is offered "Resume or roll back?", the forward move's `defer`
+        // has already re-installed the agent, so the mount is live again on
+        // `sourceRoot` — exactly the tree the reverse move writes into.
+        // Relocating files into a live `rclone nfsmount`'s `--cache-dir` is
+        // the corruption path the pre-move warm cancellation exists to avoid.
+        guard let rollbackDetach = rollbackBody.range(of: "detachForCacheMigration("),
+              let rollbackInstall = rollbackBody.range(of: "reinstallAfterCacheMigration("),
+              rollbackDetach.lowerBound < rollbackInstall.lowerBound else {
+            return report("AC-CM9", "cache-migration-install-on-every-path", false, "(rollbackCacheMigration does not detach before re-installing — it would move files into a live mount)")
+        }
+
+        return report("AC-CM9", "cache-migration-install-on-every-path", true)
+    }
+
+    // MARK: - AC-CM10 — warm is cancelled for every affected profile before uninstall
+
+    private static func testCacheMigrationWarmCancelledFirst() -> Bool {
+        var events: [String] = []
+        let profileId = UUID()
+        let sibling = UUID()
+        CacheMigrationBracket.run(
+            affectedProfileIds: [profileId, sibling],
+            installedProfileIds: [profileId],
+            cancelWarm: { events.append("warm:\($0)") },
+            uninstall: { events.append("uninstall:\($0)") },
+            install: { events.append("install:\($0)") },
+            body: { events.append("move") }
+        )
+        guard events.first == "warm:\(profileId)", events.count > 1, events[1] == "warm:\(sibling)" else {
+            return report("AC-CM10", "cache-migration-warm-cancelled-first", false, "(warm cancel did not fire first for every affected profile: \(events))")
+        }
+        guard let warmIdx = events.firstIndex(of: "warm:\(sibling)"),
+              let uninstallIdx = events.firstIndex(where: { $0.hasPrefix("uninstall:") }),
+              warmIdx < uninstallIdx else {
+            return report("AC-CM10", "cache-migration-warm-cancelled-first", false, "(cancelWarm did not precede uninstall: \(events))")
+        }
+
+        // Finding 15 — same real-source cross-check as AC-CM9 above,
+        // against the actual `migrateCacheDirectory`, not the spy-tested
+        // `CacheMigrationBracket` stand-in.
+        guard let source = readSourceFile("Services/SyncManager.swift"),
+              let body = extractFunctionBody(startingAt: "private func migrateCacheDirectory(", in: source),
+              let rollbackBody = extractFunctionBody(startingAt: "func rollbackCacheMigration(", in: source) else {
+            return report("AC-CM10", "cache-migration-warm-cancelled-first", false, "(could not read the real migration source)")
+        }
+        guard let warmRange = body.range(of: "cancelWarm(for: id)"),
+              let uninstallRange = body.range(of: "detachForCacheMigration(") else {
+            return report("AC-CM10", "cache-migration-warm-cancelled-first", false, "(real source missing a cancelWarm/detach call)")
+        }
+        guard warmRange.lowerBound < uninstallRange.lowerBound else {
+            return report("AC-CM10", "cache-migration-warm-cancelled-first", false, "(real source does not cancel warm before detaching)")
+        }
+
+        // Same requirement for the reverse move — a warm reading through the
+        // re-established mount races a rollback exactly as it races a
+        // forward move.
+        guard let rollbackWarm = rollbackBody.range(of: "cancelWarm(for: id)"),
+              let rollbackDetach = rollbackBody.range(of: "detachForCacheMigration("),
+              rollbackWarm.lowerBound < rollbackDetach.lowerBound else {
+            return report("AC-CM10", "cache-migration-warm-cancelled-first", false, "(rollbackCacheMigration does not cancel warm before detaching)")
+        }
+
+        return report("AC-CM10", "cache-migration-warm-cancelled-first", true)
+    }
+
+    // MARK: - AC-CM11 — destination parent directory is created before copying into it (finding 1)
+
+    private static func testCacheMigrationDestinationParentCreated() -> Bool {
+        let profile = mountProfile(remotePath: "Kaiju", vfsCachePath: "/tmp/cm11-src")
+        guard case .success(let plan) = CacheMigrationPlanner.plan(
+            moving: profile, allProfiles: [profile], to: "/tmp/cm11-dest", coMigrate: []
+        ) else {
+            return report("AC-CM11", "cache-migration-dest-parent-created", false, "(plan failed)")
+        }
+        let key = VFSCacheService.cacheRelativePath(for: profile)
+        let sourceContent = "/tmp/cm11-src/vfs/\(key)"
+        let sourceMeta = "/tmp/cm11-src/vfsMeta/\(key)"
+        let destContent = "/tmp/cm11-dest/vfs/\(key)"
+
+        let (system, fake) = fakeCacheMigrationFileSystem()
+        fake.directories.insert(sourceContent)
+        fake.directories.insert(sourceMeta)
+        fake.files["\(sourceContent)/only.bin"] = 3
+        fake.volumeOf["/tmp/cm11-dest"] = "other-volume"
+        // Deliberately NOT pre-inserting ANY destination directory — exactly
+        // what a fresh cache root looks like the first time a profile moves
+        // there. `FakeCacheFS.copyFile`/`copyFileDataOnly` now THROW unless
+        // the destination's parent is already in `directories` (see the
+        // FakeCacheFS doc comment above), so this regresses to FAIL if
+        // `CacheMigrationEngine.moveFile` ever stops creating that parent
+        // first — traced by hand against the pre-fix code: without the
+        // `fs.createDirectory(destParent)` call, this exact fixture threw
+        // `missingParentDirectory` on its first (and only) file, producing
+        // `.failed(.ioError, ...)` instead of `.completed` below.
+        let engine = CacheMigrationEngine(fs: system)
+        guard case .success(let pf) = engine.preflight(plan) else {
+            return report("AC-CM11", "cache-migration-dest-parent-created", false, "(preflight failed)")
+        }
+        let outcome = engine.run(plan, pf)
+        guard outcome.result == .completed else {
+            return report("AC-CM11", "cache-migration-dest-parent-created", false, "(move did not complete against a fresh destination root: \(outcome.result))")
+        }
+        guard fake.directories.contains(destContent) else {
+            return report("AC-CM11", "cache-migration-dest-parent-created", false, "(destination parent was never created)")
+        }
+        guard fake.files["\(destContent)/only.bin"] == 3 else {
+            return report("AC-CM11", "cache-migration-dest-parent-created", false, "(file did not land at the destination)")
+        }
+        return report("AC-CM11", "cache-migration-dest-parent-created", true)
+    }
+
+    // MARK: - AC-CM12 — rollback verifies BOTH sizes are present, not a naked Optional==Optional (finding 4)
+
+    private static func testCacheMigrationRollbackOptionalGuard() -> Bool {
+        // Behavioural half: drive a real rollback into the both-sizes-missing
+        // state and assert it FAILS CLOSED. Under the old naked
+        // `fs.fileSize(sourcePath) == fs.fileSize(destPath)`, two `nil`s
+        // compare EQUAL, so a rollback copy that silently produced nothing
+        // would "verify" as a match and then delete the last remaining copy
+        // at `destPath` — irrecoverable data loss on an already-failed
+        // migration (finding 4).
+        //
+        // (This replaces a `let a: Int64? = nil; let b: Int64? = nil;
+        // guard a == b` assertion, which restated a Swift language rule and
+        // could not fail for any state of this codebase.)
+        let profile = mountProfile(remotePath: "Kaiju", vfsCachePath: "/tmp/cm12-src")
+        guard case .success(let plan) = CacheMigrationPlanner.plan(
+            moving: profile, allProfiles: [profile], to: "/tmp/cm12-dest", coMigrate: []
+        ) else {
+            return report("AC-CM12", "cache-migration-rollback-optional-guard", false, "(plan failed)")
+        }
+        let key = VFSCacheService.cacheRelativePath(for: profile)
+        let sourceContent = "/tmp/cm12-src/vfs/\(key)"
+        let sourceMeta = "/tmp/cm12-src/vfsMeta/\(key)"
+        // One file per subtree, so the engine's order (`vfs` then `vfsMeta`)
+        // fixes which file moves and which one fails — independent of the
+        // fake's within-subtree enumeration.
+        let goodSource = "\(sourceContent)/good.bin"
+        let goodDest = "/tmp/cm12-dest/vfs/\(key)/good.bin"
+        let badSource = "\(sourceMeta)/bad.bin"
+        let badDest = "/tmp/cm12-dest/vfsMeta/\(key)/bad.bin"
+
+        let (system, fake) = fakeCacheMigrationFileSystem()
+        fake.directories.insert(sourceContent)
+        fake.directories.insert(sourceMeta)
+        fake.files[goodSource] = 10
+        fake.files[badSource] = 20
+        fake.volumeOf["/tmp/cm12-dest"] = "other-volume"   // cross-volume → per-file path
+        fake.writeMismatchAt.insert(badDest)               // second file fails → rollback runs
+        fake.copyProducesNothingAt.insert(goodSource)      // rollback's copy-back writes nothing
+        // `goodDest` is stat'd three times on the way out — `preflight`'s
+        // resume accounting, `moveFiles`' resume-skip probe, then
+        // `moveFile`'s verify — and would be stat'd a fourth time by
+        // rollback. Budget exactly those three so the ROLLBACK stat returns
+        // nil, i.e. a destination that EXISTS but cannot be stat'd. Both
+        // sizes are then missing, which is the only state that separates the
+        // `guard let` from the naked `==`.
+        fake.statBudget[goodDest] = 3
+
+        let engine = CacheMigrationEngine(fs: system)
+        guard case .success(let preflight) = engine.preflight(plan) else {
+            return report("AC-CM12", "cache-migration-rollback-optional-guard", false, "(preflight failed)")
+        }
+        let outcome = engine.run(plan, preflight)
+        guard case .failed(.verifyMismatch, let rolledBack) = outcome.result else {
+            return report("AC-CM12", "cache-migration-rollback-optional-guard", false, "(expected a verify-mismatch failure, got: \(outcome.result))")
+        }
+        guard fake.statBudget[goodDest] == 0 else {
+            return report("AC-CM12", "cache-migration-rollback-optional-guard", false, "(stat budget not consumed as expected — the forward move no longer stats the destination twice, so this fixture never reached the both-sizes-missing state)")
+        }
+        guard rolledBack == false else {
+            return report("AC-CM12", "cache-migration-rollback-optional-guard", false, "(rollback reported success despite being unable to verify the restored file)")
+        }
+        guard fake.files[goodDest] == 10 else {
+            return report("AC-CM12", "cache-migration-rollback-optional-guard", false, "(rollback deleted the last remaining copy at the destination: \(String(describing: fake.files[goodDest])))")
+        }
+
+        // Source half: `rollback` must reject via `guard let` (fails closed
+        // on EITHER side missing) rather than ever comparing the two
+        // Optionals to each other directly.
+        guard let source = readSourceFile("Services/CacheMigrationService.swift") else {
+            return report("AC-CM12", "cache-migration-rollback-optional-guard", false, "(could not read CacheMigrationService.swift source)")
+        }
+        guard let rollbackBody = extractFunctionBody(startingAt: "private func rollback(destPaths: [String], plan: CacheMigrationPlan) -> Bool", in: source) else {
+            return report("AC-CM12", "cache-migration-rollback-optional-guard", false, "(could not locate rollback's body)")
+        }
+        guard rollbackBody.contains("let sourceSize = fs.fileSize(sourcePath)"),
+              rollbackBody.contains("let destSize = fs.fileSize(destPath)"),
+              rollbackBody.contains("sourceSize == destSize") else {
+            return report("AC-CM12", "cache-migration-rollback-optional-guard", false, "(rollback no longer guards both sizes with guard-let)")
+        }
+        guard !rollbackBody.contains("fs.fileSize(sourcePath) == fs.fileSize(destPath)") else {
+            return report("AC-CM12", "cache-migration-rollback-optional-guard", false, "(rollback still contains the naked Optional==Optional comparison)")
+        }
+        return report("AC-CM12", "cache-migration-rollback-optional-guard", true)
+    }
+
+    // MARK: - AC-CM13 — nested co-migrated subtrees never use the whole-directory fast path (finding 5)
+
+    private static func testCacheMigrationNestedSubtreesUseFilePath() -> Bool {
+        let parent = mountProfile(name: "Parent", remotePath: "Kaiju/KAIJU", vfsCachePath: "/tmp/cm13-src")
+        let child = mountProfile(name: "Child", remotePath: "Kaiju/KAIJU/Reaper", vfsCachePath: "/tmp/cm13-src")
+        let all = [parent, child]
+        guard case .success(let plan) = CacheMigrationPlanner.plan(
+            moving: parent, allProfiles: all, to: "/tmp/cm13-dest", coMigrate: [child.id]
+        ) else {
+            return report("AC-CM13", "cache-migration-nested-subtree-file-path", false, "(co-migrated nested plan failed)")
+        }
+        let parentKey = VFSCacheService.cacheRelativePath(for: parent)
+        let childKey = VFSCacheService.cacheRelativePath(for: child)
+        guard childKey.hasPrefix(parentKey + "/") else {
+            return report("AC-CM13", "cache-migration-nested-subtree-file-path", false, "(fixture keys aren't actually nested: \(parentKey) / \(childKey))")
+        }
+        let parentContent = "/tmp/cm13-src/vfs/\(parentKey)"
+        let parentMeta = "/tmp/cm13-src/vfsMeta/\(parentKey)"
+        let childContent = "/tmp/cm13-src/vfs/\(childKey)"
+        let childMeta = "/tmp/cm13-src/vfsMeta/\(childKey)"
+
+        let (system, fake) = fakeCacheMigrationFileSystem()
+        fake.directories.insert(parentContent)
+        fake.directories.insert(parentMeta)
+        fake.directories.insert(childContent)
+        fake.directories.insert(childMeta)
+        fake.files["\(parentContent)/p.bin"] = 4
+        fake.files["\(parentMeta)/p.bin"] = 1
+        fake.files["\(childContent)/c.bin"] = 2
+        fake.files["\(childMeta)/c.bin"] = 1
+        // No `volumeOf` override — source and destination both resolve to
+        // the SAME default volume, exactly the condition that ALSO made the
+        // pre-fix `usesFastPath = sameVolume && excludedRelativePaths.isEmpty`
+        // true for this fixture (a co-migrated overlap never populates
+        // `excludedRelativePaths` — see CacheMigrationPlan's doc comment).
+        // Under that old condition this fixture would call whole-directory
+        // `moveItem` on the PARENT subtree root (silently carrying the
+        // nested Reaper directory away with it), then attempt `moveItem` on
+        // the CHILD subtree root — onto a destination that already exists,
+        // which `FileManager.moveItem` refuses (finding 5).
+        let engine = CacheMigrationEngine(fs: system)
+        guard case .success(let pf) = engine.preflight(plan), pf.sameVolume else {
+            return report("AC-CM13", "cache-migration-nested-subtree-file-path", false, "(fixture did not preflight as same-volume)")
+        }
+        let outcome = engine.run(plan, pf)
+        guard outcome.result == .completed else {
+            return report("AC-CM13", "cache-migration-nested-subtree-file-path", false, "(nested co-migrated same-volume move did not complete: \(outcome.result))")
+        }
+        guard fake.movedPaths.isEmpty else {
+            return report("AC-CM13", "cache-migration-nested-subtree-file-path", false, "(used whole-subtree moveItem despite nested subtrees: \(fake.movedPaths))")
+        }
+        guard !fake.copiedPaths.isEmpty else {
+            return report("AC-CM13", "cache-migration-nested-subtree-file-path", false, "(no per-file copy occurred — the nesting guard did not force the file-by-file path)")
+        }
+        return report("AC-CM13", "cache-migration-nested-subtree-file-path", true)
+    }
+
+    // MARK: - AC-CM14 — orchestration hardening: Task cancellation bridging, rollback's source-root
+    // sibling classification, and an abort on a mount that failed to detach (findings 2, 6, 7)
+
+    private static func testCacheMigrationOrchestrationHardening() -> Bool {
+        guard let source = readSourceFile("Services/SyncManager.swift") else {
+            return report("AC-CM14", "cache-migration-orchestration-hardening", false, "(could not read SyncManager.swift source)")
+        }
+
+        // Finding 2 — reading `Task.isCancelled` from inside a plain
+        // `DispatchQueue.global().async` closure (no enclosing `Task`)
+        // always returns `false`, so cancelling the migration Task never
+        // actually stopped the background move. Both orchestration entry
+        // points must bridge cancellation via `withTaskCancellationHandler`
+        // into an explicit, thread-safe flag the engine's `isCancelled`
+        // closure reads instead.
+        guard let migrateBody = extractFunctionBody(startingAt: "private func migrateCacheDirectory(", in: source) else {
+            return report("AC-CM14", "cache-migration-orchestration-hardening", false, "(could not locate migrateCacheDirectory)")
+        }
+        guard migrateBody.contains("withTaskCancellationHandler"),
+              migrateBody.contains("CacheMigrationCancellationFlag()"),
+              migrateBody.contains("cancellationFlag.markCancelled()") else {
+            return report("AC-CM14", "cache-migration-orchestration-hardening", false, "(migrateCacheDirectory does not bridge Task cancellation to the engine)")
+        }
+
+        guard let rollbackBody = extractFunctionBody(startingAt: "func rollbackCacheMigration(", in: source) else {
+            return report("AC-CM14", "cache-migration-orchestration-hardening", false, "(could not locate rollbackCacheMigration)")
+        }
+        guard rollbackBody.contains("withTaskCancellationHandler"), rollbackBody.contains("CacheMigrationCancellationFlag()") else {
+            return report("AC-CM14", "cache-migration-orchestration-hardening", false, "(rollbackCacheMigration does not bridge Task cancellation)")
+        }
+
+        // Finding 6 — a rollback must classify overlapping/same-root
+        // siblings against the migration's ORIGINAL source root, by
+        // re-deriving the forward plan and reversing it — not by planning
+        // directly from a profile whose `vfsCachePath` might already read
+        // as the (failed) destination, which would classify siblings
+        // against the wrong root and could silently drop one from the
+        // rollback.
+        guard rollbackBody.contains("CacheMigrationPlanner.plan("), rollbackBody.contains(".reversed()") else {
+            return report("AC-CM14", "cache-migration-orchestration-hardening", false, "(rollbackCacheMigration no longer builds a forward plan and reverses it)")
+        }
+
+        // Finding 7 — `SyncSetupService.uninstall` does NOT throw when a
+        // mount-mode profile's graceful+forced `diskutil unmount` both
+        // fail (it only logs `mount.result: failure` telemetry and
+        // proceeds). A bare `try?` around `uninstall` alone can therefore
+        // never observe that failure mode — the guard must ALSO re-check
+        // the mount state after a normal-returning `uninstall` and abort
+        // the move rather than relocate files out from under a
+        // still-attached, still-writable volume.
+        //
+        // Behavioral half (finding 9): a pure substring check on
+        // `migrateBody` cannot tell an INVERTED or unreachable guard from a
+        // correct one — `detachFailed = true`, `.failed(.mountDetachFailed`,
+        // and a bounded-recheck call could all still be PRESENT somewhere
+        // in the body even if the boolean logic gating them were backwards.
+        // Drive the actual, extracted decision function directly instead.
+        guard SyncManager.cacheMigrationDetachSucceeded(threw: false, stillMountedAfterRecheck: false) == true else {
+            return report("AC-CM14", "cache-migration-orchestration-hardening", false, "(a clean detach with no throw and no lingering mount was classified as FAILED)")
+        }
+        guard SyncManager.cacheMigrationDetachSucceeded(threw: true, stillMountedAfterRecheck: false) == false else {
+            return report("AC-CM14", "cache-migration-orchestration-hardening", false, "(uninstall throwing was classified as a SUCCESSFUL detach)")
+        }
+        guard SyncManager.cacheMigrationDetachSucceeded(threw: false, stillMountedAfterRecheck: true) == false else {
+            return report("AC-CM14", "cache-migration-orchestration-hardening", false, "(a volume still mounted after the bounded recheck was classified as a SUCCESSFUL detach)")
+        }
+        guard SyncManager.cacheMigrationDetachSucceeded(threw: true, stillMountedAfterRecheck: true) == false else {
+            return report("AC-CM14", "cache-migration-orchestration-hardening", false, "(throw AND still-mounted together were classified as a SUCCESSFUL detach)")
+        }
+
+        // Source half: `migrateCacheDirectory` must actually ROUTE its
+        // abort decision through the function above (rather than
+        // re-deriving its own inline boolean that could drift from it), and
+        // must use the BOUNDED recheck rather than a single `isMounted`
+        // sample (finding 4).
+        //
+        // The detach itself now lives in the shared `detachForCacheMigration`
+        // helper (so the rollback gets the identical treatment), so that is
+        // where the routing is asserted; the call sites are checked for
+        // acting on its verdict.
+        guard let detachBody = extractFunctionBody(startingAt: "private func detachForCacheMigration(", in: source) else {
+            return report("AC-CM14", "cache-migration-orchestration-hardening", false, "(could not locate detachForCacheMigration)")
+        }
+        guard detachBody.contains("Self.cacheMigrationDetachSucceeded(threw:"),
+              detachBody.contains("setupService.isMountedAfterBoundedRecheck(profile: profile)"),
+              detachBody.contains("return (installed, true)") else {
+            return report("AC-CM14", "cache-migration-orchestration-hardening", false, "(detachForCacheMigration no longer routes its verdict through cacheMigrationDetachSucceeded / isMountedAfterBoundedRecheck)")
+        }
+        guard migrateBody.contains("guard !detachFailed else {"),
+              migrateBody.contains(".failed(.mountDetachFailed") else {
+            return report("AC-CM14", "cache-migration-orchestration-hardening", false, "(migrateCacheDirectory no longer aborts on a failed detach)")
+        }
+        guard rollbackBody.contains("guard !detach.failed else {"),
+              rollbackBody.contains(".failed(.mountDetachFailed") else {
+            return report("AC-CM14", "cache-migration-orchestration-hardening", false, "(rollbackCacheMigration no longer aborts on a failed detach — it would reverse the move under a live mount)")
+        }
+
+        // Finding 4, telemetry half — a detach-failure abort must still
+        // emit a begin/end telemetry pair instead of returning silently.
+        guard let telemetryStart = migrateBody.range(of: "beginCacheMigration("),
+              let detachGuard = migrateBody.range(of: "guard !detachFailed else {"),
+              telemetryStart.lowerBound < detachGuard.lowerBound else {
+            return report("AC-CM14", "cache-migration-orchestration-hardening", false, "(beginCacheMigration no longer runs BEFORE the detach-failure abort guard)")
+        }
+        let detachAbortWindowEnd = migrateBody.index(detachGuard.upperBound, offsetBy: 600, limitedBy: migrateBody.endIndex) ?? migrateBody.endIndex
+        let detachAbortWindow = migrateBody[detachGuard.upperBound..<detachAbortWindowEnd]
+        guard detachAbortWindow.contains("endCacheMigration(") else {
+            return report("AC-CM14", "cache-migration-orchestration-hardening", false, "(the detach-failure abort path never calls endCacheMigration — it would emit no telemetry at all)")
+        }
+
+        // The ROLLBACK needs the identical treatment, and had none: it ran
+        // with no span at all, so its own detach-failure abort was
+        // indistinguishable from a rollback that never started. Same shape
+        // as the forward assertions above — open the span before the abort
+        // guard, close it inside the abort, and close it on the normal path.
+        guard let rollbackTelemetryStart = rollbackBody.range(of: "beginCacheMigration("),
+              let rollbackDetachGuard = rollbackBody.range(of: "guard !detach.failed else {"),
+              rollbackTelemetryStart.lowerBound < rollbackDetachGuard.lowerBound else {
+            return report("AC-CM14", "cache-migration-orchestration-hardening", false, "(rollbackCacheMigration does not open its telemetry span before the detach-failure abort guard)")
+        }
+        let rollbackAbortEnd = rollbackBody.index(rollbackDetachGuard.upperBound, offsetBy: 1400, limitedBy: rollbackBody.endIndex) ?? rollbackBody.endIndex
+        let rollbackAbortWindow = rollbackBody[rollbackDetachGuard.upperBound..<rollbackAbortEnd]
+        guard rollbackAbortWindow.contains("endCacheMigration(") else {
+            return report("AC-CM14", "cache-migration-orchestration-hardening", false, "(the rollback's detach-failure abort never calls endCacheMigration)")
+        }
+        // Two calls total — the abort AND the normal completion path. One
+        // would mean a rollback that ran to completion emitted an unclosed
+        // span.
+        guard rollbackBody.components(separatedBy: "endCacheMigration(").count - 1 >= 2 else {
+            return report("AC-CM14", "cache-migration-orchestration-hardening", false, "(rollbackCacheMigration closes its span on only one path — a completed rollback would leave it open)")
+        }
+        // Derived from the shared label function, never hand-copied: the
+        // literal would agree today only by accident of the failure enum's
+        // default rawValue. Both aborts get the guard — they are a symmetric
+        // pair, and pinning only the one that was caught leaves its twin free
+        // to reintroduce the literal with the suite green.
+        guard !rollbackBody.contains("outcome: \"mountDetachFailed\"") else {
+            return report("AC-CM14", "cache-migration-orchestration-hardening", false, "(the rollback abort hand-copies its telemetry label instead of deriving it from cacheMigrationOutcomeLabel)")
+        }
+        guard !migrateBody.contains("outcome: \"mountDetachFailed\"") else {
+            return report("AC-CM14", "cache-migration-orchestration-hardening", false, "(migrateCacheDirectory's abort hand-copies its telemetry label instead of deriving it from cacheMigrationOutcomeLabel)")
+        }
+
+        return report("AC-CM14", "cache-migration-orchestration-hardening", true)
+    }
+
+    // MARK: - AC-CM15 — UI layer: overlap-safe "Start fresh", and no dropped edits on a bare
+    // sheet dismissal (findings 3, 11 UI half, 12)
+
+    private static func testCacheMigrationUIFixes() -> Bool {
+        guard let profileDetailSource = readSourceFile("Views/Settings/ProfileDetailView.swift") else {
+            return report("AC-CM15", "cache-migration-ui-fixes", false, "(could not read ProfileDetailView.swift source)")
+        }
+
+        // Finding 3 — "Start fresh" must never delete an overlapping
+        // sibling's shared subtree (nested either direction shares the same
+        // bytes on disk).
+        guard let deleteBody = extractFunctionBody(startingAt: "private func deleteOldCacheSubtree(", in: profileDetailSource) else {
+            return report("AC-CM15", "cache-migration-ui-fixes", false, "(could not locate deleteOldCacheSubtree)")
+        }
+        guard deleteBody.contains("excluding overlappingIds: [UUID]"), deleteBody.contains("overlappingKeys.contains") else {
+            return report("AC-CM15", "cache-migration-ui-fixes", false, "(deleteOldCacheSubtree no longer excludes an overlapping sibling's subtree)")
+        }
+        guard profileDetailSource.contains("deleteOldCacheSubtree(of: latest, excluding: prompt.overlappingProfileIds)") else {
+            return report("AC-CM15", "cache-migration-ui-fixes", false, "(finalizeCachePathChange no longer passes the overlap exclusion list)")
+        }
+
+        // Finding 12 — a bare sheet dismissal (Cancel / close box) must
+        // still apply the OTHER field changes `saveProfile()`
+        // deferred-persisted before opening the cache-move prompt.
+        guard profileDetailSource.contains("cacheMoveOtherFieldsNeedReinstall") else {
+            return report("AC-CM15", "cache-migration-ui-fixes", false, "(no flag tracks deferred-but-unapplied field changes across the cache-move sheet)")
+        }
+        guard let sheetRange = profileDetailSource.range(of: ".sheet(isPresented: $showingCacheMoveSheet") else {
+            return report("AC-CM15", "cache-migration-ui-fixes", false, "(could not locate the cache-move sheet modifier)")
+        }
+        let windowEnd = profileDetailSource.index(sheetRange.upperBound, offsetBy: 2000, limitedBy: profileDetailSource.endIndex) ?? profileDetailSource.endIndex
+        let dismissWindow = profileDetailSource[sheetRange.upperBound..<windowEnd]
+        guard dismissWindow.contains("cacheMoveOtherFieldsNeedReinstall") else {
+            return report("AC-CM15", "cache-migration-ui-fixes", false, "(onDismiss no longer reinstalls the deferred field changes on a bare dismissal)")
+        }
+        // And it must reinstall the ALREADY-PERSISTED profile, never one
+        // rebuilt from the live form: the form's Cache Directory field still
+        // holds the un-gated edit this sheet exists to gate, so a bare
+        // `reinstallSync()` here would install AND persist exactly the change
+        // Cancel is supposed to refuse. The earlier version of this guard
+        // looked for the literal `reinstallSync()` and passed on a mention of
+        // it inside a comment — pin the call that actually has to be there.
+        guard dismissWindow.contains("reinstallSync(using: persisted)") else {
+            return report("AC-CM15", "cache-migration-ui-fixes", false, "(onDismiss no longer reinstalls from the persisted profile — a bare dismissal would apply the un-gated cache-path edit)")
+        }
+
+        guard let cacheMoveSheetSource = readSourceFile("Views/Settings/CacheMoveSheet.swift") else {
+            return report("AC-CM15", "cache-migration-ui-fixes", false, "(could not read CacheMoveSheet.swift source)")
+        }
+        guard cacheMoveSheetSource.contains("onMoveStarted") else {
+            return report("AC-CM15", "cache-migration-ui-fixes", false, "(CacheMoveSheet has no onMoveStarted hook to suppress the redundant onDismiss reinstall)")
+        }
+
+        // Finding 11, UI half — "nothing was cached" must be treated as a
+        // resolved success, not routed through the generic rejection path
+        // (which a user would have to retry against an unchangeable
+        // destination in pendingSave mode).
+        // It must share the `.completed` arm outright, not merely have an
+        // arm of its own: an empty source is a success that still has to
+        // continue into any accepted same-root co-migration. A separate
+        // `.nothingToMove` arm skipped those siblings entirely, showing a
+        // green "the new location is saved" while every ticked sibling
+        // stayed behind, unmoved and still pointing at the old root.
+        //
+        // Scoped to `handle(outcome:)`'s own body, NOT the whole file: the
+        // same `case .completed, .preflightRejected(.nothingToMove):` text
+        // appears three times in CacheMoveSheet (here, the same-root
+        // success test, and Roll Back's outcome switch), so a whole-file
+        // `contains` would stay green after this exact regression was
+        // reintroduced — an assertion that cannot fail. Same lesson as the
+        // `reinstallSync(using: persisted)` guard twenty lines up.
+        guard let handleBody = extractFunctionBody(startingAt: "private func handle(outcome: CacheMigrationOutcome) {", in: cacheMoveSheetSource) else {
+            return report("AC-CM15", "cache-migration-ui-fixes", false, "(could not locate CacheMoveSheet.handle(outcome:))")
+        }
+        guard handleBody.contains("case .completed, .preflightRejected(.nothingToMove):") else {
+            return report("AC-CM15", "cache-migration-ui-fixes", false, "(handle(outcome:) no longer routes .nothingToMove through the same success arm as .completed)")
+        }
+        guard handleBody.contains("moveSameRootProfiles(extraTargets") else {
+            return report("AC-CM15", "cache-migration-ui-fixes", false, "(that success arm no longer continues into the accepted same-root co-migrations)")
+        }
+
+        return report("AC-CM15", "cache-migration-ui-fixes", true)
+    }
+
+    // MARK: - AC-CM16 — telemetry span status reflects the real outcome (findings 9, 13)
+
+    private static func testCacheMigrationTelemetrySpanStatus() -> Bool {
+        // Behavioral half (finding 9): drive the ACTUAL pure decision
+        // `endCacheMigration` delegates to, rather than pinning that line's
+        // literal Swift expression text — a substring check would keep
+        // passing even if the guard were inverted or the "cancelled"
+        // exemption were dropped, as long as SOME `.error(description:
+        // "cache_migration` text remained anywhere in the function.
+        let nonErrorOutcomes = ["completed", "cancelled"]
+        for outcome in nonErrorOutcomes {
+            guard TelemetryService.CacheMigrationSpanStatus.isError(outcome: outcome) == false else {
+                return report("AC-CM16", "cache-migration-telemetry-span-status", false, "(\"\(outcome)\" was classified as an error)")
+            }
+        }
+        let errorOutcomes = ["verifyMismatch", "countMismatch", "ioError_rolled_back", "mountDetachFailed", "preflight_rejected"]
+        for outcome in errorOutcomes {
+            guard TelemetryService.CacheMigrationSpanStatus.isError(outcome: outcome) == true else {
+                return report("AC-CM16", "cache-migration-telemetry-span-status", false, "(\"\(outcome)\" was NOT classified as an error — a failed move would show green)")
+            }
+        }
+
+        // Source half: `endCacheMigration` must actually ROUTE THROUGH the
+        // decision above rather than re-deriving its own inline comparison
+        // (which would let the two silently diverge).
+        guard let source = readSourceFile("Services/TelemetryService.swift") else {
+            return report("AC-CM16", "cache-migration-telemetry-span-status", false, "(could not read TelemetryService.swift source)")
+        }
+        guard let body = extractFunctionBody(startingAt: "func endCacheMigration(", in: source) else {
+            return report("AC-CM16", "cache-migration-telemetry-span-status", false, "(could not locate endCacheMigration)")
+        }
+        guard body.contains("CacheMigrationSpanStatus.isError(outcome: outcome)"),
+              body.contains(".error(description: \"cache_migration") else {
+            return report("AC-CM16", "cache-migration-telemetry-span-status", false, "(endCacheMigration no longer routes span status through CacheMigrationSpanStatus.isError)")
+        }
+        return report("AC-CM16", "cache-migration-telemetry-span-status", true)
+    }
+
+    // MARK: - AC-CM-CLI — `cache move` parsing, EX_USAGE, mount-only refusal, spy routing
+
+    private static func testCacheMigrationCLI() -> Bool {
+        guard case .success(.cacheMove(let target, let destination, let includeOverlapping)) = SyncTrayCLI.parse(
+            ["cache", "move", "myprofile", "--to", "/Volumes/Big/cache"]
+        ), target == "myprofile", destination == "/Volumes/Big/cache", includeOverlapping == false else {
+            return report("AC-CM-CLI", "cache-migration-cli", false, "(cache move did not parse to .cacheMove)")
+        }
+
+        guard case .failure = SyncTrayCLI.parse(["cache", "move", "myprofile"]) else {
+            return report("AC-CM-CLI", "cache-migration-cli", false, "(missing --to did not fail to parse)")
+        }
+        var stderrOutput = ""
+        let usageEnv = fakeCLIEnvironment(stderr: { stderrOutput += $0 })
+        guard SyncTrayCLI.execute(["cache", "move", "myprofile"], env: usageEnv) == 64 else {
+            return report("AC-CM-CLI", "cache-migration-cli", false, "(missing --to did not exit EX_USAGE)")
+        }
+
+        let stream = mountProfile(remotePath: "Kaiju", vfsCachePath: "/tmp/cm-cli-src")
+        var migrateCalls: [(String, Bool)] = []
+        let migrateEnv = fakeCLIEnvironment(
+            readProfiles: { [stream] },
+            migrateCache: { _, destination, includeOverlapping in
+                migrateCalls.append((destination, includeOverlapping))
+                return .completed(files: 3, bytes: 300, sameVolume: true)
+            }
+        )
+        guard SyncTrayCLI.execute(["cache", "move", stream.shortId, "--to", "/tmp/dest"], env: migrateEnv) == 0,
+              migrateCalls.count == 1, migrateCalls[0] == ("/tmp/dest", false) else {
+            return report("AC-CM-CLI", "cache-migration-cli", false, "(migrateCache spy did not fire with the right destination: \(migrateCalls))")
+        }
+
+        var nonMount = sampleProfile(name: "Bisync")
+        nonMount.syncMode = .bisync
+        let nonMountEnv = fakeCLIEnvironment(readProfiles: { [nonMount] })
+        guard SyncTrayCLI.execute(["cache", "move", nonMount.shortId, "--to", "/tmp/dest"], env: nonMountEnv) != 0 else {
+            return report("AC-CM-CLI", "cache-migration-cli", false, "(non-mount profile was not refused)")
+        }
+
+        guard SyncTrayCLI.telemetryVerb(for: ["cache", "move", "x", "--to", "/y"]) == "cache-move" else {
+            return report("AC-CM-CLI", "cache-migration-cli", false, "(telemetryVerb did not map to cache-move)")
+        }
+
+        return report("AC-CM-CLI", "cache-migration-cli", true)
     }
 }
 

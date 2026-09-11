@@ -305,6 +305,27 @@ final class SyncSetupService {
         return result.output.contains(" on \(profile.localSyncPath) ")
     }
 
+    /// A single `isMounted` sample taken immediately after `uninstall`
+    /// returns can false-positive: a stale mount-table entry can briefly
+    /// linger even after a successful `diskutil unmount` (the exact failure
+    /// mode `uninstall`'s own doc comment names), and a `KeepAlive` launchd
+    /// agent can win a race and remount before the caller gets to check.
+    /// Poll a few times with a short delay before concluding the volume is
+    /// GENUINELY still attached, rather than aborting an entire cache
+    /// migration on one sample (finding 4). Bounded to a few hundred
+    /// milliseconds total — this runs synchronously on whichever thread
+    /// calls it, matching the existing synchronous `diskutil`/`launchctl`
+    /// invocations in `uninstall`/`install`.
+    func isMountedAfterBoundedRecheck(profile: SyncProfile, attempts: Int = 3, delaySeconds: TimeInterval = 0.15) -> Bool {
+        for attempt in 0..<attempts {
+            if !isMounted(profile: profile) { return false }
+            if attempt < attempts - 1 {
+                Thread.sleep(forTimeInterval: delaySeconds)
+            }
+        }
+        return true
+    }
+
     /// Unmount a mounted profile and stop its daemon.
     func unmount(profile: SyncProfile) throws {
         guard profile.isMountMode else {
