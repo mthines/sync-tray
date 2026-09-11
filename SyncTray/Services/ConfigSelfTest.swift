@@ -2242,6 +2242,34 @@ enum ConfigSelfTest {
             return report("AC-CM14", "cache-migration-orchestration-hardening", false, "(the detach-failure abort path never calls endCacheMigration — it would emit no telemetry at all)")
         }
 
+        // The ROLLBACK needs the identical treatment, and had none: it ran
+        // with no span at all, so its own detach-failure abort was
+        // indistinguishable from a rollback that never started. Same shape
+        // as the forward assertions above — open the span before the abort
+        // guard, close it inside the abort, and close it on the normal path.
+        guard let rollbackTelemetryStart = rollbackBody.range(of: "beginCacheMigration("),
+              let rollbackDetachGuard = rollbackBody.range(of: "guard !detach.failed else {"),
+              rollbackTelemetryStart.lowerBound < rollbackDetachGuard.lowerBound else {
+            return report("AC-CM14", "cache-migration-orchestration-hardening", false, "(rollbackCacheMigration does not open its telemetry span before the detach-failure abort guard)")
+        }
+        let rollbackAbortEnd = rollbackBody.index(rollbackDetachGuard.upperBound, offsetBy: 1400, limitedBy: rollbackBody.endIndex) ?? rollbackBody.endIndex
+        let rollbackAbortWindow = rollbackBody[rollbackDetachGuard.upperBound..<rollbackAbortEnd]
+        guard rollbackAbortWindow.contains("endCacheMigration(") else {
+            return report("AC-CM14", "cache-migration-orchestration-hardening", false, "(the rollback's detach-failure abort never calls endCacheMigration)")
+        }
+        // Two calls total — the abort AND the normal completion path. One
+        // would mean a rollback that ran to completion emitted an unclosed
+        // span.
+        guard rollbackBody.components(separatedBy: "endCacheMigration(").count - 1 >= 2 else {
+            return report("AC-CM14", "cache-migration-orchestration-hardening", false, "(rollbackCacheMigration closes its span on only one path — a completed rollback would leave it open)")
+        }
+        // Derived from the shared label function, never hand-copied: the
+        // literal would agree today only by accident of the failure enum's
+        // default rawValue.
+        guard !rollbackBody.contains("outcome: \"mountDetachFailed\"") else {
+            return report("AC-CM14", "cache-migration-orchestration-hardening", false, "(the rollback abort hand-copies its telemetry label instead of deriving it from cacheMigrationOutcomeLabel)")
+        }
+
         return report("AC-CM14", "cache-migration-orchestration-hardening", true)
     }
 
@@ -2308,8 +2336,22 @@ enum ConfigSelfTest {
         // `.nothingToMove` arm skipped those siblings entirely, showing a
         // green "the new location is saved" while every ticked sibling
         // stayed behind, unmoved and still pointing at the old root.
-        guard cacheMoveSheetSource.contains("case .completed, .preflightRejected(.nothingToMove):") else {
-            return report("AC-CM15", "cache-migration-ui-fixes", false, "(CacheMoveSheet no longer routes .nothingToMove through the same success arm as .completed)")
+        //
+        // Scoped to `handle(outcome:)`'s own body, NOT the whole file: the
+        // same `case .completed, .preflightRejected(.nothingToMove):` text
+        // appears three times in CacheMoveSheet (here, the same-root
+        // success test, and Roll Back's outcome switch), so a whole-file
+        // `contains` would stay green after this exact regression was
+        // reintroduced — an assertion that cannot fail. Same lesson as the
+        // `reinstallSync(using: persisted)` guard twenty lines up.
+        guard let handleBody = extractFunctionBody(startingAt: "private func handle(outcome: CacheMigrationOutcome) {", in: cacheMoveSheetSource) else {
+            return report("AC-CM15", "cache-migration-ui-fixes", false, "(could not locate CacheMoveSheet.handle(outcome:))")
+        }
+        guard handleBody.contains("case .completed, .preflightRejected(.nothingToMove):") else {
+            return report("AC-CM15", "cache-migration-ui-fixes", false, "(handle(outcome:) no longer routes .nothingToMove through the same success arm as .completed)")
+        }
+        guard handleBody.contains("moveSameRootProfiles(extraTargets") else {
+            return report("AC-CM15", "cache-migration-ui-fixes", false, "(that success arm no longer continues into the accepted same-root co-migrations)")
         }
 
         return report("AC-CM15", "cache-migration-ui-fixes", true)

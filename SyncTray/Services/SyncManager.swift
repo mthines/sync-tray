@@ -2436,7 +2436,12 @@ final class SyncManager: ObservableObject {
                     bytesMoved: 0,
                     durationSeconds: Date().timeIntervalSince(startedAt),
                     sameVolume: false,
-                    outcome: "mountDetachFailed"
+                    // Derived, not hand-copied: a literal here would agree
+                    // today only because `CacheMigrationFailure` takes its
+                    // default rawValue, and hand-copying a shared decision
+                    // is exactly what let the persist gate drift from its
+                    // own call sites earlier in this branch.
+                    outcome: SyncManager.cacheMigrationOutcomeLabel(aborted.result)
                 )
                 return aborted
             }
