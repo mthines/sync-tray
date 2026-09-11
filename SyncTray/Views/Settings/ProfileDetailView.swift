@@ -2398,13 +2398,25 @@ struct ProfileDetailView: View {
         }
     }
 
+    /// Install from the live form — the ordinary path.
+    ///
+    /// A distinct zero-argument overload rather than a default argument on
+    /// `installSync(using:)`: this function is passed by REFERENCE
+    /// (`Button(action: installSync)`), and a Swift function reference does
+    /// NOT apply default arguments, so a single defaulted-parameter version
+    /// has type `(SyncProfile?) -> Void` at those call sites and fails to
+    /// convert to the `() -> Void` a `Button` action wants.
+    private func installSync() {
+        installSync(using: nil)
+    }
+
     /// - Parameter overrideProfile: when non-nil, install exactly this
     ///   profile instead of rebuilding one from the live form. Required by
     ///   the cache-move-cancel backstop (finding 1): the form's
     ///   `vfsCachePath` field can hold an unresolved, un-gated edit, so that
     ///   path must reinstall the ALREADY-PERSISTED profile, never derive one
     ///   from form state.
-    private func installSync(using overrideProfile: SyncProfile? = nil) {
+    private func installSync(using overrideProfile: SyncProfile?) {
         isInstalling = true
         installError = nil
 
