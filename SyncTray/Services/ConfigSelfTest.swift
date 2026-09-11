@@ -1729,10 +1729,25 @@ enum ConfigSelfTest {
         cancelFake.directories.insert(sourceMeta)
         cancelFake.files["\(sourceContent)/a.bin"] = 5
         cancelFake.volumeOf["/tmp/cm8-dest"] = "other-volume"
-        let engine1 = CacheMigrationEngine(fs: cancelSystem, isCancelled: { true })
+        // Cancellation is polled in TWO places and both are asserted here.
+        // First: `preflight` itself, whose full-tree enumeration can take a
+        // while and must not run to completion after Cancel. An engine that
+        // is already cancelled therefore never returns a preflight at all —
+        // which is why this fixture cannot use a permanently-true flag to
+        // reach the file loop below, as it previously tried to.
+        let alwaysCancelled = CacheMigrationEngine(fs: cancelSystem, isCancelled: { true })
+        guard case .failure(.cancelled) = alwaysCancelled.preflight(plan) else {
+            return report("AC-CM8", "cache-migration-cancel-resume", false, "(preflight does not poll cancellation)")
+        }
+
+        // Second: the file loop. Let preflight succeed, then cancel, so the
+        // run is stopped at a file boundary with the source left intact.
+        var cancelAfterPreflight = false
+        let engine1 = CacheMigrationEngine(fs: cancelSystem, isCancelled: { cancelAfterPreflight })
         guard case .success(let pf1) = engine1.preflight(plan) else {
             return report("AC-CM8", "cache-migration-cancel-resume", false, "(preflight failed for cancel fixture)")
         }
+        cancelAfterPreflight = true
         let outcome1 = engine1.run(plan, pf1)
         guard outcome1.result == .cancelled, outcome1.filesMoved == 0 else {
             return report("AC-CM8", "cache-migration-cancel-resume", false, "(isCancelled=true did not stop the run: \(outcome1.result))")
