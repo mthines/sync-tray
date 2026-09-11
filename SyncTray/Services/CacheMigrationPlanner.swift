@@ -58,7 +58,7 @@ struct CacheMigrationPlan: Equatable {
     }
 }
 
-enum CacheMigrationRejection: Equatable {
+enum CacheMigrationRejection: Error, Equatable {
     case notMountMode
     case emptyDestination
     case destinationEqualsSource

@@ -186,7 +186,7 @@ struct CacheMigrationPreflight: Equatable {
     let sameVolume: Bool
 }
 
-enum CacheMigrationPreflightRejection: Equatable {
+enum CacheMigrationPreflightRejection: Error, Equatable {
     case nothingToMove
     case destinationUnwritable
     case insufficientSpace(requiredBytes: Int64, availableBytes: Int64)
