@@ -1259,6 +1259,20 @@ enum ConfigSelfTest {
         var volumeOf: [String: String] = [:]     // path prefix -> volume id ("default-volume" if unset)
         var availableCapacityBytes: Int64 = Int64.max
         var writeMismatchAt: Set<String> = []    // dest paths whose copy lands at the WRONG size
+        /// Copy TARGET paths whose copy silently produces no file at all —
+        /// the "the copy no-op'd" half of the both-sizes-missing footgun
+        /// AC-CM12 drives through `rollback` (finding 4). Distinct from
+        /// `writeMismatchAt`, which writes a file at the WRONG size.
+        var copyProducesNothingAt: Set<String> = []
+        /// Path -> how many more `fileSize` calls succeed before it starts
+        /// returning `nil` — simulates a file that EXISTS but cannot be
+        /// stat'd, which no combination of `files`/`directories` can express
+        /// (both derive from the same map). AC-CM12 needs it to make
+        /// `rollback`'s destination stat fail while the forward move's own
+        /// stats still succeed. A test that sets a budget should assert it
+        /// reached 0, so a refactor changing the call count fails loudly
+        /// instead of silently skipping the scenario.
+        var statBudget: [String: Int] = [:]
         /// Every root `removeEmptyDirectories` was called with, in call
         /// order — records the argument so a test can assert BOTH the
         /// scope (per-`vfs`/`vfsMeta` subtree, never the bare cache root)
@@ -1275,11 +1289,23 @@ enum ConfigSelfTest {
                 enumerateFiles: { [weak self] root in
                     guard let self else { return [] }
                     let prefix = root + "/"
+                    // Sorted: `files` is a Dictionary, so an unsorted map
+                    // would hand the engine a nondeterministic file ORDER and
+                    // any test that depends on which file fails first would
+                    // flake.
                     return self.files
                         .filter { $0.key.hasPrefix(prefix) }
+                        .sorted { $0.key < $1.key }
                         .map { (relativePath: String($0.key.dropFirst(prefix.count)), size: $0.value) }
                 },
-                fileSize: { [weak self] path in self?.files[path] },
+                fileSize: { [weak self] path in
+                    guard let self else { return nil }
+                    if let remaining = self.statBudget[path] {
+                        guard remaining > 0 else { return nil }
+                        self.statBudget[path] = remaining - 1
+                    }
+                    return self.files[path]
+                },
                 createDirectory: { [weak self] path in
                     self?.directories.insert(path)
                 },
@@ -1290,6 +1316,9 @@ enum ConfigSelfTest {
                         throw FakeCacheFSError.missingParentDirectory
                     }
                     self.copiedPaths.append((from, to))
+                    // A copy that throws nothing but writes nothing — the
+                    // scenario `rollback`'s `guard let` has to fail closed on.
+                    guard !self.copyProducesNothingAt.contains(to) else { return }
                     let sourceSize = self.files[from] ?? 0
                     self.files[to] = self.writeMismatchAt.contains(to) ? sourceSize + 1 : sourceSize
                 },
@@ -1712,6 +1741,40 @@ enum ConfigSelfTest {
             return report("AC-CM8", "cache-migration-cancel-resume", false, "(resumed source file was not cleaned up)")
         }
 
+        // Finding 5 — a RESUMED file is just as moved as one this run copied:
+        // its source copy is gone, so the destination holds the only copy and
+        // a later rollback must restore it. Tracking `movedDestPaths` only in
+        // the copy arm left every resumed file stranded at the destination
+        // while `rollback` still returned true, so a "reverted" source tree
+        // came back silently incomplete. Resume one file, then fail the next,
+        // and require the resumed one back at the source.
+        let (rollbackSystem, rollbackFake) = fakeCacheMigrationFileSystem()
+        let resumedSource = "\(sourceContent)/a.bin"
+        let resumedDest = "/tmp/cm8-dest/vfs/\(key)/a.bin"
+        let failingSource = "\(sourceMeta)/b.bin"
+        let failingDest = "/tmp/cm8-dest/vfsMeta/\(key)/b.bin"
+        rollbackFake.directories.insert(sourceContent)
+        rollbackFake.directories.insert(sourceMeta)
+        rollbackFake.files[resumedSource] = 5
+        rollbackFake.files[resumedDest] = 5      // already relocated by the interrupted run
+        rollbackFake.files[failingSource] = 9
+        rollbackFake.volumeOf["/tmp/cm8-dest"] = "other-volume"
+        rollbackFake.writeMismatchAt.insert(failingDest)
+        let engine3 = CacheMigrationEngine(fs: rollbackSystem)
+        guard case .success(let pf3) = engine3.preflight(plan) else {
+            return report("AC-CM8", "cache-migration-cancel-resume", false, "(preflight failed for resume-rollback fixture)")
+        }
+        let outcome3 = engine3.run(plan, pf3)
+        guard case .failed(.verifyMismatch, let resumeRolledBack) = outcome3.result else {
+            return report("AC-CM8", "cache-migration-cancel-resume", false, "(resume-rollback fixture did not fail on the second file: \(outcome3.result))")
+        }
+        guard rollbackFake.files[resumedSource] == 5 else {
+            return report("AC-CM8", "cache-migration-cancel-resume", false, "(rollback stranded the RESUMED file at the destination — its source was not restored)")
+        }
+        guard rollbackFake.files[resumedDest] == nil, resumeRolledBack else {
+            return report("AC-CM8", "cache-migration-cancel-resume", false, "(resumed file's destination copy survived a completed rollback, or rollback reported failure: rolledBack=\(resumeRolledBack))")
+        }
+
         return report("AC-CM8", "cache-migration-cancel-resume", true)
     }
 
@@ -1862,17 +1925,67 @@ enum ConfigSelfTest {
     // MARK: - AC-CM12 — rollback verifies BOTH sizes are present, not a naked Optional==Optional (finding 4)
 
     private static func testCacheMigrationRollbackOptionalGuard() -> Bool {
-        // Swift-semantics half: two missing (`nil`) sizes compare EQUAL under
-        // a naked `==` — the exact footgun the old
-        // `fs.fileSize(sourcePath) == fs.fileSize(destPath)` comparison fell
-        // into. A rollback copy that silently produced NOTHING on either
-        // side would "verify" as a match and then delete the last remaining
-        // copy at `destPath` — irrecoverable data loss on an already-failed
-        // migration.
-        let bothMissing: Int64? = nil
-        let alsoMissing: Int64? = nil
-        guard bothMissing == alsoMissing else {
-            return report("AC-CM12", "cache-migration-rollback-optional-guard", false, "(assumption broke: two nil Int64? no longer compare equal in this toolchain)")
+        // Behavioural half: drive a real rollback into the both-sizes-missing
+        // state and assert it FAILS CLOSED. Under the old naked
+        // `fs.fileSize(sourcePath) == fs.fileSize(destPath)`, two `nil`s
+        // compare EQUAL, so a rollback copy that silently produced nothing
+        // would "verify" as a match and then delete the last remaining copy
+        // at `destPath` — irrecoverable data loss on an already-failed
+        // migration (finding 4).
+        //
+        // (This replaces a `let a: Int64? = nil; let b: Int64? = nil;
+        // guard a == b` assertion, which restated a Swift language rule and
+        // could not fail for any state of this codebase.)
+        let profile = mountProfile(remotePath: "Kaiju", vfsCachePath: "/tmp/cm12-src")
+        guard case .success(let plan) = CacheMigrationPlanner.plan(
+            moving: profile, allProfiles: [profile], to: "/tmp/cm12-dest", coMigrate: []
+        ) else {
+            return report("AC-CM12", "cache-migration-rollback-optional-guard", false, "(plan failed)")
+        }
+        let key = VFSCacheService.cacheRelativePath(for: profile)
+        let sourceContent = "/tmp/cm12-src/vfs/\(key)"
+        let sourceMeta = "/tmp/cm12-src/vfsMeta/\(key)"
+        // One file per subtree, so the engine's order (`vfs` then `vfsMeta`)
+        // fixes which file moves and which one fails — independent of the
+        // fake's within-subtree enumeration.
+        let goodSource = "\(sourceContent)/good.bin"
+        let goodDest = "/tmp/cm12-dest/vfs/\(key)/good.bin"
+        let badSource = "\(sourceMeta)/bad.bin"
+        let badDest = "/tmp/cm12-dest/vfsMeta/\(key)/bad.bin"
+
+        let (system, fake) = fakeCacheMigrationFileSystem()
+        fake.directories.insert(sourceContent)
+        fake.directories.insert(sourceMeta)
+        fake.files[goodSource] = 10
+        fake.files[badSource] = 20
+        fake.volumeOf["/tmp/cm12-dest"] = "other-volume"   // cross-volume → per-file path
+        fake.writeMismatchAt.insert(badDest)               // second file fails → rollback runs
+        fake.copyProducesNothingAt.insert(goodSource)      // rollback's copy-back writes nothing
+        // `goodDest` is stat'd three times on the way out — `preflight`'s
+        // resume accounting, `moveFiles`' resume-skip probe, then
+        // `moveFile`'s verify — and would be stat'd a fourth time by
+        // rollback. Budget exactly those three so the ROLLBACK stat returns
+        // nil, i.e. a destination that EXISTS but cannot be stat'd. Both
+        // sizes are then missing, which is the only state that separates the
+        // `guard let` from the naked `==`.
+        fake.statBudget[goodDest] = 3
+
+        let engine = CacheMigrationEngine(fs: system)
+        guard case .success(let preflight) = engine.preflight(plan) else {
+            return report("AC-CM12", "cache-migration-rollback-optional-guard", false, "(preflight failed)")
+        }
+        let outcome = engine.run(plan, preflight)
+        guard case .failed(.verifyMismatch, let rolledBack) = outcome.result else {
+            return report("AC-CM12", "cache-migration-rollback-optional-guard", false, "(expected a verify-mismatch failure, got: \(outcome.result))")
+        }
+        guard fake.statBudget[goodDest] == 0 else {
+            return report("AC-CM12", "cache-migration-rollback-optional-guard", false, "(stat budget not consumed as expected — the forward move no longer stats the destination twice, so this fixture never reached the both-sizes-missing state)")
+        }
+        guard rolledBack == false else {
+            return report("AC-CM12", "cache-migration-rollback-optional-guard", false, "(rollback reported success despite being unable to verify the restored file)")
+        }
+        guard fake.files[goodDest] == 10 else {
+            return report("AC-CM12", "cache-migration-rollback-optional-guard", false, "(rollback deleted the last remaining copy at the destination: \(String(describing: fake.files[goodDest])))")
         }
 
         // Source half: `rollback` must reject via `guard let` (fails closed

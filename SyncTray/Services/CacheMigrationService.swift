@@ -409,6 +409,18 @@ struct CacheMigrationEngine {
             // cleaning up the now-redundant source copy.
             if let existing = fs.fileSize(destPath), existing == file.size {
                 try? fs.removeItem(sourcePath)
+                // Once the source copy is gone the destination holds the
+                // file's ONLY copy, so a later rollback has to restore it
+                // exactly like a file this run copied itself. Tracking it
+                // only in the copy arm below stranded every resumed file at
+                // the destination while `rollback` still reported success,
+                // leaving a "reverted" source tree silently incomplete
+                // (finding 5). Keyed on the source actually being gone, not
+                // on the removal call: if it survived, the destination is
+                // still redundant and rollback has nothing to restore here.
+                if !fs.fileExists(sourcePath) {
+                    movedDestPaths.append(destPath)
+                }
                 filesMoved += 1
                 bytesMoved += file.size
                 onProgress(filesMoved, bytesMoved, file.relativePath)
