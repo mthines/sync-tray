@@ -309,16 +309,30 @@ struct CacheMoveSheet: View {
     /// Sequentially migrate each accepted same-root sibling to the same
     /// destination — a SEPARATE plan/run per profile (R14): these are
     /// disjoint bytes on disk, not part of the primary plan.
-    private func moveSameRootProfiles(_ ids: [UUID], thenSummarize summary: String) {
+    private func moveSameRootProfiles(_ ids: [UUID], thenSummarize summary: String, failed: Int = 0) {
         guard let id = ids.first else {
+            // A sibling that did not complete is reported, not folded
+            // silently into the primary profile's success summary: its
+            // `vfsCachePath` was NOT persisted, so it is still pointing at
+            // the old root and the user needs to know to retry it.
+            guard failed == 0 else {
+                errorMessage = "\(failed) other profile\(failed == 1 ? "" : "s") sharing this cache root could not be moved and still point at the old location."
+                step = .done(summary)
+                return
+            }
             step = .done(summary)
             return
         }
         let task = syncManager.startCacheMigration(for: id, destination: destination, coMigrate: [])
         Task {
-            _ = await task.value
+            let outcome = await task.value
             await MainActor.run {
-                moveSameRootProfiles(Array(ids.dropFirst()), thenSummarize: summary)
+                let ok: Bool
+                switch outcome.result {
+                case .completed, .preflightRejected(.nothingToMove): ok = true
+                default: ok = false
+                }
+                moveSameRootProfiles(Array(ids.dropFirst()), thenSummarize: summary, failed: failed + (ok ? 0 : 1))
             }
         }
     }
@@ -361,18 +375,43 @@ struct CacheMoveSheet: View {
         VStack(alignment: .leading, spacing: 10) {
             Text("Move cancelled. Files already relocated are still at the new location; nothing was left half-copied.")
                 .font(.callout)
+            // This step is also where a FAILED roll back lands, so it needs
+            // an error slot of its own — otherwise the message set below
+            // would be written and never shown.
+            if let errorMessage {
+                Text(errorMessage).font(.caption).foregroundStyle(.red)
+            }
             HStack {
                 Button("Resume") { startMove() }
                     .buttonStyle(.borderedProminent)
                 Button("Roll Back", role: .destructive) {
+                    errorMessage = nil
                     step = .moving
                     let task = syncManager.rollbackCacheMigration(
                         for: movingProfileId, sourceRoot: sourceRoot, destinationRoot: destination, coMigrate: Set(overlappingIds)
                     )
                     Task {
-                        _ = await task.value
+                        let outcome = await task.value
                         await MainActor.run {
-                            step = .done("Rolled back — cache is back at the original location.")
+                            // The rollback's own outcome decides the message.
+                            // Discarding it (`_ = await task.value`) claimed
+                            // "cache is back at the original location" even
+                            // when the reverse move failed or was itself
+                            // cancelled, leaving files at the destination
+                            // while telling the user the opposite.
+                            switch outcome.result {
+                            case .completed, .preflightRejected(.nothingToMove):
+                                step = .done("Rolled back — cache is back at the original location.")
+                            case .cancelled:
+                                errorMessage = "Roll back was cancelled — some files are still at the new location."
+                                step = .cancelledChoice
+                            case .failed(let reason, _):
+                                errorMessage = "Roll back failed (\(reason.rawValue)) — some files are still at the new location."
+                                step = .cancelledChoice
+                            case .preflightRejected(let rejection):
+                                errorMessage = "Roll back couldn't start: \(rejection)"
+                                step = .cancelledChoice
+                            }
                         }
                     }
                 }
@@ -383,8 +422,16 @@ struct CacheMoveSheet: View {
     // MARK: - Step: done
 
     private func doneContent(_ summary: String) -> some View {
-        Label(summary, systemImage: "checkmark.circle.fill")
-            .foregroundStyle(.green)
+        VStack(alignment: .leading, spacing: 8) {
+            Label(summary, systemImage: "checkmark.circle.fill")
+                .foregroundStyle(.green)
+            // The primary profile can succeed while an optional same-root
+            // co-migration does not — that partial outcome is reported here
+            // rather than hidden behind the green checkmark.
+            if let errorMessage {
+                Text(errorMessage).font(.caption).foregroundStyle(.orange)
+            }
+        }
     }
 
     private var footer: some View {

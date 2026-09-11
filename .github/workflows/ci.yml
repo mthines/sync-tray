@@ -225,6 +225,7 @@ jobs:
             build \
             ONLY_ACTIVE_ARCH=YES \
             CODE_SIGNING_ALLOWED=NO \
+            -derivedDataPath "$RUNNER_TEMP/DerivedData" \
             > "$RUNNER_TEMP/xcodebuild.log" 2>&1 || rc=$?
 
           if [ "$rc" -ne 0 ]; then
@@ -238,6 +239,22 @@ jobs:
           fi
 
           tail -30 "$RUNNER_TEMP/xcodebuild.log"
+
+      # SyncTray has no XCTest target (see the job comment above), so the
+      # `#if DEBUG` ConfigSelfTest suite IS the test suite — round-trip,
+      # migration, reconcile-delta, self-write, external-create, CLI and
+      # cache-migration assertions. It only ever ran when someone typed
+      # `SyncTray --self-test` by hand, which meant a broken assertion could
+      # (and did) sit on a branch through a green CI run. Run it here, where
+      # the Debug binary the previous step just produced is sitting.
+      - name: Self-test
+        run: |
+          APP="$RUNNER_TEMP/DerivedData/Build/Products/Debug/SyncTray.app/Contents/MacOS/SyncTray"
+          if [ ! -x "$APP" ]; then
+            echo "Debug binary not found at $APP — the build layout changed."
+            exit 1
+          fi
+          "$APP" --self-test
 
   # ===========================================================================
   # version — calculate the next version from conventional commits and create

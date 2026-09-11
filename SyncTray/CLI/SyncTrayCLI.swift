@@ -839,43 +839,37 @@ extension CLIEnvironment {
         )
 
         let finalResult: CacheMigrationCLIResult
-        switch result.outcome.result {
-        case .completed:
-            var updated = profile
-            updated.vfsCachePath = destination
-            _ = ProfileStore.writeProfileFile(updated, in: SyncProfile.configDirectory)
-            if let plan = result.plan {
-                for id in plan.profileIdsToRewrite where id != profile.id {
-                    if var sibling = allProfiles.first(where: { $0.id == id }) {
-                        sibling.vfsCachePath = destination
-                        _ = ProfileStore.writeProfileFile(sibling, in: SyncProfile.configDirectory)
-                    }
-                }
+        // Route through the SHARED persist gate rather than re-deriving the
+        // case list here — the CLI and `SyncManager.migrateCacheDirectory`
+        // previously each hand-copied `.completed` + `.nothingToMove`
+        // branches, which is precisely how the two drifted from the gate
+        // they were supposed to be quoting.
+        if CacheMigrationPersistDecision.shouldPersist(result.outcome) {
+            var idsToRewrite = result.plan?.profileIdsToRewrite ?? []
+            if !idsToRewrite.contains(profile.id) { idsToRewrite.append(profile.id) }
+            // Re-read from disk rather than reusing the pre-move snapshots:
+            // a migration can run for hours, and the running app (or a
+            // hand edit) may have changed other fields meanwhile.
+            let onDisk = ProfileStore.profilesOnDisk(in: SyncProfile.configDirectory)
+            for id in idsToRewrite {
+                guard var latest = onDisk.first(where: { $0.id == id })
+                    ?? allProfiles.first(where: { $0.id == id }) else { continue }
+                latest.vfsCachePath = destination
+                _ = ProfileStore.writeProfileFile(latest, in: SyncProfile.configDirectory)
             }
             finalResult = .completed(files: result.outcome.filesMoved, bytes: result.outcome.bytesMoved, sameVolume: result.outcome.sameVolume)
-        case .preflightRejected(.nothingToMove):
-            // Nothing was cached at the source — there is nothing to lose by
-            // persisting the new directory choice (finding 11, CLI half —
-            // same fix as `SyncManager.migrateCacheDirectory`). R20 only
-            // guards against persisting an INCOMPLETE cache.
-            var updated = profile
-            updated.vfsCachePath = destination
-            _ = ProfileStore.writeProfileFile(updated, in: SyncProfile.configDirectory)
-            if let plan = result.plan {
-                for id in plan.profileIdsToRewrite where id != profile.id {
-                    if var sibling = allProfiles.first(where: { $0.id == id }) {
-                        sibling.vfsCachePath = destination
-                        _ = ProfileStore.writeProfileFile(sibling, in: SyncProfile.configDirectory)
-                    }
-                }
+        } else {
+            switch result.outcome.result {
+            case .cancelled:
+                finalResult = .failed("cancelled")
+            case .failed(let reason, _):
+                finalResult = .failed(reason.rawValue)
+            case .preflightRejected(let rejection):
+                finalResult = .rejected("\(rejection)")
+            case .completed:
+                // Unreachable: `shouldPersist` returns true for `.completed`.
+                finalResult = .completed(files: result.outcome.filesMoved, bytes: result.outcome.bytesMoved, sameVolume: result.outcome.sameVolume)
             }
-            finalResult = .completed(files: result.outcome.filesMoved, bytes: result.outcome.bytesMoved, sameVolume: result.outcome.sameVolume)
-        case .cancelled:
-            finalResult = .failed("cancelled")
-        case .failed(let reason, _):
-            finalResult = .failed(reason.rawValue)
-        case .preflightRejected(let rejection):
-            finalResult = .rejected("\(rejection)")
         }
 
         if wasInstalled {

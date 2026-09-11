@@ -2389,6 +2389,26 @@ final class SyncManager: ObservableObject {
         asSource.vfsCachePath = sourceRoot
         let cancellationFlag = CacheMigrationCancellationFlag()
 
+        // R4/R5 for the REVERSE move, which the forward bracket does not
+        // cover: `migrateCacheDirectory`'s `defer` has already re-installed
+        // the agent by the time the user is offered "Resume or roll back?",
+        // so the mount is live again on `sourceRoot` — precisely the tree a
+        // rollback writes into. Cancel any warm and re-detach first, exactly
+        // as the forward move does.
+        let affectedIds = [profileId] + coMigrate
+        for id in affectedIds { cancelWarm(for: id) }
+        let detach = detachForCacheMigration([asSource] + coMigrate.compactMap { profileStore.profile(for: $0) })
+        guard !detach.failed else {
+            // Still mounted after a graceful and a forced unmount — moving
+            // files back under a live mount is worse than leaving them at
+            // the destination, where the (unpersisted) profile simply does
+            // not point yet. Re-install and report, changing nothing.
+            reinstallAfterCacheMigration(detach.toReinstall)
+            cacheMigrationProgress[profileId] = nil
+            return Task { CacheMigrationOutcome(result: .failed(.mountDetachFailed, rolledBack: false), filesMoved: 0, bytesMoved: 0, sameVolume: false) }
+        }
+        let profilesToReinstall = detach.toReinstall
+
         let task = Task { [weak self] () -> CacheMigrationOutcome in
             let fs = CacheMigrationFileSystem.production()
             let outcome = await withTaskCancellationHandler {
@@ -2425,7 +2445,16 @@ final class SyncManager: ObservableObject {
             } onCancel: {
                 cancellationFlag.markCancelled()
             }
-            await MainActor.run { self?.cacheMigrationProgress[profileId] = nil }
+            // Re-install on EVERY exit path, mirroring the forward move's
+            // `defer` — a rollback that completed, failed, or was cancelled
+            // must never leave the profile with no launchd agent. `defer`
+            // can't be used here because the re-install has to hop back to
+            // the main actor, so it sits on the single path out of the
+            // `await` above.
+            await MainActor.run {
+                self?.reinstallAfterCacheMigration(profilesToReinstall)
+                self?.cacheMigrationProgress[profileId] = nil
+            }
             return outcome
         }
         cacheMigrationTasks[profileId] = task
@@ -2440,6 +2469,65 @@ final class SyncManager: ObservableObject {
     /// detect an inverted or unreachable guard around this decision).
     nonisolated static func cacheMigrationDetachSucceeded(threw: Bool, stillMountedAfterRecheck: Bool) -> Bool {
         !threw && !stillMountedAfterRecheck
+    }
+
+    /// R4 — detach and unload every currently-installed profile among
+    /// `profiles`, so nothing writes into either cache tree while files are
+    /// being relocated.
+    ///
+    /// Shared by the forward move AND the rollback. The rollback needs it
+    /// just as badly: by the time the user sees the "Resume or roll back?"
+    /// choice, `migrateCacheDirectory`'s `defer` has already re-installed
+    /// the agent, and the mount is back up using `sourceRoot` as its
+    /// `--cache-dir` — which is exactly where a rollback writes. Relocating
+    /// files into a live `rclone nfsmount`'s cache directory is the same
+    /// corruption path the pre-move warm cancellation exists to avoid, so
+    /// Roll Back must re-detach rather than assume the forward bracket
+    /// still covers it.
+    ///
+    /// `setupService.uninstall` does the graceful volume detach but does NOT
+    /// throw when that detach genuinely fails (`diskutil unmount` and its
+    /// `force` retry both non-zero) — it logs `mount.result: failure` and
+    /// proceeds to unload the agent anyway. So both a thrown error and that
+    /// non-throwing failure are checked explicitly (finding 7), the latter
+    /// via `isMountedAfterBoundedRecheck` rather than one `isMounted`
+    /// sample, since a stale mount-table entry or a `KeepAlive` remount race
+    /// would otherwise abort the whole run on a single bad reading
+    /// (finding 4).
+    ///
+    /// - Returns: the profiles that were unloaded and therefore MUST be
+    ///   passed to `reinstallAfterCacheMigration` on every exit path, and
+    ///   whether the detach failed (in which case the caller must abort
+    ///   without touching a file).
+    private func detachForCacheMigration(_ profiles: [SyncProfile]) -> (toReinstall: [SyncProfile], failed: Bool) {
+        let installed = profiles.filter { setupService.isInstalled(profile: $0) }
+        for profile in installed {
+            do {
+                try setupService.uninstall(profile: profile)
+            } catch {
+                return (installed, true)
+            }
+            let stillMounted = profile.isMountMode && setupService.isMountedAfterBoundedRecheck(profile: profile)
+            guard Self.cacheMigrationDetachSucceeded(threw: false, stillMountedAfterRecheck: stillMounted) else {
+                // `uninstall` returned normally but the volume is still
+                // attached — the graceful/forced `diskutil unmount` both
+                // failed. Abort rather than move files out from under it.
+                return (installed, true)
+            }
+        }
+        return (installed, false)
+    }
+
+    /// Re-install everything `detachForCacheMigration` unloaded and re-push
+    /// the FinderSync App Group data (R7). Always installs from the CURRENT
+    /// persisted profile, so a `vfsCachePath` the move just persisted is the
+    /// one the re-installed agent mounts with.
+    private func reinstallAfterCacheMigration(_ profiles: [SyncProfile]) {
+        for profile in profiles {
+            let latest = profileStore.profile(for: profile.id) ?? profile
+            try? setupService.install(profile: latest)
+        }
+        updateAppGroupMountPaths()
     }
 
     /// The full orchestration: cancel any in-flight warm for the affected
@@ -2485,36 +2573,16 @@ final class SyncManager: ObservableObject {
         // `isMounted` sample, since a stale mount-table entry or a
         // `KeepAlive` remount race can otherwise false-positive and abort
         // the WHOLE migration on one bad sample (finding 4).
-        let profilesToReinstall = ([movingProfile] + coMigrate.compactMap { profileStore.profile(for: $0) })
-            .filter { setupService.isInstalled(profile: $0) }
-        var detachFailed = false
-        for profile in profilesToReinstall {
-            do {
-                try setupService.uninstall(profile: profile)
-            } catch {
-                detachFailed = true
-                break
-            }
-            let stillMounted = profile.isMountMode && setupService.isMountedAfterBoundedRecheck(profile: profile)
-            guard Self.cacheMigrationDetachSucceeded(threw: false, stillMountedAfterRecheck: stillMounted) else {
-                // `uninstall` returned normally but the volume is still
-                // attached — the graceful/forced `diskutil unmount` both
-                // failed. Abort rather than move files out from under it.
-                detachFailed = true
-                break
-            }
-        }
+        let detach = detachForCacheMigration([movingProfile] + coMigrate.compactMap { profileStore.profile(for: $0) })
+        let profilesToReinstall = detach.toReinstall
+        let detachFailed = detach.failed
 
         defer {
             // Re-install on EVERY exit path — completed, failed, cancelled,
             // a detach failure, or a thrown error above — so a profile is
             // never left with no launchd agent (`optimize-approach(plan)`
             // proposal P2).
-            for profile in profilesToReinstall {
-                let latest = self.profileStore.profile(for: profile.id) ?? profile
-                try? self.setupService.install(profile: latest)
-            }
-            updateAppGroupMountPaths()
+            reinstallAfterCacheMigration(profilesToReinstall)
         }
 
         guard !detachFailed else {
@@ -2581,43 +2649,39 @@ final class SyncManager: ObservableObject {
         progress.sameVolume = outcome.sameVolume
         progress.finishedAt = Date()
 
-        switch outcome.result {
-        case .completed where CacheMigrationPersistDecision.shouldPersist(outcome):
+        // `shouldPersist` is the ACTUAL gate, not a `where` clause on a
+        // `.completed` pattern that had already decided the answer. It
+        // covers both persisting outcomes — a completed move, and
+        // `.nothingToMove` (an empty source is nothing to lose, so the
+        // user's directory choice must not be silently dropped; R20 only
+        // guards against persisting an INCOMPLETE cache). The two branches
+        // were previously hand-copied, which is how they drifted apart from
+        // the gate in the first place.
+        if CacheMigrationPersistDecision.shouldPersist(outcome) {
             progress.phase = .completed
-            var updated = movingProfile
-            updated.vfsCachePath = destination
-            profileStore.update(updated)
-            if let plan {
-                for id in plan.profileIdsToRewrite where id != profileId {
-                    if var sibling = profileStore.profile(for: id) {
-                        sibling.vfsCachePath = destination
-                        profileStore.update(sibling)
-                    }
-                }
+            // Re-read each profile from the store instead of writing back
+            // `movingProfile`. That snapshot was taken before a move that
+            // can run for hours; writing it back wholesale would silently
+            // revert any edit the UI or `ConfigFileWatcher` made in the
+            // meantime. `vfsCachePath` is the only field this migration
+            // owns. (The sibling loop already worked this way — the moving
+            // profile itself was the outlier.)
+            var idsToRewrite = plan?.profileIdsToRewrite ?? []
+            if !idsToRewrite.contains(profileId) { idsToRewrite.append(profileId) }
+            for id in idsToRewrite {
+                guard var latest = profileStore.profile(for: id) else { continue }
+                latest.vfsCachePath = destination
+                profileStore.update(latest)
             }
-        case .preflightRejected(.nothingToMove):
-            // Nothing was cached at the source — there is nothing to lose by
-            // persisting, so the user's directory choice must not be
-            // silently dropped (finding 11). R20 only guards against
-            // persisting an INCOMPLETE cache; an empty one carries no such risk.
-            progress.phase = .completed
-            var updated = movingProfile
-            updated.vfsCachePath = destination
-            profileStore.update(updated)
-            if let plan {
-                for id in plan.profileIdsToRewrite where id != profileId {
-                    if var sibling = profileStore.profile(for: id) {
-                        sibling.vfsCachePath = destination
-                        profileStore.update(sibling)
-                    }
-                }
+        } else {
+            switch outcome.result {
+            case .cancelled:
+                progress.phase = .cancelled
+            case .failed(let reason, _):
+                progress.phase = .failed(reason.rawValue)
+            default:
+                progress.phase = .failed("rejected")
             }
-        case .cancelled:
-            progress.phase = .cancelled
-        case .failed(let reason, _):
-            progress.phase = .failed(reason.rawValue)
-        default:
-            progress.phase = .failed("rejected")
         }
         cacheMigrationProgress[profileId] = progress
 

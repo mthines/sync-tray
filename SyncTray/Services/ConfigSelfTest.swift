@@ -1674,21 +1674,39 @@ enum ConfigSelfTest {
         return report("AC-CM6", "cache-migration-verify-order", true)
     }
 
-    // MARK: - AC-CM7 — persist ONLY on a completed outcome
+    // MARK: - AC-CM7 — persist on a completed move OR an empty source, never otherwise
 
     private static func testCacheMigrationPersistOnSuccess() -> Bool {
-        let completed = CacheMigrationOutcome(result: .completed, filesMoved: 3, bytesMoved: 300, sameVolume: true)
-        let cancelled = CacheMigrationOutcome(result: .cancelled, filesMoved: 1, bytesMoved: 10, sameVolume: true)
-        let failed = CacheMigrationOutcome(result: .failed(.verifyMismatch, rolledBack: true), filesMoved: 0, bytesMoved: 0, sameVolume: true)
-        let rejected = CacheMigrationOutcome(result: .preflightRejected(.nothingToMove), filesMoved: 0, bytesMoved: 0, sameVolume: false)
-
-        guard CacheMigrationPersistDecision.shouldPersist(completed) else {
-            return report("AC-CM7", "cache-migration-persist-on-success", false, "(a completed outcome did not persist)")
+        // The gate persists on exactly TWO outcomes: a completed move, and
+        // `.nothingToMove` — an empty/absent source cache is nothing to lose,
+        // so re-pointing the profile at the new root is the whole job and
+        // refusing to persist would leave the user's Save silently ignored.
+        //
+        // This test previously asserted `!shouldPersist(.nothingToMove)`,
+        // written against the single-case version of the gate and never
+        // updated when `.nothingToMove` was added to it. It therefore failed
+        // deterministically, which nothing caught because `--self-test` was
+        // not wired into CI — it is now (the `test` job's "Self-test" step).
+        let persisting: [(String, CacheMigrationOutcome)] = [
+            ("completed", CacheMigrationOutcome(result: .completed, filesMoved: 3, bytesMoved: 300, sameVolume: true)),
+            ("nothingToMove", CacheMigrationOutcome(result: .preflightRejected(.nothingToMove), filesMoved: 0, bytesMoved: 0, sameVolume: false)),
+        ]
+        for (label, outcome) in persisting where !CacheMigrationPersistDecision.shouldPersist(outcome) {
+            return report("AC-CM7", "cache-migration-persist-on-success", false, "(\(label) did not persist)")
         }
-        guard !CacheMigrationPersistDecision.shouldPersist(cancelled),
-              !CacheMigrationPersistDecision.shouldPersist(failed),
-              !CacheMigrationPersistDecision.shouldPersist(rejected) else {
-            return report("AC-CM7", "cache-migration-persist-on-success", false, "(a non-completed outcome persisted)")
+
+        // Everything else must leave `vfsCachePath` alone, so a `.profile.json`
+        // can never name a cache directory the bytes did not actually reach.
+        let notPersisting: [(String, CacheMigrationOutcome)] = [
+            ("cancelled", CacheMigrationOutcome(result: .cancelled, filesMoved: 1, bytesMoved: 10, sameVolume: true)),
+            ("failed/verifyMismatch", CacheMigrationOutcome(result: .failed(.verifyMismatch, rolledBack: true), filesMoved: 0, bytesMoved: 0, sameVolume: true)),
+            ("failed/ioError", CacheMigrationOutcome(result: .failed(.ioError, rolledBack: false), filesMoved: 2, bytesMoved: 20, sameVolume: false)),
+            ("rejected/destinationUnwritable", CacheMigrationOutcome(result: .preflightRejected(.destinationUnwritable), filesMoved: 0, bytesMoved: 0, sameVolume: false)),
+            ("rejected/insufficientSpace", CacheMigrationOutcome(result: .preflightRejected(.insufficientSpace(requiredBytes: 10, availableBytes: 1)), filesMoved: 0, bytesMoved: 0, sameVolume: false)),
+            ("rejected/cancelled", CacheMigrationOutcome(result: .preflightRejected(.cancelled), filesMoved: 0, bytesMoved: 0, sameVolume: false)),
+        ]
+        for (label, outcome) in notPersisting where CacheMigrationPersistDecision.shouldPersist(outcome) {
+            return report("AC-CM7", "cache-migration-persist-on-success", false, "(\(label) persisted)")
         }
         return report("AC-CM7", "cache-migration-persist-on-success", true)
     }
@@ -1821,15 +1839,39 @@ enum ConfigSelfTest {
         // (`global::aw-lessons::mock-that-reimplements-the-thing-under-test`).
         // Assert the SAME ordering against the real source too.
         guard let source = readSourceFile("Services/SyncManager.swift"),
-              let body = extractFunctionBody(startingAt: "private func migrateCacheDirectory(", in: source) else {
-            return report("AC-CM9", "cache-migration-install-on-every-path", false, "(could not read migrateCacheDirectory's real source)")
+              let body = extractFunctionBody(startingAt: "private func migrateCacheDirectory(", in: source),
+              let rollbackBody = extractFunctionBody(startingAt: "func rollbackCacheMigration(", in: source),
+              let detachBody = extractFunctionBody(startingAt: "private func detachForCacheMigration(", in: source),
+              let reinstallBody = extractFunctionBody(startingAt: "private func reinstallAfterCacheMigration(", in: source) else {
+            return report("AC-CM9", "cache-migration-install-on-every-path", false, "(could not read the real migration bracket source)")
         }
-        guard let uninstallRange = body.range(of: "setupService.uninstall"),
-              let installRange = body.range(of: "setupService.install") else {
-            return report("AC-CM9", "cache-migration-install-on-every-path", false, "(real source missing an uninstall/install call)")
+        // The two halves of the bracket live in shared helpers now, so the
+        // forward move and the rollback cannot implement it differently.
+        // Assert the helpers really do the work, then that both call sites
+        // detach before they re-install.
+        guard detachBody.contains("setupService.uninstall"),
+              reinstallBody.contains("setupService.install"),
+              reinstallBody.contains("updateAppGroupMountPaths()") else {
+            return report("AC-CM9", "cache-migration-install-on-every-path", false, "(the shared detach/reinstall helpers no longer uninstall/install)")
+        }
+        guard let uninstallRange = body.range(of: "detachForCacheMigration("),
+              let installRange = body.range(of: "reinstallAfterCacheMigration(") else {
+            return report("AC-CM9", "cache-migration-install-on-every-path", false, "(migrateCacheDirectory no longer brackets the move)")
         }
         guard uninstallRange.lowerBound < installRange.lowerBound, body.contains("defer {") else {
-            return report("AC-CM9", "cache-migration-install-on-every-path", false, "(real source does not uninstall before install via a defer)")
+            return report("AC-CM9", "cache-migration-install-on-every-path", false, "(migrateCacheDirectory does not detach before re-installing via a defer)")
+        }
+
+        // The ROLLBACK needs the same bracket. It had none: by the time the
+        // user is offered "Resume or roll back?", the forward move's `defer`
+        // has already re-installed the agent, so the mount is live again on
+        // `sourceRoot` — exactly the tree the reverse move writes into.
+        // Relocating files into a live `rclone nfsmount`'s `--cache-dir` is
+        // the corruption path the pre-move warm cancellation exists to avoid.
+        guard let rollbackDetach = rollbackBody.range(of: "detachForCacheMigration("),
+              let rollbackInstall = rollbackBody.range(of: "reinstallAfterCacheMigration("),
+              rollbackDetach.lowerBound < rollbackInstall.lowerBound else {
+            return report("AC-CM9", "cache-migration-install-on-every-path", false, "(rollbackCacheMigration does not detach before re-installing — it would move files into a live mount)")
         }
 
         return report("AC-CM9", "cache-migration-install-on-every-path", true)
@@ -1862,15 +1904,25 @@ enum ConfigSelfTest {
         // against the actual `migrateCacheDirectory`, not the spy-tested
         // `CacheMigrationBracket` stand-in.
         guard let source = readSourceFile("Services/SyncManager.swift"),
-              let body = extractFunctionBody(startingAt: "private func migrateCacheDirectory(", in: source) else {
-            return report("AC-CM10", "cache-migration-warm-cancelled-first", false, "(could not read migrateCacheDirectory's real source)")
+              let body = extractFunctionBody(startingAt: "private func migrateCacheDirectory(", in: source),
+              let rollbackBody = extractFunctionBody(startingAt: "func rollbackCacheMigration(", in: source) else {
+            return report("AC-CM10", "cache-migration-warm-cancelled-first", false, "(could not read the real migration source)")
         }
         guard let warmRange = body.range(of: "cancelWarm(for: id)"),
-              let uninstallRange = body.range(of: "setupService.uninstall") else {
-            return report("AC-CM10", "cache-migration-warm-cancelled-first", false, "(real source missing a cancelWarm/uninstall call)")
+              let uninstallRange = body.range(of: "detachForCacheMigration(") else {
+            return report("AC-CM10", "cache-migration-warm-cancelled-first", false, "(real source missing a cancelWarm/detach call)")
         }
         guard warmRange.lowerBound < uninstallRange.lowerBound else {
-            return report("AC-CM10", "cache-migration-warm-cancelled-first", false, "(real source does not cancel warm before uninstall)")
+            return report("AC-CM10", "cache-migration-warm-cancelled-first", false, "(real source does not cancel warm before detaching)")
+        }
+
+        // Same requirement for the reverse move — a warm reading through the
+        // re-established mount races a rollback exactly as it races a
+        // forward move.
+        guard let rollbackWarm = rollbackBody.range(of: "cancelWarm(for: id)"),
+              let rollbackDetach = rollbackBody.range(of: "detachForCacheMigration("),
+              rollbackWarm.lowerBound < rollbackDetach.lowerBound else {
+            return report("AC-CM10", "cache-migration-warm-cancelled-first", false, "(rollbackCacheMigration does not cancel warm before detaching)")
         }
 
         return report("AC-CM10", "cache-migration-warm-cancelled-first", true)
@@ -2140,11 +2192,26 @@ enum ConfigSelfTest {
         // re-deriving its own inline boolean that could drift from it), and
         // must use the BOUNDED recheck rather than a single `isMounted`
         // sample (finding 4).
-        guard migrateBody.contains("detachFailed = true"),
-              migrateBody.contains("Self.cacheMigrationDetachSucceeded(threw:"),
-              migrateBody.contains("setupService.isMountedAfterBoundedRecheck(profile: profile)"),
+        //
+        // The detach itself now lives in the shared `detachForCacheMigration`
+        // helper (so the rollback gets the identical treatment), so that is
+        // where the routing is asserted; the call sites are checked for
+        // acting on its verdict.
+        guard let detachBody = extractFunctionBody(startingAt: "private func detachForCacheMigration(", in: source) else {
+            return report("AC-CM14", "cache-migration-orchestration-hardening", false, "(could not locate detachForCacheMigration)")
+        }
+        guard detachBody.contains("Self.cacheMigrationDetachSucceeded(threw:"),
+              detachBody.contains("setupService.isMountedAfterBoundedRecheck(profile: profile)"),
+              detachBody.contains("return (installed, true)") else {
+            return report("AC-CM14", "cache-migration-orchestration-hardening", false, "(detachForCacheMigration no longer routes its verdict through cacheMigrationDetachSucceeded / isMountedAfterBoundedRecheck)")
+        }
+        guard migrateBody.contains("guard !detachFailed else {"),
               migrateBody.contains(".failed(.mountDetachFailed") else {
-            return report("AC-CM14", "cache-migration-orchestration-hardening", false, "(migrateCacheDirectory no longer routes its abort decision through cacheMigrationDetachSucceeded / isMountedAfterBoundedRecheck)")
+            return report("AC-CM14", "cache-migration-orchestration-hardening", false, "(migrateCacheDirectory no longer aborts on a failed detach)")
+        }
+        guard rollbackBody.contains("guard !detach.failed else {"),
+              rollbackBody.contains(".failed(.mountDetachFailed") else {
+            return report("AC-CM14", "cache-migration-orchestration-hardening", false, "(rollbackCacheMigration no longer aborts on a failed detach — it would reverse the move under a live mount)")
         }
 
         // Finding 4, telemetry half — a detach-failure abort must still
@@ -2193,10 +2260,20 @@ enum ConfigSelfTest {
         guard let sheetRange = profileDetailSource.range(of: ".sheet(isPresented: $showingCacheMoveSheet") else {
             return report("AC-CM15", "cache-migration-ui-fixes", false, "(could not locate the cache-move sheet modifier)")
         }
-        let windowEnd = profileDetailSource.index(sheetRange.upperBound, offsetBy: 700, limitedBy: profileDetailSource.endIndex) ?? profileDetailSource.endIndex
+        let windowEnd = profileDetailSource.index(sheetRange.upperBound, offsetBy: 2000, limitedBy: profileDetailSource.endIndex) ?? profileDetailSource.endIndex
         let dismissWindow = profileDetailSource[sheetRange.upperBound..<windowEnd]
-        guard dismissWindow.contains("cacheMoveOtherFieldsNeedReinstall"), dismissWindow.contains("reinstallSync()") else {
+        guard dismissWindow.contains("cacheMoveOtherFieldsNeedReinstall") else {
             return report("AC-CM15", "cache-migration-ui-fixes", false, "(onDismiss no longer reinstalls the deferred field changes on a bare dismissal)")
+        }
+        // And it must reinstall the ALREADY-PERSISTED profile, never one
+        // rebuilt from the live form: the form's Cache Directory field still
+        // holds the un-gated edit this sheet exists to gate, so a bare
+        // `reinstallSync()` here would install AND persist exactly the change
+        // Cancel is supposed to refuse. The earlier version of this guard
+        // looked for the literal `reinstallSync()` and passed on a mention of
+        // it inside a comment — pin the call that actually has to be there.
+        guard dismissWindow.contains("reinstallSync(using: persisted)") else {
+            return report("AC-CM15", "cache-migration-ui-fixes", false, "(onDismiss no longer reinstalls from the persisted profile — a bare dismissal would apply the un-gated cache-path edit)")
         }
 
         guard let cacheMoveSheetSource = readSourceFile("Views/Settings/CacheMoveSheet.swift") else {

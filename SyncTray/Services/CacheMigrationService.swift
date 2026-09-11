@@ -228,15 +228,20 @@ struct CacheMigrationOutcome: Equatable {
 /// persisted? `.completed` obviously may (R20). `.preflightRejected(.nothingToMove)`
 /// ALSO may: an empty source cache carries none of the "incomplete data"
 /// risk R20 guards against, so silently dropping the user's directory
-/// choice would serve no purpose. This is now the SINGLE, real gate every
-/// call site routes through — `SyncManager.migrateCacheDirectory` and the
-/// CLI's `migrateCacheProcess` both ask this function instead of each
-/// re-deriving the same case list themselves (finding 3: previously this
-/// function covered only `.completed` while both call sites separately,
-/// identically hand-copied a SECOND persist branch for `.nothingToMove`,
-/// making the doc comment's "single persist gate" claim false and the
-/// `case .completed where shouldPersist(outcome)` guard at the call site
-/// dead — always true given the pattern already matched `.completed`).
+/// choice would serve no purpose.
+///
+/// This is the SINGLE, real gate: `SyncManager.migrateCacheDirectory` and
+/// the CLI's `migrateCacheProcess` each branch on `if shouldPersist(...)`,
+/// with no case list of their own to drift from it. That is a correction of
+/// an earlier state in which this function had been widened to cover
+/// `.nothingToMove` while BOTH call sites still carried their own
+/// hand-copied `.completed` + `.nothingToMove` branches — so the doc's
+/// "single gate" claim was false, and the one place that did call this
+/// function used it as `case .completed where shouldPersist(outcome)`,
+/// a dead guard the matched pattern had already decided.
+///
+/// The lesson it encodes: a shared decision helper only *is* the decision
+/// when every caller's control flow actually hangs off its return value.
 enum CacheMigrationPersistDecision {
     static func shouldPersist(_ outcome: CacheMigrationOutcome) -> Bool {
         switch outcome.result {
@@ -361,8 +366,20 @@ struct CacheMigrationEngine {
     /// Same-volume, no-exclusions fast path: atomically rename each subtree
     /// ROOT (never a single file inside it) instead of walking file-by-file.
     private func fastPathMove(_ plan: CacheMigrationPlan, _ preflight: CacheMigrationPreflight) -> CacheMigrationOutcome {
+        // Subtrees already renamed on this pass, newest last — so a failure
+        // partway through can put them back. Without this, a failure on the
+        // SECOND subtree left `vfs` at the destination and `vfsMeta` at the
+        // source: the split cache this whole feature exists to prevent
+        // (rclone reads the two as one unit and re-downloads everything when
+        // they disagree), reported as `filesMoved: 0, rolledBack: false` so
+        // nothing recorded that it had happened.
+        var renamed: [(source: String, dest: String)] = []
         for subtree in plan.subtrees {
             if isCancelled() {
+                // A cancel between subtrees is recoverable and is NOT rolled
+                // back, matching the per-file path's between-file guarantee:
+                // a resumed run skips a subtree whose source is already gone
+                // and moves the rest.
                 return CacheMigrationOutcome(result: .cancelled, filesMoved: 0, bytesMoved: 0, sameVolume: preflight.sameVolume)
             }
             let sourcePath = subtreePath(subtree, root: plan.sourceRoot)
@@ -376,14 +393,40 @@ struct CacheMigrationEngine {
             do {
                 try fs.moveItem(sourcePath, destPath)
             } catch {
-                return CacheMigrationOutcome(result: .failed(.ioError, rolledBack: false), filesMoved: 0, bytesMoved: 0, sameVolume: preflight.sameVolume)
+                let rolledBack = fastPathRollback(renamed)
+                return CacheMigrationOutcome(result: .failed(.ioError, rolledBack: rolledBack), filesMoved: 0, bytesMoved: 0, sameVolume: preflight.sameVolume)
             }
+            renamed.append((source: sourcePath, dest: destPath))
             onProgress(0, 0, subtree.relativePath)
         }
         onProgress(preflight.totalFiles, preflight.totalBytes, "")
         return CacheMigrationOutcome(
             result: .completed, filesMoved: preflight.totalFiles, bytesMoved: preflight.totalBytes, sameVolume: preflight.sameVolume
         )
+    }
+
+    /// Rename each already-relocated subtree root back to where it came
+    /// from, newest first. Same-volume by construction (the fast path only
+    /// runs when source and destination share a volume), so this is a
+    /// cheap metadata operation, not a re-copy.
+    ///
+    /// - Returns: whether EVERY subtree made it back. `false` means the
+    ///   caller must report `rolledBack: false` — some bytes are still at
+    ///   the destination and the two trees may still disagree.
+    private func fastPathRollback(_ renamed: [(source: String, dest: String)]) -> Bool {
+        var ok = true
+        for entry in renamed.reversed() {
+            let parent = (entry.source as NSString).deletingLastPathComponent
+            if !fs.directoryExists(parent) {
+                try? fs.createDirectory(parent)
+            }
+            do {
+                try fs.moveItem(entry.dest, entry.source)
+            } catch {
+                ok = false
+            }
+        }
+        return ok
     }
 
     /// Per-file copy → verify → delete walk, used whenever the fast path
@@ -418,9 +461,18 @@ struct CacheMigrationEngine {
                 // (finding 5). Keyed on the source actually being gone, not
                 // on the removal call: if it survived, the destination is
                 // still redundant and rollback has nothing to restore here.
-                if !fs.fileExists(sourcePath) {
-                    movedDestPaths.append(destPath)
+                guard !fs.fileExists(sourcePath) else {
+                    // The source survived its removal — the same condition
+                    // `moveFile` reports as `.ioError` below. Reporting it
+                    // the same way here keeps the two arms consistent:
+                    // counting it moved and finishing `.completed` would
+                    // leave a duplicate at the source, and the final
+                    // count/bytes reconciliation would still pass because
+                    // the file DID reach the destination.
+                    let rolledBack = rollback(destPaths: movedDestPaths, plan: plan)
+                    return CacheMigrationOutcome(result: .failed(.ioError, rolledBack: rolledBack), filesMoved: filesMoved, bytesMoved: bytesMoved, sameVolume: preflight.sameVolume)
                 }
+                movedDestPaths.append(destPath)
                 filesMoved += 1
                 bytesMoved += file.size
                 onProgress(filesMoved, bytesMoved, file.relativePath)
