@@ -2265,9 +2265,14 @@ enum ConfigSelfTest {
         }
         // Derived from the shared label function, never hand-copied: the
         // literal would agree today only by accident of the failure enum's
-        // default rawValue.
+        // default rawValue. Both aborts get the guard — they are a symmetric
+        // pair, and pinning only the one that was caught leaves its twin free
+        // to reintroduce the literal with the suite green.
         guard !rollbackBody.contains("outcome: \"mountDetachFailed\"") else {
             return report("AC-CM14", "cache-migration-orchestration-hardening", false, "(the rollback abort hand-copies its telemetry label instead of deriving it from cacheMigrationOutcomeLabel)")
+        }
+        guard !migrateBody.contains("outcome: \"mountDetachFailed\"") else {
+            return report("AC-CM14", "cache-migration-orchestration-hardening", false, "(migrateCacheDirectory's abort hand-copies its telemetry label instead of deriving it from cacheMigrationOutcomeLabel)")
         }
 
         return report("AC-CM14", "cache-migration-orchestration-hardening", true)
