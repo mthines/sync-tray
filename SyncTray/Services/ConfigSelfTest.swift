@@ -50,6 +50,7 @@ enum ConfigSelfTest {
             testIsolatedLaunchAtLogin,
             testDeleteDurable,
             testWarmExcludePatternsRoundTrip,
+            testWarmSkipsCachedFiles,
             testWarmReconcileTrigger,
             testMigrationIntegrity,
             testExternalCreateEnabled,
@@ -557,6 +558,71 @@ enum ConfigSelfTest {
             return report("AC-20", "warm-exclude-roundtrip", false, "(missing key did not default to [])")
         }
         return report("AC-20", "warm-exclude-roundtrip", true)
+    }
+
+    // MARK: - AC-23 — warm skips files already fully in the VFS cache
+
+    /// The offline warmer must only download files NOT already cached. The decision lives in
+    /// the pure `VFSCacheService.isCacheComplete` (byte-range coverage of the `vfsMeta`
+    /// sidecar), so this drives that core directly with crafted metadata — no mount, no
+    /// disk. A regression here is what caused a re-warm to re-fetch the entire pinned set
+    /// (~95 GB / 12k files over SMB) instead of just the missing delta.
+    private static func testWarmSkipsCachedFiles() -> Bool {
+        typealias Meta = VFSCacheService.VFSCacheMeta
+        typealias Range = VFSCacheService.VFSCacheMeta.Range
+        func complete(_ meta: Meta, _ size: Int64) -> Bool {
+            VFSCacheService.isCacheComplete(meta: meta, expectedSize: size)
+        }
+
+        // 1. Fully downloaded, clean, single range covering the whole file → cached.
+        guard complete(Meta(Size: 42311, Rs: [Range(Pos: 0, Size: 42311)], Dirty: false), 42311) else {
+            return report("AC-23", "warm-skips-cached", false, "(complete single range not recognised)")
+        }
+        // 2. Size mismatch (remote grew / shrank) → not cached.
+        guard !complete(Meta(Size: 100, Rs: [Range(Pos: 0, Size: 100)], Dirty: false), 200) else {
+            return report("AC-23", "warm-skips-cached", false, "(size mismatch treated as cached)")
+        }
+        // 3. Dirty (unflushed local write) → not cached.
+        guard !complete(Meta(Size: 100, Rs: [Range(Pos: 0, Size: 100)], Dirty: true), 100) else {
+            return report("AC-23", "warm-skips-cached", false, "(dirty file treated as cached)")
+        }
+        // 4. A gap between ranges → partial → not cached.
+        guard !complete(Meta(Size: 100, Rs: [Range(Pos: 0, Size: 40), Range(Pos: 50, Size: 50)], Dirty: false), 100) else {
+            return report("AC-23", "warm-skips-cached", false, "(gap in ranges treated as cached)")
+        }
+        // 5. Multiple contiguous (and out-of-order) ranges covering the whole file → cached.
+        guard complete(Meta(Size: 100, Rs: [Range(Pos: 60, Size: 40), Range(Pos: 0, Size: 60)], Dirty: false), 100) else {
+            return report("AC-23", "warm-skips-cached", false, "(contiguous multi-range not recognised)")
+        }
+        // 6. Overlapping ranges that still cover the file → cached.
+        guard complete(Meta(Size: 100, Rs: [Range(Pos: 0, Size: 70), Range(Pos: 50, Size: 50)], Dirty: false), 100) else {
+            return report("AC-23", "warm-skips-cached", false, "(overlapping full coverage not recognised)")
+        }
+        // 7. Ranges present but short of the end → not cached.
+        guard !complete(Meta(Size: 100, Rs: [Range(Pos: 0, Size: 90)], Dirty: false), 100) else {
+            return report("AC-23", "warm-skips-cached", false, "(short coverage treated as cached)")
+        }
+        // 8. Missing ranges on a non-empty file → not cached.
+        guard !complete(Meta(Size: 100, Rs: nil, Dirty: false), 100) else {
+            return report("AC-23", "warm-skips-cached", false, "(nil ranges treated as cached)")
+        }
+        // 9. Empty file: no ranges needed → cached.
+        guard complete(Meta(Size: 0, Rs: nil, Dirty: false), 0) else {
+            return report("AC-23", "warm-skips-cached", false, "(empty file not recognised as cached)")
+        }
+        // 10. End-to-end through the JSON entry point with rclone's real sidecar shape.
+        let realSidecar = """
+        {"ModTime":"2026-09-13T12:08:27.6+02:00","ATime":"2026-09-14T09:49:16.1+02:00",\
+        "Size":42311,"Rs":[{"Pos":0,"Size":42311}],"Fingerprint":"42311,2024-01-10 07:32:32 +0000 UTC","Dirty":false}
+        """.data(using: .utf8)!
+        guard VFSCacheService.isCacheComplete(metaJSON: realSidecar, expectedSize: 42311) else {
+            return report("AC-23", "warm-skips-cached", false, "(real rclone sidecar JSON not recognised)")
+        }
+        // Garbage / non-JSON must fail closed (→ warm the file), never crash.
+        guard !VFSCacheService.isCacheComplete(metaJSON: Data("not json".utf8), expectedSize: 42311) else {
+            return report("AC-23", "warm-skips-cached", false, "(garbage sidecar treated as cached)")
+        }
+        return report("AC-23", "warm-skips-cached", true)
     }
 
     // MARK: - AC-21 — external warm-field edit triggers the app-side warm path

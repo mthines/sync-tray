@@ -452,8 +452,81 @@ final class VFSCacheService {
         }
     }
 
-    /// Estimated work for warming a directory: number of regular files and their total bytes.
-    struct WarmEstimate { let files: Int; let bytes: Int64 }
+    // MARK: - Cache completeness (skip already-cached files)
+
+    /// Minimal decoded shape of an rclone `vfsMeta` sidecar (`--vfs-cache-mode full`).
+    /// Only the fields needed to prove a file is fully downloaded. `Rs` is the list of
+    /// downloaded byte ranges; `Dirty` flags an unflushed local write.
+    struct VFSCacheMeta: Decodable {
+        struct Range: Decodable { let Pos: Int64; let Size: Int64 }
+        let Size: Int64
+        let Rs: [Range]?
+        let Dirty: Bool?
+    }
+
+    /// Pure completeness check: does this `vfsMeta` sidecar prove the file is FULLY
+    /// downloaded and clean? True iff the recorded size matches `expectedSize`, the file
+    /// isn't dirty, and the downloaded byte ranges contiguously cover `[0, expectedSize)`.
+    ///
+    /// **Deliberately ignores modtime / fingerprint.** On backends with unstable
+    /// modtimes (SMB especially — see the mount notes in CLAUDE.md) rclone's own
+    /// open-time fingerprint check spuriously fails and re-downloads a complete cache
+    /// copy. That re-download is the bug this guards against, so gating the skip on
+    /// modtime would re-inherit it. Consequence: a same-size in-place remote edit won't
+    /// re-warm until the cache entry is otherwise invalidated — an accepted trade-off.
+    static func isCacheComplete(metaJSON: Data, expectedSize: Int64) -> Bool {
+        guard let meta = try? JSONDecoder().decode(VFSCacheMeta.self, from: metaJSON) else { return false }
+        return isCacheComplete(meta: meta, expectedSize: expectedSize)
+    }
+
+    /// Range-coverage core of `isCacheComplete`, split out so the self-test can drive it
+    /// directly with crafted metadata (no disk, no mount).
+    static func isCacheComplete(meta: VFSCacheMeta, expectedSize: Int64) -> Bool {
+        guard meta.Size == expectedSize else { return false }
+        if meta.Dirty == true { return false }
+        if expectedSize == 0 { return true }              // empty file: no ranges needed
+        guard let ranges = meta.Rs, !ranges.isEmpty else { return false }
+        // Walk ranges in position order; require contiguous (gap-free) coverage from 0.
+        var covered: Int64 = 0
+        for r in ranges.sorted(by: { $0.Pos < $1.Pos }) {
+            if r.Pos > covered { return false }           // gap before this range
+            covered = max(covered, r.Pos + r.Size)
+        }
+        return covered >= expectedSize
+    }
+
+    /// The `{data, meta}` cache-subtree roots for a profile, derived purely from the
+    /// profile (no disk probing). A file at mount-relative path `p` has its cached data at
+    /// `data/p` and its sidecar at `meta/p`. Shares `cacheRelativePath(for:)` with
+    /// `cacheDirectory(for:)` so the keys can't drift.
+    func cacheSubtreeRoots(for profile: SyncProfile) -> (data: String, meta: String) {
+        let base = (profile.vfsCachePath as NSString).expandingTildeInPath
+        let key = Self.cacheRelativePath(for: profile)
+        let data = ((base as NSString).appendingPathComponent(CacheTreeKind.content.rawValue) as NSString)
+            .appendingPathComponent(key)
+        let meta = ((base as NSString).appendingPathComponent(CacheTreeKind.meta.rawValue) as NSString)
+            .appendingPathComponent(key)
+        return (data, meta)
+    }
+
+    /// True iff the file at mount-relative `rel` (of `size` bytes) is already fully present
+    /// in this profile's on-disk VFS cache: the data file exists and the `vfsMeta` sidecar
+    /// proves complete coverage (`isCacheComplete`). Conservative — any missing file,
+    /// unreadable sidecar, or partial range → false → the warmer reads it as usual.
+    func isFullyCached(mountRelativePath rel: String, size: Int64, roots: (data: String, meta: String)) -> Bool {
+        let fm = FileManager.default
+        let dataPath = (roots.data as NSString).appendingPathComponent(rel)
+        guard fm.fileExists(atPath: dataPath) else { return false }
+        let metaPath = (roots.meta as NSString).appendingPathComponent(rel)
+        guard let metaData = fm.contents(atPath: metaPath) else { return false }
+        return Self.isCacheComplete(metaJSON: metaData, expectedSize: size)
+    }
+
+    /// Estimated work for warming a directory. `files`/`bytes` are what the warmer will
+    /// actually download (already-cached files excluded); `cachedFiles`/`cachedBytes` are
+    /// the files skipped because they're already fully offline — surfaced in the UI so a
+    /// re-warm of a warm cache reads as "already offline", not a fresh multi-GB fetch.
+    struct WarmEstimate { let files: Int; let bytes: Int64; let cachedFiles: Int; let cachedBytes: Int64 }
 
     /// Count the regular files and total bytes under a pinned directory with a metadata-only
     /// walk (no byte reads). Used to give the warming UI a determinate progress bar. Files
@@ -467,22 +540,33 @@ final class VFSCacheService {
                 at: URL(fileURLWithPath: fullDirPath),
                 includingPropertiesForKeys: [.fileSizeKey, .isRegularFileKey],
                 options: [.skipsHiddenFiles]
-              ) else { return WarmEstimate(files: 0, bytes: 0) }
+              ) else { return WarmEstimate(files: 0, bytes: 0, cachedFiles: 0, cachedBytes: 0) }
 
         let matcher = ExcludeMatcher(patterns: profile.warmExcludePatterns)
-        let prefixLen = fullDirPath.count + 1
+        let roots = cacheSubtreeRoots(for: profile)
+        let mountPrefixLen = profile.localSyncPath.count + 1  // for the mount-relative cache key
+        let dirPrefixLen = fullDirPath.count + 1              // for exclude matching (relative to dir)
         var files = 0
         var bytes: Int64 = 0
+        var cachedFiles = 0
+        var cachedBytes: Int64 = 0
         for case let fileURL as URL in enumerator {
             guard let rv = try? fileURL.resourceValues(forKeys: [.fileSizeKey, .isRegularFileKey]),
                   rv.isRegularFile == true else { continue }
-            let rel = fileURL.path.count > prefixLen ? String(fileURL.path.dropFirst(prefixLen)) : fileURL.lastPathComponent
+            let rel = fileURL.path.count > dirPrefixLen ? String(fileURL.path.dropFirst(dirPrefixLen)) : fileURL.lastPathComponent
             if !matcher.isEmpty,
                matcher.matches(relativePath: rel, name: fileURL.lastPathComponent) { continue }
+            let size = Int64(rv.fileSize ?? 0)
+            let mountRel = fileURL.path.count > mountPrefixLen ? String(fileURL.path.dropFirst(mountPrefixLen)) : fileURL.lastPathComponent
+            if isFullyCached(mountRelativePath: mountRel, size: size, roots: roots) {
+                cachedFiles += 1
+                cachedBytes += size
+                continue
+            }
             files += 1
-            bytes += Int64(rv.fileSize ?? 0)
+            bytes += size
         }
-        return WarmEstimate(files: files, bytes: bytes)
+        return WarmEstimate(files: files, bytes: bytes, cachedFiles: cachedFiles, cachedBytes: cachedBytes)
     }
 
     /// Fallback number of files warmed concurrently, used only when a caller doesn't pass an
@@ -550,7 +634,9 @@ final class VFSCacheService {
 
         let maxConcurrent = max(1, concurrency)
         let matcher = ExcludeMatcher(patterns: profile.warmExcludePatterns)
+        let roots = cacheSubtreeRoots(for: profile)
         let prefixLen = fullDirPath.count + 1
+        let mountPrefixLen = mountPath.count + 1
 
         // Bounded-concurrency task group: keep up to `maxConcurrent` file reads in flight,
         // starting a new one each time a running one completes.
@@ -577,6 +663,14 @@ final class VFSCacheService {
                     let rel = path.count > prefixLen ? String(path.dropFirst(prefixLen)) : name
                     if matcher.matches(relativePath: rel, name: name) { continue }
                 }
+
+                // Skip files already fully in the local VFS cache — reading them back through
+                // the mount is wasted work, and on a fingerprint-unstable backend (SMB) it
+                // triggers rclone to re-download a complete copy. This is what makes a re-warm
+                // fetch only the missing delta instead of the whole pinned set every run.
+                let size = Int64(rv.fileSize ?? 0)
+                let mountRel = path.count > mountPrefixLen ? String(path.dropFirst(mountPrefixLen)) : name
+                if isFullyCached(mountRelativePath: mountRel, size: size, roots: roots) { continue }
 
                 if running >= maxConcurrent {
                     await group.next()      // wait for a slot

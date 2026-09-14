@@ -298,6 +298,32 @@ does not populate the rclone VFS content cache. `warmDirectory` now:
 I/O budget: sequential reads (not concurrent), 2 GB total ceiling per call, cancellable
 between files via `try Task.checkCancellation()`.
 
+**Skip files already fully cached (only download the missing delta).** Both
+`warmDirectory` and `estimateWarmWork` check each file against the on-disk VFS cache
+before reading it, and skip any that are already fully present. The decision is the pure
+`VFSCacheService.isCacheComplete(metaJSON:expectedSize:)`: it reads the file's `vfsMeta`
+sidecar and returns true iff the recorded `Size` matches, `Dirty` is false, and the
+downloaded byte ranges (`Rs`) contiguously cover `[0, size)`. The estimate excludes cached
+files from `filesTotal`/`bytesTotal` and reports them as `filesAlreadyCached`/
+`bytesAlreadyCached` (surfaced in `OfflineFilesSection` as "N already offline" / "All N
+files already offline"), so a re-warm of a warm cache is near-instant instead of re-fetching
+the whole pinned set. `cacheSubtreeRoots(for:)` derives the `{vfs, vfsMeta}` roots purely
+from the profile (sharing `cacheRelativePath(for:)` with `cacheDirectory(for:)`), and the
+per-file lookup keys on the **mount-relative** path. Covered by `ConfigSelfTest`'s AC-23.
+
+**The check deliberately ignores modtime — and that is the whole point.** Under
+`--vfs-cache-mode full` rclone re-validates a `size,modtime` fingerprint on every open;
+on a **fingerprint-unstable backend (SMB especially)** the modtime drifts, the fingerprint
+check fails, and rclone re-downloads a *complete* cache copy. That is exactly the bug this
+guards against (observed: a manual warm re-fetching all 12,179 files / ~95 GB over SMB at
+~1.2 MB/s ≈ 22 h, per the `synctray.offline.warm.*` telemetry), so gating the app-side skip
+on modtime would re-inherit it. By skipping the open entirely for a byte-complete cache
+entry, rclone never gets the chance to needlessly re-fetch. Trade-off: a **same-size**
+in-place remote edit won't re-warm until the cache entry is otherwise invalidated (a
+different-size edit still does, since the size check fails). On the **fallback** remote the
+primary-derived cache roots may not resolve, in which case the skip simply doesn't apply and
+the warmer reads as before — safe degradation.
+
 ### Models/
 
 | File | Purpose |
@@ -322,7 +348,7 @@ between files via `try Task.checkCancellation()`.
 | `ConfigReconciler.swift` | `SyncManager.reconcileAction` (shared launchd install/uninstall/reinstall delta logic), `SyncManager.applyExternalCreateIfNeeded`/`ExternalCreateOutcome` (create-from-file decision), `warmReconcileNeeded`/`applyWarmReconcileIfNeeded` (orthogonal app-side warm delta — pinned dirs / warm-exclude globs), and `SettingsReconciler` (isolated launch-at-login apply) |
 | `AppSettingsFileStore.swift` | Reads/writes `~/.config/synctray/settings.json` — an enumerated safe-key mirror of `SyncTraySettings` (no secrets, no telemetry IDs) |
 | `ConfigSchemaInstaller.swift` | Copies the committed JSON Schemas into `~/.config/synctray/schema/` at launch |
-| `ConfigSelfTest.swift` | `#if DEBUG` host self-test suite (`SyncTray --self-test`) — round-trip (incl. `warmExcludePatterns`), migration + migration-integrity, reconcile-delta, warm-reconcile-trigger, self-write, isolated-login, external-create, and CLI assertions |
+| `ConfigSelfTest.swift` | `#if DEBUG` host self-test suite (`SyncTray --self-test`) — round-trip (incl. `warmExcludePatterns`), migration + migration-integrity, reconcile-delta, warm-reconcile-trigger, warm-skips-cached, self-write, isolated-login, external-create, and CLI assertions |
 | `NotificationService.swift` | Batched macOS notifications with action support |
 | `TelemetryService.swift` | Opt-in OTel telemetry (traces, metrics, logs) via OTLP/HTTP |
 | `CacheMigrationPlanner.swift` | Pure cache-directory-move planning — `CacheTreeKind` (`vfs`/`vfsMeta`), subtree/overlap/exclusion resolution, no I/O |

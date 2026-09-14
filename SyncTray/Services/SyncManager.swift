@@ -2797,15 +2797,19 @@ final class SyncManager: ObservableObject {
         // Estimate work up front (metadata-only walk) so the bar can be determinate. The
         // walk can hit the network on an NFS mount, so run it off the main actor.
         let estimate = await Task.detached(priority: .utility) {
-            targets.reduce(into: (files: 0, bytes: Int64(0))) { acc, dir in
+            targets.reduce(into: (files: 0, bytes: Int64(0), cachedFiles: 0, cachedBytes: Int64(0))) { acc, dir in
                 let e = VFSCacheService.shared.estimateWarmWork(dir, for: profile)
                 acc.files += e.files
                 acc.bytes += e.bytes
+                acc.cachedFiles += e.cachedFiles
+                acc.cachedBytes += e.cachedBytes
             }
         }.value
 
         progress.filesTotal = estimate.files
         progress.bytesTotal = estimate.bytes
+        progress.filesAlreadyCached = estimate.cachedFiles
+        progress.bytesAlreadyCached = estimate.cachedBytes
         progress.phase = .downloading
         warmProgress[profileId] = progress
 

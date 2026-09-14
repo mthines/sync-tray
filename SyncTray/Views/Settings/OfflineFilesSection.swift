@@ -493,8 +493,7 @@ struct OfflineFilesSection: View {
                         Image(systemName: "checkmark.circle.fill")
                             .font(.caption)
                             .foregroundStyle(.green)
-                        Text("Synced \(w.filesDone) \(w.filesDone == 1 ? "file" : "files") · "
-                            + "\(w.formattedBytesDone) · \(w.formattedElapsed)")
+                        Text(warmCompletedText(w))
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
@@ -521,8 +520,8 @@ struct OfflineFilesSection: View {
         "\(w.formattedBytesProgress) · \(w.formattedElapsed)"
     }
 
-    /// Secondary line: file count, parallelism, and rate — e.g.
-    /// "12 of 340 files · 4 downloading in parallel · 2 MB/s".
+    /// Secondary line: file count, parallelism, rate, and how many were already offline —
+    /// e.g. "12 of 340 files · 4 downloading in parallel · 2 MB/s · 11,839 already offline".
     private func warmSubline(_ w: WarmProgress) -> String {
         var parts: [String] = []
         if w.filesTotal > 0 {
@@ -534,7 +533,25 @@ struct OfflineFilesSection: View {
             parts.append("\(w.filesInFlight) downloading in parallel")
         }
         parts.append(w.bytesDone > 0 ? w.formattedRate : "waiting for data…")
+        if w.filesAlreadyCached > 0 {
+            parts.append("\(w.filesAlreadyCached) already offline")
+        }
         return parts.joined(separator: " · ")
+    }
+
+    /// Completion line. When nothing needed downloading (a re-warm of an already-warm
+    /// cache), say so plainly instead of "Synced 0 files"; otherwise report the delta
+    /// downloaded, noting how many were already offline.
+    private func warmCompletedText(_ w: WarmProgress) -> String {
+        if w.filesDone == 0 && w.filesAlreadyCached > 0 {
+            return "All \(w.filesAlreadyCached) files already offline · \(w.formattedElapsed)"
+        }
+        var text = "Synced \(w.filesDone) \(w.filesDone == 1 ? "file" : "files") · "
+            + "\(w.formattedBytesDone) · \(w.formattedElapsed)"
+        if w.filesAlreadyCached > 0 {
+            text += " · \(w.filesAlreadyCached) already offline"
+        }
+        return text
     }
 
     // MARK: - Exclude Patterns
