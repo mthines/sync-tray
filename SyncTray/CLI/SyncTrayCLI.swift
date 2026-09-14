@@ -1000,8 +1000,11 @@ enum SyncTrayCLI {
         case "vfsCachePath":
             if let e = requireNonEmpty() { return e }
             // Re-point only (matches the external-file-edit path); a warm-cache
-            // relocation is `synctray cache move`.
-            profile.vfsCachePath = (value as NSString).expandingTildeInPath
+            // relocation is `synctray cache move`. Store the raw value (with any
+            // leading `~`) like every other path key — read sites expand on read
+            // (VFSCacheService, SyncSetupService, CacheMigrationPlanner), so a
+            // `profile show` → edit → `profile create` round-trip still emits `~`.
+            profile.vfsCachePath = value
 
         // Ints (with range validation where the model clamps).
         case "syncIntervalMinutes":
