@@ -76,6 +76,25 @@ on each open); `--vfs-cache-max-size` still bounds total cache size with LRU
 eviction. There is no rclone-native per-file "pin" — `pinnedDirectories` are kept
 warm app-side via the RC API + reads (see Offline Files).
 
+**Offline use — read the warm cache and record with no internet, sync on return.**
+A Stream mount is a *long-lived, always-up* process (its launchd agent is
+`RunAtLoad`+`KeepAlive`), so the intended offline workflow is served entirely by the
+live mount, not by unmounting: with a full warm cache and no network, rclone serves
+fully-cached file **data** straight from disk, new files **recorded** into the mount
+land in the VFS cache as dirty and rclone retries the **write-back** until the remote
+returns. Two things make this reliable:
+- `--vfs-cache-mode full` (SyncTray's default) — required for both cache-served reads
+  and dirty-write queueing.
+- `--dir-cache-time 1000h` (~41 days, in `SyncSetupService`'s mount command) — folder
+  **listings** must survive the offline period too, or Finder browsing breaks when the
+  cache expires and rclone tries to re-list from the unreachable remote. The window is
+  deliberately long, not infinite; freshness is preserved by SyncTray's explicit
+  recursive `/vfs/refresh` on startup/mount and offline-warm (SMB has no
+  `--poll-interval` change notification), so remote-side additions still surface. Do
+  NOT symlink-swap the mount point to expose the cache offline: a file written into the
+  raw cache tree has no `vfsMeta` sidecar, so rclone never uploads it (the recording is
+  lost), and mounting NFS onto a symlink fails with `mount_nfs` exit 66.
+
 **Download connections (`downloadConnections`, default 2, range 1–16):** a per-profile
 "Download Connections" control (Advanced Options, mount mode only) that sets how many
 files download in parallel. It drives BOTH the mount's `--transfers` and the app-side
