@@ -528,10 +528,12 @@ final class VFSCacheService {
     /// re-warm of a warm cache reads as "already offline", not a fresh multi-GB fetch.
     struct WarmEstimate { let files: Int; let bytes: Int64; let cachedFiles: Int; let cachedBytes: Int64 }
 
-    /// Count the regular files and total bytes under a pinned directory with a metadata-only
-    /// walk (no byte reads). Used to give the warming UI a determinate progress bar. Files
-    /// matching the profile's exclude patterns are not counted, so the total matches what the
-    /// warmer will actually download.
+    /// Count the files and bytes the warmer will actually download under a pinned directory,
+    /// without reading any bytes through the mount. Used to give the warming UI a determinate
+    /// progress bar. Files matching the profile's exclude patterns, and files already fully in
+    /// the local VFS cache (a cheap per-file `vfsMeta` sidecar read — local disk, not the
+    /// mount), are excluded from the total and reported separately as `cachedFiles`/`cachedBytes`,
+    /// so the bar matches what the warmer downloads rather than the whole pinned set.
     func estimateWarmWork(_ dir: String, for profile: SyncProfile) -> WarmEstimate {
         let fullDirPath = (profile.localSyncPath as NSString).appendingPathComponent(dir)
         let fm = FileManager.default

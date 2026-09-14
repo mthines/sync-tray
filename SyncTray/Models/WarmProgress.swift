@@ -40,9 +40,9 @@ struct WarmProgress: Equatable {
         self.finishedAt = nil
     }
 
-    /// True when the estimate found work but every file was already cached — a re-warm of an
-    /// already-warm cache. Lets the UI say "already offline" instead of showing an empty bar.
-    var nothingToDownload: Bool { filesTotal == 0 && filesAlreadyCached > 0 }
+    var formattedBytesAlreadyCached: String {
+        ByteCountFormatter.string(fromByteCount: bytesAlreadyCached, countStyle: .file)
+    }
 
     /// Number of files reading through the mount right now (drives the "N downloading in
     /// parallel" copy). Derived from `inFlightFiles` so the count and the list never drift.

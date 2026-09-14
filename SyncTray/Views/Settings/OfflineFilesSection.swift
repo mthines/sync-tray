@@ -534,7 +534,7 @@ struct OfflineFilesSection: View {
         }
         parts.append(w.bytesDone > 0 ? w.formattedRate : "waiting for data…")
         if w.filesAlreadyCached > 0 {
-            parts.append("\(w.filesAlreadyCached) already offline")
+            parts.append("\(w.filesAlreadyCached) already offline (\(w.formattedBytesAlreadyCached))")
         }
         return parts.joined(separator: " · ")
     }
@@ -544,12 +544,12 @@ struct OfflineFilesSection: View {
     /// downloaded, noting how many were already offline.
     private func warmCompletedText(_ w: WarmProgress) -> String {
         if w.filesDone == 0 && w.filesAlreadyCached > 0 {
-            return "All \(w.filesAlreadyCached) files already offline · \(w.formattedElapsed)"
+            return "All \(w.filesAlreadyCached) files (\(w.formattedBytesAlreadyCached)) already offline · \(w.formattedElapsed)"
         }
         var text = "Synced \(w.filesDone) \(w.filesDone == 1 ? "file" : "files") · "
             + "\(w.formattedBytesDone) · \(w.formattedElapsed)"
         if w.filesAlreadyCached > 0 {
-            text += " · \(w.filesAlreadyCached) already offline"
+            text += " · \(w.filesAlreadyCached) already offline (\(w.formattedBytesAlreadyCached))"
         }
         return text
     }
