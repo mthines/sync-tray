@@ -51,6 +51,7 @@ enum ConfigSelfTest {
             testDeleteDurable,
             testWarmExcludePatternsRoundTrip,
             testWarmSkipsCachedFiles,
+            testMountMonitorAutoWarm,
             testWarmReconcileTrigger,
             testMigrationIntegrity,
             testExternalCreateEnabled,
@@ -634,6 +635,50 @@ enum ConfigSelfTest {
             return report("AC-23", "warm-skips-cached", false, "(negative range treated as cached)")
         }
         return report("AC-23", "warm-skips-cached", true)
+    }
+
+    // MARK: - AC-24 — mount monitor auto-warms a detected mount once per session
+
+    /// A launchd/externally-mounted Stream profile (e.g. auto-mounted at login) never runs
+    /// the app's mount-path warm, so new remote files never reach the offline cache. The 5s
+    /// mount monitor closes that gap by warming a detected mount — but exactly ONCE per mount
+    /// session, or it would thrash (`startWarm` supersedes). This drives the pure decision
+    /// (`SyncManager.shouldAutoWarmOnMount`) through a mount → steady-state → unmount → remount
+    /// lifecycle without a real mount.
+    private static func testMountMonitorAutoWarm() -> Bool {
+        let id = UUID()
+        var warmed: Set<UUID> = []
+        func decide(mounted: Bool, pins: Bool) -> Bool {
+            SyncManager.shouldAutoWarmOnMount(isMounted: mounted, hasPinnedDirs: pins, profileId: id, alreadyWarmed: &warmed)
+        }
+
+        // First tick seen mounted with pins → warm once.
+        guard decide(mounted: true, pins: true) else {
+            return report("AC-24", "mount-monitor-auto-warm", false, "(first mounted tick did not warm)")
+        }
+        // Subsequent ticks while still mounted → no repeat warm (would thrash).
+        guard !decide(mounted: true, pins: true), !decide(mounted: true, pins: true) else {
+            return report("AC-24", "mount-monitor-auto-warm", false, "(re-warmed while still mounted)")
+        }
+        // Seen unmounted → re-arm.
+        guard !decide(mounted: false, pins: true) else {
+            return report("AC-24", "mount-monitor-auto-warm", false, "(unmounted tick returned true)")
+        }
+        // Remount → warms again (picks up files added while unmounted).
+        guard decide(mounted: true, pins: true) else {
+            return report("AC-24", "mount-monitor-auto-warm", false, "(remount did not re-warm after re-arm)")
+        }
+        // A profile with no pinned directories never warms and is never tracked.
+        let unpinned = UUID()
+        var w2: Set<UUID> = []
+        let noPins = SyncManager.shouldAutoWarmOnMount(isMounted: true, hasPinnedDirs: false, profileId: unpinned, alreadyWarmed: &w2)
+        guard !noPins, w2.isEmpty else {
+            return report("AC-24", "mount-monitor-auto-warm", false, "(unpinned profile warmed or was tracked)")
+        }
+        // A stuck-.failed profile that never emitted a mounted tick still re-arms cleanly on
+        // an unmounted tick (no crash, idempotent remove).
+        _ = SyncManager.shouldAutoWarmOnMount(isMounted: false, hasPinnedDirs: true, profileId: UUID(), alreadyWarmed: &warmed)
+        return report("AC-24", "mount-monitor-auto-warm", true)
     }
 
     // MARK: - AC-21 — external warm-field edit triggers the app-side warm path

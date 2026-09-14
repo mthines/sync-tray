@@ -56,6 +56,13 @@ final class SyncManager: ObservableObject {
     /// clearing the cache mid-warm just re-downloads the files the warmer is still reading.
     private var warmTasks: [UUID: Task<Void, Never>] = [:]
 
+    /// Profiles the app has already auto-warmed for their CURRENT mount session, so the
+    /// repeating mount monitor warms a launchd/externally-mounted profile exactly once when
+    /// it first appears mounted — not every 5s tick (which would thrash, since `startWarm`
+    /// supersedes rather than coalesces). Re-armed when the profile is seen unmounted, so a
+    /// later remount warms again and picks up files added on the remote in the meantime.
+    private var autoWarmedMounts: Set<UUID> = []
+
     /// Live progress of an in-flight cache-directory move, keyed by the
     /// profile whose Cache Directory is changing. Drives `CacheMoveSheet`'s
     /// progress UI.
@@ -357,6 +364,10 @@ final class SyncManager: ObservableObject {
                             updateAppGroupMountPaths()
                             // Auto-refresh pinned directories after successful mount
                             if !profile.pinnedDirectories.isEmpty {
+                                // Claim the warm here so the mount monitor's own
+                                // warm-on-detect (reconcileMountStatesOffMain) doesn't also
+                                // fire for this same mount.
+                                autoWarmedMounts.insert(profile.id)
                                 Task { [weak self] in
                                     // Wait for RC API to be ready
                                     try? await Task.sleep(nanoseconds: 2_000_000_000)
@@ -394,6 +405,7 @@ final class SyncManager: ObservableObject {
 
         // Stop any warming first — reads through a mount that's going away would hang or fail.
         cancelWarm(for: profile.id)
+        autoWarmedMounts.remove(profile.id)  // re-arm auto-warm for the next mount
 
         Task {
             do {
@@ -3145,6 +3157,29 @@ final class SyncManager: ObservableObject {
         }
     }
 
+    /// Decide whether a mount-monitor tick should trigger a one-time auto-warm for a
+    /// profile, updating the already-warmed set in place. Pure and static so the self-test
+    /// can drive the "warm exactly once per mount session" invariant without a real mount.
+    ///
+    /// Returns true exactly once per mount session — the first tick a pinned profile is seen
+    /// mounted — and false on every later tick while it stays mounted. Seeing it unmounted
+    /// re-arms it (removes it from the set), so a subsequent remount warms again and picks up
+    /// files added on the remote in the meantime. A profile with no pinned directories never
+    /// warms and is never added.
+    static func shouldAutoWarmOnMount(
+        isMounted: Bool,
+        hasPinnedDirs: Bool,
+        profileId: UUID,
+        alreadyWarmed: inout Set<UUID>
+    ) -> Bool {
+        guard isMounted else {
+            alreadyWarmed.remove(profileId)   // re-arm for the next mount
+            return false
+        }
+        guard hasPinnedDirs else { return false }
+        return alreadyWarmed.insert(profileId).inserted
+    }
+
     /// Reconcile mount states without blocking the main thread: snapshot the mount
     /// profiles on the main actor, probe `/sbin/mount` on a background queue, then
     /// merge results back on the main actor. Used by the repeating 5s monitor so the
@@ -3162,11 +3197,27 @@ final class SyncManager: ObservableObject {
             DispatchQueue.main.async {
                 let before = Set(self.profileMountStates.filter { $0.value == .mounted }.keys)
                 for profile in mountProfiles {
-                    if mounted[profile.id] == true {
+                    let isMounted = mounted[profile.id] == true
+                    if isMounted {
                         self.profileMountStates[profile.id] = .mounted
                     } else if self.profileMountStates[profile.id] == nil
                                 || self.profileMountStates[profile.id] == .mounted {
                         self.profileMountStates[profile.id] = .unmounted
+                    }
+                    // A launchd mount at login/reboot (RunAtLoad), an externally-driven mount,
+                    // or a slow fallback that established after mountProfile's poll gave up
+                    // never ran a warm, so new remote files were never pulled into the offline
+                    // cache. Warm such a mount once per session; the app-driven mount path sets
+                    // the same flag so this can't double-fire. Decided independently of the
+                    // UI-state transition above, so a profile stuck in `.failed` still re-arms
+                    // once it is actually unmounted.
+                    if Self.shouldAutoWarmOnMount(
+                        isMounted: isMounted,
+                        hasPinnedDirs: !profile.pinnedDirectories.isEmpty,
+                        profileId: profile.id,
+                        alreadyWarmed: &self.autoWarmedMounts
+                    ) {
+                        self.startWarm(for: profile.id, trigger: "startup")
                     }
                 }
                 // Republish to the FinderSync extension whenever the set of mounted

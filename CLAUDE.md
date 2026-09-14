@@ -311,6 +311,22 @@ the whole pinned set. `cacheSubtreeRoots(for:)` derives the `{vfs, vfsMeta}` roo
 from the profile (sharing `cacheRelativePath(for:)` with `cacheDirectory(for:)`), and the
 per-file lookup keys on the **mount-relative** path. Covered by `ConfigSelfTest`'s AC-23.
 
+**Warm on mount detection, not just app-driven mounts.** A Stream profile with
+`mountAtStartup` is mounted by launchd at login/reboot (`RunAtLoad`) *without the app*,
+so when the app later launches it finds the volume already mounted and
+`mountProfilesAtStartup` skips it — meaning the app-driven mount warm never runs and
+files added to the remote while away are never pulled into the offline cache. The 5s
+mount monitor (`reconcileMountStatesOffMain`) closes this: when it first observes a
+pinned mount-mode profile mounted, it fires a one-time `startWarm(trigger: "startup")`
+(whose step 1 is a recursive `/vfs/refresh`, so newly-added remote files become visible
+and download as uncached). The decision is the pure `SyncManager.shouldAutoWarmOnMount`,
+gated by an `autoWarmedMounts` set so it warms **exactly once per mount session** — not
+every 5s tick (`startWarm` supersedes rather than coalesces, so per-tick calls would
+thrash) — and re-arms when the profile is seen unmounted, so a later remount warms again.
+The app-driven mount path (`mountProfile`) sets the same flag so the two can't double-fire.
+This also covers a slow fallback mount that established after `mountProfile`'s poll gave
+up. Covered by `ConfigSelfTest` AC-24.
+
 **The check deliberately ignores modtime — and that is the whole point.** Under
 `--vfs-cache-mode full` rclone re-validates a `size,modtime` fingerprint on every open;
 on a **fingerprint-unstable backend (SMB especially)** the modtime drifts, the fingerprint
