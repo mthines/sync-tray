@@ -808,13 +808,18 @@ final class SyncSetupService {
                 # from the (unreachable) remote. A short window (rclone's 5m default, or the
                 # old 12h) would expire mid-trip and break offline browsing. This is the
                 # concert case: full warm cache, no internet, read + record, sync on return.
-                # Freshness is NOT sacrificed: SMB doesn't support --poll-interval (change
-                # notification), and SyncTray already issues an explicit recursive /vfs/refresh
-                # on startup/mount and on offline-warm (VFSCacheService), so remote-side
-                # additions still surface promptly — the long dir-cache-time only stops the
-                # listing from self-expiring while offline. Offline WRITES need no flag here:
-                # under --vfs-cache-mode full a write while the remote is down lands in the VFS
-                # cache as dirty and rclone retries the write-back until the remote returns.
+                # Freshness tradeoff — and it applies ONLINE too, not only offline: a longer
+                # dir-cache-time also raises the ceiling on how long an OUT-OF-BAND remote
+                # change (a file added from another device or the NAS web UI) stays invisible
+                # in Finder while the mount is up. It now surfaces on the next explicit
+                # recursive /vfs/refresh (startup/mount, and offline-warm via VFSCacheService)
+                # instead of within the old 12h auto-expiry. Accepted here because: (a) the
+                # primary use is single-user, (b) changes made THROUGH the mount are visible
+                # immediately — the VFS tracks its own writes, and (c) SMB has no
+                # --poll-interval to notify of remote-side changes anyway, so even 12h was a
+                # coarse polling ceiling, never live propagation. Offline WRITES need no flag
+                # here: under --vfs-cache-mode full a write while the remote is down lands in
+                # the VFS cache as dirty and rclone retries the write-back until it returns.
                 RCLONE_CMD="$RCLONE_CMD --buffer-size 128M --vfs-read-ahead 256M --transfers $DOWNLOAD_CONNECTIONS --vfs-read-chunk-size 128M --vfs-read-chunk-size-limit off --dir-cache-time 1000h --attr-timeout 5s"
 
                 # Name the mounted volume after the mount-point folder so Finder
