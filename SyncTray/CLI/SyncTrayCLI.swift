@@ -760,6 +760,10 @@ enum SyncTrayCLI {
             env.stderr("error: \"\(profile.name)\" is disabled; run 'synctray profile enable \(profile.shortId)' first\n")
             return 1
         }
+        guard profile.isValid else {
+            env.stderr("error: \"\(profile.name)\" is incomplete (name/remote/paths); fix it with 'synctray profile set' first\n")
+            return 1
+        }
         // Uninstall is cleanup — a failure here is non-fatal (mirrors delete),
         // since the following install regenerates every file anyway.
         if let err = env.uninstallProfile(profile) {
