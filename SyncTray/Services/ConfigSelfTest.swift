@@ -62,6 +62,8 @@ enum ConfigSelfTest {
             testCLIArgParsing,
             testCLIDispatchGate,
             testCLIWriteCommands,
+            testCLILifecycleCommands,
+            testCLIProfileSetAndShow,
             testDoctorPureChecks,
             testCLIResolveAndList,
             testShimInstallIdempotentNonClobber,
@@ -973,6 +975,8 @@ enum ConfigSelfTest {
         uninstallProfile: @escaping (SyncProfile) -> String? = { _ in nil },
         deleteProfileFile: @escaping (SyncProfile) -> Void = { _ in },
         runSyncScript: @escaping (_ configPath: String) -> Int32 = { _ in 0 },
+        mountProfile: @escaping (SyncProfile) -> String? = { _ in nil },
+        unmountProfile: @escaping (SyncProfile) -> String? = { _ in nil },
         readStdin: @escaping () -> String? = { nil },
         readFile: @escaping (String) -> String? = { _ in nil },
         stdout: @escaping (String) -> Void = { _ in },
@@ -992,6 +996,8 @@ enum ConfigSelfTest {
             uninstallProfile: uninstallProfile,
             deleteProfileFile: deleteProfileFile,
             runSyncScript: runSyncScript,
+            mountProfile: mountProfile,
+            unmountProfile: unmountProfile,
             migrateCache: migrateCache,
             readStdin: readStdin,
             readFile: readFile,
@@ -1135,6 +1141,194 @@ enum ConfigSelfTest {
         }
 
         return report("AC-CLI6", "cli-write-commands", true)
+    }
+
+    // MARK: - AC-CLI7 — lifecycle: mount/unmount/reinstall/install parse + side-effect routing
+
+    /// Drives the agent-first lifecycle commands through parse + `execute` with
+    /// spied closures: mount/unmount route to the mount/unmount closures and
+    /// refuse a non-mount profile; reinstall does uninstall→install for an enabled
+    /// profile and refuses a disabled one; install runs installProfile for an
+    /// enabled profile and refuses a disabled one. Also locks their bounded
+    /// telemetry verbs.
+    private static func testCLILifecycleCommands() -> Bool {
+        // Parse.
+        guard case .success(.mount("s")) = SyncTrayCLI.parse(["mount", "s"]),
+              case .success(.unmount("s")) = SyncTrayCLI.parse(["unmount", "s"]),
+              case .success(.reinstall("s")) = SyncTrayCLI.parse(["reinstall", "s"]),
+              case .success(.install("s")) = SyncTrayCLI.parse(["install", "s"]) else {
+            return report("AC-CLI7", "cli-lifecycle-commands", false, "(lifecycle commands did not parse)")
+        }
+        guard case .failure = SyncTrayCLI.parse(["mount"]) else {
+            return report("AC-CLI7", "cli-lifecycle-commands", false, "(mount without a target did not fail to parse)")
+        }
+
+        var stream = sampleProfile(id: UUID(), name: "Streamer", isEnabled: true)
+        stream.syncMode = .mount
+
+        // mount → mountProfile closure fires for a mount profile.
+        var mounted = false
+        let mountEnv = fakeCLIEnvironment(readProfiles: { [stream] }, mountProfile: { _ in mounted = true; return nil })
+        guard SyncTrayCLI.execute(["mount", stream.shortId], env: mountEnv) == 0, mounted else {
+            return report("AC-CLI7", "cli-lifecycle-commands", false, "(mount did not fire mountProfile)")
+        }
+
+        // mount → surfaces the closure's error as a non-zero exit.
+        let mountFailEnv = fakeCLIEnvironment(readProfiles: { [stream] }, mountProfile: { _ in "mount did not establish within 60s" })
+        guard SyncTrayCLI.execute(["mount", stream.shortId], env: mountFailEnv) != 0 else {
+            return report("AC-CLI7", "cli-lifecycle-commands", false, "(mount did not propagate a mount failure)")
+        }
+
+        // unmount → unmountProfile closure fires.
+        var unmounted = false
+        let unmountEnv = fakeCLIEnvironment(readProfiles: { [stream] }, unmountProfile: { _ in unmounted = true; return nil })
+        guard SyncTrayCLI.execute(["unmount", stream.shortId], env: unmountEnv) == 0, unmounted else {
+            return report("AC-CLI7", "cli-lifecycle-commands", false, "(unmount did not fire unmountProfile)")
+        }
+
+        // mount/unmount refuse a non-mount profile (no closure fires).
+        let bisync = sampleProfile(id: UUID(), name: "Bisync", isEnabled: true)
+        var mountFiredOnBisync = false
+        let mountBisyncEnv = fakeCLIEnvironment(readProfiles: { [bisync] }, mountProfile: { _ in mountFiredOnBisync = true; return nil })
+        guard SyncTrayCLI.execute(["mount", bisync.shortId], env: mountBisyncEnv) != 0, !mountFiredOnBisync else {
+            return report("AC-CLI7", "cli-lifecycle-commands", false, "(mount did not refuse a non-mount profile)")
+        }
+
+        // reinstall (enabled) → uninstall THEN install both fire.
+        var reUninstalled = false, reInstalled = false
+        let reinstallEnv = fakeCLIEnvironment(
+            readProfiles: { [bisync] },
+            installProfile: { _ in reInstalled = true; return nil },
+            uninstallProfile: { _ in reUninstalled = true; return nil }
+        )
+        guard SyncTrayCLI.execute(["reinstall", bisync.shortId], env: reinstallEnv) == 0, reUninstalled, reInstalled else {
+            return report("AC-CLI7", "cli-lifecycle-commands", false, "(reinstall did not uninstall+install)")
+        }
+
+        // install (enabled) → installProfile fires, uninstall does NOT.
+        var installFired = false
+        let installEnv = fakeCLIEnvironment(
+            readProfiles: { [bisync] },
+            installProfile: { _ in installFired = true; return nil },
+            uninstallProfile: { _ in "should-not-be-called" }
+        )
+        guard SyncTrayCLI.execute(["install", bisync.shortId], env: installEnv) == 0, installFired else {
+            return report("AC-CLI7", "cli-lifecycle-commands", false, "(install did not run installProfile)")
+        }
+
+        // install/reinstall refuse a disabled profile (no install fires).
+        let disabled = sampleProfile(id: UUID(), name: "Disabled", isEnabled: false)
+        var disabledInstallFired = false
+        let disabledEnv = fakeCLIEnvironment(
+            readProfiles: { [disabled] },
+            installProfile: { _ in disabledInstallFired = true; return nil }
+        )
+        guard SyncTrayCLI.execute(["install", disabled.shortId], env: disabledEnv) != 0,
+              SyncTrayCLI.execute(["reinstall", disabled.shortId], env: disabledEnv) != 0,
+              !disabledInstallFired else {
+            return report("AC-CLI7", "cli-lifecycle-commands", false, "(install/reinstall did not refuse a disabled profile)")
+        }
+
+        // Bounded telemetry verbs.
+        let verbCases: [([String], String)] = [
+            (["mount", "SECRET"], "mount"),
+            (["unmount", "SECRET"], "unmount"),
+            (["reinstall", "SECRET"], "reinstall"),
+            (["install", "SECRET"], "install"),
+        ]
+        for (argv, expected) in verbCases where SyncTrayCLI.telemetryVerb(for: argv) != expected {
+            return report("AC-CLI7", "cli-lifecycle-commands", false, "(telemetryVerb\(argv) != \(expected))")
+        }
+
+        return report("AC-CLI7", "cli-lifecycle-commands", true)
+    }
+
+    // MARK: - AC-CLI8 — profile set: assignment matrix, reconcile routing, profile show round-trip
+
+    /// Exercises the keystone `profile set` end to end: the pure
+    /// `applyProfileAssignment` matrix (valid fields, invalid values, unknown key,
+    /// the three excluded keys), then `execute` for the write + reconcile routing
+    /// (a reinstall-triggering field on an enabled profile drives uninstall→install;
+    /// an invalid value writes NOTHING), and finally `profile show` producing JSON
+    /// that decodes back to the same profile.
+    private static func testCLIProfileSetAndShow() -> Bool {
+        // Parse: positional key/value pairs; odd count fails.
+        guard case .success(.profileSet(target: "work", assignments: let a)) = SyncTrayCLI.parse(
+            ["profile", "set", "work", "isMuted", "true", "downloadConnections", "4"]
+        ), a == [ProfileAssignment(key: "isMuted", value: "true"), ProfileAssignment(key: "downloadConnections", value: "4")] else {
+            return report("AC-CLI8", "cli-profile-set-and-show", false, "(profile set did not parse into pairs)")
+        }
+        guard case .failure = SyncTrayCLI.parse(["profile", "set", "work", "isMuted"]) else {
+            return report("AC-CLI8", "cli-profile-set-and-show", false, "(odd pair count did not fail to parse)")
+        }
+
+        // applyProfileAssignment matrix.
+        var p = sampleProfile(id: UUID(), name: "Base", isEnabled: true)
+        guard SyncTrayCLI.applyProfileAssignment(&p, key: "syncMode", value: "mount") == nil, p.syncMode == .mount else {
+            return report("AC-CLI8", "cli-profile-set-and-show", false, "(valid syncMode assignment failed)")
+        }
+        guard SyncTrayCLI.applyProfileAssignment(&p, key: "mountBackend", value: "macfuse") == nil, p.mountBackend == .macfuse else {
+            return report("AC-CLI8", "cli-profile-set-and-show", false, "(valid mountBackend assignment failed)")
+        }
+        guard SyncTrayCLI.applyProfileAssignment(&p, key: "downloadConnections", value: "8") == nil, p.downloadConnections == 8 else {
+            return report("AC-CLI8", "cli-profile-set-and-show", false, "(valid downloadConnections assignment failed)")
+        }
+        guard SyncTrayCLI.applyProfileAssignment(&p, key: "isMuted", value: "yes") == nil, p.isMuted == true else {
+            return report("AC-CLI8", "cli-profile-set-and-show", false, "(valid bool assignment failed)")
+        }
+        guard SyncTrayCLI.applyProfileAssignment(&p, key: "pinnedDirectories", value: "A, B ,C") == nil,
+              p.pinnedDirectories == ["A", "B", "C"] else {
+            return report("AC-CLI8", "cli-profile-set-and-show", false, "(comma list assignment failed: \(p.pinnedDirectories))")
+        }
+        // Invalid values.
+        guard SyncTrayCLI.applyProfileAssignment(&p, key: "downloadConnections", value: "99") != nil else {
+            return report("AC-CLI8", "cli-profile-set-and-show", false, "(out-of-range downloadConnections was accepted)")
+        }
+        guard SyncTrayCLI.applyProfileAssignment(&p, key: "syncMode", value: "bogus") != nil else {
+            return report("AC-CLI8", "cli-profile-set-and-show", false, "(invalid enum value was accepted)")
+        }
+        guard SyncTrayCLI.applyProfileAssignment(&p, key: "name", value: "") != nil else {
+            return report("AC-CLI8", "cli-profile-set-and-show", false, "(empty required string was accepted)")
+        }
+        // Unknown + excluded keys.
+        for badKey in ["totallyBogus", "id", "isEnabled", "fallbackRequiresCacheRebuild"] {
+            guard SyncTrayCLI.applyProfileAssignment(&p, key: badKey, value: "x") != nil else {
+                return report("AC-CLI8", "cli-profile-set-and-show", false, "(key \"\(badKey)\" was not rejected)")
+            }
+        }
+
+        // execute: a reinstall-triggering field on an enabled profile → write + uninstall→install.
+        let enabled = sampleProfile(id: UUID(), name: "Enabled", isEnabled: true)
+        var written: SyncProfile?, reUninstalled = false, reInstalled = false
+        let setEnv = fakeCLIEnvironment(
+            readProfiles: { [enabled] },
+            writeProfile: { written = $0; return true },
+            installProfile: { _ in reInstalled = true; return nil },
+            uninstallProfile: { _ in reUninstalled = true; return nil }
+        )
+        guard SyncTrayCLI.execute(["profile", "set", enabled.shortId, "syncIntervalMinutes", "42"], env: setEnv) == 0,
+              written?.syncIntervalMinutes == 42, reUninstalled, reInstalled else {
+            return report("AC-CLI8", "cli-profile-set-and-show", false, "(profile set did not write + reinstall)")
+        }
+
+        // execute: an invalid value writes NOTHING and exits non-zero.
+        var wroteOnInvalid = false
+        let invalidEnv = fakeCLIEnvironment(readProfiles: { [enabled] }, writeProfile: { _ in wroteOnInvalid = true; return true })
+        guard SyncTrayCLI.execute(["profile", "set", enabled.shortId, "syncMode", "bogus"], env: invalidEnv) != 0, !wroteOnInvalid else {
+            return report("AC-CLI8", "cli-profile-set-and-show", false, "(invalid profile set value still wrote the file)")
+        }
+
+        // profile show → JSON that decodes back to the same profile.
+        var shown = ""
+        let showEnv = fakeCLIEnvironment(readProfiles: { [enabled] }, stdout: { shown += $0 })
+        guard SyncTrayCLI.execute(["profile", "show", enabled.shortId], env: showEnv) == 0,
+              let data = shown.data(using: .utf8),
+              let decoded = try? JSONDecoder().decode(SyncProfile.self, from: data),
+              decoded == enabled else {
+            return report("AC-CLI8", "cli-profile-set-and-show", false, "(profile show JSON did not round-trip)")
+        }
+
+        return report("AC-CLI8", "cli-profile-set-and-show", true)
     }
 
     // MARK: - AC-CLI1 — arg parsing: unknown/absent → usage error; known commands route correctly

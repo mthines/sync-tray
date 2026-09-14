@@ -6,6 +6,14 @@ enum CreateSource: Equatable {
     case stdin
 }
 
+/// One `key value` assignment for `profile set`. A named struct (rather than a
+/// bare tuple) so `CLICommand` stays `Equatable` — an array of labelled tuples
+/// isn't `Equatable`-synthesizable.
+struct ProfileAssignment: Equatable {
+    let key: String
+    let value: String
+}
+
 /// Parsed CLI subcommand — the pure, testable result of `SyncTrayCLI.parse`.
 enum CLICommand: Equatable {
     case doctor
@@ -15,8 +23,14 @@ enum CLICommand: Equatable {
     case profiles
     case status(target: String?)
     case sync(String)
+    case mount(String)
+    case unmount(String)
+    case reinstall(String)
+    case install(String)
     case profileCreate(CreateSource)
+    case profileShow(String)
     case profileDelete(String)
+    case profileSet(target: String, assignments: [ProfileAssignment])
     case profileSetEnabled(target: String, enabled: Bool)
     case cacheMove(target: String, destination: String, includeOverlapping: Bool)
     case help
@@ -76,6 +90,15 @@ struct CLIEnvironment {
     /// Run the shared sync script against a profile's derived config path,
     /// blocking until it exits. Returns the script's exit code.
     var runSyncScript: (_ configPath: String) -> Int32
+    /// Mount a Stream (mount-mode) profile now (load + kickstart its agent) and
+    /// BLOCK until the volume attaches or a timeout elapses. Returns `nil` on a
+    /// confirmed mount, or an error message (with the real reason from the log
+    /// tail) on failure. The mount-only guard is enforced by the caller.
+    var mountProfile: (SyncProfile) -> String?
+    /// Unmount a mounted Stream profile (graceful+forced detach, then unload the
+    /// agent so `rclone nfsmount` actually exits). Returns `nil` on success or an
+    /// error message. The mount-only guard is enforced by the caller.
+    var unmountProfile: (SyncProfile) -> String?
     /// Move a Stream profile's VFS cache (content + metadata) to
     /// `destination`, blocking until it finishes. `includeOverlapping`
     /// authorizes co-migrating an overlapping sibling profile (R28's
@@ -111,6 +134,7 @@ enum SyncTrayCLI {
       doctor                       Run a health check and print a report
       status [name|id]             Show live state for one or all profiles
       profiles                     List configured SyncTray profiles
+      profile show <name|id>       Print one profile's full config as JSON
       logs <name|id> [--follow]    Print or tail a profile's sync log
       test-remote <name|id>        Probe a profile's remote reachability
       listremotes                  List configured rclone remotes
@@ -121,11 +145,26 @@ enum SyncTrayCLI {
       profile enable <name|id>     Enable a profile (install its launchd agent)
       profile disable <name|id>    Disable a profile (unload its agent)
       profile delete <name|id>     Delete a profile and its launchd agent
+      profile set <name|id> <key> <value> [<key> <value> ...]
+                                   Edit fields on an existing profile and reconcile
+      install <name|id>            Install an enabled profile's launchd agent (idempotent)
+      reinstall <name|id>          Regenerate script+plist and reinstall the agent
 
     Operate:
       sync <name|id>                          Run a sync now and wait for it to finish
+      mount <name|id>                         Mount a Stream profile now and wait for it to attach
+      unmount <name|id>                       Unmount a mounted Stream profile
       cache move <name|id> --to <path> [--include-overlapping]
                                               Move a Stream profile's VFS cache and wait for it to finish
+
+    profile set keys: name, rcloneRemote, remotePath, localSyncPath,
+      drivePathToMonitor, additionalRcloneFlags, syncMode (bisync|sync|mount),
+      syncDirection (localToRemote|remoteToLocal), syncIntervalMinutes,
+      fallbackRemote, fallbackRemotePath, mountBackend (nfs|macfuse),
+      vfsCacheMode (off|minimal|writes|full), vfsCacheMaxSize, vfsCacheMaxAge,
+      vfsCachePath, allowNonEmptyMount, mountAtStartup, isMuted, rcPort,
+      downloadConnections, pinnedDirectories (comma-separated),
+      warmExcludePatterns (comma-separated). Use enable/disable for isEnabled.
 
     Profiles author JSON against schema/profile.schema.json under the config
     directory; the same file an agent can drop in or edit directly.
@@ -176,11 +215,12 @@ enum SyncTrayCLI {
         guard let first = argv.first else { return "(none)" }
         let known: Set<String> = [
             "doctor", "status", "profiles", "logs", "test-remote",
-            "listremotes", "sync", "help", "-h", "--help",
+            "listremotes", "sync", "mount", "unmount", "reinstall", "install",
+            "help", "-h", "--help",
         ]
         if first == "profile" {
             let sub = argv.dropFirst().first(where: { !$0.hasPrefix("-") }) ?? ""
-            let knownSubs: Set<String> = ["create", "delete", "enable", "disable", "list"]
+            let knownSubs: Set<String> = ["create", "show", "delete", "enable", "disable", "list", "set"]
             return knownSubs.contains(sub) ? "profile-\(sub)" : "(other)"
         }
         if first == "cache" {
@@ -230,6 +270,17 @@ enum SyncTrayCLI {
             }
             return .success(.sync(target))
 
+        case "mount", "unmount", "reinstall", "install":
+            guard let target = rest.first(where: { !$0.hasPrefix("-") }) else {
+                return .failure(CLIUsageError(message: "usage: synctray \(command) <name|shortId>"))
+            }
+            switch command {
+            case "mount": return .success(.mount(target))
+            case "unmount": return .success(.unmount(target))
+            case "reinstall": return .success(.reinstall(target))
+            default: return .success(.install(target))
+            }
+
         case "profile":
             return parseProfile(rest)
 
@@ -247,13 +298,37 @@ enum SyncTrayCLI {
     /// Parse the `profile <subcommand>` group.
     private static func parseProfile(_ rest: [String]) -> Result<CLICommand, CLIUsageError> {
         guard let sub = rest.first else {
-            return .failure(CLIUsageError(message: "usage: synctray profile <create|enable|disable|delete|list> ..."))
+            return .failure(CLIUsageError(message: "usage: synctray profile <create|enable|disable|delete|set|list> ..."))
         }
         let args = Array(rest.dropFirst())
 
         switch sub {
         case "list":
             return .success(.profiles)
+
+        case "show":
+            guard let target = args.first(where: { !$0.hasPrefix("-") }) else {
+                return .failure(CLIUsageError(message: "usage: synctray profile show <name|shortId>"))
+            }
+            return .success(.profileShow(target))
+
+        case "set":
+            // `profile set <target> <key> <value> [<key> <value> ...]` — the
+            // remaining tokens after the target are positional key/value pairs
+            // (so a value may contain `=`, unlike a `--set key=value` form).
+            let setUsage = CLIUsageError(message: "usage: synctray profile set <name|shortId> <key> <value> [<key> <value> ...]")
+            guard let target = args.first else { return .failure(setUsage) }
+            let pairTokens = Array(args.dropFirst())
+            guard !pairTokens.isEmpty, pairTokens.count % 2 == 0 else {
+                return .failure(setUsage)
+            }
+            var assignments: [ProfileAssignment] = []
+            var idx = 0
+            while idx < pairTokens.count {
+                assignments.append(ProfileAssignment(key: pairTokens[idx], value: pairTokens[idx + 1]))
+                idx += 2
+            }
+            return .success(.profileSet(target: target, assignments: assignments))
 
         case "create":
             // `--from <file>` reads a file; a bare `-` reads stdin.
@@ -329,10 +404,22 @@ enum SyncTrayCLI {
             return runStatus(target, env: env)
         case .sync(let target):
             return runSync(target, env: env)
+        case .mount(let target):
+            return runMount(target, env: env)
+        case .unmount(let target):
+            return runUnmount(target, env: env)
+        case .reinstall(let target):
+            return runReinstall(target, env: env)
+        case .install(let target):
+            return runInstall(target, env: env)
         case .profileCreate(let source):
             return runProfileCreate(source, env: env)
+        case .profileShow(let target):
+            return runProfileShow(target, env: env)
         case .profileDelete(let target):
             return runProfileDelete(target, env: env)
+        case .profileSet(let target, let assignments):
+            return runProfileSet(target, assignments: assignments, env: env)
         case .profileSetEnabled(let target, let enabled):
             return runProfileSetEnabled(target, enabled: enabled, env: env)
         case .cacheMove(let target, let destination, let includeOverlapping):
@@ -597,6 +684,95 @@ enum SyncTrayCLI {
         return code
     }
 
+    // MARK: - mount / unmount
+
+    private static func runMount(_ target: String, env: CLIEnvironment) -> Int32 {
+        guard let profile = resolveProfile(target, in: env.readProfiles()) else {
+            env.stderr("error: no profile matches \"\(target)\"\n")
+            return 1
+        }
+        guard profile.isMountMode else {
+            env.stderr("error: \"\(profile.name)\" is not a Stream (mount) profile\n")
+            return 1
+        }
+        env.stdout("mounting \"\(profile.name)\" (\(profile.shortId))…\n")
+        if let err = env.mountProfile(profile) {
+            env.stderr("error: \(err)\n")
+            return 1
+        }
+        env.stdout("mounted \(profile.name) (\(profile.shortId)) at \(profile.localSyncPath)\n")
+        return 0
+    }
+
+    private static func runUnmount(_ target: String, env: CLIEnvironment) -> Int32 {
+        guard let profile = resolveProfile(target, in: env.readProfiles()) else {
+            env.stderr("error: no profile matches \"\(target)\"\n")
+            return 1
+        }
+        guard profile.isMountMode else {
+            env.stderr("error: \"\(profile.name)\" is not a Stream (mount) profile\n")
+            return 1
+        }
+        if let err = env.unmountProfile(profile) {
+            env.stderr("error: \(err)\n")
+            return 1
+        }
+        env.stdout("unmounted \(profile.name) (\(profile.shortId))\n")
+        return 0
+    }
+
+    // MARK: - install / reinstall
+
+    /// Install the launchd agent for an already-persisted, enabled profile —
+    /// idempotent, and the complement to `profile enable` (which early-returns
+    /// without installing when the profile is ALREADY enabled, so it can't
+    /// re-create an agent that went missing). Never flips `isEnabled`.
+    private static func runInstall(_ target: String, env: CLIEnvironment) -> Int32 {
+        guard let profile = resolveProfile(target, in: env.readProfiles()) else {
+            env.stderr("error: no profile matches \"\(target)\"\n")
+            return 1
+        }
+        guard profile.isEnabled else {
+            env.stderr("error: \"\(profile.name)\" is disabled; run 'synctray profile enable \(profile.shortId)' first\n")
+            return 1
+        }
+        guard profile.isValid else {
+            env.stderr("error: \"\(profile.name)\" is incomplete (name/remote/paths); fix it with 'synctray profile set' first\n")
+            return 1
+        }
+        if let err = env.installProfile(profile) {
+            env.stderr("error: install failed: \(err)\n")
+            return 1
+        }
+        env.stdout("installed \(profile.name) (\(profile.shortId))\n")
+        return 0
+    }
+
+    /// Regenerate the script/plist and reinstall the agent (uninstall → install)
+    /// — the settings-save reinstall path. For a mounted Stream profile this
+    /// detaches the volume before remounting it, exactly as the app does.
+    private static func runReinstall(_ target: String, env: CLIEnvironment) -> Int32 {
+        guard let profile = resolveProfile(target, in: env.readProfiles()) else {
+            env.stderr("error: no profile matches \"\(target)\"\n")
+            return 1
+        }
+        guard profile.isEnabled else {
+            env.stderr("error: \"\(profile.name)\" is disabled; run 'synctray profile enable \(profile.shortId)' first\n")
+            return 1
+        }
+        // Uninstall is cleanup — a failure here is non-fatal (mirrors delete),
+        // since the following install regenerates every file anyway.
+        if let err = env.uninstallProfile(profile) {
+            env.stderr("warning: uninstall reported: \(err)\n")
+        }
+        if let err = env.installProfile(profile) {
+            env.stderr("error: reinstall failed: \(err)\n")
+            return 1
+        }
+        env.stdout("reinstalled \(profile.name) (\(profile.shortId))\n")
+        return 0
+    }
+
     // MARK: - profile create
 
     private static func runProfileCreate(_ source: CreateSource, env: CLIEnvironment) -> Int32 {
@@ -647,6 +823,28 @@ enum SyncTrayCLI {
         return 0
     }
 
+    // MARK: - profile show
+
+    /// Print one profile's FULL config as pretty JSON — the same shape as the
+    /// authoritative `.profile.json`, so an agent can `profile show` → edit →
+    /// `profile create`/`profile set` round-trip. Stable key order (sorted) so a
+    /// diff between two shows is meaningful.
+    private static func runProfileShow(_ target: String, env: CLIEnvironment) -> Int32 {
+        guard let profile = resolveProfile(target, in: env.readProfiles()) else {
+            env.stderr("error: no profile matches \"\(target)\"\n")
+            return 1
+        }
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        guard let data = try? encoder.encode(profile),
+              let json = String(data: data, encoding: .utf8) else {
+            env.stderr("error: failed to encode profile \(profile.shortId)\n")
+            return 1
+        }
+        env.stdout(json + "\n")
+        return 0
+    }
+
     // MARK: - profile delete
 
     private static func runProfileDelete(_ target: String, env: CLIEnvironment) -> Int32 {
@@ -683,21 +881,188 @@ enum SyncTrayCLI {
 
         // Reuse the single source of truth for the launchd delta.
         let action = SyncManager.reconcileAction(from: profile, to: updated)
-        let err: String?
-        switch action {
-        case .install, .reinstall:
-            err = env.installProfile(updated)
-        case .uninstall:
-            err = env.uninstallProfile(profile)
-        case .none:
-            err = nil
-        }
-        if let err {
+        if let err = applyLaunchdReconcile(action, current: profile, updated: updated, env: env) {
             env.stderr("\(enabled ? "enabled" : "disabled") \(profile.shortId) but launchd step failed: \(err)\n")
             return 1
         }
         env.stdout("\(enabled ? "enabled" : "disabled") \(profile.name) (\(profile.shortId))\n")
         return 0
+    }
+
+    /// Apply the launchd side effect a `ProfileReconcileAction` implies, over the
+    /// injected `env` closures — the SINGLE place the CLI turns a reconcile delta
+    /// into install/uninstall calls, shared by `profile enable/disable` and
+    /// `profile set` so they can never route a delta differently. A `.reinstall`
+    /// is an uninstall of the OLD profile (which detaches a mounted volume) then
+    /// an install of the NEW one — the same order the app's settings-save path
+    /// uses. Returns an error message or `nil`.
+    private static func applyLaunchdReconcile(
+        _ action: ProfileReconcileAction,
+        current: SyncProfile,
+        updated: SyncProfile,
+        env: CLIEnvironment
+    ) -> String? {
+        switch action {
+        case .none:
+            return nil
+        case .install:
+            return env.installProfile(updated)
+        case .uninstall:
+            return env.uninstallProfile(current)
+        case .reinstall:
+            if let err = env.uninstallProfile(current) { return err }
+            return env.installProfile(updated)
+        }
+    }
+
+    // MARK: - profile set
+
+    /// Edit fields on an existing profile headlessly, rewrite the authoritative
+    /// `.profile.json`, and drive the correct launchd reconcile
+    /// (`SyncManager.reconcileAction`). The key set is bounded and enumerated in
+    /// `applyProfileAssignment`; an unknown key or invalid value is a greppable
+    /// `error:` and rewrites NOTHING (all assignments are validated against a copy
+    /// before any write).
+    private static func runProfileSet(_ target: String, assignments: [ProfileAssignment], env: CLIEnvironment) -> Int32 {
+        guard let original = resolveProfile(target, in: env.readProfiles()) else {
+            env.stderr("error: no profile matches \"\(target)\"\n")
+            return 1
+        }
+
+        // Validate + apply against a copy first — a bad key/value never touches disk.
+        var updated = original
+        for assignment in assignments {
+            if let err = applyProfileAssignment(&updated, key: assignment.key, value: assignment.value) {
+                env.stderr("error: \(err)\n")
+                return 65  // EX_DATAERR
+            }
+        }
+
+        guard updated != original else {
+            env.stdout("no changes for \(original.name) (\(original.shortId))\n")
+            return 0
+        }
+
+        guard env.writeProfile(updated) else {
+            env.stderr("error: failed to write profile file\n")
+            return 1
+        }
+
+        let action = SyncManager.reconcileAction(from: original, to: updated)
+        if let err = applyLaunchdReconcile(action, current: original, updated: updated, env: env) {
+            env.stderr("updated \(original.shortId) but launchd step failed: \(err)\n")
+            return 1
+        }
+
+        let changed = assignments.map { $0.key }.joined(separator: ", ")
+        env.stdout("updated \(updated.name) (\(updated.shortId)) — \(changed)\n")
+        return 0
+    }
+
+    /// Apply one `key`→`value` assignment to `profile` in place. Returns an error
+    /// message (unknown key, or a value that fails validation) or `nil` on
+    /// success. The key set MIRRORS `SyncProfile.CodingKeys` minus three
+    /// deliberately-excluded keys: `id` (immutable), `isEnabled` (use
+    /// enable/disable), and `fallbackRequiresCacheRebuild` (derived at
+    /// install/save time from the two remotes' wire types). Pure — no I/O — so the
+    /// self-test drives the whole matrix without touching disk.
+    static func applyProfileAssignment(_ profile: inout SyncProfile, key: String, value: String) -> String? {
+        // Comma-separated list, trimming whitespace and dropping empty entries.
+        func list(_ raw: String) -> [String] {
+            raw.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+        }
+        func bool(_ raw: String) -> Bool? {
+            switch raw.lowercased() {
+            case "true", "1", "yes", "on": return true
+            case "false", "0", "no", "off": return false
+            default: return nil
+            }
+        }
+        func int(_ raw: String) -> Int? { Int(raw) }
+        func requireNonEmpty() -> String? {
+            value.isEmpty ? "\(key) cannot be empty" : nil
+        }
+
+        switch key {
+        // Required strings (empty would break isValid — reject explicitly).
+        case "name": if let e = requireNonEmpty() { return e }; profile.name = value
+        case "rcloneRemote": if let e = requireNonEmpty() { return e }; profile.rcloneRemote = value
+        case "remotePath": if let e = requireNonEmpty() { return e }; profile.remotePath = value
+        case "localSyncPath": if let e = requireNonEmpty() { return e }; profile.localSyncPath = value
+
+        // Optional strings.
+        case "drivePathToMonitor": profile.drivePathToMonitor = value
+        case "additionalRcloneFlags": profile.additionalRcloneFlags = value
+        case "fallbackRemote": profile.fallbackRemote = value
+        case "fallbackRemotePath": profile.fallbackRemotePath = value
+        case "vfsCacheMaxSize": profile.vfsCacheMaxSize = value
+        case "vfsCacheMaxAge": profile.vfsCacheMaxAge = value
+        case "vfsCachePath":
+            if let e = requireNonEmpty() { return e }
+            // Re-point only (matches the external-file-edit path); a warm-cache
+            // relocation is `synctray cache move`.
+            profile.vfsCachePath = (value as NSString).expandingTildeInPath
+
+        // Ints (with range validation where the model clamps).
+        case "syncIntervalMinutes":
+            guard let n = int(value), n >= 1 else { return "syncIntervalMinutes must be an integer ≥ 1" }
+            profile.syncIntervalMinutes = n
+        case "downloadConnections":
+            guard let n = int(value), (1...16).contains(n) else { return "downloadConnections must be an integer in 1...16" }
+            profile.downloadConnections = n
+        case "rcPort":
+            guard let n = int(value), (1...65535).contains(n) else { return "rcPort must be an integer in 1...65535" }
+            profile.rcPort = n
+
+        // Bools.
+        case "isMuted":
+            guard let b = bool(value) else { return "isMuted must be true or false" }
+            profile.isMuted = b
+        case "mountAtStartup":
+            guard let b = bool(value) else { return "mountAtStartup must be true or false" }
+            profile.mountAtStartup = b
+        case "allowNonEmptyMount":
+            guard let b = bool(value) else { return "allowNonEmptyMount must be true or false" }
+            profile.allowNonEmptyMount = b
+
+        // Enums.
+        case "syncMode":
+            guard let m = SyncMode(rawValue: value) else {
+                return "syncMode must be one of: \(SyncMode.allCases.map(\.rawValue).joined(separator: "|"))"
+            }
+            profile.syncMode = m
+        case "syncDirection":
+            guard let d = SyncDirection(rawValue: value) else {
+                return "syncDirection must be one of: \(SyncDirection.allCases.map(\.rawValue).joined(separator: "|"))"
+            }
+            profile.syncDirection = d
+        case "mountBackend":
+            guard let b = MountBackend(rawValue: value) else {
+                return "mountBackend must be one of: \(MountBackend.allCases.map(\.rawValue).joined(separator: "|"))"
+            }
+            profile.mountBackend = b
+        case "vfsCacheMode":
+            guard let c = VFSCacheMode(rawValue: value) else {
+                return "vfsCacheMode must be one of: \(VFSCacheMode.allCases.map(\.rawValue).joined(separator: "|"))"
+            }
+            profile.vfsCacheMode = c
+
+        // Lists (comma-separated).
+        case "pinnedDirectories": profile.pinnedDirectories = list(value)
+        case "warmExcludePatterns": profile.warmExcludePatterns = list(value)
+
+        // Explicitly excluded keys — greppable, with the right command to use.
+        case "id":
+            return "id is immutable and cannot be changed"
+        case "isEnabled":
+            return "use 'synctray profile enable|disable' to change isEnabled"
+        case "fallbackRequiresCacheRebuild":
+            return "fallbackRequiresCacheRebuild is derived at install time and cannot be set directly"
+
+        default:
+            return "unknown key \"\(key)\" (see 'synctray help' for the profile set key list)"
+        }
+        return nil
     }
 
     // MARK: - cache move
@@ -766,6 +1131,11 @@ extension CLIEnvironment {
                 )
                 return exit
             },
+            mountProfile: { profile in CLIEnvironment.mountProfileProcess(profile) },
+            unmountProfile: { profile in
+                do { try SyncSetupService.shared.unmount(profile: profile); return nil }
+                catch { return "\(error)" }
+            },
             migrateCache: { profile, destination, includeOverlapping in
                 CLIEnvironment.migrateCacheProcess(profile: profile, destination: destination, includeOverlapping: includeOverlapping)
             },
@@ -778,6 +1148,39 @@ extension CLIEnvironment {
             stderr: { FileHandle.standardError.write(Data($0.utf8)) },
             now: { Date() }
         )
+    }
+
+    /// Real implementation of `mountProfile`: load + kickstart the launchd agent
+    /// (the same `loadAgent` + `startAgent` pair `SyncManager.mountProfile` uses —
+    /// `kickstart -k` is what actually starts an opt-out `RunAtLoad=false` mount
+    /// and reaps a zombie rclone), then poll `isMounted` for up to ~60s. Blocks
+    /// synchronously on the calling thread via `Thread.sleep`, matching the
+    /// synchronous `diskutil`/`launchctl` calls elsewhere in the setup service. On
+    /// timeout it returns the tail of the sync log so an agent sees the real
+    /// reason (auth failure, unreachable remote, …) rather than a bare timeout.
+    fileprivate static func mountProfileProcess(_ profile: SyncProfile) -> String? {
+        let service = SyncSetupService.shared
+        if service.isMounted(profile: profile) { return nil }  // already up
+
+        _ = service.loadAgent(for: profile)
+        _ = service.startAgent(for: profile)
+
+        for _ in 0..<60 {
+            if service.isMounted(profile: profile) { return nil }
+            Thread.sleep(forTimeInterval: 1)
+        }
+
+        let tail = CLIEnvironment.tailOfLog(at: profile.logPath, lines: 10)
+        let reason = tail.isEmpty ? "" : " — recent log:\n\(tail)"
+        return "mount did not establish within 60s\(reason)"
+    }
+
+    /// Last `lines` non-empty lines of a log file, for surfacing a mount failure's
+    /// real cause. Best-effort — an unreadable/absent log yields "".
+    fileprivate static func tailOfLog(at path: String, lines: Int) -> String {
+        guard let contents = try? String(contentsOfFile: path, encoding: .utf8) else { return "" }
+        let all = contents.split(separator: "\n", omittingEmptySubsequences: true)
+        return all.suffix(lines).joined(separator: "\n")
     }
 
     /// Real implementation of `migrateCache`: refuses an unresolved overlap
