@@ -489,8 +489,13 @@ final class VFSCacheService {
         // Walk ranges in position order; require contiguous (gap-free) coverage from 0.
         var covered: Int64 = 0
         for r in ranges.sorted(by: { $0.Pos < $1.Pos }) {
+            if r.Pos < 0 || r.Size < 0 { return false }   // malformed range → fail closed
             if r.Pos > covered { return false }           // gap before this range
-            covered = max(covered, r.Pos + r.Size)
+            // A valid file can't extend past Int64.max; an overflowing Pos+Size is a
+            // pathological (valid-JSON) sidecar, so fail closed rather than trap.
+            let (end, overflow) = r.Pos.addingReportingOverflow(r.Size)
+            if overflow { return false }
+            covered = max(covered, end)
         }
         return covered >= expectedSize
     }

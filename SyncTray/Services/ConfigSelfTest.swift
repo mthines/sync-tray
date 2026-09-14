@@ -622,6 +622,17 @@ enum ConfigSelfTest {
         guard !VFSCacheService.isCacheComplete(metaJSON: Data("not json".utf8), expectedSize: 42311) else {
             return report("AC-23", "warm-skips-cached", false, "(garbage sidecar treated as cached)")
         }
+        // 11. A valid-JSON but pathological sidecar whose ranges overflow Int64 must fail
+        // closed, not overflow-trap: a leading [0,size) range then a Pos==covered range
+        // whose Pos+Size wraps past Int64.max. Reaching this line at all proves no trap.
+        let overflowMeta = Meta(Size: 100, Rs: [Range(Pos: 0, Size: 100), Range(Pos: 100, Size: Int64.max)], Dirty: false)
+        guard !complete(overflowMeta, 100) else {
+            return report("AC-23", "warm-skips-cached", false, "(overflowing range treated as cached)")
+        }
+        // 12. Negative range fields (impossible for a real sidecar) also fail closed.
+        guard !complete(Meta(Size: 100, Rs: [Range(Pos: -1, Size: 101)], Dirty: false), 100) else {
+            return report("AC-23", "warm-skips-cached", false, "(negative range treated as cached)")
+        }
         return report("AC-23", "warm-skips-cached", true)
     }
 
