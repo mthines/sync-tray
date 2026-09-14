@@ -524,6 +524,97 @@ final class SyncSetupService {
         // Don't remove the script path since we'll reuse it
     }
 
+    // MARK: - Offline Reconcile (offline read/write for Stream profiles)
+
+    /// The offline-reconcile staging-sweep bash fragment, embedded into the
+    /// mount branch of the shared sync script (D3) right before the mount
+    /// point is (re)claimed. Factored out of `generateSyncScript()` so
+    /// `ConfigSelfTest` can EXECUTE this exact text against a fixture
+    /// (AC-OFF17) instead of merely grepping for substrings — this is the
+    /// highest-bug-risk code in the feature (arbitrary filenames, spaces,
+    /// nesting all have to survive).
+    ///
+    /// Entirely driven by bash runtime variables already parsed earlier in
+    /// the shared script ($REMOTE_NAME / $REMOTE_PATH / $VFS_CACHE_PATH /
+    /// $CONFIG_FILE / $LOG_FILE) — the emitted text is therefore identical
+    /// for every profile, matching the fact that the script itself is
+    /// shared and profile-agnostic (`SyncProfile.sharedScriptPath`).
+    ///
+    /// Gated on the `vfsOffline/{key}/unmounted-at` marker (D6/R23) so the
+    /// full-tree walk only runs after a genuine offline session, never on
+    /// every routine mount of a multi-GB / 10k-file cache. Stages a file
+    /// from `$VFS_DATA_ROOT` into `$VFS_CACHE_PATH/vfsPending/$CACHE_KEY`
+    /// via `mv` (same-volume rename, R5 — zero extra disk) iff it:
+    ///   (a) has NO `vfsMeta` sidecar (never rclone-streamed — user-authored),
+    ///   (b) is fully block-allocated (`st_blocks * 512 >= logical size` —
+    ///       the R19 BLOCKER guard: a sidecar-less SPARSE file must never
+    ///       be staged, or a later upload would zero-overwrite the remote),
+    ///   (c) is not `.DS_Store` / `._*` Finder metadata (R20), and
+    ///   (d) does not match one of the profile's `warmExcludePatterns` —
+    ///       matched via bash's native `case` globbing, a best-effort
+    ///       second exclusion layer; `OfflineShadowPlanner.classifyOfflineFile`
+    ///       is the authoritative filter, this is not the only one.
+    /// Uses null-delimited, fully-quoted iteration (`find -print0` /
+    /// `while IFS= read -r -d ''`, R21) so filenames containing spaces
+    /// survive intact.
+    func offlineStagingSweep() -> String {
+        """
+                # Offline reconcile: stage user-authored, fully-downloaded files
+                # out of the VFS cache before mounting, so rclone never sees them
+                # as orphans and a later app-side inject can safely write them
+                # through the live mount (R3/R12-R14/R19-R23).
+                CACHE_KEY="$REMOTE_NAME"
+                if [[ -n "$REMOTE_PATH" ]]; then
+                    CACHE_KEY="$REMOTE_NAME/$REMOTE_PATH"
+                fi
+                VFS_DATA_ROOT="$VFS_CACHE_PATH/vfs/$CACHE_KEY"
+                VFS_META_ROOT="$VFS_CACHE_PATH/vfsMeta/$CACHE_KEY"
+                VFS_OFFLINE_MARKER="$VFS_CACHE_PATH/vfsOffline/$CACHE_KEY/unmounted-at"
+                WARM_EXCLUDE_PATTERNS_RAW=$(python3 -c "
+        import json
+        d = json.load(open('$CONFIG_FILE'))
+        for p in d.get('warmExcludePatterns', []):
+            print(p)
+        " 2>/dev/null)
+
+                if [[ -f "$VFS_OFFLINE_MARKER" && -d "$VFS_DATA_ROOT" ]]; then
+                    echo "$(date '+%Y-%m-%d %H:%M:%S') - Offline marker present, staging eligible files" >> "$LOG_FILE"
+                    mkdir -p "$VFS_CACHE_PATH/vfsPending/$CACHE_KEY"
+                    find "$VFS_DATA_ROOT" -type f -print0 | while IFS= read -r -d '' f; do
+                        base=$(basename "$f")
+                        case "$base" in
+                            .DS_Store|._*) continue ;;
+                        esac
+                        rel="${f#$VFS_DATA_ROOT/}"
+                        sidecar="$VFS_META_ROOT/$rel"
+                        if [[ -e "$sidecar" ]]; then
+                            continue
+                        fi
+                        excluded=false
+                        if [[ -n "$WARM_EXCLUDE_PATTERNS_RAW" ]]; then
+                            while IFS= read -r pattern; do
+                                [[ -z "$pattern" ]] && continue
+                                case "$base" in $pattern) excluded=true ;; esac
+                                case "$rel" in $pattern) excluded=true ;; esac
+                            done <<< "$WARM_EXCLUDE_PATTERNS_RAW"
+                        fi
+                        if $excluded; then
+                            continue
+                        fi
+                        logical_size=$(stat -f %z "$f" 2>/dev/null || echo 0)
+                        allocated_blocks=$(stat -f %b "$f" 2>/dev/null || echo 0)
+                        allocated_bytes=$((allocated_blocks * 512))
+                        if [[ "$allocated_bytes" -lt "$logical_size" ]]; then
+                            echo "$(date '+%Y-%m-%d %H:%M:%S') - Skipping sparse offline file: $rel" >> "$LOG_FILE"
+                            continue
+                        fi
+                        mkdir -p "$(dirname "$VFS_CACHE_PATH/vfsPending/$CACHE_KEY/$rel")"
+                        mv "$f" "$VFS_CACHE_PATH/vfsPending/$CACHE_KEY/$rel"
+                    done
+                fi
+        """
+    }
+
     // MARK: - Script Generation
 
     /// Generate the shared sync script that reads config from JSON
@@ -739,7 +830,18 @@ final class SyncSetupService {
                 # Mount mode - stream files on-demand
                 echo "$(date '+%Y-%m-%d %H:%M:%S') - Starting mount" >> "$LOG_FILE"
 
-                # Ensure mount point exists
+                # Ensure mount point exists. A shadow symlink (offline browse,
+                # see the Offline Read/Write section) may currently occupy
+                # $LOCAL_PATH from a prior unmounted session — tear it down
+                # FIRST so the mount is never established on top of a
+                # symlink (which would follow it and mount over the cache
+                # dir it points at). This guard runs on every mount path,
+                # including launchd RunAtLoad/KeepAlive and an external
+                # mount, since this script — not the app — is what actually
+                # brings the volume up.
+                if [ -L "$LOCAL_PATH" ]; then
+                    rm -f "$LOCAL_PATH"
+                fi
                 mkdir -p "$LOCAL_PATH"
 
                 # Check if already mounted
@@ -747,6 +849,8 @@ final class SyncSetupService {
                     echo "$(date '+%Y-%m-%d %H:%M:%S') - Already mounted at $LOCAL_PATH" >> "$LOG_FILE"
                     exit 0
                 fi
+
+                \(offlineStagingSweep())
 
                 # Not mounted, but a previous rclone for this mount point may still
                 # be alive after a failed attempt (its RC/NFS server keeps holding

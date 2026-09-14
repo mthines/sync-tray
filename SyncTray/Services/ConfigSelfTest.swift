@@ -82,6 +82,18 @@ enum ConfigSelfTest {
             testCacheMigrationUIFixes,
             testCacheMigrationTelemetrySpanStatus,
             testCacheMigrationCLI,
+            testOfflineShadowLinkDecision,
+            testOfflineSparseSkip,
+            testOfflineClassifyNew,
+            testOfflineNoDelete,
+            testOfflineMetadataFiltered,
+            testOfflineReconcileOnce,
+            testOfflineUnmountGuarded,
+            testOfflineSparseNoSidecarSkip,
+            testOfflineStagingSweepExecuted,
+            testOfflineShadowScope,
+            testOfflineInjectConfirmed,
+            testOfflineStageRename,
         ]
 
         for check in checks {
@@ -2566,6 +2578,480 @@ enum ConfigSelfTest {
         }
 
         return report("AC-CM-CLI", "cache-migration-cli", true)
+    }
+
+    // MARK: - Offline read/write (P1 browse + P2 add-new-file reconcile) fakes
+
+    /// A minimal recording fake for `OfflineShadowFileSystem`, mirroring
+    /// `FakeCacheFS`'s "spy closures, dumb state" style. `files` doubles as
+    /// existence + size + allocated-bytes for a data file (self-test fixtures
+    /// don't need to distinguish logical vs. allocated size — the sparse
+    /// guard itself is proven directly against `classifyOfflineFile`, not
+    /// through this fake); `textFiles` holds small text payloads (the
+    /// `unmounted-at` marker, and — for AC-OFF10 — a pre-seeded `vfsMeta`
+    /// sidecar simulating rclone having confirmed a write).
+    private final class FakeOfflineFS {
+        var files: [String: Int64] = [:]
+        var textFiles: [String: String] = [:]
+        var directories: Set<String> = []
+        var symlinks: [String: String] = [:]
+        var removedPaths: [String] = []
+        var movedPaths: [(String, String)] = []
+        var copiedPaths: [(String, String)] = []
+
+        func system() -> OfflineShadowFileSystem {
+            OfflineShadowFileSystem(
+                fileExists: { [weak self] p in
+                    guard let self else { return false }
+                    return self.files[p] != nil || self.textFiles[p] != nil || self.symlinks[p] != nil
+                },
+                isSymlink: { [weak self] p in self?.symlinks[p] != nil },
+                directoryExists: { [weak self] p in self?.directories.contains(p) ?? false },
+                directoryIsEmpty: { [weak self] p in
+                    guard let self else { return true }
+                    let prefix = p + "/"
+                    return !self.files.keys.contains(where: { $0.hasPrefix(prefix) })
+                },
+                listFiles: { [weak self] root in
+                    guard let self else { return [] }
+                    let prefix = root + "/"
+                    return self.files.keys.filter { $0.hasPrefix(prefix) }
+                        .map { String($0.dropFirst(prefix.count)) }
+                        .sorted()
+                },
+                fileSize: { [weak self] p in self?.files[p] },
+                allocatedBytes: { [weak self] p in self?.files[p] },
+                createSymbolicLink: { [weak self] atPath, target in self?.symlinks[atPath] = target },
+                removeItem: { [weak self] p in
+                    self?.removedPaths.append(p)
+                    self?.files.removeValue(forKey: p)
+                    self?.textFiles.removeValue(forKey: p)
+                    self?.symlinks.removeValue(forKey: p)
+                },
+                createDirectory: { [weak self] p in self?.directories.insert(p) },
+                moveItem: { [weak self] from, to in
+                    guard let self else { return }
+                    self.movedPaths.append((from, to))
+                    if let size = self.files[from] {
+                        self.files[to] = size
+                        self.files.removeValue(forKey: from)
+                    }
+                },
+                copyFileData: { [weak self] from, to in
+                    guard let self else { return }
+                    self.copiedPaths.append((from, to))
+                    self.files[to] = self.files[from] ?? 0
+                },
+                writeTextFile: { [weak self] path, contents in self?.textFiles[path] = contents },
+                readTextFile: { [weak self] path in self?.textFiles[path] }
+            )
+        }
+    }
+
+    private static func fakeOfflineFileSystem() -> (fs: OfflineShadowFileSystem, recorder: FakeOfflineFS) {
+        let recorder = FakeOfflineFS()
+        return (recorder.system(), recorder)
+    }
+
+    // MARK: - AC-OFF1 — offline shadow-link decision
+
+    private static func testOfflineShadowLinkDecision() -> Bool {
+        guard case .create(let target) = OfflineShadowPlanner.shadowLinkDecision(
+            isMounted: false, cacheDataDirExists: true, cacheDataDirNonEmpty: true, dataRoot: "/tmp/cache/vfs/key"
+        ), target == "/tmp/cache/vfs/key" else {
+            return report("AC-OFF1", "offline-shadow-decision", false, "(non-empty+unmounted did not create)")
+        }
+        guard OfflineShadowPlanner.shadowLinkDecision(
+            isMounted: false, cacheDataDirExists: false, cacheDataDirNonEmpty: false, dataRoot: "/tmp/x"
+        ) == .skip else {
+            return report("AC-OFF1", "offline-shadow-decision", false, "(missing cache dir did not skip)")
+        }
+        guard OfflineShadowPlanner.shadowLinkDecision(
+            isMounted: false, cacheDataDirExists: true, cacheDataDirNonEmpty: false, dataRoot: "/tmp/x"
+        ) == .skip else {
+            return report("AC-OFF1", "offline-shadow-decision", false, "(empty cache dir did not skip)")
+        }
+        guard OfflineShadowPlanner.shadowLinkDecision(
+            isMounted: true, cacheDataDirExists: true, cacheDataDirNonEmpty: true, dataRoot: "/tmp/x"
+        ) == .skip else {
+            return report("AC-OFF1", "offline-shadow-decision", false, "(mounted did not skip)")
+        }
+        return report("AC-OFF1", "offline-shadow-decision", true)
+    }
+
+    // MARK: - AC-OFF2 — sidecar'd sparse/incomplete file never selected for upload
+
+    private static func testOfflineSparseSkip() -> Bool {
+        typealias Meta = VFSCacheService.VFSCacheMeta
+        typealias Range = VFSCacheService.VFSCacheMeta.Range
+        let exclude = VFSCacheService.ExcludeMatcher(patterns: [])
+        let boundary = Date()
+
+        let sparseFacts = OfflineFileFacts(
+            relativePath: "foo/bar.bin", name: "bar.bin", hasSidecar: true,
+            dataSize: 100, allocatedBytes: 100,
+            sidecarMeta: Meta(Size: 100, Rs: [Range(Pos: 0, Size: 40)], Dirty: false)
+        )
+        guard OfflineShadowPlanner.classifyOfflineFile(sparseFacts, unmountBoundary: boundary, exclude: exclude)
+                == .skip(reason: .incomplete) else {
+            return report("AC-OFF2", "offline-sparse-skip", false, "(sidecar'd sparse file was not .skip(.incomplete))")
+        }
+
+        let dirtyFacts = OfflineFileFacts(
+            relativePath: "dirty.bin", name: "dirty.bin", hasSidecar: true,
+            dataSize: 100, allocatedBytes: 100,
+            sidecarMeta: Meta(Size: 100, Rs: [Range(Pos: 0, Size: 100)], Dirty: true)
+        )
+        guard OfflineShadowPlanner.classifyOfflineFile(dirtyFacts, unmountBoundary: boundary, exclude: exclude)
+                == .skip(reason: .incomplete) else {
+            return report("AC-OFF2", "offline-sparse-skip", false, "(sidecar'd dirty file was not .skip(.incomplete))")
+        }
+
+        return report("AC-OFF2", "offline-sparse-skip", true)
+    }
+
+    // MARK: - AC-OFF3 — no-sidecar complete file uploads; unchanged sidecar'd file skips
+
+    private static func testOfflineClassifyNew() -> Bool {
+        typealias Meta = VFSCacheService.VFSCacheMeta
+        typealias Range = VFSCacheService.VFSCacheMeta.Range
+        let exclude = VFSCacheService.ExcludeMatcher(patterns: [])
+        let boundary = Date()
+
+        let newFacts = OfflineFileFacts(
+            relativePath: "new/file.txt", name: "file.txt", hasSidecar: false,
+            dataSize: 1024, allocatedBytes: 1024, sidecarMeta: nil
+        )
+        guard OfflineShadowPlanner.classifyOfflineFile(newFacts, unmountBoundary: boundary, exclude: exclude) == .upload else {
+            return report("AC-OFF3", "offline-classify-new", false, "(no-sidecar fully-allocated file was not .upload)")
+        }
+
+        let unchangedFacts = OfflineFileFacts(
+            relativePath: "cached/file.bin", name: "file.bin", hasSidecar: true,
+            dataSize: 500, allocatedBytes: 500,
+            sidecarMeta: Meta(Size: 500, Rs: [Range(Pos: 0, Size: 500)], Dirty: false),
+            modifiedDate: boundary.addingTimeInterval(-3600)
+        )
+        guard OfflineShadowPlanner.classifyOfflineFile(unchangedFacts, unmountBoundary: boundary, exclude: exclude)
+                == .skip(reason: .unchanged) else {
+            return report("AC-OFF3", "offline-classify-new", false, "(sidecar'd complete unchanged file was not .skip(.unchanged))")
+        }
+
+        return report("AC-OFF3", "offline-classify-new", true)
+    }
+
+    // MARK: - AC-OFF4 — deletion is never propagated
+
+    private static func testOfflineNoDelete() -> Bool {
+        let exclude = VFSCacheService.ExcludeMatcher(patterns: [])
+        let present = OfflineScanEntry(facts: OfflineFileFacts(
+            relativePath: "a.txt", name: "a.txt", hasSidecar: false,
+            dataSize: 10, allocatedBytes: 10, sidecarMeta: nil
+        ))
+        let plan = OfflineShadowPlanner.planOfflineReconcile(scan: [present], unmountBoundary: Date(), exclude: exclude)
+        guard plan.uploads == ["a.txt"] else {
+            return report("AC-OFF4", "offline-no-delete", false, "(present file did not produce the expected upload)")
+        }
+        // A remote path with NO corresponding scan entry (everything else was
+        // "deleted locally") produces literally no action — `OfflineReconcilePlan`
+        // has no field that could express "delete this remote path".
+        let emptyPlan = OfflineShadowPlanner.planOfflineReconcile(scan: [], unmountBoundary: Date(), exclude: exclude)
+        guard emptyPlan.uploads.isEmpty else {
+            return report("AC-OFF4", "offline-no-delete", false, "(empty scan produced actions)")
+        }
+        return report("AC-OFF4", "offline-no-delete", true)
+    }
+
+    // MARK: - AC-OFF5 — metadata / warm-exclude filtering
+
+    private static func testOfflineMetadataFiltered() -> Bool {
+        let exclude = VFSCacheService.ExcludeMatcher(patterns: ["*.bak", "**/BACKUP/**"])
+        func entry(_ rel: String) -> OfflineScanEntry {
+            OfflineScanEntry(facts: OfflineFileFacts(
+                relativePath: rel, name: (rel as NSString).lastPathComponent, hasSidecar: false,
+                dataSize: 10, allocatedBytes: 10, sidecarMeta: nil
+            ))
+        }
+        let entries = [
+            entry(".DS_Store"), entry("._resource"), entry("notes.bak"),
+            entry("Nested/BACKUP/old.txt"), entry("keep.txt"),
+        ]
+        let plan = OfflineShadowPlanner.planOfflineReconcile(scan: entries, unmountBoundary: Date(), exclude: exclude)
+        guard plan.uploads == ["keep.txt"] else {
+            return report("AC-OFF5", "offline-metadata-filtered", false, "(unexpected upload set: \(plan.uploads))")
+        }
+        return report("AC-OFF5", "offline-metadata-filtered", true)
+    }
+
+    // MARK: - AC-OFF6 — reconcile fires once per mount session, re-arms on unmount
+
+    private static func testOfflineReconcileOnce() -> Bool {
+        let id = UUID()
+        var reconciled: Set<UUID> = []
+        func decide(mounted: Bool, pending: Bool) -> Bool {
+            OfflineShadowPlanner.shouldReconcileOnMount(
+                isMounted: mounted, hasPendingFiles: pending, profileId: id, alreadyReconciled: &reconciled)
+        }
+        guard decide(mounted: true, pending: true) else {
+            return report("AC-OFF6", "offline-reconcile-once", false, "(first mounted tick with pending files did not reconcile)")
+        }
+        guard !decide(mounted: true, pending: true), !decide(mounted: true, pending: true) else {
+            return report("AC-OFF6", "offline-reconcile-once", false, "(re-reconciled while still mounted)")
+        }
+        guard !decide(mounted: false, pending: true) else {
+            return report("AC-OFF6", "offline-reconcile-once", false, "(unmounted tick returned true)")
+        }
+        guard decide(mounted: true, pending: true) else {
+            return report("AC-OFF6", "offline-reconcile-once", false, "(remount did not reconcile again after re-arm)")
+        }
+        let noPending = UUID()
+        var w2: Set<UUID> = []
+        guard !OfflineShadowPlanner.shouldReconcileOnMount(isMounted: true, hasPendingFiles: false, profileId: noPending, alreadyReconciled: &w2),
+              w2.isEmpty else {
+            return report("AC-OFF6", "offline-reconcile-once", false, "(no-pending profile reconciled or was tracked)")
+        }
+        return report("AC-OFF6", "offline-reconcile-once", true)
+    }
+
+    // MARK: - AC-OFF8 — shadow creation is guarded; remountOnPrimary never creates one
+
+    private static func testOfflineUnmountGuarded() -> Bool {
+        guard let source = readSourceFile("Services/SyncManager.swift") else {
+            return report("AC-OFF8", "offline-unmount-guarded", false, "(could not read SyncManager.swift source)")
+        }
+        guard let unmountBody = extractFunctionBody(startingAt: "func unmountProfile(_ profile: SyncProfile)", in: source) else {
+            return report("AC-OFF8", "offline-unmount-guarded", false, "(could not locate unmountProfile body)")
+        }
+        guard unmountBody.contains("createOfflineShadow"), unmountBody.contains("do {"), unmountBody.contains("} catch {") else {
+            return report("AC-OFF8", "offline-unmount-guarded", false, "(unmountProfile does not guard createOfflineShadow with do/catch)")
+        }
+        guard let remountBody = extractFunctionBody(startingAt: "func remountOnPrimary(_ profile: SyncProfile)", in: source) else {
+            return report("AC-OFF8", "offline-unmount-guarded", false, "(could not locate remountOnPrimary body)")
+        }
+        guard !remountBody.contains("createOfflineShadow") else {
+            return report("AC-OFF8", "offline-unmount-guarded", false, "(remountOnPrimary unexpectedly creates an offline shadow)")
+        }
+        return report("AC-OFF8", "offline-unmount-guarded", true)
+    }
+
+    // MARK: - AC-OFF16 — BLOCKER: a no-sidecar SPARSE (under-allocated) file is never uploaded
+
+    private static func testOfflineSparseNoSidecarSkip() -> Bool {
+        let exclude = VFSCacheService.ExcludeMatcher(patterns: [])
+        let sparseFacts = OfflineFileFacts(
+            relativePath: "sparse.bin", name: "sparse.bin", hasSidecar: false,
+            dataSize: 10_485_761, allocatedBytes: 4096, sidecarMeta: nil
+        )
+        guard OfflineShadowPlanner.classifyOfflineFile(sparseFacts, unmountBoundary: Date(), exclude: exclude)
+                == .skip(reason: .sparseNoSidecar) else {
+            return report("AC-OFF16", "offline-sparse-no-sidecar-skip", false, "(under-allocated no-sidecar file was not .skip(.sparseNoSidecar))")
+        }
+        // Boundary case — exactly fully allocated must NOT be a false positive.
+        let boundaryFacts = OfflineFileFacts(
+            relativePath: "exact.bin", name: "exact.bin", hasSidecar: false,
+            dataSize: 4096, allocatedBytes: 4096, sidecarMeta: nil
+        )
+        guard OfflineShadowPlanner.classifyOfflineFile(boundaryFacts, unmountBoundary: Date(), exclude: exclude) == .upload else {
+            return report("AC-OFF16", "offline-sparse-no-sidecar-skip", false, "(exactly-allocated no-sidecar file was incorrectly skipped)")
+        }
+        return report("AC-OFF16", "offline-sparse-no-sidecar-skip", true)
+    }
+
+    // MARK: - AC-OFF17 — the emitted staging sweep is EXECUTED against a real fixture
+
+    /// Drives the exact bash text `SyncSetupService.offlineStagingSweep()`
+    /// emits against a fixture with spaces, nesting, a sparse file, and a
+    /// `.DS_Store` — grep-only would be insufficient for the highest-bug-risk
+    /// code in this feature. The sparse fixture seeks a full 64 MB past the
+    /// write, comfortably beyond the ~16 MB threshold observed empirically
+    /// where this APFS volume stops materializing a fully-allocated file for
+    /// a `seek`+`write` gap (measured 10 MB dense, 20 MB+ reliably sparse).
+    private static func testOfflineStagingSweepExecuted() -> Bool {
+        let fm = FileManager.default
+        let root = "\(selfTestRoot)/ac-off17"
+        try? fm.removeItem(atPath: root)
+        let dataRoot = "\(root)/cache/vfs/testremote/Remote Path"
+        let metaRoot = "\(root)/cache/vfsMeta/testremote/Remote Path"
+        let markerDir = "\(root)/cache/vfsOffline/testremote/Remote Path"
+        do {
+            try fm.createDirectory(atPath: "\(dataRoot)/Nested Folder/Sub Dir", withIntermediateDirectories: true)
+            try fm.createDirectory(atPath: metaRoot, withIntermediateDirectories: true)
+            try fm.createDirectory(atPath: markerDir, withIntermediateDirectories: true)
+        } catch {
+            return report("AC-OFF17", "offline-staging-sweep-exec", false, "(failed to create fixture dirs: \(error))")
+        }
+        fm.createFile(atPath: "\(markerDir)/unmounted-at", contents: Data("2026-01-01T00:00:00Z".utf8))
+
+        let userFileRel = "Nested Folder/Sub Dir/My New File.txt"
+        fm.createFile(atPath: "\(dataRoot)/\(userFileRel)", contents: Data("hello world".utf8))
+        fm.createFile(atPath: "\(dataRoot)/.DS_Store", contents: Data("junk".utf8))
+
+        fm.createFile(atPath: "\(dataRoot)/streamed.bin", contents: Data(repeating: 1, count: 10))
+        fm.createFile(atPath: "\(metaRoot)/streamed.bin", contents: Data("{}".utf8))
+
+        let sparsePath = "\(dataRoot)/sparse.bin"
+        fm.createFile(atPath: sparsePath, contents: nil)
+        if let handle = FileHandle(forWritingAtPath: sparsePath) {
+            handle.seek(toFileOffset: 64 * 1024 * 1024)
+            handle.write(Data([0xFF]))
+            try? handle.close()
+        } else {
+            return report("AC-OFF17", "offline-staging-sweep-exec", false, "(could not open sparse fixture for writing)")
+        }
+
+        let fragment = SyncSetupService.shared.offlineStagingSweep()
+        guard fragment.contains("vfsPending"), fragment.contains(".DS_Store") else {
+            return report("AC-OFF17", "offline-staging-sweep-exec", false, "(fragment missing expected content)")
+        }
+
+        let configFile = "\(root)/config.json"
+        let logFile = "\(root)/sweep.log"
+        do {
+            try "{\"warmExcludePatterns\": []}".write(toFile: configFile, atomically: true, encoding: .utf8)
+        } catch {
+            return report("AC-OFF17", "offline-staging-sweep-exec", false, "(failed to write config fixture: \(error))")
+        }
+
+        let script = """
+        #!/bin/bash
+        set -u
+        REMOTE_NAME="testremote"
+        REMOTE_PATH="Remote Path"
+        VFS_CACHE_PATH="\(root)/cache"
+        CONFIG_FILE="\(configFile)"
+        LOG_FILE="\(logFile)"
+        \(fragment)
+        """
+        let scriptPath = "\(root)/sweep.sh"
+        do {
+            try script.write(toFile: scriptPath, atomically: true, encoding: .utf8)
+            try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: scriptPath)
+        } catch {
+            return report("AC-OFF17", "offline-staging-sweep-exec", false, "(failed to write sweep script: \(error))")
+        }
+
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/bash")
+        process.arguments = [scriptPath]
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = pipe
+        do {
+            try process.run()
+        } catch {
+            return report("AC-OFF17", "offline-staging-sweep-exec", false, "(failed to launch /bin/bash: \(error))")
+        }
+        process.waitUntilExit()
+        guard process.terminationStatus == 0 else {
+            let output = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+            return report("AC-OFF17", "offline-staging-sweep-exec", false, "(sweep exited \(process.terminationStatus): \(output))")
+        }
+
+        let pendingRoot = "\(root)/cache/vfsPending/testremote/Remote Path"
+
+        guard fm.fileExists(atPath: "\(pendingRoot)/\(userFileRel)") else {
+            return report("AC-OFF17", "offline-staging-sweep-exec", false, "(user-authored nested/spaced file was not staged)")
+        }
+        guard !fm.fileExists(atPath: "\(dataRoot)/\(userFileRel)") else {
+            return report("AC-OFF17", "offline-staging-sweep-exec", false, "(user-authored file was not moved out of vfs)")
+        }
+        guard !fm.fileExists(atPath: "\(pendingRoot)/.DS_Store"), fm.fileExists(atPath: "\(dataRoot)/.DS_Store") else {
+            return report("AC-OFF17", "offline-staging-sweep-exec", false, "(.DS_Store was staged or removed)")
+        }
+        guard !fm.fileExists(atPath: "\(pendingRoot)/streamed.bin"), fm.fileExists(atPath: "\(dataRoot)/streamed.bin") else {
+            return report("AC-OFF17", "offline-staging-sweep-exec", false, "(sidecar'd streamed file was staged or removed)")
+        }
+        guard !fm.fileExists(atPath: "\(pendingRoot)/sparse.bin"), fm.fileExists(atPath: "\(dataRoot)/sparse.bin") else {
+            return report("AC-OFF17", "offline-staging-sweep-exec", false, "(sparse no-sidecar file was staged — R19 BLOCKER regression)")
+        }
+        var isDir: ObjCBool = false
+        guard fm.fileExists(atPath: "\(pendingRoot)/\(userFileRel)", isDirectory: &isDir), !isDir.boolValue else {
+            return report("AC-OFF17", "offline-staging-sweep-exec", false, "(staged entry is a directory, not a file)")
+        }
+
+        return report("AC-OFF17", "offline-staging-sweep-exec", true)
+    }
+
+    // MARK: - AC-OFF18 — shadow creation is scoped to genuine user-initiated unmount
+
+    private static func testOfflineShadowScope() -> Bool {
+        guard OfflineShadowPlanner.shouldCreateShadow(reason: .userInitiated) else {
+            return report("AC-OFF18", "offline-shadow-scope", false, "(userInitiated unmount did not create a shadow)")
+        }
+        let nonCreating: [UnmountReason] = [.remountOnPrimary, .settingsReinstall, .cacheMigration, .profileDelete]
+        for reason in nonCreating {
+            guard !OfflineShadowPlanner.shouldCreateShadow(reason: reason) else {
+                return report("AC-OFF18", "offline-shadow-scope", false, "(\(reason) unexpectedly created a shadow)")
+            }
+        }
+
+        guard let source = readSourceFile("Services/SyncManager.swift") else {
+            return report("AC-OFF18", "offline-shadow-scope", false, "(could not read SyncManager.swift source)")
+        }
+        guard let migrateBody = extractFunctionBody(startingAt: "private func migrateCacheDirectory(", in: source) else {
+            return report("AC-OFF18", "offline-shadow-scope", false, "(could not locate migrateCacheDirectory body)")
+        }
+        guard !migrateBody.contains("OfflineShadow") else {
+            return report("AC-OFF18", "offline-shadow-scope", false, "(migrateCacheDirectory references the offline-shadow surface)")
+        }
+
+        return report("AC-OFF18", "offline-shadow-scope", true)
+    }
+
+    // MARK: - AC-OFF10 — inject deletes a staged file only after a sidecar confirms handoff
+
+    private static func testOfflineInjectConfirmed() -> Bool {
+        let (fs, fake) = fakeOfflineFileSystem()
+        let pendingRoot = "/pending/key"
+        let metaRoot = "/meta/key"
+        let localSyncPath = "/mount"
+
+        fake.files["\(pendingRoot)/confirmed.txt"] = 11
+        fake.files["\(pendingRoot)/unconfirmed.txt"] = 5
+        // Pre-seed the sidecar rclone would have written after accepting the
+        // "confirmed" write — the fake's `copyFileData` doesn't itself model
+        // rclone's async caching, so this stands in for that.
+        fake.textFiles["\(metaRoot)/confirmed.txt"] = "{}"
+
+        let result = OfflineShadowService.inject(pendingRoot: pendingRoot, metaRoot: metaRoot, localSyncPath: localSyncPath, fs: fs)
+
+        guard result.injected == 1, result.retained == 1 else {
+            return report("AC-OFF10", "offline-inject-confirmed", false, "(unexpected counts: injected=\(result.injected) retained=\(result.retained))")
+        }
+        guard fake.files["\(pendingRoot)/confirmed.txt"] == nil else {
+            return report("AC-OFF10", "offline-inject-confirmed", false, "(confirmed staged copy was not deleted)")
+        }
+        guard fake.files["\(pendingRoot)/unconfirmed.txt"] != nil else {
+            return report("AC-OFF10", "offline-inject-confirmed", false, "(unconfirmed staged copy was deleted despite no sidecar)")
+        }
+        guard fake.copiedPaths.contains(where: { $0.0 == "\(pendingRoot)/confirmed.txt" }),
+              fake.copiedPaths.contains(where: { $0.0 == "\(pendingRoot)/unconfirmed.txt" }) else {
+            return report("AC-OFF10", "offline-inject-confirmed", false, "(both staged files were not written through the mount)")
+        }
+        return report("AC-OFF10", "offline-inject-confirmed", true)
+    }
+
+    // MARK: - AC-OFF11 — staging is a same-volume rename, never a copy
+
+    private static func testOfflineStageRename() -> Bool {
+        let (fs, fake) = fakeOfflineFileSystem()
+        let dataRoot = "/vfs/key"
+        let pendingRoot = "/pending/key"
+        fake.files["\(dataRoot)/new.txt"] = 42
+
+        let plan = OfflineReconcilePlan(uploads: ["new.txt"])
+        OfflineShadowService.stagePending(plan: plan, dataRoot: dataRoot, pendingRoot: pendingRoot, fs: fs)
+
+        guard fake.movedPaths.count == 1, fake.movedPaths[0] == ("\(dataRoot)/new.txt", "\(pendingRoot)/new.txt") else {
+            return report("AC-OFF11", "offline-stage-rename", false, "(unexpected movedPaths: \(fake.movedPaths))")
+        }
+        guard fake.copiedPaths.isEmpty else {
+            return report("AC-OFF11", "offline-stage-rename", false, "(staging used a copy instead of a same-volume rename: \(fake.copiedPaths))")
+        }
+        guard fake.files["\(pendingRoot)/new.txt"] == 42, fake.files["\(dataRoot)/new.txt"] == nil else {
+            return report("AC-OFF11", "offline-stage-rename", false, "(file was not relocated)")
+        }
+        return report("AC-OFF11", "offline-stage-rename", true)
     }
 }
 

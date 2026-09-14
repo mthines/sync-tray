@@ -63,6 +63,15 @@ final class SyncManager: ObservableObject {
     /// later remount warms again and picks up files added on the remote in the meantime.
     private var autoWarmedMounts: Set<UUID> = []
 
+    /// Profiles the app has already reconciled (injected pending offline-authored
+    /// uploads for) in their CURRENT mount session — the offline-read/write
+    /// counterpart of `autoWarmedMounts`, tracked SEPARATELY because the two
+    /// concerns have different re-arm semantics (a profile can have pending
+    /// offline files without being warm-eligible, and vice versa). Mirrors
+    /// `shouldAutoWarmOnMount`'s "fire exactly once per mount session, re-arm on
+    /// unmount" shape via `OfflineShadowPlanner.shouldReconcileOnMount`.
+    private var reconciledMounts: Set<UUID> = []
+
     /// Live progress of an in-flight cache-directory move, keyed by the
     /// profile whose Cache Directory is changing. Drives `CacheMoveSheet`'s
     /// progress UI.
@@ -362,8 +371,27 @@ final class SyncManager: ObservableObject {
                             // Update App Group mount paths so the FinderSync extension
                             // registers this newly mounted directory.
                             updateAppGroupMountPaths()
-                            // Auto-refresh pinned directories after successful mount
-                            if !profile.pinnedDirectories.isEmpty {
+
+                            // D5: offline-reconcile injection runs BEFORE any warm for
+                            // this mount session. If there are files staged by the
+                            // script's offline sweep (D3), claim BOTH guard sets here
+                            // so the mount monitor's own warm-on-detect
+                            // (reconcileMountStatesOffMain) can't also fire for this
+                            // same mount — `reconcileOfflineFiles` starts the deferred
+                            // warm itself once injection completes.
+                            let shadowFS = OfflineShadowFileSystem.production()
+                            let auxRoots = OfflineShadowService.auxiliaryRoots(for: profile)
+                            let hasPending = OfflineShadowService.hasPendingFiles(pendingRoot: auxRoots.pending, fs: shadowFS)
+                            if OfflineShadowPlanner.shouldReconcileOnMount(
+                                isMounted: true,
+                                hasPendingFiles: hasPending,
+                                profileId: profile.id,
+                                alreadyReconciled: &reconciledMounts
+                            ) {
+                                autoWarmedMounts.insert(profile.id)
+                                reconcileOfflineFiles(for: profile)
+                            } else if !profile.pinnedDirectories.isEmpty {
+                                // Auto-refresh pinned directories after successful mount.
                                 // Claim the warm here so the mount monitor's own
                                 // warm-on-detect (reconcileMountStatesOffMain) doesn't also
                                 // fire for this same mount.
@@ -406,6 +434,7 @@ final class SyncManager: ObservableObject {
         // Stop any warming first — reads through a mount that's going away would hang or fail.
         cancelWarm(for: profile.id)
         autoWarmedMounts.remove(profile.id)  // re-arm auto-warm for the next mount
+        reconciledMounts.remove(profile.id)  // re-arm offline-reconcile for the next mount
 
         Task {
             do {
@@ -421,6 +450,21 @@ final class SyncManager: ObservableObject {
                     // Update App Group mount paths so the FinderSync extension
                     // unregisters this directory.
                     updateAppGroupMountPaths()
+
+                    // D7/R22: this is the ONLY caller that creates an offline-browse
+                    // shadow — a genuine user-initiated unmount, the feature's whole
+                    // purpose. `remountOnPrimary`, the settings-save reinstall path,
+                    // cache-directory migration, and profile delete all call
+                    // `setupService.unmount`/`uninstall` directly and never reach here,
+                    // so none of them ever create (or need to consult) a shadow.
+                    // Guarded so a shadow-creation failure can NEVER surface into (or
+                    // block) the unmount path itself (AC-OFF8).
+                    do {
+                        try Self.createOfflineShadow(for: profile)
+                    } catch {
+                        SyncTraySettings.debugLog(
+                            "unmountProfile: failed to create offline shadow for '\(profile.name)': \(error)")
+                    }
                 }
             } catch {
                 await MainActor.run {
@@ -2340,6 +2384,67 @@ final class SyncManager: ObservableObject {
         warmTasks[profileId]?.cancel()
     }
 
+    // MARK: - Offline Read/Write (P1 browse + P2 add-new-file reconcile)
+
+    /// D1/D2/D6 — replace the (now-empty) mountpoint with a symlink to the cache
+    /// DATA subtree, when there's something to browse, and write the
+    /// `unmounted-at` marker that gates the next mount's staging sweep. Called
+    /// ONLY from `unmountProfile`'s success path (D7/R22) — see the caller audit
+    /// table in the plan. `static` + `nonisolated` so it touches no `SyncManager`
+    /// state, mirroring the rest of this file's pure/injected-boundary split.
+    private static func createOfflineShadow(for profile: SyncProfile) throws {
+        guard profile.isMountMode else { return }
+        let fs = OfflineShadowFileSystem.production()
+        let roots = VFSCacheService.shared.cacheSubtreeRoots(for: profile)
+        let decision = OfflineShadowService.shadowLinkDecision(dataRoot: roots.data, isMounted: false, fs: fs)
+        try OfflineShadowService.applyShadowLink(decision, mountPath: profile.localSyncPath, fs: fs)
+
+        let aux = OfflineShadowService.auxiliaryRoots(for: profile)
+        let markerPath = OfflineShadowService.unmountMarkerPath(offlineRoot: aux.offline)
+        try OfflineShadowService.writeUnmountMarker(at: markerPath, timestamp: Date(), fs: fs)
+    }
+
+    /// D4/D5 — inject any offline-authored files the script's staging sweep (D3)
+    /// left in `vfsPending/{key}` back through the now-live mount, then clear the
+    /// `unmounted-at` marker on success (so a routine future mount doesn't
+    /// re-walk the cache, R23) and finally kick the deferred warm for this
+    /// session — injection always finishes (or has nothing left to retry)
+    /// BEFORE a warm starts pulling new remote bytes into the same cache (D5's
+    /// "one writer to the mount at a time" guarantee).
+    private func reconcileOfflineFiles(for profile: SyncProfile) {
+        Task { [weak self] in
+            guard let self else { return }
+            let fs = OfflineShadowFileSystem.production()
+            let dataRoots = VFSCacheService.shared.cacheSubtreeRoots(for: profile)
+            let aux = OfflineShadowService.auxiliaryRoots(for: profile)
+
+            // Defensive teardown — mirrors the script's own guard (D2) in case a
+            // Swift-driven mount raced ahead of (or ran instead of) the script's
+            // teardown. A no-op once the mount is actually live.
+            OfflineShadowService.tearDownShadowLink(mountPath: profile.localSyncPath, fs: fs)
+
+            let result = OfflineShadowService.inject(
+                pendingRoot: aux.pending,
+                metaRoot: dataRoots.meta,
+                localSyncPath: profile.localSyncPath,
+                fs: fs
+            )
+
+            await MainActor.run {
+                if result.retained == 0 {
+                    OfflineShadowService.clearUnmountMarker(
+                        at: OfflineShadowService.unmountMarkerPath(offlineRoot: aux.offline), fs: fs)
+                }
+                SyncTraySettings.debugLog(
+                    "reconcileOfflineFiles: '\(profile.name)' injected=\(result.injected) retained=\(result.retained)")
+
+                if !profile.pinnedDirectories.isEmpty {
+                    self.startWarm(for: profile.id, trigger: "startup")
+                }
+            }
+        }
+    }
+
     // MARK: - Cache Directory Migration
 
     /// Cancel an in-flight cache-directory migration for a profile. The
@@ -3194,6 +3299,14 @@ final class SyncManager: ObservableObject {
             let mounted = mountProfiles.reduce(into: [UUID: Bool]()) { acc, profile in
                 acc[profile.id] = self.setupService.isMounted(profile: profile)
             }
+            // Offline-reconcile "has pending files?" signal, computed off-main
+            // alongside the mount probe above — mirrors `mounted`'s shape so the
+            // merge-back block below stays a pure state update.
+            let shadowFS = OfflineShadowFileSystem.production()
+            let hasPending = mountProfiles.reduce(into: [UUID: Bool]()) { acc, profile in
+                let aux = OfflineShadowService.auxiliaryRoots(for: profile)
+                acc[profile.id] = OfflineShadowService.hasPendingFiles(pendingRoot: aux.pending, fs: shadowFS)
+            }
             DispatchQueue.main.async {
                 let before = Set(self.profileMountStates.filter { $0.value == .mounted }.keys)
                 for profile in mountProfiles {
@@ -3211,7 +3324,19 @@ final class SyncManager: ObservableObject {
                     // the same flag so this can't double-fire. Decided independently of the
                     // UI-state transition above, so a profile stuck in `.failed` still re-arms
                     // once it is actually unmounted.
-                    if Self.shouldAutoWarmOnMount(
+                    //
+                    // D5: offline-reconcile injection takes priority over — and defers —
+                    // the auto-warm for the SAME mount session, exactly like the
+                    // app-driven `mountProfile` path.
+                    if OfflineShadowPlanner.shouldReconcileOnMount(
+                        isMounted: isMounted,
+                        hasPendingFiles: hasPending[profile.id] == true,
+                        profileId: profile.id,
+                        alreadyReconciled: &self.reconciledMounts
+                    ) {
+                        self.autoWarmedMounts.insert(profile.id)
+                        self.reconcileOfflineFiles(for: profile)
+                    } else if Self.shouldAutoWarmOnMount(
                         isMounted: isMounted,
                         hasPinnedDirs: !profile.pinnedDirectories.isEmpty,
                         profileId: profile.id,

@@ -175,6 +175,123 @@ subtree/overlap/exclusion planning, no I/O), `SyncTray/Services/CacheMigrationSe
 (published per-profile progress), and `SyncTray/Views/Settings/CacheMoveSheet.swift`
 (the shared sheet for both UI entry points).
 
+#### Offline Read/Write
+
+A Stream (mount) profile's warmed VFS cache stays **browsable and writable**
+while the profile is unmounted (e.g. the external drive backing its NFS
+export is disconnected, or the remote is unreachable), and new files
+authored offline are uploaded automatically the next time the profile
+remounts. Shipped in two phases; a third is designed but deliberately
+deferred:
+
+- **P1 — offline browse (shipped).** On a genuine user-initiated unmount
+  (`SyncManager.unmountProfile` only — never on `remountOnPrimary`, the
+  settings-save reinstall path, `migrateCacheDirectory`, or profile delete;
+  see the caller-scoping table below), if the VFS cache's data subtree
+  (`{vfsCachePath}/vfs/{key}`) exists and is non-empty, SyncTray replaces the
+  now-empty local mountpoint with a **symlink** into that data directory.
+  Finder (and any other app) can browse and read the last-known-good cache
+  contents exactly as if the mount were still live. The generated sync
+  script tears this symlink down before every mount (`[ -L "$LOCAL_PATH" ]
+  && rm -f "$LOCAL_PATH"`), so a stale symlink never blocks `nfsmount`/`mount`
+  from creating the real mountpoint.
+- **P2 — offline-authored file upload on remount (shipped).** Writing a NEW
+  file into the shadow symlink while offline lands it in the VFS cache's data
+  tree with no corresponding `vfsMeta/{key}/…` sidecar — the sidecar is only
+  ever written by rclone itself, so "no sidecar" is the safe signal for
+  "user-authored, never streamed by rclone." On the next mount, the
+  generated sync script's **staging sweep** runs (gated on a
+  `{vfsCachePath}/vfsOffline/{key}/unmounted-at` marker written at unmount
+  time, so the full-tree walk never runs on a routine mount): it walks the
+  data tree with a null-delimited `find … -print0` (safe against spaces and
+  nested paths), skips `.DS_Store`/`._*`/`warmExcludePatterns` matches, and
+  **only stages a file that is fully block-allocated**
+  (`stat -f %b × 512 ≥ stat -f %z` — i.e. no sparse holes) — any sidecar-less
+  file that is NOT fully allocated is left in place untouched, never staged.
+  Eligible files are `mv`'d (same-volume rename, zero extra disk I/O) into
+  `{vfsCachePath}/vfsPending/{key}`. Once the mount is live, the app injects
+  each staged file by writing it back through the mount (so rclone's own
+  write-back path performs the actual upload) and deletes the staged copy
+  only after the corresponding `vfsMeta` sidecar confirms rclone accepted
+  the write — never before.
+- **P3 — in-place edit reconcile (designed, NOT implemented).** Re-uploading
+  an offline edit to an EXISTING (sidecar'd) file is deliberately deferred to
+  a separate gated PR. The intended gate: a sidecar'd file whose data mtime
+  is newer than the unmount boundary is eligible for upload only if it still
+  passes `VFSCacheService.isCacheComplete` — a size-changing edit fails that
+  check (`Size` mismatch) and is correctly skipped rather than uploaded as a
+  partial; a same-size in-place edit is the one residual ambiguity this
+  design does not yet resolve, which is why P3 ships separately rather than
+  bundled with P1/P2.
+
+**The sparse-file guard is a data-safety BLOCKER, not a nice-to-have.** A
+sidecar-less data file can exist without being complete — an interrupted
+download, a process crash mid-write, an independently evicted sidecar
+(`--vfs-cache-max-age`), or (unconfirmed in this environment; see the spike
+note below) rclone itself writing cache data before its sidecar. Uploading
+such a file as if it were a complete user-authored file would zero-overwrite
+the real remote original with a truncated/sparse copy. The block-allocation
+check (`allocatedBytes ≥ logicalSize`) exists in BOTH the pure Swift
+classifier (`OfflineShadowPlanner.classifyOfflineFile`) and the bash staging
+sweep independently, so neither layer depends on the other to catch it.
+
+**Deletions are never propagated.** The offline reconcile plan's result type
+(`OfflineReconcilePlan`) structurally has no delete/removal case — a file
+absent from a scan simply produces no action, not a delete action. This
+means an offline **deletion silently reverts on remount**: the file
+reappears once the live mount re-shows the remote's state. This is expected
+behavior, not a bug — propagating an offline delete would risk deleting a
+remote file based on an incomplete/aborted offline session with no chance to
+confirm intent.
+
+**Cosmetic note:** there is a brief empty-folder flash at mount time — the
+shadow symlink is torn down just before `nfsmount`/`mount` populates the
+real mountpoint, so Finder can show an empty folder for a moment mid-mount.
+
+**Shadow-creation caller scoping (data-safety invariant).** Only
+`SyncManager.unmountProfile`'s genuine user-initiated unmount path may create
+a shadow symlink or write the `unmounted-at` marker
+(`OfflineShadowPlanner.shouldCreateShadow(reason:)` returns true only for
+`.userInitiated`). `remountOnPrimary` (primary-recovery remount),
+`SyncSetupService`'s settings-save reinstall, `migrateCacheDirectory`
+(Cache Directory Migration, above), and profile delete all detach the
+volume too, but none of them creates or consults a shadow — a migration in
+particular must never race a live shadow/staging cycle. Covered by
+`ConfigSelfTest`'s AC-OFF8/AC-OFF18.
+
+**Reconcile-on-mount runs at most once per mount session**, mirroring
+`shouldAutoWarmOnMount`'s pattern but tracked in its own `reconciledMounts`
+set (not shared with `autoWarmedMounts` — the two have different re-arm
+semantics): the first tick a profile is observed mounted with pending
+offline-authored files triggers `SyncManager.reconcileOfflineFiles(for:)`;
+the offline-file warm is deferred until injection completes so the two
+mount-mode background operations never race the same cache subtree.
+
+**rclone write-ordering spike (R14) — inconclusive in this environment.**
+The no-sidecar-implies-user-authored invariant assumes rclone never leaves a
+cache data file without its `vfsMeta` sidecar mid-stream. An attempt was
+made to confirm this empirically against a local (non-production) rclone
+VFS mount — `rclone nfsmount` against a throwaway local backend, observed
+via `--log-level DEBUG`. The mount established at the NFS RPC level (the
+server answered `Lookup`/`GetAttr`/`FSStat` calls), but every subsequent
+filesystem operation against the mountpoint failed with "Operation not
+permitted," and the classic macOS workaround
+(`vfs.generic.nfs.client.mount.require_resv_port`) is not even a valid
+`sysctl` OID in this sandboxed session — consistent with a restricted NFS
+client stack unrelated to rclone or this feature's code. **The spike did not
+complete; this is reported honestly rather than claimed as passing.** The
+`allocatedBytes` block-allocation guard is the designed safety net
+regardless of the spike's outcome (see the BLOCKER paragraph above) — the
+feature's data-safety property does not depend on confirming rclone's
+ordering, only on refusing to upload anything that isn't provably complete.
+
+New source files: `SyncTray/Services/OfflineShadowPlanner.swift` (pure —
+shadow-link decision, offline-file classification incl. the sparse-no-sidecar
+BLOCKER guard, reconcile-once-per-mount-session guard, no I/O) and
+`SyncTray/Services/OfflineShadowService.swift` (the injected-filesystem
+engine — shadow create/teardown, marker read/write, offline-file scan,
+same-volume-rename staging, write-through-mount injection).
+
 ### How It Works
 1. User configures a profile: local path, rclone remote, and sync interval
 2. SyncTray generates a shell script and launchd plist for scheduled syncs
@@ -369,6 +486,8 @@ the warmer reads as before — safe degradation.
 | `TelemetryService.swift` | Opt-in OTel telemetry (traces, metrics, logs) via OTLP/HTTP |
 | `CacheMigrationPlanner.swift` | Pure cache-directory-move planning — `CacheTreeKind` (`vfs`/`vfsMeta`), subtree/overlap/exclusion resolution, no I/O |
 | `CacheMigrationService.swift` | The cache-move engine — injected `CacheMigrationFileSystem`, free-space preflight, copy → verify → delete per file with a same-volume rename fast path, cancellation, resume, rollback |
+| `OfflineShadowPlanner.swift` | Pure offline-read/write planning — shadow-link decision, offline-file classification incl. the sparse-no-sidecar BLOCKER guard (R19), shadow-creation caller scoping (`shouldCreateShadow`), reconcile-once-per-mount-session guard, no I/O |
+| `OfflineShadowService.swift` | The offline-shadow engine — injected `OfflineShadowFileSystem`, shadow symlink create/teardown, unmount marker read/write, offline-authored file scan, same-volume-rename staging, write-through-mount injection |
 
 ### CLI/
 
@@ -886,6 +1005,8 @@ open ~/Library/Developer/Xcode/DerivedData/SyncTray-*/Build/Products/Debug/SyncT
 | `TelemetryService.swift` | OTel singleton — traces, metrics, logs via OTLP/HTTP |
 | `TelemetryDetailsSheet.swift` | Shared privacy disclosure sheet for wizard, banner, and settings |
 | `Settings.swift` | Global settings including `installationId`, `anonymousUserId`, and `autoFixSyncIssues` |
+| `OfflineShadowPlanner.swift` | Pure offline read/write logic — shadow-link decision, sparse-no-sidecar BLOCKER classification, shadow-creation caller scoping, reconcile-once-per-mount guard (see "Offline Read/Write") |
+| `OfflineShadowService.swift` | Injected-filesystem offline-shadow engine — shadow create/teardown, marker, scan, stage, inject |
 
 ## Telemetry
 
@@ -929,3 +1050,5 @@ Priority: process env vars > `~/.config/synctray/.env` > Info.plist. Key vars: `
 | `/tmp/synctray-sync-{shortId}.lock` | Lock file (prevents concurrent syncs) |
 | `{vfsCachePath}/vfs/{remote}/{path}/…` | Mount mode only — VFS cached file **data** |
 | `{vfsCachePath}/vfsMeta/{remote}/{path}/…` | Mount mode only — VFS metadata sidecars, including the `--vfs-cache-mode full` downloaded byte-range list. Load-bearing for Cache Directory Migration: moving `vfs` without `vfsMeta` makes rclone re-download everything. |
+| `{vfsCachePath}/vfsOffline/{remote}/{path}/unmounted-at` | Mount mode only — marker written on a genuine user-initiated unmount; gates the staging sweep and reconcile-on-mount (see "Offline Read/Write"). Cleared once injection completes. |
+| `{vfsCachePath}/vfsPending/{remote}/{path}/…` | Mount mode only — offline-authored files staged (same-volume rename) out of the VFS data tree, awaiting write-through-mount injection on the next mount. Emptied once injection completes. |
