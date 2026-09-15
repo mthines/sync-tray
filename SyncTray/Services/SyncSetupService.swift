@@ -180,6 +180,22 @@ final class SyncSetupService {
         return result.exitCode == 0
     }
 
+    /// Whether the profile's launchd job currently has a live process. Used as a
+    /// liveness signal while polling for a mount to establish: `rclone nfsmount`
+    /// walks the whole VFS cache before it attaches the NFS volume, which on a
+    /// large cache takes minutes (observed ~112s for a 121GB / 12k-file cache), so
+    /// a not-yet-mounted profile whose agent is still running is *establishing*,
+    /// not failed. A job that reports no PID (its script/rclone exited and — for a
+    /// non-KeepAlive profile — nothing respawned it) is the fail-fast signal that
+    /// the mount attempt is genuinely dead rather than slow.
+    func isMountAgentRunning(profile: SyncProfile) -> Bool {
+        let result = runCommand("/bin/launchctl", arguments: ["list", profile.launchdLabel])
+        guard result.exitCode == 0 else { return false }
+        // A running job's dict contains a `"PID" = <n>;` entry; a loaded-but-idle
+        // job (script exited, awaiting its next KeepAlive/schedule) omits it.
+        return result.output.contains("\"PID\" =")
+    }
+
     /// Unload the launchd agent WITHOUT removing any files. Used by pause so a
     /// paused profile stops firing scheduled syncs; resume calls `loadAgent`.
     @discardableResult

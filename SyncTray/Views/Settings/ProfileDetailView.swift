@@ -1529,7 +1529,9 @@ struct ProfileDetailView: View {
                     switch mountState {
                     case .mounting:
                         ProgressView().controlSize(.small)
-                        Text("Mounting…").foregroundStyle(.blue)
+                        Text(syncManager.profileMountProgress[profile.id] ?? "Mounting…")
+                            .foregroundStyle(.blue)
+                            .lineLimit(2)
                     case .mounted:
                         Label("Streaming", systemImage: "dot.radiowaves.left.and.right")
                             .foregroundColor(.green)

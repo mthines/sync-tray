@@ -52,6 +52,7 @@ enum ConfigSelfTest {
             testWarmExcludePatternsRoundTrip,
             testWarmSkipsCachedFiles,
             testMountMonitorAutoWarm,
+            testMountPollDecision,
             testWarmReconcileTrigger,
             testMigrationIntegrity,
             testExternalCreateEnabled,
@@ -640,6 +641,55 @@ enum ConfigSelfTest {
     }
 
     // MARK: - AC-24 — mount monitor auto-warms a detected mount once per session
+
+    // MARK: - AC-MP1 — mount-establishment poll decision + staged loading text
+
+    /// The mount poll must stay in `.mounting` while a large VFS cache walk is
+    /// still establishing (up to 5 min), fail fast only when the launchd agent is
+    /// genuinely stopped, and never mis-read a mount that comes up on the same tick
+    /// the cap elapses. Also asserts the loading text escalates through distinct
+    /// buckets. Drives the pure `SyncManager.mountPollDecision` /
+    /// `mountProgressMessage` without a real mount.
+    private static func testMountPollDecision() -> Bool {
+        let maxS = 300, dead = 3
+        func decide(_ elapsed: Int, _ mounted: Bool, _ alive: Bool, _ consec: Int) -> SyncManager.MountPollDecision {
+            SyncManager.mountPollDecision(
+                elapsedSeconds: elapsed, maxSeconds: maxS, isMounted: mounted,
+                agentAlive: alive, consecutiveDead: consec, deadThreshold: dead)
+        }
+        // isMounted wins over everything — even at the cap or with a long-dead agent.
+        if decide(0, true, false, 99) != .established {
+            return report("AC-MP1", "mount-poll-decision", false, "(mounted not established)")
+        }
+        if decide(maxS, true, false, 99) != .established {
+            return report("AC-MP1", "mount-poll-decision", false, "(mounted-at-cap not established)")
+        }
+        // Not mounted, agent alive, before cap → keep the loading state.
+        if decide(40, false, true, 0) != .keepWaiting {
+            return report("AC-MP1", "mount-poll-decision", false, "(establishing not keepWaiting)")
+        }
+        // Agent momentarily not-alive but under the threshold → still waiting (respawn gap).
+        if decide(40, false, false, dead - 1) != .keepWaiting {
+            return report("AC-MP1", "mount-poll-decision", false, "(one dead sample failed too early)")
+        }
+        // Agent dead for >= threshold consecutive samples → fail fast.
+        if decide(40, false, false, dead) != .failedDead {
+            return report("AC-MP1", "mount-poll-decision", false, "(dead agent not failedDead)")
+        }
+        // Not mounted, agent alive, cap reached → timeout.
+        if decide(maxS, false, true, 0) != .failedTimeout {
+            return report("AC-MP1", "mount-poll-decision", false, "(cap not failedTimeout)")
+        }
+        // Staged loading text: distinct, escalating, non-empty buckets.
+        let msgs = [0, 20, 60, 200].map { SyncManager.mountProgressMessage(elapsedSeconds: $0) }
+        if Set(msgs).count != msgs.count {
+            return report("AC-MP1", "mount-poll-decision", false, "(progress buckets not distinct: \(msgs))")
+        }
+        if msgs.contains(where: { $0.isEmpty }) {
+            return report("AC-MP1", "mount-poll-decision", false, "(empty progress message)")
+        }
+        return report("AC-MP1", "mount-poll-decision", true)
+    }
 
     /// A launchd/externally-mounted Stream profile (e.g. auto-mounted at login) never runs
     /// the app's mount-path warm, so new remote files never reach the offline cache. The 5s

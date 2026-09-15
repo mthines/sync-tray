@@ -40,6 +40,13 @@ final class SyncManager: ObservableObject {
     /// Mount state per profile (for mount mode profiles only)
     @Published private(set) var profileMountStates: [UUID: MountState] = [:]
 
+    /// Human-friendly status shown under a `.mounting` profile, escalated by how
+    /// long establishment has taken (see `mountProgressMessage`). Lets the UI say
+    /// "Starting mount…" → "Mounting…" → "warming a large cache…" instead of a
+    /// single static label during a multi-minute NFS cache walk. Cleared when the
+    /// mount resolves.
+    @Published private(set) var profileMountProgress: [UUID: String] = [:]
+
     /// Active transport per profile (primary or fallback)
     @Published private(set) var profileTransports: [UUID: ActiveTransport] = [:]
 
@@ -313,10 +320,56 @@ final class SyncManager: ObservableObject {
     }
 
     /// Mount a profile (for mount mode only)
+    /// Outcome of one tick of the mount-establishment poll.
+    enum MountPollDecision: Equatable {
+        case established    // the volume is in the mount table now
+        case keepWaiting    // not mounted yet, still establishing — stay in `.mounting`
+        case failedDead     // the mount agent stopped (fail fast, don't wait the cap)
+        case failedTimeout  // the hard time cap elapsed while still unmounted
+    }
+
+    /// Pure decision for the mount-establishment poll (see `mountProfile`).
+    /// Extracted so the timeout / liveness logic is unit-testable without a real
+    /// mount (`ConfigSelfTest` AC-MP1). A mount is `.established` the moment the
+    /// volume appears; otherwise an agent that is still alive means "establishing"
+    /// (keep the loading state) up to `maxSeconds`, while `deadThreshold`
+    /// consecutive not-alive samples end it early as `.failedDead` — so a genuinely
+    /// stopped agent fails fast, but a KeepAlive respawn gap (one missed sample)
+    /// does not.
+    /// - Note: `isMounted` wins over everything, so a mount that comes up on the
+    ///   same tick the cap elapses still reports success.
+    static func mountPollDecision(
+        elapsedSeconds: Int,
+        maxSeconds: Int,
+        isMounted: Bool,
+        agentAlive: Bool,
+        consecutiveDead: Int,
+        deadThreshold: Int
+    ) -> MountPollDecision {
+        if isMounted { return .established }
+        if !agentAlive && consecutiveDead >= deadThreshold { return .failedDead }
+        if elapsedSeconds >= maxSeconds { return .failedTimeout }
+        return .keepWaiting
+    }
+
+    /// Staged status text for a `.mounting` profile, chosen by how long the mount
+    /// has been establishing. Pure so the message buckets are unit-testable
+    /// (`ConfigSelfTest` AC-MP1). The later buckets reassure the user that a slow
+    /// mount is a large-cache walk, not a hang, and name the 5-minute ceiling.
+    static func mountProgressMessage(elapsedSeconds: Int) -> String {
+        switch elapsedSeconds {
+        case ..<8:   return "Starting mount…"
+        case ..<45:  return "Mounting…"
+        case ..<120: return "Mounting… warming a large cache, this can take a minute"
+        default:     return "Still mounting… large cache, this can take up to 5 minutes"
+        }
+    }
+
     func mountProfile(_ profile: SyncProfile) {
         guard profile.isMountMode else { return }
 
         profileMountStates[profile.id] = .mounting
+        profileMountProgress[profile.id] = Self.mountProgressMessage(elapsedSeconds: 0)
 
         Task {
             do {
@@ -337,20 +390,52 @@ final class SyncManager: ObservableObject {
                 let success = setupService.startAgent(for: profile)
 
                 if success {
-                    // Poll for the mount to establish. NFS mounts can take a while —
-                    // especially a fallback over a slower backend (SFTP handshake + VFS
-                    // warm-up + the NFS attach), which was observed taking ~14s and so
-                    // tripped the old 12s cap into a false "Mount did not establish". Give
-                    // it 30s; the 5s mount-state monitor still corrects any later arrival.
-                    var established = false
-                    for _ in 0..<30 {
-                        try? await Task.sleep(nanoseconds: 1_000_000_000)
-                        if setupService.isMounted(profile: profile) {
-                            established = true
-                            break
+                    // Poll for the mount to establish, staying in `.mounting` (the UI
+                    // shows a spinner) the whole time. A large VFS cache walk before the
+                    // NFS volume attaches can take minutes (observed ~112s for a 121GB /
+                    // 12k-file cache), so the old fixed 30s cap flipped the UI to a false
+                    // "Mount did not establish" while the mount was still coming up. Poll
+                    // up to 5 minutes using launchd job liveness as the signal: an
+                    // unmounted-but-agent-alive profile is still establishing; a stopped
+                    // agent (deadThreshold consecutive samples) fails fast; the 5-minute
+                    // cap is the backstop. The 5s mount-state monitor independently
+                    // confirms a late arrival, so this loop never needs to over-wait.
+                    let maxSeconds = 300
+                    let pollInterval = 2
+                    let deadThreshold = 3
+                    var decision: MountPollDecision = .keepWaiting
+                    var consecutiveDead = 0
+                    var elapsed = 0
+                    var lastProgress = Self.mountProgressMessage(elapsedSeconds: 0)
+                    while elapsed < maxSeconds {
+                        try? await Task.sleep(nanoseconds: UInt64(pollInterval) * 1_000_000_000)
+                        elapsed += pollInterval
+                        let mounted = setupService.isMounted(profile: profile)
+                        let alive = setupService.isMountAgentRunning(profile: profile)
+                        consecutiveDead = alive ? 0 : consecutiveDead + 1
+                        decision = Self.mountPollDecision(
+                            elapsedSeconds: elapsed,
+                            maxSeconds: maxSeconds,
+                            isMounted: mounted,
+                            agentAlive: alive,
+                            consecutiveDead: consecutiveDead,
+                            deadThreshold: deadThreshold
+                        )
+                        if decision != .keepWaiting { break }
+                        // Escalate the loading text only when the bucket changes, so a
+                        // multi-minute cache walk reads as progress, not a hang.
+                        let progress = Self.mountProgressMessage(elapsedSeconds: elapsed)
+                        if progress != lastProgress {
+                            lastProgress = progress
+                            await MainActor.run { self.profileMountProgress[profile.id] = progress }
                         }
                     }
+                    let established = (decision == .established)
+                    let failReason = decision == .failedDead
+                        ? "Mount agent stopped before the volume attached"
+                        : "Mount did not establish within 5 minutes"
                     await MainActor.run {
+                        profileMountProgress[profile.id] = nil
                         if established {
                             profileMountStates[profile.id] = .mounted
                             TelemetryService.shared.recordMountOperation(
@@ -375,7 +460,7 @@ final class SyncManager: ObservableObject {
                                 }
                             }
                         } else {
-                            profileMountStates[profile.id] = .failed("Mount did not establish")
+                            profileMountStates[profile.id] = .failed(failReason)
                             TelemetryService.shared.recordMountOperation(
                                 profileId: profile.id,
                                 profileName: profile.name,
