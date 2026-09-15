@@ -370,16 +370,28 @@ final class SyncSetupService {
         _ = unloadAgent(for: profile)
     }
 
-    /// Clean up stale mounts on app startup.
+    /// Clean up **orphaned** mounts on app startup — a mount point still in the mount
+    /// table whose `rclone` process is gone (e.g. left behind by a crash), which macOS
+    /// would otherwise surface as a dead volume.
     ///
     /// Matches mount points against the known mount-mode profile paths rather than
     /// the filesystem type. This is both backend-agnostic (handles macFUSE *and* the
     /// kext-free NFS backend, whose `mount` lines don't contain "rclone") and safe —
     /// it will never force-unmount an unrelated NFS share the user mounted themselves.
+    ///
+    /// **Liveness gate (critical):** a managed mount point is force-unmounted ONLY when
+    /// its owning profile's launchd job is NOT running — i.e. no live `rclone` is serving
+    /// it. A HEALTHY live mount (job running) is left untouched. Without this gate, every
+    /// app launch tore down a perfectly good stream and let launchd `KeepAlive` remount it
+    /// (a multi-minute cache walk on a large VFS cache), which macOS reports as "Server
+    /// connections interrupted" — a self-inflicted disconnect on startup.
     /// - Parameter mountProfiles: mount-mode profiles whose paths are owned by SyncTray.
     func cleanupStaleMounts(mountProfiles: [SyncProfile]) {
-        let managedPaths = Set(mountProfiles.filter { $0.isMountMode }.map { $0.localSyncPath })
-        guard !managedPaths.isEmpty else { return }
+        let managed = mountProfiles.filter { $0.isMountMode }
+        guard !managed.isEmpty else { return }
+        // Map mount point → owning profile so we can check that profile's liveness.
+        let profileByPath = Dictionary(managed.map { ($0.localSyncPath, $0) },
+                                       uniquingKeysWith: { first, _ in first })
 
         let result = runCommand("/sbin/mount", arguments: [])
         let lines = result.output.components(separatedBy: "\n")
@@ -391,10 +403,12 @@ final class SyncSetupService {
                   let parenRange = line.range(of: " (") else { continue }
             let mountPoint = String(line[onRange.upperBound..<parenRange.lowerBound])
 
-            // Only unmount paths SyncTray manages — never a user's own NFS/FUSE mount.
-            if managedPaths.contains(mountPoint) {
-                _ = runCommand("/usr/sbin/diskutil", arguments: ["unmount", "force", mountPoint])
-            }
+            // Only touch paths SyncTray manages — never a user's own NFS/FUSE mount.
+            guard let profile = profileByPath[mountPoint] else { continue }
+
+            // Leave a HEALTHY live mount alone; only clear a genuine orphan (job dead).
+            if isMountAgentRunning(profile: profile) { continue }
+            _ = runCommand("/usr/sbin/diskutil", arguments: ["unmount", "force", mountPoint])
         }
     }
 
