@@ -102,6 +102,10 @@
       "type": "boolean",
       "description": "Whether this mount profile auto-mounts at login/app launch."
     },
+    "offlineAccessEnabled": {
+      "type": "boolean",
+      "description": "Mount mode only. When true (default), SyncTray maintains a read-only \"<mount-name> (Offline)\" folder next to the mount point that links to the VFS cache, so already-cached files stay browsable in Finder while the network is down. App-side only — not consumed by the sync script."
+    },
     "pinnedDirectories": {
       "type": "array",
       "items": { "type": "string" },

@@ -95,6 +95,27 @@ returns. Two things make this reliable:
   raw cache tree has no `vfsMeta` sidecar, so rclone never uploads it (the recording is
   lost), and mounting NFS onto a symlink fails with `mount_nfs` exit 66.
 
+**Offline access browse point (`offlineAccessEnabled`, Advanced Options, default true).**
+The live mount is the intended offline path, but in practice `rclone nfsmount` over SMB
+does **not** always ride out a network drop — the backend connection can die, the NFS
+server stall, and macOS drop the volume ("Server connections interrupted"), so the live
+mount is not a dependable offline-read surface on its own. When this per-profile toggle
+is on (the default), SyncTray maintains a **read-only** `"<mount-name> (Offline)"`
+directory *next to* the mount point — a plain symlink to the VFS cache **data** tree
+(`{vfsCachePath}/vfs/{key}`) — so everything already cached stays browsable in Finder
+with no internet and no rclone process involved. It is a **sibling**, never the mount
+point itself (symlink-swapping the mount point is the exit-66 crash above), and it only
+ever *reads*: writing into it edits the raw cache with no `vfsMeta`, so those bytes never
+sync — the caption and docs say read-only for that reason. The whole mechanism is pure +
+a thin filesystem apply in `OfflineAccessLink.swift` (`linkPath`/`target`/`action` are
+I/O-free and shared with `VFSCacheService.cacheRelativePath`, so the link can never point
+at the wrong subtree); `SyncManager.maintainOfflineAccessLink(for:)` /
+`maintainAllOfflineAccessLinks()` apply it at launch, on a successful mount, and after
+every profile save / external-file edit / CLI write, and remove it on disable or delete.
+App-side only — like `mountAtStartup`/`pinnedDirectories` it is **not** emitted into the
+script's `{shortId}.json`. Covered by `ConfigSelfTest` AC-OA1 (pure decision matrix) and
+AC-OA2 (real filesystem apply).
+
 **Download connections (`downloadConnections`, default 2, range 1–16):** a per-profile
 "Download Connections" control (Advanced Options, mount mode only) that sets how many
 files download in parallel. It drives BOTH the mount's `--transfers` and the app-side

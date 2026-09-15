@@ -32,6 +32,13 @@ struct SyncProfile: Identifiable, Codable, Equatable {
     var vfsCachePath: String            // Cache directory path (default: ~/.cache/rclone)
     var allowNonEmptyMount: Bool        // Allow mounting to non-empty folders (default: false)
     var mountAtStartup: Bool            // Auto-mount when SyncTray launches (mount mode, default: true)
+    /// Maintain a read-only "<mount-name> (Offline)" browse point next to the mount that
+    /// links straight to the VFS cache DATA tree, so already-cached files stay readable in
+    /// Finder even when the network is down and the live `rclone nfsmount` has stalled/dropped
+    /// (rclone's streaming VFS cannot itself serve purely-from-cache offline). App-side only —
+    /// never written to the script's `{shortId}.json`. Mount mode; default: true. See the
+    /// "Offline access" section in CLAUDE.md.
+    var offlineAccessEnabled: Bool
     var pinnedDirectories: [String]     // Directories to automatically cache offline (mount mode)
     /// Glob patterns excluded from offline warming, matched **case-sensitively** against each
     /// file's name and its path relative to the pinned dir. Supports `*` (within a segment),
@@ -188,6 +195,7 @@ struct SyncProfile: Identifiable, Codable, Equatable {
         vfsCachePath: String = "",
         allowNonEmptyMount: Bool = false,
         mountAtStartup: Bool = true,
+        offlineAccessEnabled: Bool = true,
         pinnedDirectories: [String] = [],
         warmExcludePatterns: [String] = [],
         rcPort: Int = 0,
@@ -215,6 +223,7 @@ struct SyncProfile: Identifiable, Codable, Equatable {
         self.vfsCachePath = vfsCachePath.isEmpty ? "\(NSHomeDirectory())/.cache/rclone" : vfsCachePath
         self.allowNonEmptyMount = allowNonEmptyMount
         self.mountAtStartup = mountAtStartup
+        self.offlineAccessEnabled = offlineAccessEnabled
         self.pinnedDirectories = pinnedDirectories
         self.warmExcludePatterns = warmExcludePatterns
         self.rcPort = rcPort > 0 ? rcPort : SyncProfile.defaultRCPort(for: id)
@@ -248,7 +257,7 @@ extension SyncProfile {
         case fallbackRemote, fallbackRemotePath, fallbackRequiresCacheRebuild
         case mountBackend
         case vfsCacheMode, vfsCacheMaxSize, vfsCacheMaxAge, vfsCachePath, allowNonEmptyMount
-        case mountAtStartup
+        case mountAtStartup, offlineAccessEnabled
         case pinnedDirectories, warmExcludePatterns, rcPort
         case downloadConnections
     }
@@ -297,6 +306,10 @@ extension SyncProfile {
         // Backwards compatibility: auto-mount on startup defaults to true (matches the
         // pre-existing behaviour where an installed mount profile always came up on launch)
         mountAtStartup = try container.decodeIfPresent(Bool.self, forKey: .mountAtStartup) ?? true
+        // Backwards compatibility: offline access defaults to true, so a profile
+        // persisted before this field existed gains the read-only "(Offline)" browse
+        // point on its next mount (the VFS cache is shared, so nothing re-downloads).
+        offlineAccessEnabled = try container.decodeIfPresent(Bool.self, forKey: .offlineAccessEnabled) ?? true
         // Backwards compatibility: default to empty array if not present
         pinnedDirectories = try container.decodeIfPresent([String].self, forKey: .pinnedDirectories) ?? []
         // Backwards compatibility: default to empty array if not present

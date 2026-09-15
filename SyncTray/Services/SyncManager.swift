@@ -192,6 +192,7 @@ final class SyncManager: ObservableObject {
         startMountProgressMonitor()
         startPrimaryRecoveryMonitor()
         mountProfilesAtStartup()
+        maintainAllOfflineAccessLinks()  // Read-only offline cache browse points, independent of mount success
         setupFinderSyncIPC()
         updateAppGroupMountPaths()
         refreshSettingsFile()
@@ -316,6 +317,32 @@ final class SyncManager: ObservableObject {
             && setupService.isInstalled(profile: profile)
             && !setupService.isMounted(profile: profile) {
             mountProfile(profile)
+        }
+    }
+
+    // MARK: - Offline Access Browse Point
+
+    /// Maintain the read-only "<mount-name> (Offline)" cache browse point for one
+    /// profile: create it (or re-point it after a `vfsCachePath` change) when the
+    /// profile is a mount with `offlineAccessEnabled`, remove a stale one otherwise.
+    /// The filesystem work runs off the main actor because it touches the profile's
+    /// (possibly slow, external) cache volume and needs no main-actor state — the
+    /// decision is pure (`OfflineAccessLink`) and the profile is a value type.
+    func maintainOfflineAccessLink(for profile: SyncProfile) {
+        DispatchQueue.global(qos: .utility).async {
+            OfflineAccessLink.apply(for: profile) { SyncTraySettings.debugLog($0) }
+        }
+    }
+
+    /// Maintain the offline browse point for **every** profile — mount profiles gain
+    /// or keep their link, non-mount profiles have any stale link cleaned up. Called
+    /// at launch and after profile mutations so the on-disk links always match config.
+    func maintainAllOfflineAccessLinks() {
+        let profiles = profileStore.profiles
+        DispatchQueue.global(qos: .utility).async {
+            for profile in profiles {
+                OfflineAccessLink.apply(for: profile) { SyncTraySettings.debugLog($0) }
+            }
         }
     }
 
@@ -447,6 +474,9 @@ final class SyncManager: ObservableObject {
                             // Update App Group mount paths so the FinderSync extension
                             // registers this newly mounted directory.
                             updateAppGroupMountPaths()
+                            // Ensure the read-only "(Offline)" browse point exists now that
+                            // the cache dir is (or is about to be) populated.
+                            maintainOfflineAccessLink(for: profile)
                             // Auto-refresh pinned directories after successful mount
                             if !profile.pinnedDirectories.isEmpty {
                                 // Claim the warm here so the mount monitor's own
@@ -750,6 +780,11 @@ final class SyncManager: ObservableObject {
             self?.applyWarmReconcile(for: id, trigger: "external_edit")
         }
 
+        // Offline browse point: create / remove / re-point per the edited profile
+        // (a toggled `offlineAccessEnabled` yields `action == .none`, and a changed
+        // `vfsCachePath` a `.reinstall`; either way the link must follow config).
+        maintainOfflineAccessLink(for: updatedProfile)
+
         updateAggregateState()
         TelemetryService.shared.recordExternalConfigEdit(kind: "profile")
     }
@@ -773,6 +808,7 @@ final class SyncManager: ObservableObject {
             persist: { [weak self] profile in
                 self?.profileStore.add(profile)
                 self?.clearError(for: profile.id)
+                self?.maintainOfflineAccessLink(for: profile)
 
                 let canonicalFilename = "\(profile.shortId).profile.json"
                 let sourceFilename = (sourcePath as NSString).lastPathComponent

@@ -53,6 +53,8 @@ enum ConfigSelfTest {
             testWarmSkipsCachedFiles,
             testMountMonitorAutoWarm,
             testMountPollDecision,
+            testOfflineAccessLink,
+            testOfflineAccessApply,
             testWarmReconcileTrigger,
             testMigrationIntegrity,
             testExternalCreateEnabled,
@@ -689,6 +691,133 @@ enum ConfigSelfTest {
             return report("AC-MP1", "mount-poll-decision", false, "(empty progress message)")
         }
         return report("AC-MP1", "mount-poll-decision", true)
+    }
+
+    /// The read-only "(Offline)" cache browse point: verifies the pure path
+    /// derivation (`linkPath`/`target`) and the create/remove/re-point decision
+    /// matrix (`OfflineAccessLink.action`) without touching the filesystem.
+    private static func testOfflineAccessLink() -> Bool {
+        func mk(mode: SyncMode, offline: Bool, local: String) -> SyncProfile {
+            SyncProfile(
+                name: "T", rcloneRemote: "synology:", remotePath: "Kaiju/KAIJU",
+                localSyncPath: local, syncMode: mode,
+                vfsCachePath: "/Volumes/Ext/.config/rclone", offlineAccessEnabled: offline
+            )
+        }
+        let mount = mk(mode: .mount, offline: true, local: "/Volumes/Ext/KaijuNew")
+
+        // linkPath: sibling of the mount point, "<name> (Offline)".
+        guard OfflineAccessLink.linkPath(for: mount) == "/Volumes/Ext/KaijuNew (Offline)" else {
+            return report("AC-OA1", "offline-access-link", false, "(bad linkPath: \(OfflineAccessLink.linkPath(for: mount) ?? "nil"))")
+        }
+        // No mount point → no link to compute.
+        guard OfflineAccessLink.linkPath(for: mk(mode: .mount, offline: true, local: "")) == nil else {
+            return report("AC-OA1", "offline-access-link", false, "(empty localSyncPath should yield nil linkPath)")
+        }
+        // target: {vfsCachePath}/vfs/{remote-no-colon}/{remotePath}.
+        let want = "/Volumes/Ext/.config/rclone/vfs/synology/Kaiju/KAIJU"
+        guard OfflineAccessLink.target(for: mount) == want else {
+            return report("AC-OA1", "offline-access-link", false, "(bad target: \(OfflineAccessLink.target(for: mount)))")
+        }
+
+        let link = OfflineAccessLink.linkPath(for: mount)!
+        // Enabled mount, no link yet → create.
+        guard OfflineAccessLink.action(for: mount, linkExists: false, currentTarget: nil)
+            == .create(link: link, target: want) else {
+            return report("AC-OA1", "offline-access-link", false, "(missing link should create)")
+        }
+        // Enabled mount, link already correct → nothing to do.
+        guard OfflineAccessLink.action(for: mount, linkExists: true, currentTarget: want) == .none else {
+            return report("AC-OA1", "offline-access-link", false, "(correct link should be none)")
+        }
+        // Enabled mount, link points at the wrong (old) cache dir → re-point.
+        guard OfflineAccessLink.action(for: mount, linkExists: true, currentTarget: "/old/vfs/x")
+            == .create(link: link, target: want) else {
+            return report("AC-OA1", "offline-access-link", false, "(stale-target link should re-point)")
+        }
+        // Disabled on a mount, link present → remove; absent → none.
+        let mountOff = mk(mode: .mount, offline: false, local: "/Volumes/Ext/KaijuNew")
+        guard OfflineAccessLink.action(for: mountOff, linkExists: true, currentTarget: want) == .remove(link: link) else {
+            return report("AC-OA1", "offline-access-link", false, "(disabled should remove existing link)")
+        }
+        guard OfflineAccessLink.action(for: mountOff, linkExists: false, currentTarget: nil) == .none else {
+            return report("AC-OA1", "offline-access-link", false, "(disabled + no link should be none)")
+        }
+        // Non-mount profile with a stray link (e.g. after a mode switch) → clean it up.
+        let bisync = mk(mode: .bisync, offline: true, local: "/Volumes/Ext/KaijuNew")
+        guard OfflineAccessLink.action(for: bisync, linkExists: true, currentTarget: want) == .remove(link: link) else {
+            return report("AC-OA1", "offline-access-link", false, "(non-mount stray link should remove)")
+        }
+        guard OfflineAccessLink.action(for: bisync, linkExists: false, currentTarget: nil) == .none else {
+            return report("AC-OA1", "offline-access-link", false, "(non-mount + no link should be none)")
+        }
+        return report("AC-OA1", "offline-access-link", true)
+    }
+
+    /// Exercises the real filesystem apply (`OfflineAccessLink.apply` / `removeLink`)
+    /// against a throwaway temp tree: create → idempotent re-run → re-point after a
+    /// cache-dir change → disable removes → delete removes. Covers the ~lines of
+    /// FileManager glue that AC-OA1's pure checks can't reach.
+    private static func testOfflineAccessApply() -> Bool {
+        let fm = FileManager.default
+        let root = (NSTemporaryDirectory() as NSString)
+            .appendingPathComponent("synctray-oa-\(UUID().uuidString)")
+        defer { try? fm.removeItem(atPath: root) }
+        let mountPoint = (root as NSString).appendingPathComponent("KaijuNew")
+        try? fm.createDirectory(atPath: mountPoint, withIntermediateDirectories: true)
+
+        func profile(offline: Bool, cacheRoot: String) -> SyncProfile {
+            SyncProfile(
+                name: "T", rcloneRemote: "synology:", remotePath: "Kaiju/KAIJU",
+                localSyncPath: mountPoint, syncMode: .mount,
+                vfsCachePath: cacheRoot, offlineAccessEnabled: offline
+            )
+        }
+        let cacheA = (root as NSString).appendingPathComponent("cacheA")
+        let cacheB = (root as NSString).appendingPathComponent("cacheB")
+        let link = OfflineAccessLink.linkPath(for: profile(offline: true, cacheRoot: cacheA))!
+
+        func linkTarget() -> String? {
+            guard let attrs = try? fm.attributesOfItem(atPath: link),
+                  (attrs[.type] as? FileAttributeType) == .typeSymbolicLink else { return nil }
+            return try? fm.destinationOfSymbolicLink(atPath: link)
+        }
+
+        // Enabled → creates a symlink at the cacheA target.
+        let pA = profile(offline: true, cacheRoot: cacheA)
+        _ = OfflineAccessLink.apply(for: pA)
+        guard linkTarget() == OfflineAccessLink.target(for: pA) else {
+            return report("AC-OA2", "offline-access-apply", false, "(create did not link to cacheA target)")
+        }
+        // Idempotent re-run → still the same link (no throw, no duplicate).
+        guard OfflineAccessLink.apply(for: pA) == .none, linkTarget() == OfflineAccessLink.target(for: pA) else {
+            return report("AC-OA2", "offline-access-apply", false, "(second apply was not a no-op)")
+        }
+        // Cache dir changed → re-point to cacheB.
+        let pB = profile(offline: true, cacheRoot: cacheB)
+        _ = OfflineAccessLink.apply(for: pB)
+        guard linkTarget() == OfflineAccessLink.target(for: pB) else {
+            return report("AC-OA2", "offline-access-apply", false, "(cache change did not re-point)")
+        }
+        // Disabled → link removed.
+        _ = OfflineAccessLink.apply(for: profile(offline: false, cacheRoot: cacheB))
+        guard linkTarget() == nil, !fm.fileExists(atPath: link) else {
+            return report("AC-OA2", "offline-access-apply", false, "(disable did not remove the link)")
+        }
+        // A real (non-symlink) directory at the link path must never be clobbered.
+        try? fm.createDirectory(atPath: link, withIntermediateDirectories: true)
+        _ = OfflineAccessLink.apply(for: pA)  // wants to create, but a real dir sits there
+        var isDir: ObjCBool = false
+        guard fm.fileExists(atPath: link, isDirectory: &isDir), isDir.boolValue, linkTarget() == nil else {
+            return report("AC-OA2", "offline-access-apply", false, "(clobbered a real directory at the link path)")
+        }
+        try? fm.removeItem(atPath: link)
+        // removeLink force-removes regardless of the (still-enabled) flag, symlink-only.
+        _ = OfflineAccessLink.apply(for: pA)
+        guard OfflineAccessLink.removeLink(for: pA), linkTarget() == nil else {
+            return report("AC-OA2", "offline-access-apply", false, "(removeLink did not delete the symlink)")
+        }
+        return report("AC-OA2", "offline-access-apply", true)
     }
 
     /// A launchd/externally-mounted Stream profile (e.g. auto-mounted at login) never runs

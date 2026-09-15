@@ -162,7 +162,8 @@ enum SyncTrayCLI {
       syncDirection (localToRemote|remoteToLocal), syncIntervalMinutes,
       fallbackRemote, fallbackRemotePath, mountBackend (nfs|macfuse),
       vfsCacheMode (off|minimal|writes|full), vfsCacheMaxSize, vfsCacheMaxAge,
-      vfsCachePath, allowNonEmptyMount, mountAtStartup, isMuted, rcPort,
+      vfsCachePath, allowNonEmptyMount, mountAtStartup, offlineAccessEnabled,
+      isMuted, rcPort,
       downloadConnections, pinnedDirectories (comma-separated),
       warmExcludePatterns (comma-separated). Use enable/disable for isEnabled.
 
@@ -1028,6 +1029,9 @@ enum SyncTrayCLI {
         case "mountAtStartup":
             guard let b = bool(value) else { return "mountAtStartup must be true or false" }
             profile.mountAtStartup = b
+        case "offlineAccessEnabled":
+            guard let b = bool(value) else { return "offlineAccessEnabled must be true or false" }
+            profile.offlineAccessEnabled = b
         case "allowNonEmptyMount":
             guard let b = bool(value) else { return "allowNonEmptyMount must be true or false" }
             profile.allowNonEmptyMount = b
@@ -1117,7 +1121,13 @@ extension CLIEnvironment {
                     FileManager.default.fileExists(atPath: "\(ConfigSchemaInstaller.schemaDirectory())/\($0)")
                 }
             },
-            writeProfile: { ProfileStore.writeProfileFile($0, in: SyncProfile.configDirectory) != nil },
+            writeProfile: { profile in
+                let ok = ProfileStore.writeProfileFile(profile, in: SyncProfile.configDirectory) != nil
+                // Keep the read-only "(Offline)" browse point in sync with the written
+                // profile (create/re-point/remove) so a headless CLI edit matches the app.
+                OfflineAccessLink.apply(for: profile)
+                return ok
+            },
             installProfile: { profile in
                 do { try SyncSetupService.shared.install(profile: profile); return nil }
                 catch { return "\(error)" }
@@ -1129,6 +1139,8 @@ extension CLIEnvironment {
             deleteProfileFile: { profile in
                 let path = "\(SyncProfile.configDirectory)/\(profile.shortId).profile.json"
                 try? FileManager.default.removeItem(atPath: path)
+                // Remove the "(Offline)" browse point too (symlink only — never a real dir).
+                OfflineAccessLink.removeLink(for: profile)
             },
             runSyncScript: { configPath in
                 let (exit, _) = CLIEnvironment.runProcess(
