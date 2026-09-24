@@ -118,6 +118,16 @@ final class SyncSetupService {
                 try FileManager.default.createDirectory(
                     atPath: cacheDir, withIntermediateDirectories: true)
             }
+
+            // Adopt a pre-existing remote-named cache tree into the profile's stable
+            // identity tree BEFORE the mount comes up, so switching a profile's remote (or
+            // turning `stableCacheIdentity` on for the first time) re-uses the bytes already
+            // downloaded instead of starting a second, empty tree. Same-directory renames —
+            // fast even for a multi-GB cache — and a no-op once migrated. Never throws: a
+            // failed adoption costs a re-download, blocking the install would cost the mount.
+            CacheIdentityMigration.apply(for: profile) { message in
+                SyncTraySettings.debugLog(message)
+            }
         }
 
         // Generate and write the shared script (only if it doesn't exist or needs update)
@@ -607,6 +617,12 @@ final class SyncSetupService {
             VFS_CACHE_MAX_SIZE=$(parse_json "vfsCacheMaxSize" "10G")
             VFS_CACHE_MAX_AGE=$(parse_json "vfsCacheMaxAge" "168h")
             VFS_CACHE_PATH=$(parse_json "vfsCachePath" "$HOME/.cache/rclone")
+            # Profile-owned rclone remote name the mount runs under, so the VFS cache is
+            # keyed by the PROFILE instead of by whichever remote is currently reachable.
+            # Empty = legacy behaviour (mount `remote:path` directly, cache keyed by remote).
+            CACHE_IDENTITY=$(parse_json "cacheIdentity" "")
+            # Cache-Only (Offline): mount read-only and stop chasing the remote.
+            STREAM_CACHE_ONLY=$(parse_json "streamCacheOnly" "false")
             # Parallel downloaders. Defaults to 2 — a safe value on a contended Wi-Fi/mesh
             # link (or spinning-disk cache) where extra streams contend and collapse
             # aggregate throughput. Raise it (up to 16) for a fast wired link.
@@ -725,6 +741,12 @@ final class SyncSetupService {
             # Ensure local sync directory exists
             mkdir -p "$LOCAL_PATH"
 
+            # The remote whose stored rclone config backs this run. Normally the primary;
+            # swapped to the fallback below when the primary is unreachable. The mount branch
+            # copies THIS remote's parameters onto the profile's cache identity, so the cache
+            # follows the profile rather than the connection that happened to be up.
+            ACTIVE_REMOTE_NAME="${REMOTE%%:*}"
+
             # Remote fallback: if primary remote is unreachable, try fallback remote
             if [[ -n "$FALLBACK_REMOTE" ]]; then
                 REMOTE_NAME="${REMOTE%%:*}"
@@ -733,6 +755,7 @@ final class SyncSetupService {
                     echo "$(date '+%Y-%m-%d %H:%M:%S') - Primary remote unreachable, using fallback: $FALLBACK_REMOTE" >> "$LOG_FILE"
                     # Re-check cert setting for the fallback remote
                     NO_CHECK_CERT=$(check_no_cert "$FALLBACK_REMOTE")
+                    ACTIVE_REMOTE_NAME="${FALLBACK_REMOTE%%:*}"
 
                     # Mount mode ALWAYS uses env-var overrides, even across wire types.
                     # The VFS cache is keyed by remote name ({cache}/vfs/{name}/…), so keeping
@@ -768,6 +791,64 @@ final class SyncSetupService {
             if [[ "$SYNC_MODE" == "mount" ]]; then
                 # Mount mode - stream files on-demand
                 echo "$(date '+%Y-%m-%d %H:%M:%S') - Starting mount" >> "$LOG_FILE"
+
+                # PROFILE-STABLE CACHE IDENTITY
+                #
+                # rclone puts the VFS cache at {cache-dir}/vfs/{fsName}/{fsRoot} (and the
+                # byte-range sidecars at {cache-dir}/vfsMeta/{fsName}/{fsRoot}), where fsName
+                # is the REMOTE NAME. So `synology:Kaiju/KAIJU` and `synology-sftp:Kaiju/KAIJU`
+                # — the same NAS, reached two ways — get two separate caches, and moving off
+                # the LAN re-downloads everything into an empty second tree.
+                #
+                # Fix: don't hand rclone the user's remote name. Define a remote named after
+                # the PROFILE (synctray_{shortId}) entirely through RCLONE_CONFIG_<NAME>_<KEY>
+                # environment variables, copying every parameter of whichever remote is
+                # actually active (primary, or the fallback picked above), and mount THAT.
+                # fsName is then invariant, so one cache is shared across every remote the
+                # profile ever uses — including a fallback activation.
+                #
+                # Safe by construction: CACHE_IDENTITY is [a-z0-9_] only, so the name maps to
+                # environment variables with no escaping. If the active remote has no stored
+                # config (e.g. it is itself env-defined), TYPE comes back empty and we mount
+                # the original remote reference instead of a broken identity.
+                if [[ -n "$CACHE_IDENTITY" ]]; then
+                    IDENT_UPPER=$(echo "$CACHE_IDENTITY" | tr '[:lower:]' '[:upper:]' | tr '-' '_')
+                    eval "$($RCLONE_BIN config dump 2>/dev/null | python3 -c "
+            import json, sys
+            d = json.load(sys.stdin).get('${ACTIVE_REMOTE_NAME}', {})
+            name = '${IDENT_UPPER}'
+            for k, v in d.items():
+                safe_k = k.upper().replace('-', '_')
+                print(f'export RCLONE_CONFIG_{name}_{safe_k}=\\\"' + str(v).replace('\\\"', '\\\\\\\"') + '\\\"')
+            ")"
+                    IDENT_TYPE_VAR="RCLONE_CONFIG_${IDENT_UPPER}_TYPE"
+                    if [[ -n "${!IDENT_TYPE_VAR}" ]]; then
+                        REMOTE="${CACHE_IDENTITY}:${REMOTE_PATH}"
+                        NO_CHECK_CERT=$(check_no_cert "$ACTIVE_REMOTE_NAME")
+                        echo "$(date '+%Y-%m-%d %H:%M:%S') - Cache identity: $CACHE_IDENTITY (backed by $ACTIVE_REMOTE_NAME)" >> "$LOG_FILE"
+                    else
+                        echo "$(date '+%Y-%m-%d %H:%M:%S') - Cache identity unavailable (no stored config for $ACTIVE_REMOTE_NAME), mounting $REMOTE" >> "$LOG_FILE"
+                    fi
+                fi
+
+                # VFS CACHE PREFLIGHT
+                #
+                # When --cache-dir is not writable, rclone logs "Failed to create vfs cache -
+                # disabling" and then MOUNTS ANYWAY with no cache at all. Every read becomes a
+                # remote round trip, which reads to a user as "streaming got mysteriously
+                # slow" rather than as a failure. The common trigger is a cache directory on
+                # an external drive that isn't attached: /Volumes/<Drive> is then a
+                # root-owned placeholder and the mkdir fails with EPERM.
+                #
+                # Refuse the mount instead. launchd's KeepAlive retries, so the profile comes
+                # up by itself once the drive is back — with its cache intact.
+                VFS_CACHE_PATH_EXPANDED="${VFS_CACHE_PATH/#\\~/$HOME}"
+                if ! mkdir -p "$VFS_CACHE_PATH_EXPANDED" 2>/dev/null || [[ ! -w "$VFS_CACHE_PATH_EXPANDED" ]]; then
+                    echo "$(date '+%Y-%m-%d %H:%M:%S') - Error: VFS cache directory not writable: $VFS_CACHE_PATH_EXPANDED - refusing to mount uncached" >> "$LOG_FILE"
+                    # Back off so KeepAlive doesn't spin while the drive is away.
+                    sleep 30
+                    exit 1
+                fi
 
                 # Ensure mount point exists
                 mkdir -p "$LOCAL_PATH"
@@ -850,7 +931,37 @@ final class SyncSetupService {
                 # coarse polling ceiling, never live propagation. Offline WRITES need no flag
                 # here: under --vfs-cache-mode full a write while the remote is down lands in
                 # the VFS cache as dirty and rclone retries the write-back until it returns.
-                RCLONE_CMD="$RCLONE_CMD --buffer-size 128M --vfs-read-ahead 256M --transfers $DOWNLOAD_CONNECTIONS --vfs-read-chunk-size 128M --vfs-read-chunk-size-limit off --dir-cache-time 1000h --attr-timeout 5s"
+                DIR_CACHE_TIME="1000h"
+                RCLONE_CMD="$RCLONE_CMD --buffer-size 128M --vfs-read-ahead 256M --transfers $DOWNLOAD_CONNECTIONS --vfs-read-chunk-size 128M --vfs-read-chunk-size-limit off --attr-timeout 5s"
+
+                # CACHE-ONLY (OFFLINE) MODE
+                #
+                # "Stop syncing, just show me the cache." The mount still comes up — so every
+                # absolute path a Reaper project (or any app) already references keeps
+                # resolving, which a separate read-only browse folder cannot give you — but it
+                # stops trying to stay in step with the remote:
+                #   --read-only            no write-back queue, no dirty cache entries.
+                #   --vfs-fast-fingerprint change detection on size+modtime only, never a hash.
+                #                          The slow, fingerprint-unstable revalidation on every
+                #                          open (SMB especially) is what makes opening a project
+                #                          full of already-cached media crawl.
+                #   --no-checksum          don't ask the backend to hash on open/close.
+                #   --no-modtime           don't issue per-object modtime reads.
+                #   --poll-interval 0      no change-notification polling.
+                #   --dir-cache-time       effectively never re-list from the remote.
+                #   --timeout/--contimeout/--retries/--low-level-retries
+                #                          anything that DOES reach for the remote (an uncached
+                #                          file) fails in seconds instead of hanging the app
+                #                          that asked for it.
+                # Uncached files therefore error rather than download — that is the trade the
+                # mode makes, and why it is off by default.
+                if [[ "$STREAM_CACHE_ONLY" == "true" || "$STREAM_CACHE_ONLY" == "True" ]]; then
+                    DIR_CACHE_TIME="9999h"
+                    RCLONE_CMD="$RCLONE_CMD --read-only --vfs-fast-fingerprint --no-checksum --no-modtime --poll-interval 0 --contimeout 3s --timeout 5s --retries 1 --low-level-retries 1"
+                    echo "$(date '+%Y-%m-%d %H:%M:%S') - Cache-only mode: serving from VFS cache, remote reads fail fast" >> "$LOG_FILE"
+                fi
+
+                RCLONE_CMD="$RCLONE_CMD --dir-cache-time $DIR_CACHE_TIME"
 
                 # Name the mounted volume after the mount-point folder so Finder
                 # shows e.g. "Temp" instead of the auto-generated NFS share name
@@ -1027,6 +1138,13 @@ final class SyncSetupService {
             "vfsCacheMaxAge": profile.vfsCacheMaxAge,
             "vfsCachePath": profile.vfsCachePath,
             "allowNonEmptyMount": profile.allowNonEmptyMount,
+            // The rclone remote name the mount must run under so its VFS cache is keyed by
+            // the PROFILE rather than by whichever remote is active. Empty string disables
+            // it (the script then mounts `remote:path` as before). The script defines this
+            // name entirely from the active remote's config via RCLONE_CONFIG_<NAME>_<KEY>
+            // environment variables — see the mount branch of the generated script.
+            "cacheIdentity": profile.stableCacheIdentity ? profile.cacheIdentityName : "",
+            "streamCacheOnly": profile.streamCacheOnly,
             "pinnedDirectories": profile.pinnedDirectories,
             "rcPort": profile.rcPort,
             "downloadConnections": profile.downloadConnections,

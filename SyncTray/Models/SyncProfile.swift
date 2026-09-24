@@ -39,6 +39,26 @@ struct SyncProfile: Identifiable, Codable, Equatable {
     /// never written to the script's `{shortId}.json`. Mount mode; default: true. See the
     /// "Offline access" section in CLAUDE.md.
     var offlineAccessEnabled: Bool
+    /// Key the VFS cache by a **profile-owned** identity (`synctray_{shortId}`) instead of
+    /// by the rclone remote name. rclone derives the cache location from the mounted Fs's
+    /// name + root (`{cache}/vfs/{fsName}/{fsRoot}`), so with this off, changing a profile's
+    /// `rcloneRemote` — LAN SMB at home, SFTP/QuickConnect away — re-keys the whole cache
+    /// and re-downloads everything into a second tree. With it on, SyncTray mounts an
+    /// env-var-defined remote named after the PROFILE whose connection parameters are copied
+    /// from whichever remote is currently active, so one cache is shared across every remote
+    /// the profile ever points at. Mount mode only; default true. `CacheIdentityMigration`
+    /// adopts a pre-existing remote-named tree on the next install, so turning this on never
+    /// costs a re-download. See "Cache identity" in CLAUDE.md.
+    var stableCacheIdentity: Bool
+    /// Cache-Only (Offline): serve this Stream profile from the VFS cache and stop trying to
+    /// keep up with the remote. The mount still comes up (so existing absolute paths keep
+    /// resolving — a Reaper project referencing the mount point does not have to be relinked)
+    /// but it is mounted `--read-only`, with change detection reduced to the fast fingerprint
+    /// and every remote call bounded by a short timeout, and the app-side offline warmer is
+    /// suppressed. Cached files then open at local-disk speed instead of blocking on
+    /// per-file revalidation against a remote that is slow or gone. Mount mode only;
+    /// default false.
+    var streamCacheOnly: Bool
     var pinnedDirectories: [String]     // Directories to automatically cache offline (mount mode)
     /// Glob patterns excluded from offline warming, matched **case-sensitively** against each
     /// file's name and its path relative to the pinned dir. Supports `*` (within a segment),
@@ -64,6 +84,33 @@ struct SyncProfile: Identifiable, Codable, Equatable {
     /// Returns true if this profile is in mount mode
     var isMountMode: Bool {
         syncMode == .mount
+    }
+
+    // MARK: - Cache Identity
+
+    /// The rclone remote name this profile's VFS cache is keyed by when
+    /// `stableCacheIdentity` is on — derived from the profile UUID, so it never changes
+    /// when the user re-points `rcloneRemote` or a fallback activates.
+    ///
+    /// Only `[a-z0-9_]` by construction (`synctray_` + 8 lowercase hex chars), which
+    /// matters twice: rclone accepts it as a remote name, and it maps to the
+    /// `RCLONE_CONFIG_<NAME>_<KEY>` environment variables that define the remote without
+    /// any escaping.
+    var cacheIdentityName: String {
+        "synctray_\(shortId)"
+    }
+
+    /// Remote name (colon stripped) of the profile's PRIMARY remote — the name rclone
+    /// keyed the cache by before `stableCacheIdentity` existed, and still does when the
+    /// flag is off.
+    var primaryRemoteName: String {
+        rcloneRemote.hasSuffix(":") ? String(rcloneRemote.dropLast()) : rcloneRemote
+    }
+
+    /// The remote name rclone will report as the mounted Fs's name, i.e. the first path
+    /// component of the profile's cache subtree.
+    var effectiveCacheRemoteName: String {
+        stableCacheIdentity ? cacheIdentityName : primaryRemoteName
     }
 
     // MARK: - Computed Paths
@@ -196,6 +243,8 @@ struct SyncProfile: Identifiable, Codable, Equatable {
         allowNonEmptyMount: Bool = false,
         mountAtStartup: Bool = true,
         offlineAccessEnabled: Bool = true,
+        stableCacheIdentity: Bool = true,
+        streamCacheOnly: Bool = false,
         pinnedDirectories: [String] = [],
         warmExcludePatterns: [String] = [],
         rcPort: Int = 0,
@@ -224,6 +273,8 @@ struct SyncProfile: Identifiable, Codable, Equatable {
         self.allowNonEmptyMount = allowNonEmptyMount
         self.mountAtStartup = mountAtStartup
         self.offlineAccessEnabled = offlineAccessEnabled
+        self.stableCacheIdentity = stableCacheIdentity
+        self.streamCacheOnly = streamCacheOnly
         self.pinnedDirectories = pinnedDirectories
         self.warmExcludePatterns = warmExcludePatterns
         self.rcPort = rcPort > 0 ? rcPort : SyncProfile.defaultRCPort(for: id)
@@ -258,6 +309,7 @@ extension SyncProfile {
         case mountBackend
         case vfsCacheMode, vfsCacheMaxSize, vfsCacheMaxAge, vfsCachePath, allowNonEmptyMount
         case mountAtStartup, offlineAccessEnabled
+        case stableCacheIdentity, streamCacheOnly
         case pinnedDirectories, warmExcludePatterns, rcPort
         case downloadConnections
     }
@@ -310,6 +362,15 @@ extension SyncProfile {
         // persisted before this field existed gains the read-only "(Offline)" browse
         // point on its next mount (the VFS cache is shared, so nothing re-downloads).
         offlineAccessEnabled = try container.decodeIfPresent(Bool.self, forKey: .offlineAccessEnabled) ?? true
+        // Backwards compatibility: a profile persisted before this field existed adopts the
+        // profile-stable cache identity on its next install. That re-keys the cache subtree
+        // from vfs/{remote}/… to vfs/synctray_{shortId}/… — which would strand an existing
+        // warm cache, so `CacheIdentityMigration` renames the legacy tree into place first.
+        // Nothing re-downloads; set it false to stay on the remote-named layout.
+        stableCacheIdentity = try container.decodeIfPresent(Bool.self, forKey: .stableCacheIdentity) ?? true
+        // Backwards compatibility: cache-only is opt-in, so an existing profile keeps
+        // streaming from the remote exactly as before.
+        streamCacheOnly = try container.decodeIfPresent(Bool.self, forKey: .streamCacheOnly) ?? false
         // Backwards compatibility: default to empty array if not present
         pinnedDirectories = try container.decodeIfPresent([String].self, forKey: .pinnedDirectories) ?? []
         // Backwards compatibility: default to empty array if not present
