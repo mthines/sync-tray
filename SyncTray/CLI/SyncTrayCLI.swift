@@ -163,7 +163,7 @@ enum SyncTrayCLI {
       fallbackRemote, fallbackRemotePath, mountBackend (nfs|macfuse),
       vfsCacheMode (off|minimal|writes|full), vfsCacheMaxSize, vfsCacheMaxAge,
       vfsCachePath, allowNonEmptyMount, mountAtStartup, offlineAccessEnabled,
-      isMuted, rcPort,
+      stableCacheIdentity, streamCacheOnly, isMuted, rcPort,
       downloadConnections, pinnedDirectories (comma-separated),
       warmExcludePatterns (comma-separated). Use enable/disable for isEnabled.
 
@@ -1032,6 +1032,12 @@ enum SyncTrayCLI {
         case "offlineAccessEnabled":
             guard let b = bool(value) else { return "offlineAccessEnabled must be true or false" }
             profile.offlineAccessEnabled = b
+        case "stableCacheIdentity":
+            guard let b = bool(value) else { return "stableCacheIdentity must be true or false" }
+            profile.stableCacheIdentity = b
+        case "streamCacheOnly":
+            guard let b = bool(value) else { return "streamCacheOnly must be true or false" }
+            profile.streamCacheOnly = b
         case "allowNonEmptyMount":
             guard let b = bool(value) else { return "allowNonEmptyMount must be true or false" }
             profile.allowNonEmptyMount = b

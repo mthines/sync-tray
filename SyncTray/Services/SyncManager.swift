@@ -3332,9 +3332,13 @@ final class SyncManager: ObservableObject {
                     // the same flag so this can't double-fire. Decided independently of the
                     // UI-state transition above, so a profile stuck in `.failed` still re-arms
                     // once it is actually unmounted.
+                    // Cache-Only means "stop chasing the remote": the warmer's whole job is
+                    // to pull uncached bytes down through the mount, which is exactly what
+                    // the mode exists to stop. Treat it as having nothing pinned so the
+                    // profile still re-arms normally when the mode is switched back off.
                     if Self.shouldAutoWarmOnMount(
                         isMounted: isMounted,
-                        hasPinnedDirs: !profile.pinnedDirectories.isEmpty,
+                        hasPinnedDirs: !profile.pinnedDirectories.isEmpty && !profile.streamCacheOnly,
                         profileId: profile.id,
                         alreadyWarmed: &self.autoWarmedMounts
                     ) {

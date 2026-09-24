@@ -106,6 +106,16 @@
       "type": "boolean",
       "description": "Mount mode only. When true (default), SyncTray maintains a read-only \"<mount-name> (Offline)\" folder next to the mount point that links to the VFS cache, so already-cached files stay browsable in Finder while the network is down. App-side only — not consumed by the sync script."
     },
+    "stableCacheIdentity": {
+      "type": "boolean",
+      "default": true,
+      "description": "Mount mode only. When true (default), the VFS cache is keyed by the profile (synctray_{shortId}) instead of by the rclone remote name, so one cache is shared across every remote the profile points at — changing remotes (LAN SMB at home, SFTP away) no longer re-downloads into a second tree. SyncTray mounts an env-var-defined remote of that name carrying the active remote's parameters; an existing remote-named cache tree is renamed into place on the next install, so turning this on costs no re-download."
+    },
+    "streamCacheOnly": {
+      "type": "boolean",
+      "default": false,
+      "description": "Mount mode only. Cache-Only (Offline): keep the mount up so existing absolute paths resolve, but serve it read-only from the VFS cache — fast fingerprints, no modtime/checksum round trips, no polling, short remote timeouts, and no offline warming. Cached files open at local-disk speed; uncached files fail fast instead of downloading."
+    },
     "pinnedDirectories": {
       "type": "array",
       "items": { "type": "string" },

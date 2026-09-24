@@ -60,6 +60,8 @@ struct ProfileDetailView: View {
     @State private var allowNonEmptyMount: Bool = false
     @State private var mountAtStartup: Bool = true
     @State private var offlineAccessEnabled: Bool = true
+    @State private var stableCacheIdentity: Bool = true
+    @State private var streamCacheOnly: Bool = false
     @State private var downloadConnections: Int = 2
 
     // UI State
@@ -185,6 +187,8 @@ struct ProfileDetailView: View {
         allowNonEmptyMount != profile.allowNonEmptyMount ||
         mountAtStartup != profile.mountAtStartup ||
         offlineAccessEnabled != profile.offlineAccessEnabled ||
+        stableCacheIdentity != profile.stableCacheIdentity ||
+        streamCacheOnly != profile.streamCacheOnly ||
         downloadConnections != profile.downloadConnections
     }
 
@@ -1057,6 +1061,30 @@ struct ProfileDetailView: View {
                             Text("Offline access to cached files")
                                 .font(.subheadline)
                             Text("Keep a read-only \u{201C}\(mountFolderName) (Offline)\u{201D} folder next to the mount that opens your already-cached files directly — browsable in Finder even with no internet, when the live stream can't reach the remote. Read-only: don't edit files there.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    .toggleStyle(.switch)
+
+                    // Share one cache across every remote this profile uses
+                    Toggle(isOn: $stableCacheIdentity) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Share the cache across remotes")
+                                .font(.subheadline)
+                            Text("Store the cache under this profile instead of under the remote's name, so switching remotes — your LAN address at home, SFTP or QuickConnect away — keeps the files you've already downloaded instead of re-fetching them into a second cache. Files already cached under the old remote name are moved across on save.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    .toggleStyle(.switch)
+
+                    // Cache-only (offline) mode
+                    Toggle(isOn: $streamCacheOnly) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Cache-only (stop syncing)")
+                                .font(.subheadline)
+                            Text("Serve \u{201C}\(mountFolderName)\u{201D} read-only from what's already cached and stop checking the remote for changes. The mount stays where it is, so projects that point at these files keep opening — just without the per-file checks that make opening them slow. Files that aren't cached yet won't download until you turn this off.")
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                         }
@@ -2060,6 +2088,8 @@ struct ProfileDetailView: View {
         allowNonEmptyMount = profile.allowNonEmptyMount
         mountAtStartup = profile.mountAtStartup
         offlineAccessEnabled = profile.offlineAccessEnabled
+        stableCacheIdentity = profile.stableCacheIdentity
+        streamCacheOnly = profile.streamCacheOnly
         downloadConnections = profile.downloadConnections
 
         // Show text input if the path contains "/" (nested path) or is a custom path
@@ -2094,6 +2124,8 @@ struct ProfileDetailView: View {
         updatedProfile.allowNonEmptyMount = allowNonEmptyMount
         updatedProfile.mountAtStartup = mountAtStartup
         updatedProfile.offlineAccessEnabled = offlineAccessEnabled
+        updatedProfile.stableCacheIdentity = stableCacheIdentity
+        updatedProfile.streamCacheOnly = streamCacheOnly
         updatedProfile.downloadConnections = downloadConnections
         return updatedProfile
     }

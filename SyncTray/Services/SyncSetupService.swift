@@ -684,6 +684,26 @@ final class SyncSetupService {
                 fi
             }
 
+            # Re-emit one remote's stored rclone config as RCLONE_CONFIG_<NAME>_<KEY> export
+            # lines, reading `rclone config dump` JSON on stdin.
+            #   $1 — remote to read FROM (as it appears in rclone.conf)
+            #   $2 — already upper-cased/underscored name to export UNDER
+            # The caller `eval`s the output. Both arguments are passed as argv, never
+            # interpolated into the Python source, and every value goes through
+            # `shlex.quote`, so a config value containing a quote, a space, a backslash or a
+            # `$` round-trips intact. (It previously did not: the `\\"` escapes were consumed
+            # by the enclosing double-quoted shell string before Python ever saw them, so a
+            # password containing a double quote produced an unterminated `eval`.)
+            dump_remote_as_env() {
+                python3 -c "
+import json, shlex, sys
+remote, prefix = sys.argv[1], sys.argv[2]
+for k, v in json.load(sys.stdin).get(remote, {}).items():
+    key = k.upper().replace('-', '_')
+    print('export RCLONE_CONFIG_%s_%s=%s' % (prefix, key, shlex.quote(str(v))))
+" "$1" "$2"
+            }
+
             REMOTE_NAME="${REMOTE%%:*}"
             NO_CHECK_CERT=$(check_no_cert "$REMOTE_NAME")
 
@@ -769,14 +789,7 @@ final class SyncSetupService {
                         # Same remote name preserved: use env var overrides to swap transport.
                         # This preserves the VFS/bisync cache since the remote name stays the same.
                         UPPER_NAME=$(echo "$REMOTE_NAME" | tr '[:lower:]' '[:upper:]' | tr '-' '_')
-                        eval "$($RCLONE_BIN config dump 2>/dev/null | python3 -c "
-            import json, sys
-            d = json.load(sys.stdin).get('${FALLBACK_REMOTE}', {})
-            name = '${UPPER_NAME}'
-            for k, v in d.items():
-                safe_k = k.upper().replace('-', '_')
-                print(f'export RCLONE_CONFIG_{name}_{safe_k}=\\\"' + str(v).replace('\\\"', '\\\\\\\"') + '\\\"')
-            ")"
+                        eval "$($RCLONE_BIN config dump 2>/dev/null | dump_remote_as_env "$FALLBACK_REMOTE" "$UPPER_NAME")"
                     else
                         # Different wire type OR explicit path change: swap entire REMOTE reference.
                         # bisync will rebuild listings on first switch (~12s for 85K files).
@@ -813,14 +826,7 @@ final class SyncSetupService {
                 # the original remote reference instead of a broken identity.
                 if [[ -n "$CACHE_IDENTITY" ]]; then
                     IDENT_UPPER=$(echo "$CACHE_IDENTITY" | tr '[:lower:]' '[:upper:]' | tr '-' '_')
-                    eval "$($RCLONE_BIN config dump 2>/dev/null | python3 -c "
-            import json, sys
-            d = json.load(sys.stdin).get('${ACTIVE_REMOTE_NAME}', {})
-            name = '${IDENT_UPPER}'
-            for k, v in d.items():
-                safe_k = k.upper().replace('-', '_')
-                print(f'export RCLONE_CONFIG_{name}_{safe_k}=\\\"' + str(v).replace('\\\"', '\\\\\\\"') + '\\\"')
-            ")"
+                    eval "$($RCLONE_BIN config dump 2>/dev/null | dump_remote_as_env "$ACTIVE_REMOTE_NAME" "$IDENT_UPPER")"
                     IDENT_TYPE_VAR="RCLONE_CONFIG_${IDENT_UPPER}_TYPE"
                     if [[ -n "${!IDENT_TYPE_VAR}" ]]; then
                         REMOTE="${CACHE_IDENTITY}:${REMOTE_PATH}"

@@ -11,6 +11,7 @@
 		58578B4CF51E7600D4E39636 /* ProviderFieldsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 77CC26F6DC209C0F0B6626D7 /* ProviderFieldsView.swift */; };
 		6E46DC7E3B954257AB1518D0 /* CacheMigrationPlanner.swift in Sources */ = {isa = PBXBuildFile; fileRef = F8DCCC96421D65D187C3C59F /* CacheMigrationPlanner.swift */; };
 		0FF11AE000000000000000B1 /* OfflineAccessLink.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0FF11AE000000000000000A2 /* OfflineAccessLink.swift */; };
+		0FF11AE000000000000000C1 /* CacheIdentityMigration.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0FF11AE000000000000000C2 /* CacheIdentityMigration.swift */; };
 		7D9FBA7536F4EB2EDCAEE043 /* RcloneConfigService.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0DC6141FBB853681643F593 /* RcloneConfigService.swift */; };
 		80A56C81D9C62272D0FBA2F6 /* CacheMoveSheet.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0E078DEC9D7F0C241D48DD14 /* CacheMoveSheet.swift */; };
 		97D529370EB9EC5B06EFB9EE /* CLIShimInstaller.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6E8B026F33644146D215E2A3 /* CLIShimInstaller.swift */; };
@@ -142,6 +143,7 @@
 		F2B3C4D5E6F7089012AB0002 /* MigrationRunner.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MigrationRunner.swift; sourceTree = "<group>"; };
 		F8DCCC96421D65D187C3C59F /* CacheMigrationPlanner.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = CacheMigrationPlanner.swift; sourceTree = "<group>"; };
 		0FF11AE000000000000000A2 /* OfflineAccessLink.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = OfflineAccessLink.swift; sourceTree = "<group>"; };
+		0FF11AE000000000000000C2 /* CacheIdentityMigration.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = CacheIdentityMigration.swift; sourceTree = "<group>"; };
 		FS000000000000000000A001 /* FinderSyncExtension.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FinderSyncExtension.swift; sourceTree = "<group>"; };
 		FS000000000000000000A002 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		FS000000000000000000A003 /* SyncTrayFinderSync.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = SyncTrayFinderSync.appex; sourceTree = BUILT_PRODUCTS_DIR; };
@@ -265,6 +267,7 @@
 				7F52EB2FA3D07D3E970F226D /* ConfigSelfTest.swift */,
 				F8DCCC96421D65D187C3C59F /* CacheMigrationPlanner.swift */,
 				0FF11AE000000000000000A2 /* OfflineAccessLink.swift */,
+				0FF11AE000000000000000C2 /* CacheIdentityMigration.swift */,
 				CE2089D1111CD3C727D2BF40 /* CacheMigrationService.swift */,
 			);
 			path = Services;
@@ -512,6 +515,7 @@
 				97D529370EB9EC5B06EFB9EE /* CLIShimInstaller.swift in Sources */,
 				6E46DC7E3B954257AB1518D0 /* CacheMigrationPlanner.swift in Sources */,
 				0FF11AE000000000000000B1 /* OfflineAccessLink.swift in Sources */,
+				0FF11AE000000000000000C1 /* CacheIdentityMigration.swift in Sources */,
 				EF980FBC32B46CA1A4645855 /* CacheMigrationService.swift in Sources */,
 				C72A75499AA71D2236AA288C /* CacheMigrationProgress.swift in Sources */,
 				80A56C81D9C62272D0FBA2F6 /* CacheMoveSheet.swift in Sources */,

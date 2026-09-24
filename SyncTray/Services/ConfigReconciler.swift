@@ -86,7 +86,15 @@ extension SyncManager {
             current.vfsCacheMaxAge != updated.vfsCacheMaxAge ||
             current.vfsCachePath != updated.vfsCachePath ||
             current.downloadConnections != updated.downloadConnections ||
-            current.mountAtStartup != updated.mountAtStartup
+            current.mountAtStartup != updated.mountAtStartup ||
+            // Both are emitted into the script's {shortId}.json and change the rclone
+            // command line (which remote name the mount runs under; the read-only /
+            // fast-fingerprint flag set), so the agent has to be reinstalled and the stream
+            // remounted for either to take effect. `stableCacheIdentity` additionally
+            // re-keys the cache subtree, and install() adopts the legacy tree on the way
+            // through — another reason it cannot be an in-memory-only change.
+            current.stableCacheIdentity != updated.stableCacheIdentity ||
+            current.streamCacheOnly != updated.streamCacheOnly
 
         return needsReinstall ? .reinstall : .none
     }
