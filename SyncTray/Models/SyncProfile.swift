@@ -53,10 +53,15 @@ struct SyncProfile: Identifiable, Codable, Equatable {
     /// Cache-Only (Offline): serve this Stream profile from the VFS cache and stop trying to
     /// keep up with the remote. The mount still comes up (so existing absolute paths keep
     /// resolving — a Reaper project referencing the mount point does not have to be relinked)
-    /// but it is mounted `--read-only`, with change detection reduced to the fast fingerprint
-    /// and every remote call bounded by a short timeout, and the app-side offline warmer is
-    /// suppressed. Cached files then open at local-disk speed instead of blocking on
-    /// per-file revalidation against a remote that is slow or gone. Mount mode only;
+    /// but it is mounted `--read-only`, with change detection reduced to the fast fingerprint,
+    /// cache retention pinned open so nothing expires while the remote is out of reach, every
+    /// remote call bounded by a short timeout, and the app-side offline warmer suppressed.
+    /// Cached files then open at local-disk speed instead of blocking on per-file
+    /// revalidation against a remote that is slow or gone.
+    ///
+    /// Two reversible trade-offs, both surfaced in the UI: an uncached file errors instead of
+    /// downloading, and `--read-only` pauses write-back, so a recording still queued in the
+    /// cache is deferred (not lost) until the mode is switched off. Mount mode only;
     /// default false.
     var streamCacheOnly: Bool
     var pinnedDirectories: [String]     // Directories to automatically cache offline (mount mode)

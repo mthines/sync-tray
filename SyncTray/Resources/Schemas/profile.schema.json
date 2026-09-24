@@ -114,7 +114,7 @@
     "streamCacheOnly": {
       "type": "boolean",
       "default": false,
-      "description": "Mount mode only. Cache-Only (Offline): keep the mount up so existing absolute paths resolve, but serve it read-only from the VFS cache — fast fingerprints, no modtime/checksum round trips, no polling, short remote timeouts, and no offline warming. Cached files open at local-disk speed; uncached files fail fast instead of downloading."
+      "description": "Mount mode only. Cache-Only (Offline): keep the mount up so existing absolute paths resolve, but serve it read-only from the VFS cache — fast fingerprints, no change polling, cache retention paused so nothing expires while you are offline, and short remote timeouts, with the offline warmer suppressed. Cached files open at local-disk speed; uncached files fail fast instead of downloading, and any write still queued in the cache stays queued (deferred, not lost) until this is turned off."
     },
     "pinnedDirectories": {
       "type": "array",

@@ -2060,12 +2060,25 @@ enum ConfigSelfTest {
         return report("AC-CI2", "cache-identity-config", true)
     }
 
-    private static func mountProfile(id: UUID = UUID(), name: String = "Stream", remotePath: String, vfsCachePath: String) -> SyncProfile {
+    /// - Parameter stableCacheIdentity: pass `false` for fixtures that need the LEGACY,
+    ///   remote-named cache key. Two profiles can only share on-disk bytes under that
+    ///   layout — with the identity on, each profile owns `vfs/synctray_{shortId}/…`, so
+    ///   nested remote paths no longer produce nested cache keys and the overlap machinery
+    ///   has nothing to classify. The overlap tests therefore pin the legacy layout, which
+    ///   remains reachable whenever a user turns the identity off.
+    private static func mountProfile(
+        id: UUID = UUID(),
+        name: String = "Stream",
+        remotePath: String,
+        vfsCachePath: String,
+        stableCacheIdentity: Bool = true
+    ) -> SyncProfile {
         var profile = sampleProfile(id: id, name: name)
         profile.syncMode = .mount
         profile.rcloneRemote = "synology:"
         profile.remotePath = remotePath
         profile.vfsCachePath = vfsCachePath
+        profile.stableCacheIdentity = stableCacheIdentity
         return profile
     }
 
@@ -2122,10 +2135,14 @@ enum ConfigSelfTest {
     // MARK: - AC-CM3 — overlap classification: nested sibling excluded/co-migrated/disjoint
 
     private static func testCacheMigrationOverlap() -> Bool {
+        // LEGACY (remote-named) layout: only there can two profiles address the same bytes.
         let sharedRoot = "/tmp/cm3-src"
-        let parent = mountProfile(name: "Parent", remotePath: "Kaiju/KAIJU", vfsCachePath: sharedRoot)
-        let child = mountProfile(name: "Child", remotePath: "Kaiju/KAIJU/Reaper", vfsCachePath: sharedRoot)
-        let disjoint = mountProfile(name: "Disjoint", remotePath: "OtherShare", vfsCachePath: sharedRoot)
+        let parent = mountProfile(name: "Parent", remotePath: "Kaiju/KAIJU",
+                                  vfsCachePath: sharedRoot, stableCacheIdentity: false)
+        let child = mountProfile(name: "Child", remotePath: "Kaiju/KAIJU/Reaper",
+                                 vfsCachePath: sharedRoot, stableCacheIdentity: false)
+        let disjoint = mountProfile(name: "Disjoint", remotePath: "OtherShare",
+                                    vfsCachePath: sharedRoot, stableCacheIdentity: false)
         let all = [parent, child, disjoint]
 
         switch CacheMigrationPlanner.plan(moving: parent, allProfiles: all, to: "/tmp/cm3-dest", coMigrate: []) {
@@ -2151,6 +2168,28 @@ enum ConfigSelfTest {
         guard plan.sameRootProfiles == [disjoint.id] else {
             return report("AC-CM3", "cache-migration-overlap", false, "(sameRootProfiles \(plan.sameRootProfiles) != [disjoint])")
         }
+
+        // The profile-stable cache identity DISSOLVES overlap: the same nested pair now
+        // owns vfs/synctray_{shortId}/… each, which are disjoint subtrees no matter how
+        // their remote paths nest. The nested sibling must therefore classify as merely
+        // same-root (offered as an independent migration) and the move must succeed
+        // without a co-migration — asserted here so a future change can't quietly
+        // reintroduce a false overlap rejection for identity-keyed profiles.
+        var idParent = parent; idParent.stableCacheIdentity = true
+        var idChild = child; idChild.stableCacheIdentity = true
+        let (identityOverlapping, identitySameRoot) = CacheMigrationPlanner.classifySiblings(
+            of: idParent, sourceRoot: sharedRoot, allProfiles: [idParent, idChild])
+        guard identityOverlapping.isEmpty, identitySameRoot.map({ $0.id }) == [idChild.id] else {
+            return report("AC-CM3", "cache-migration-overlap", false,
+                          "(identity-keyed nested profiles should be same-root, not overlapping)")
+        }
+        guard case .success = CacheMigrationPlanner.plan(
+            moving: idParent, allProfiles: [idParent, idChild], to: "/tmp/cm3-dest", coMigrate: []
+        ) else {
+            return report("AC-CM3", "cache-migration-overlap", false,
+                          "(identity-keyed move rejected for a non-existent overlap)")
+        }
+
         return report("AC-CM3", "cache-migration-overlap", true)
     }
 
@@ -2734,8 +2773,13 @@ enum ConfigSelfTest {
     // MARK: - AC-CM13 — nested co-migrated subtrees never use the whole-directory fast path (finding 5)
 
     private static func testCacheMigrationNestedSubtreesUseFilePath() -> Bool {
-        let parent = mountProfile(name: "Parent", remotePath: "Kaiju/KAIJU", vfsCachePath: "/tmp/cm13-src")
-        let child = mountProfile(name: "Child", remotePath: "Kaiju/KAIJU/Reaper", vfsCachePath: "/tmp/cm13-src")
+        // LEGACY (remote-named) layout — see `mountProfile`: nested cache subtrees, the
+        // condition this fast-path guard exists for, only occur when two profiles share a
+        // remote name.
+        let parent = mountProfile(name: "Parent", remotePath: "Kaiju/KAIJU",
+                                  vfsCachePath: "/tmp/cm13-src", stableCacheIdentity: false)
+        let child = mountProfile(name: "Child", remotePath: "Kaiju/KAIJU/Reaper",
+                                 vfsCachePath: "/tmp/cm13-src", stableCacheIdentity: false)
         let all = [parent, child]
         guard case .success(let plan) = CacheMigrationPlanner.plan(
             moving: parent, allProfiles: all, to: "/tmp/cm13-dest", coMigrate: [child.id]

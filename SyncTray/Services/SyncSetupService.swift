@@ -617,6 +617,13 @@ final class SyncSetupService {
             VFS_CACHE_MAX_SIZE=$(parse_json "vfsCacheMaxSize" "10G")
             VFS_CACHE_MAX_AGE=$(parse_json "vfsCacheMaxAge" "168h")
             VFS_CACHE_PATH=$(parse_json "vfsCachePath" "$HOME/.cache/rclone")
+            # Expand a leading `~` ONCE, here, and use the result everywhere below.
+            # `vfsCachePath` is stored raw (the CLI and the file-backed config both keep a
+            # user-written `~`) and every Swift read site expands on read, but the shell
+            # passes it through quoted — so an unexpanded value made rclone create a
+            # directory literally named `~` in its working directory, silently putting the
+            # cache somewhere neither the app nor the preflight looks.
+            VFS_CACHE_PATH="${VFS_CACHE_PATH/#\\~/$HOME}"
             # Profile-owned rclone remote name the mount runs under, so the VFS cache is
             # keyed by the PROFILE instead of by whichever remote is currently reachable.
             # Empty = legacy behaviour (mount `remote:path` directly, cache keyed by remote).
@@ -848,10 +855,17 @@ for k, v in json.load(sys.stdin).get(remote, {}).items():
                 #
                 # Refuse the mount instead. launchd's KeepAlive retries, so the profile comes
                 # up by itself once the drive is back — with its cache intact.
-                VFS_CACHE_PATH_EXPANDED="${VFS_CACHE_PATH/#\\~/$HOME}"
-                if ! mkdir -p "$VFS_CACHE_PATH_EXPANDED" 2>/dev/null || [[ ! -w "$VFS_CACHE_PATH_EXPANDED" ]]; then
-                    echo "$(date '+%Y-%m-%d %H:%M:%S') - Error: VFS cache directory not writable: $VFS_CACHE_PATH_EXPANDED - refusing to mount uncached" >> "$LOG_FILE"
-                    # Back off so KeepAlive doesn't spin while the drive is away.
+                #
+                # This checks the SAME path that goes to --cache-dir (both expanded above),
+                # so the preflight can't pass while rclone caches somewhere else.
+                if ! mkdir -p "$VFS_CACHE_PATH" 2>/dev/null || [[ ! -w "$VFS_CACHE_PATH" ]]; then
+                    echo "$(date '+%Y-%m-%d %H:%M:%S') - Error: VFS cache directory not writable: $VFS_CACHE_PATH - refusing to mount uncached" >> "$LOG_FILE"
+                    # Release the lock BEFORE backing off. KeepAlive restarts us on exit, so
+                    # the sleep only exists to stop a hot respawn loop while the drive is
+                    # away — holding the lock through it would silently swallow a manual
+                    # Mount (the app's trigger takes the same lock) for 30s at a time.
+                    rm -f "$LOCK_FILE"
+                    trap - EXIT
                     sleep 30
                     exit 1
                 fi
@@ -899,7 +913,7 @@ for k, v in json.load(sys.stdin).get(remote, {}).items():
                 # Both backends share the same VFS cache layer, so retention/eviction
                 # (--vfs-cache-max-size / --vfs-cache-max-age) behaves identically.
                 # Note: No --daemon flag - launchd manages the process lifecycle.
-                RCLONE_CMD="$RCLONE_BIN $MOUNT_SUBCMD \\"$REMOTE\\" \\"$LOCAL_PATH\\" --vfs-cache-mode $VFS_CACHE_MODE --vfs-cache-max-size $VFS_CACHE_MAX_SIZE --vfs-cache-max-age $VFS_CACHE_MAX_AGE --cache-dir \\"$VFS_CACHE_PATH\\" --log-level INFO --use-json-log"
+                RCLONE_CMD="$RCLONE_BIN $MOUNT_SUBCMD \\"$REMOTE\\" \\"$LOCAL_PATH\\" --vfs-cache-mode $VFS_CACHE_MODE --vfs-cache-max-size $VFS_CACHE_MAX_SIZE --cache-dir \\"$VFS_CACHE_PATH\\" --log-level INFO --use-json-log"
 
                 # Throughput tuning. Reading a file through the mount (streaming or offline
                 # warming) otherwise trickles: the nfsmount -> rclone-NFS-server -> VFS hop
@@ -938,6 +952,7 @@ for k, v in json.load(sys.stdin).get(remote, {}).items():
                 # here: under --vfs-cache-mode full a write while the remote is down lands in
                 # the VFS cache as dirty and rclone retries the write-back until it returns.
                 DIR_CACHE_TIME="1000h"
+                CACHE_MAX_AGE="$VFS_CACHE_MAX_AGE"
                 RCLONE_CMD="$RCLONE_CMD --buffer-size 128M --vfs-read-ahead 256M --transfers $DOWNLOAD_CONNECTIONS --vfs-read-chunk-size 128M --vfs-read-chunk-size-limit off --attr-timeout 5s"
 
                 # CACHE-ONLY (OFFLINE) MODE
@@ -947,27 +962,45 @@ for k, v in json.load(sys.stdin).get(remote, {}).items():
                 # resolving, which a separate read-only browse folder cannot give you — but it
                 # stops trying to stay in step with the remote:
                 #   --read-only            no write-back queue, no dirty cache entries.
-                #   --vfs-fast-fingerprint change detection on size+modtime only, never a hash.
-                #                          The slow, fingerprint-unstable revalidation on every
-                #                          open (SMB especially) is what makes opening a project
-                #                          full of already-cached media crawl.
-                #   --no-checksum          don't ask the backend to hash on open/close.
-                #   --no-modtime           don't issue per-object modtime reads.
+                #   --vfs-fast-fingerprint change detection on size+modtime, never a hash. The
+                #                          slow, fingerprint-unstable revalidation on every open
+                #                          (SMB especially) is what makes opening a project full
+                #                          of already-cached media crawl.
                 #   --poll-interval 0      no change-notification polling.
                 #   --dir-cache-time       effectively never re-list from the remote.
+                #   --vfs-cache-max-age    effectively never expire. This one is load-bearing:
+                #                          the profile's normal retention (168h by default) is a
+                #                          timer that keeps running while you are offline, and
+                #                          an entry it evicts here CANNOT be re-fetched — the
+                #                          whole point of the mode is that the remote is out of
+                #                          reach. Size-based eviction still bounds the cache,
+                #                          and read-only means nothing new is being added to
+                #                          trigger it.
                 #   --timeout/--contimeout/--retries/--low-level-retries
                 #                          anything that DOES reach for the remote (an uncached
                 #                          file) fails in seconds instead of hanging the app
                 #                          that asked for it.
-                # Uncached files therefore error rather than download — that is the trade the
-                # mode makes, and why it is off by default.
+                #
+                # Deliberately NOT set: --no-modtime. It would suppress the modtime reads that
+                # --vfs-fast-fingerprint compares against, and a fingerprint that changes shape
+                # reads as "this cache entry is stale". Online that costs a re-download; in THIS
+                # mode the re-read fails against an unreachable remote, so a false staleness
+                # verdict turns a perfectly good cached file into an unreadable one. Keeping the
+                # fingerprint stable matters more here than saving a metadata round trip.
+                # --no-checksum is likewise omitted: it governs transfers, and read-only has none.
+                #
+                # Uncached files error rather than download — that is the trade the mode makes,
+                # and why it is off by default. So is the write-back pause: a recording still
+                # queued in the cache when this is switched on stays queued (unsynced, not lost)
+                # until it is switched back off.
                 if [[ "$STREAM_CACHE_ONLY" == "true" || "$STREAM_CACHE_ONLY" == "True" ]]; then
-                    DIR_CACHE_TIME="9999h"
-                    RCLONE_CMD="$RCLONE_CMD --read-only --vfs-fast-fingerprint --no-checksum --no-modtime --poll-interval 0 --contimeout 3s --timeout 5s --retries 1 --low-level-retries 1"
-                    echo "$(date '+%Y-%m-%d %H:%M:%S') - Cache-only mode: serving from VFS cache, remote reads fail fast" >> "$LOG_FILE"
+                    DIR_CACHE_TIME="876000h"
+                    CACHE_MAX_AGE="876000h"
+                    RCLONE_CMD="$RCLONE_CMD --read-only --vfs-fast-fingerprint --poll-interval 0 --contimeout 3s --timeout 5s --retries 1 --low-level-retries 1"
+                    echo "$(date '+%Y-%m-%d %H:%M:%S') - Cache-only mode: serving from VFS cache, retention paused, remote reads fail fast" >> "$LOG_FILE"
                 fi
 
-                RCLONE_CMD="$RCLONE_CMD --dir-cache-time $DIR_CACHE_TIME"
+                RCLONE_CMD="$RCLONE_CMD --dir-cache-time $DIR_CACHE_TIME --vfs-cache-max-age $CACHE_MAX_AGE"
 
                 # Name the mounted volume after the mount-point folder so Finder
                 # shows e.g. "Temp" instead of the auto-generated NFS share name

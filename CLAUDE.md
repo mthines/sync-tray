@@ -195,7 +195,19 @@ location. Both trees live under the same `--cache-dir`, so it is an atomic
 same-directory rename — instant even for a ~95 GB cache, and a no-op once
 done. It never merges: if a tree already sits at the destination, the legacy
 one is left alone (reconciling two partial `vfsMeta` byte-range sets is how
-you end up serving corrupt bytes). Candidates are the primary remote's key
+you end up serving corrupt bytes).
+
+**Side effect on cache-move overlap classification.** Under the legacy layout
+two profiles could address the *same on-disk bytes* when one remote path nested
+inside another's (`Kaiju/KAIJU` and `Kaiju/KAIJU/Reaper` under one remote), which
+is what `CacheMigrationPlanner`'s overlap machinery exists for. With the identity
+on, each profile owns `vfs/synctray_{its own shortId}/…`, so nested remote paths
+no longer produce nested cache keys and such a pair classifies as merely
+**same-root** — no co-migration prompt, no `unresolvedOverlap` rejection. That is
+correct (the bytes really are disjoint now), but it means the overlap tests
+(AC-CM3, AC-CM13) must pin `stableCacheIdentity: false`, which the shared
+`mountProfile` fixture takes as a parameter. The legacy layout stays reachable
+whenever a user turns the identity off, so the machinery still has to work. Candidates are the primary remote's key
 first, then the fallback's. `vfsMeta` is adopted before `vfs`, so an
 interrupted run can only ever lose metadata — the direction rclone recovers
 from by re-fetching — never leave data without the byte-ranges that prove it
@@ -223,13 +235,33 @@ The mount still comes up — that is the point, and it is what the read-only
 `(Offline)` browse point below cannot do: a project references absolute paths
 under the mount point, so a sibling folder means relinking every file. What
 changes is that the mount stops chasing the remote: `--read-only`,
-`--vfs-fast-fingerprint`, `--no-checksum`, `--no-modtime`, `--poll-interval 0`,
-`--dir-cache-time 9999h`, and short `--contimeout`/`--timeout`/`--retries` so
-anything that *does* reach for the remote fails in seconds instead of hanging
-the app that asked. The app-side warmer is suppressed too
-(`shouldAutoWarmOnMount`) — downloading uncached bytes is precisely what the
-mode exists to stop. Trade-off: an uncached file errors rather than
-downloading, which is why it is opt-in.
+`--vfs-fast-fingerprint`, `--poll-interval 0`, a `--dir-cache-time` of ~100
+years, and short `--contimeout`/`--timeout`/`--retries` so anything that *does*
+reach for the remote fails in seconds instead of hanging the app that asked.
+The app-side warmer is suppressed too (`shouldAutoWarmOnMount`) — downloading
+uncached bytes is precisely what the mode exists to stop.
+
+**Retention is paused, and that is load-bearing.** `--vfs-cache-max-age` is
+pinned to the same ~100 years for the duration. The profile's normal retention
+(168h by default) is a timer that keeps running while you are offline, and an
+entry it evicts in this mode **cannot be re-fetched** — the remote being out of
+reach is the whole premise. `--vfs-cache-max-size` still bounds the cache, and
+read-only means nothing new is arriving to trigger size eviction anyway.
+
+**`--no-modtime` is deliberately NOT set** (and neither is `--no-checksum`).
+`--no-modtime` would suppress the modtime reads `--vfs-fast-fingerprint`
+compares against, and a fingerprint that changes shape reads as "this entry is
+stale". Online that costs a re-download; *here* the re-read fails against an
+unreachable remote, so a false staleness verdict turns a perfectly good cached
+file into an unreadable one. A stable fingerprint is worth more than a saved
+metadata round trip. `--no-checksum` governs transfers, of which read-only has
+none.
+
+Two trade-offs, both why it is opt-in and reversible: an uncached file errors
+rather than downloading, and **a write still queued in the cache when the mode
+is switched on stays queued** — `--read-only` pauses the write-back, so an
+unsynced recording is deferred, not lost, and uploads when the mode is switched
+back off. The UI caption says so in orange.
 
 #### Mount preflight — never mount with the cache silently disabled
 
@@ -241,7 +273,17 @@ that is not attached: `/Volumes/<Drive>` is then a root-owned placeholder and
 the `mkdir` fails with EPERM. The script's mount branch now preflights the
 cache directory and refuses the mount with a logged error instead; launchd's
 `KeepAlive` brings the profile up by itself once the drive is back, cache
-intact.
+intact. It releases the lock file *before* its back-off sleep, so a manual
+Mount during that window isn't silently swallowed.
+
+The script also expands a leading `~` in `vfsCachePath` **once**, up front, and
+uses the result for both the preflight and `--cache-dir`. The field is stored
+raw (the CLI and file-backed config keep a user-written `~`, and Swift read
+sites expand on read), but the shell passes it through quoted — so an
+unexpanded value made rclone create a directory literally named `~` in its
+working directory, putting the cache somewhere neither the app nor the
+preflight looks. Checking one path while rclone uses another would have made
+the preflight worse than useless.
 
 Changing a Stream profile's Cache Directory only re-points rclone by
 default — the already-downloaded bytes at the old location are abandoned.

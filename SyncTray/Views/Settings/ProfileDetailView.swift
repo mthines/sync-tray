@@ -1084,9 +1084,12 @@ struct ProfileDetailView: View {
                         VStack(alignment: .leading, spacing: 2) {
                             Text("Cache-only (stop syncing)")
                                 .font(.subheadline)
-                            Text("Serve \u{201C}\(mountFolderName)\u{201D} read-only from what's already cached and stop checking the remote for changes. The mount stays where it is, so projects that point at these files keep opening — just without the per-file checks that make opening them slow. Files that aren't cached yet won't download until you turn this off.")
+                            Text("Serve \u{201C}\(mountFolderName)\u{201D} read-only from what's already cached and stop checking the remote for changes. The mount stays where it is, so projects that point at these files keep opening — just without the per-file checks that make opening them slow. Cached files also stop expiring while this is on, so they're still there when you get back.")
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
+                            Text("While it's on, files that aren't cached yet won't download, and anything you've recorded into this folder that hasn't reached the remote yet stays queued — nothing is lost, but it won't upload until you turn this off.")
+                                .font(.caption)
+                                .foregroundStyle(.orange)
                         }
                     }
                     .toggleStyle(.switch)
