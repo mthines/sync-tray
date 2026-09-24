@@ -94,6 +94,7 @@ extension SyncManager {
             // re-keys the cache subtree, and install() adopts the legacy tree on the way
             // through — another reason it cannot be an in-memory-only change.
             current.stableCacheIdentity != updated.stableCacheIdentity ||
+            current.cacheIdentity != updated.cacheIdentity ||
             current.streamCacheOnly != updated.streamCacheOnly
 
         return needsReinstall ? .reinstall : .none

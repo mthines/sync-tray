@@ -18,12 +18,18 @@ import Foundation
 /// Two trees, the same bytes, downloaded twice — and the second one starts empty, which is
 /// what turns "I changed my remote because I'm not on my local network" into a full re-fetch.
 ///
-/// `stableCacheIdentity` fixes that going forward by mounting an env-var-defined remote
-/// named after the PROFILE (`synctray_{shortId}`) whose connection parameters are copied from
-/// whichever remote is active, so `fsName` never changes. But flipping that on would *itself*
-/// strand the tree already on disk under the old name. This type is the one-time rename that
-/// closes the gap: it moves `vfs/{legacyName}/{remotePath}` (and its `vfsMeta` sibling) to
-/// `vfs/{identity}/{remotePath}` before the first mount under the new identity.
+/// `stableCacheIdentity` fixes that going forward by mounting an env-var-defined remote under
+/// a **pinned** name whose connection parameters are copied from whichever remote is active,
+/// so `fsName` never changes. That pinned name is the profile's own remote name at pin time
+/// (`MigrationV4PinCacheIdentity`), so for the common case the bytes are ALREADY in the right
+/// place and this type does nothing at all.
+///
+/// It earns its keep for the leftovers: a tree sitting under a name the profile has used but
+/// is no longer keyed by — most often the fallback's, written by a failover that landed in
+/// `vfs/{fallback}/…` (the 640 K vs 6.7 G split recorded in CLAUDE.md). It moves
+/// `vfs/{strayName}/{remotePath}` and its `vfsMeta` sibling to `vfs/{identity}/{remotePath}`
+/// before the mount comes up. Note the direction: it consolidates TOWARD the primary remote
+/// name, which is also where an older build would look, so it never makes a rollback worse.
 ///
 /// # Shape
 ///
@@ -67,8 +73,10 @@ enum CacheIdentityMigration {
         return (kindDir as NSString).appendingPathComponent(key)
     }
 
-    /// Every legacy cache key a profile's bytes could be sitting under: its primary remote
-    /// name, plus the fallback remote's name when one is configured.
+    /// Every stray cache key a profile's bytes could be sitting under: its primary remote
+    /// name, plus the fallback remote's name when one is configured. With the identity pinned
+    /// to the primary name — the normal case — the primary candidate equals the identity key
+    /// and is filtered out below, leaving only a fallback tree to consolidate.
     ///
     /// The fallback is included because the mount only keeps one shared tree across a
     /// failover when `fallbackRequiresCacheRebuild` is false; a profile that failed over

@@ -109,7 +109,11 @@
     "stableCacheIdentity": {
       "type": "boolean",
       "default": true,
-      "description": "Mount mode only. When true (default), the VFS cache is keyed by the profile (synctray_{shortId}) instead of by the rclone remote name, so one cache is shared across every remote the profile points at — changing remotes (LAN SMB at home, SFTP away) no longer re-downloads into a second tree. SyncTray mounts an env-var-defined remote of that name carrying the active remote's parameters; an existing remote-named cache tree is renamed into place on the next install, so turning this on costs no re-download."
+      "description": "Mount mode only. When true (default), the VFS cache is keyed by the pinned cacheIdentity instead of by whatever rcloneRemote currently says, so one cache is shared across every remote the profile points at — changing remotes (LAN SMB at home, SFTP away) no longer re-downloads into a second tree. SyncTray mounts an env-var-defined remote under the pinned name carrying the active remote's parameters."
+    },
+    "cacheIdentity": {
+      "type": "string",
+      "description": "Mount mode only. The rclone remote name this profile's VFS cache is keyed by, pinned once and then left alone. Empty means unpinned, which resolves to the primary remote name — identical to how the cache was keyed before this field existed. SyncTray pins it to the profile's current remote name on first launch, so no cached bytes move on upgrade and an older SyncTray (which ignores this key and mounts rcloneRemote:) still finds the same cache. Must be a name expressible as RCLONE_CONFIG_<NAME>_<KEY> environment variables, i.e. letters, digits, underscore and hyphen; anything else is ignored and the primary remote name is used."
     },
     "streamCacheOnly": {
       "type": "boolean",

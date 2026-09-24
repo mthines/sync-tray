@@ -39,16 +39,21 @@ struct SyncProfile: Identifiable, Codable, Equatable {
     /// never written to the script's `{shortId}.json`. Mount mode; default: true. See the
     /// "Offline access" section in CLAUDE.md.
     var offlineAccessEnabled: Bool
-    /// Key the VFS cache by a **profile-owned** identity (`synctray_{shortId}`) instead of
-    /// by the rclone remote name. rclone derives the cache location from the mounted Fs's
-    /// name + root (`{cache}/vfs/{fsName}/{fsRoot}`), so with this off, changing a profile's
-    /// `rcloneRemote` — LAN SMB at home, SFTP/QuickConnect away — re-keys the whole cache
+    /// Key the VFS cache by a **pinned identity** (`cacheIdentity`) instead of by whatever
+    /// `rcloneRemote` currently says. rclone derives the cache location from the mounted
+    /// Fs's name + root (`{cache}/vfs/{fsName}/{fsRoot}`), so with this off, changing a
+    /// profile's remote — LAN SMB at home, SFTP/QuickConnect away — re-keys the whole cache
     /// and re-downloads everything into a second tree. With it on, SyncTray mounts an
-    /// env-var-defined remote named after the PROFILE whose connection parameters are copied
-    /// from whichever remote is currently active, so one cache is shared across every remote
-    /// the profile ever points at. Mount mode only; default true. `CacheIdentityMigration`
-    /// adopts a pre-existing remote-named tree on the next install, so turning this on never
-    /// costs a re-download. See "Cache identity" in CLAUDE.md.
+    /// env-var-defined remote under the pinned name, carrying the connection parameters of
+    /// whichever remote is currently active, so one cache is shared across every remote the
+    /// profile ever points at.
+    ///
+    /// The pinned name is the profile's own remote name at the time it was pinned, NOT a
+    /// synthetic one, so switching this on moves nothing and an older build still finds the
+    /// same subtree. Mount mode only; default true. `CacheIdentityMigration` consolidates a
+    /// stray fallback-named tree into it. See "Cache identity" in CLAUDE.md.
+    ///
+    /// Turning it OFF returns the profile to deriving the key from `rcloneRemote` live.
     var stableCacheIdentity: Bool
     /// Cache-Only (Offline): serve this Stream profile from the VFS cache and stop trying to
     /// keep up with the remote. The mount still comes up (so existing absolute paths keep
@@ -93,29 +98,63 @@ struct SyncProfile: Identifiable, Codable, Equatable {
 
     // MARK: - Cache Identity
 
-    /// The rclone remote name this profile's VFS cache is keyed by when
-    /// `stableCacheIdentity` is on — derived from the profile UUID, so it never changes
-    /// when the user re-points `rcloneRemote` or a fallback activates.
-    ///
-    /// Only `[a-z0-9_]` by construction (`synctray_` + 8 lowercase hex chars), which
-    /// matters twice: rclone accepts it as a remote name, and it maps to the
-    /// `RCLONE_CONFIG_<NAME>_<KEY>` environment variables that define the remote without
-    /// any escaping.
-    var cacheIdentityName: String {
-        "synctray_\(shortId)"
-    }
-
     /// Remote name (colon stripped) of the profile's PRIMARY remote — the name rclone
-    /// keyed the cache by before `stableCacheIdentity` existed, and still does when the
-    /// flag is off.
+    /// keys the cache by when `stableCacheIdentity` is off, and the name
+    /// `MigrationV4PinCacheIdentity` pins `cacheIdentity` to for an existing profile.
     var primaryRemoteName: String {
         rcloneRemote.hasSuffix(":") ? String(rcloneRemote.dropLast()) : rcloneRemote
+    }
+
+    /// The rclone remote name this profile's VFS cache is keyed by, **pinned once and
+    /// then never derived again**. Empty until pinned, which falls back to the primary
+    /// remote name — i.e. exactly the pre-existing behaviour.
+    ///
+    /// Pinning rather than deriving is what makes this safe to install and safe to roll
+    /// back. `MigrationV4PinCacheIdentity` writes the profile's CURRENT primary remote
+    /// name here on first launch, so the cache key is byte-identical to the one the
+    /// previous version used: nothing moves on upgrade, and an older build — which simply
+    /// ignores this key and mounts `rcloneRemote:` — lands on the same subtree. A derived
+    /// name (`synctray_{shortId}`) would have been tidier and was the first attempt, but it
+    /// re-keys every existing cache and strips a downgrade of ~95 GB of warm bytes with no
+    /// reverse path.
+    ///
+    /// The value only has to be a name rclone accepts AND one expressible as
+    /// `RCLONE_CONFIG_<NAME>_<KEY>` environment variables — see `isEnvExpressibleIdentity`.
+    var cacheIdentity: String
+
+    /// Whether `name` survives the round trip into `RCLONE_CONFIG_<NAME>_<KEY>` variables
+    /// the sync script uses to define the identity remote. rclone's documented mapping
+    /// upper-cases the name and replaces `-` with `_`; a name containing anything else
+    /// (a dot, a space) has no expressible variable, so the identity is simply not used
+    /// for that profile. Harmless, because an unpinned identity resolves to the primary
+    /// remote name — the same subtree rclone already uses.
+    static func isEnvExpressibleIdentity(_ name: String) -> Bool {
+        !name.isEmpty && name.allSatisfy {
+            $0.isASCII && ($0.isLetter || $0.isNumber || $0 == "_" || $0 == "-")
+        }
+    }
+
+    /// The pinned identity, or the primary remote name while it is still unpinned.
+    var effectiveCacheIdentity: String {
+        let pinned = cacheIdentity.trimmingCharacters(in: .whitespaces)
+        return pinned.isEmpty ? primaryRemoteName : pinned
+    }
+
+    /// The identity actually handed to the sync script, or `nil` when the profile must
+    /// mount its plain `remote:path` reference — the flag is off, or the pinned name
+    /// cannot be expressed as environment variables. Both cases key the cache exactly as
+    /// the pre-existing code did.
+    var scriptCacheIdentity: String? {
+        guard stableCacheIdentity else { return nil }
+        let identity = effectiveCacheIdentity
+        guard Self.isEnvExpressibleIdentity(identity) else { return nil }
+        return identity
     }
 
     /// The remote name rclone will report as the mounted Fs's name, i.e. the first path
     /// component of the profile's cache subtree.
     var effectiveCacheRemoteName: String {
-        stableCacheIdentity ? cacheIdentityName : primaryRemoteName
+        scriptCacheIdentity ?? primaryRemoteName
     }
 
     // MARK: - Computed Paths
@@ -249,6 +288,7 @@ struct SyncProfile: Identifiable, Codable, Equatable {
         mountAtStartup: Bool = true,
         offlineAccessEnabled: Bool = true,
         stableCacheIdentity: Bool = true,
+        cacheIdentity: String = "",
         streamCacheOnly: Bool = false,
         pinnedDirectories: [String] = [],
         warmExcludePatterns: [String] = [],
@@ -279,6 +319,7 @@ struct SyncProfile: Identifiable, Codable, Equatable {
         self.mountAtStartup = mountAtStartup
         self.offlineAccessEnabled = offlineAccessEnabled
         self.stableCacheIdentity = stableCacheIdentity
+        self.cacheIdentity = cacheIdentity
         self.streamCacheOnly = streamCacheOnly
         self.pinnedDirectories = pinnedDirectories
         self.warmExcludePatterns = warmExcludePatterns
@@ -314,7 +355,7 @@ extension SyncProfile {
         case mountBackend
         case vfsCacheMode, vfsCacheMaxSize, vfsCacheMaxAge, vfsCachePath, allowNonEmptyMount
         case mountAtStartup, offlineAccessEnabled
-        case stableCacheIdentity, streamCacheOnly
+        case stableCacheIdentity, cacheIdentity, streamCacheOnly
         case pinnedDirectories, warmExcludePatterns, rcPort
         case downloadConnections
     }
@@ -373,6 +414,11 @@ extension SyncProfile {
         // warm cache, so `CacheIdentityMigration` renames the legacy tree into place first.
         // Nothing re-downloads; set it false to stay on the remote-named layout.
         stableCacheIdentity = try container.decodeIfPresent(Bool.self, forKey: .stableCacheIdentity) ?? true
+        // Empty until MigrationV4PinCacheIdentity pins it (or the user sets it). Empty
+        // resolves to the primary remote name, which is the key every previous version
+        // used — so a profile file written before this field existed keys its cache
+        // identically, and no bytes move.
+        cacheIdentity = try container.decodeIfPresent(String.self, forKey: .cacheIdentity) ?? ""
         // Backwards compatibility: cache-only is opt-in, so an existing profile keeps
         // streaming from the remote exactly as before.
         streamCacheOnly = try container.decodeIfPresent(Bool.self, forKey: .streamCacheOnly) ?? false

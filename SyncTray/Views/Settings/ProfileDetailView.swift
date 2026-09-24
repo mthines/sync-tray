@@ -61,6 +61,7 @@ struct ProfileDetailView: View {
     @State private var mountAtStartup: Bool = true
     @State private var offlineAccessEnabled: Bool = true
     @State private var stableCacheIdentity: Bool = true
+    @State private var cacheIdentity: String = ""
     @State private var streamCacheOnly: Bool = false
     @State private var downloadConnections: Int = 2
 
@@ -188,6 +189,7 @@ struct ProfileDetailView: View {
         mountAtStartup != profile.mountAtStartup ||
         offlineAccessEnabled != profile.offlineAccessEnabled ||
         stableCacheIdentity != profile.stableCacheIdentity ||
+        cacheIdentity != profile.cacheIdentity ||
         streamCacheOnly != profile.streamCacheOnly ||
         downloadConnections != profile.downloadConnections
     }
@@ -197,6 +199,17 @@ struct ProfileDetailView: View {
     private var mountFolderName: String {
         let name = (localSyncPath as NSString).lastPathComponent
         return name.isEmpty ? "Stream" : name
+    }
+
+    /// The name the VFS cache is (or will be) keyed by, for the "Share the cache across
+    /// remotes" caption. Mirrors `SyncProfile.effectiveCacheIdentity` against the live form
+    /// fields, so an unpinned profile shows the remote name it is about to be pinned to
+    /// rather than an empty quote.
+    private var cacheIdentityDisplayName: String {
+        let pinned = cacheIdentity.trimmingCharacters(in: .whitespaces)
+        if !pinned.isEmpty { return pinned }
+        let primary = rcloneRemote.hasSuffix(":") ? String(rcloneRemote.dropLast()) : rcloneRemote
+        return primary.isEmpty ? "this profile" : primary
     }
 
     private var canInstall: Bool {
@@ -1072,7 +1085,7 @@ struct ProfileDetailView: View {
                         VStack(alignment: .leading, spacing: 2) {
                             Text("Share the cache across remotes")
                                 .font(.subheadline)
-                            Text("Store the cache under this profile instead of under the remote's name, so switching remotes — your LAN address at home, SFTP or QuickConnect away — keeps the files you've already downloaded instead of re-fetching them into a second cache. Files already cached under the old remote name are moved across on save.")
+                            Text("Keep the cache under \u{201C}\(cacheIdentityDisplayName)\u{201D} whichever remote this profile is pointed at, so switching remotes — your LAN address at home, SFTP or QuickConnect away — keeps the files you've already downloaded instead of re-fetching them into a second cache. Nothing moves on disk when you turn this on.")
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                         }
@@ -2092,6 +2105,7 @@ struct ProfileDetailView: View {
         mountAtStartup = profile.mountAtStartup
         offlineAccessEnabled = profile.offlineAccessEnabled
         stableCacheIdentity = profile.stableCacheIdentity
+        cacheIdentity = profile.cacheIdentity
         streamCacheOnly = profile.streamCacheOnly
         downloadConnections = profile.downloadConnections
 
@@ -2128,6 +2142,7 @@ struct ProfileDetailView: View {
         updatedProfile.mountAtStartup = mountAtStartup
         updatedProfile.offlineAccessEnabled = offlineAccessEnabled
         updatedProfile.stableCacheIdentity = stableCacheIdentity
+        updatedProfile.cacheIdentity = cacheIdentity
         updatedProfile.streamCacheOnly = streamCacheOnly
         updatedProfile.downloadConnections = downloadConnections
         return updatedProfile

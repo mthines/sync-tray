@@ -119,12 +119,15 @@ final class SyncSetupService {
                     atPath: cacheDir, withIntermediateDirectories: true)
             }
 
-            // Adopt a pre-existing remote-named cache tree into the profile's stable
-            // identity tree BEFORE the mount comes up, so switching a profile's remote (or
-            // turning `stableCacheIdentity` on for the first time) re-uses the bytes already
-            // downloaded instead of starting a second, empty tree. Same-directory renames —
-            // fast even for a multi-GB cache — and a no-op once migrated. Never throws: a
-            // failed adoption costs a re-download, blocking the install would cost the mount.
+            // Consolidate a stray cache tree into the profile's pinned identity BEFORE the
+            // mount comes up. Normally a no-op: the identity IS the primary remote name, so
+            // the bytes are already in the right place. It earns its keep when a tree exists
+            // under a DIFFERENT name the profile has used — most often the fallback's, from
+            // a failover that wrote into `vfs/{fallback}/…`. Consolidating toward the pinned
+            // name is also the direction a downgrade wants, since an older build looks under
+            // the primary name. Same-directory renames — fast even for a multi-GB cache.
+            // Never throws: a failed adoption costs a re-download, blocking the install
+            // would cost the mount.
             CacheIdentityMigration.apply(for: profile) { message in
                 SyncTraySettings.debugLog(message)
             }
@@ -827,11 +830,16 @@ for k, v in json.load(sys.stdin).get(remote, {}).items():
                 # fsName is then invariant, so one cache is shared across every remote the
                 # profile ever uses — including a fallback activation.
                 #
-                # Safe by construction: CACHE_IDENTITY is [a-z0-9_] only, so the name maps to
-                # environment variables with no escaping. If the active remote has no stored
-                # config (e.g. it is itself env-defined), TYPE comes back empty and we mount
-                # the original remote reference instead of a broken identity.
-                if [[ -n "$CACHE_IDENTITY" ]]; then
+                # The identity is normally the profile's OWN remote name, pinned once
+                # (MigrationV4PinCacheIdentity) so it stops following `rcloneRemote`. Keeping
+                # the existing name is what makes this free to adopt and free to roll back:
+                # the cache stays exactly where every previous version put it.
+                #
+                # Two guards. The name must be expressible as RCLONE_CONFIG_<NAME>_<KEY>
+                # ([A-Za-z0-9_-]; the app emits "" otherwise), and the active remote must have
+                # a stored config to copy — if TYPE comes back empty we mount the original
+                # reference rather than a half-defined identity.
+                if [[ "$CACHE_IDENTITY" =~ ^[A-Za-z0-9_-]+$ ]]; then
                     IDENT_UPPER=$(echo "$CACHE_IDENTITY" | tr '[:lower:]' '[:upper:]' | tr '-' '_')
                     eval "$($RCLONE_BIN config dump 2>/dev/null | dump_remote_as_env "$ACTIVE_REMOTE_NAME" "$IDENT_UPPER")"
                     IDENT_TYPE_VAR="RCLONE_CONFIG_${IDENT_UPPER}_TYPE"
@@ -1177,12 +1185,12 @@ for k, v in json.load(sys.stdin).get(remote, {}).items():
             "vfsCacheMaxAge": profile.vfsCacheMaxAge,
             "vfsCachePath": profile.vfsCachePath,
             "allowNonEmptyMount": profile.allowNonEmptyMount,
-            // The rclone remote name the mount must run under so its VFS cache is keyed by
-            // the PROFILE rather than by whichever remote is active. Empty string disables
-            // it (the script then mounts `remote:path` as before). The script defines this
-            // name entirely from the active remote's config via RCLONE_CONFIG_<NAME>_<KEY>
-            // environment variables — see the mount branch of the generated script.
-            "cacheIdentity": profile.stableCacheIdentity ? profile.cacheIdentityName : "",
+            // The rclone remote name the mount must run under so its VFS cache stops
+            // tracking whichever remote is active. Empty string disables it (the script then
+            // mounts `remote:path` as before) — which is also what a name that cannot be
+            // expressed as RCLONE_CONFIG_<NAME>_<KEY> variables degrades to. The script
+            // defines this name from the active remote's config; see its mount branch.
+            "cacheIdentity": profile.scriptCacheIdentity ?? "",
             "streamCacheOnly": profile.streamCacheOnly,
             "pinnedDirectories": profile.pinnedDirectories,
             "rcPort": profile.rcPort,

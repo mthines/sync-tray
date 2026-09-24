@@ -166,54 +166,85 @@ home for deriving it is `VFSCacheService.cacheRelativePath(for:)`, called by
 `CacheMigrationPlanner` so they cannot disagree about which subtree a profile
 owns. Which *name* that first component is, is the subject of the next section.
 
-#### Cache identity — the cache belongs to the profile, not the remote
+#### Cache identity — pin the cache key, don't let it follow the remote
 
-rclone derives the cache location from the Fs it is handed, and an Fs's name
-is the **remote name**. Left alone, that makes the cache a property of the
-connection rather than of the data: `synology:Kaiju/KAIJU` (SMB, on the LAN)
-and `synology-sftp:Kaiju/KAIJU` (SFTP, from anywhere) are the same files on
-the same NAS, but they get `vfs/synology/…` and `vfs/synology-sftp/…` — two
-trees, downloaded twice. Re-pointing a profile's remote because you left the
-house therefore starts from an empty cache and re-fetches everything.
+rclone derives the cache location from the Fs it is handed, and an Fs's name is
+the **remote name**. Left alone, that makes the cache a property of the
+connection rather than of the data: `synology:Kaiju/KAIJU` (SMB, on the LAN) and
+`synology-sftp:Kaiju/KAIJU` (SFTP, from anywhere) are the same files on the same
+NAS, but they get `vfs/synology/…` and `vfs/synology-sftp/…` — two trees,
+downloaded twice. Re-pointing a profile's remote because you left the house
+therefore starts from an empty cache and re-fetches everything.
 
 **`stableCacheIdentity` (Advanced Options, "Share the cache across remotes",
-default true)** removes the remote name from the equation. The sync script
-defines a remote named after the PROFILE — `synctray_{shortId}`, so
-`[a-z0-9_]` only and safe to map onto environment variables — entirely through
-`RCLONE_CONFIG_<NAME>_<KEY>` variables copied from whichever remote is
-actually active, and mounts that. `fsName` is then invariant, so **one cache
-is shared across every remote the profile ever points at**, including a
-fallback activation. `generateProfileConfig` emits the name as `cacheIdentity`
-(empty string = off, mount `remote:path` as before); the script falls back to
-the original reference when the active remote has no stored config to copy, so
-an env-defined remote degrades to the old behaviour instead of a broken mount.
+default true)** removes the *current* remote name from the equation. The sync
+script defines a remote under the profile's **pinned** `cacheIdentity` entirely
+through `RCLONE_CONFIG_<NAME>_<KEY>` variables copied from whichever remote is
+actually active, and mounts that. `fsName` is then invariant, so **one cache is
+shared across every remote the profile ever points at**, including a fallback
+activation.
 
-Because that re-keys the subtree, **`CacheIdentityMigration`** runs in
-`SyncSetupService.install` before the mount comes up: it renames an existing
-`vfs/{remote}/{path}` (and its `vfsMeta` sibling) into the identity's
-location. Both trees live under the same `--cache-dir`, so it is an atomic
-same-directory rename — instant even for a ~95 GB cache, and a no-op once
-done. It never merges: if a tree already sits at the destination, the legacy
-one is left alone (reconciling two partial `vfsMeta` byte-range sets is how
-you end up serving corrupt bytes).
+**The pinned name is the profile's own remote name, not a synthetic one — and
+that choice is the whole upgrade/rollback story.** `MigrationV4PinCacheIdentity`
+writes each mount profile's current primary remote name into `cacheIdentity` on
+first launch, in both the authoritative `{shortId}.profile.json` and the derived
+`{shortId}.json` (the latter so the behaviour is live from the next mount rather
+than dormant until something reinstalls the profile). Because that name is what
+rclone was already keying by:
 
-**Side effect on cache-move overlap classification.** Under the legacy layout
-two profiles could address the *same on-disk bytes* when one remote path nested
-inside another's (`Kaiju/KAIJU` and `Kaiju/KAIJU/Reaper` under one remote), which
-is what `CacheMigrationPlanner`'s overlap machinery exists for. With the identity
-on, each profile owns `vfs/synctray_{its own shortId}/…`, so nested remote paths
-no longer produce nested cache keys and such a pair classifies as merely
-**same-root** — no co-migration prompt, no `unresolvedOverlap` rejection. That is
-correct (the bytes really are disjoint now), but it means the overlap tests
-(AC-CM3, AC-CM13) must pin `stableCacheIdentity: false`, which the shared
-`mountProfile` fixture takes as a parameter. The legacy layout stays reachable
-whenever a user turns the identity off, so the machinery still has to work. Candidates are the primary remote's key
-first, then the fallback's. `vfsMeta` is adopted before `vfs`, so an
-interrupted run can only ever lose metadata — the direction rclone recovers
-from by re-fetching — never leave data without the byte-ranges that prove it
-complete. Covered by `ConfigSelfTest` AC-CI1 (key derivation + planner + a
-real filesystem adoption) and AC-CI2 (the field reaches the script and forces
-a reinstall).
+- **Upgrade moves nothing.** The key before and after the migration are
+  identical. No rename, no re-download, no window where the cache is in the
+  wrong place.
+- **Downgrade is safe.** An older build has no `cacheIdentity` key, ignores it in
+  the profile JSON, and mounts `rcloneRemote:` — the same subtree the bytes are
+  already in.
+
+The first attempt used a derived `synctray_{shortId}` plus a one-time rename of
+the existing tree. It was tidier to read and quietly catastrophic to roll back:
+after a downgrade, 0.80.0 looks under `vfs/{remote}/…`, finds nothing,
+re-downloads the whole cache, and leaves the renamed tree orphaned on disk with
+nothing pointing at it. Pinning to the existing name makes both directions free.
+`ConfigSelfTest` AC-CI3 asserts that contract directly (pre-migration key ==
+post-migration key == the key an older build computes).
+
+One residual, and it is inherent rather than a defect: if the user changes the
+remote **and then** downgrades, the old build follows the remote and lands on a
+different tree — exactly what it would have done without this feature at all.
+
+`cacheIdentity` only has to be a name expressible as `RCLONE_CONFIG_<NAME>_<KEY>`
+(letters, digits, `_`, `-` — rclone's documented mapping upper-cases and turns
+`-` into `_`, so a dot or a space has no variable). `SyncProfile.scriptCacheIdentity`
+returns nil for anything else and the script re-checks with its own `[A-Za-z0-9_-]+`
+guard; both degrade to mounting the plain `remote:path`, which keys the cache the
+same way anyway. `generateProfileConfig` emits the name as `cacheIdentity`, empty
+string meaning "off".
+
+**`CacheIdentityMigration`** is therefore usually a no-op — the bytes are already
+under the pinned name. It exists for the leftovers: a tree under a name the
+profile has used but is no longer keyed by, most often the fallback's, written by
+a failover that landed in `vfs/{fallback}/…` (the 640 K vs 6.7 G split recorded
+above). It renames that tree and its `vfsMeta` sibling into the pinned location
+during `install`, before the mount comes up — an atomic same-directory rename,
+instant even for a multi-GB cache. It never merges: if a tree already sits at the
+destination the stray one is left alone (reconciling two partial `vfsMeta`
+byte-range sets is how you end up serving corrupt bytes). `vfsMeta` is adopted
+before `vfs`, so an interrupted run can only ever lose metadata — the direction
+rclone recovers from by re-fetching — never leave data without the byte-ranges
+that prove it complete. Note the direction is *toward* the primary remote name,
+which is also where an older build looks, so it never makes a rollback worse.
+Covered by `ConfigSelfTest` AC-CI1 (key derivation, degradation, planner, real
+filesystem adoption), AC-CI2 (the fields reach the script and force a reinstall)
+and AC-CI3 (the upgrade/rollback contract).
+
+**Side effect on cache-move overlap classification.** Two profiles can only
+address the *same on-disk bytes* when they share a cache identity AND one remote
+path nests inside the other's (`Kaiju/KAIJU` and `Kaiju/KAIJU/Reaper` under one
+remote), which is what `CacheMigrationPlanner`'s overlap machinery exists for.
+That is unchanged when both profiles pin the same remote name — the usual case —
+but two profiles pinned to *different* identities are always disjoint and
+classify as merely **same-root**. The overlap tests (AC-CM3, AC-CM13) pin
+`stableCacheIdentity: false` via the shared `mountProfile` fixture so the legacy
+derivation stays covered; AC-CM3 additionally asserts the disjoint case.
 
 This supersedes, rather than replaces, the fallback's env-var-override trick:
 that one kept the cache by reusing the *primary's* name, which only helps a
@@ -528,7 +559,7 @@ the warmer reads as before — safe degradation.
 | `NotificationService.swift` | Batched macOS notifications with action support |
 | `TelemetryService.swift` | Opt-in OTel telemetry (traces, metrics, logs) via OTLP/HTTP |
 | `CacheMigrationPlanner.swift` | Pure cache-directory-move planning — `CacheTreeKind` (`vfs`/`vfsMeta`), subtree/overlap/exclusion resolution, no I/O |
-| `CacheIdentityMigration.swift` | Pure planner + thin filesystem apply that renames a legacy remote-named cache tree into the profile's stable-identity tree, so `stableCacheIdentity` costs no re-download (see "Cache identity") |
+| `CacheIdentityMigration.swift` | Pure planner + thin filesystem apply that consolidates a stray (usually fallback-named) cache tree into the profile's pinned identity tree; a no-op in the common case (see "Cache identity") |
 | `CacheMigrationService.swift` | The cache-move engine — injected `CacheMigrationFileSystem`, free-space preflight, copy → verify → delete per file with a same-volume rename fast path, cancellation, resume, rollback |
 
 ### CLI/
@@ -604,6 +635,12 @@ read-write via `SMAppService.register`/`unregister`, applied through
 `SettingsReconciler` in a path ISOLATED from every other safe key and from all
 profile state — a thrown `SMAppService` error can never corrupt profile
 reconcile or another setting.
+
+**Migration v4 — pin the cache identity.** `MigrationV4PinCacheIdentity` writes
+each mount profile's current primary remote name into `cacheIdentity` (see
+"Cache identity" above). Metadata only: no cached bytes move, and the resulting
+key is the one rclone was already using, so both the upgrade and a later
+downgrade are free.
 
 **Migration.** `MigrationV3BlobToPerProfileFiles` (`MigrationRunner.swift`)
 moves the legacy `syncProfiles` UserDefaults blob to per-profile files on
@@ -1094,5 +1131,5 @@ Priority: process env vars > `~/.config/synctray/.env` > Info.plist. Key vars: `
 | `~/Library/LaunchAgents/com.synctray.sync.{shortId}.plist` | launchd schedule |
 | `~/.local/log/synctray-sync-{shortId}.log` | Sync logs |
 | `/tmp/synctray-sync-{shortId}.lock` | Lock file (prevents concurrent syncs) |
-| `{vfsCachePath}/vfs/{cacheIdentity}/{path}/…` | Mount mode only — VFS cached file **data**. `{cacheIdentity}` is `synctray_{shortId}` (or the remote name when `stableCacheIdentity` is off) |
+| `{vfsCachePath}/vfs/{cacheIdentity}/{path}/…` | Mount mode only — VFS cached file **data**. `{cacheIdentity}` is the profile's pinned remote name (the primary remote name when unpinned, or when `stableCacheIdentity` is off) |
 | `{vfsCachePath}/vfsMeta/{cacheIdentity}/{path}/…` | Mount mode only — VFS metadata sidecars, including the `--vfs-cache-mode full` downloaded byte-range list. Load-bearing for Cache Directory Migration: moving `vfs` without `vfsMeta` makes rclone re-download everything. |

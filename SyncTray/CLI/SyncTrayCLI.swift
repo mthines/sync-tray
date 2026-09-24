@@ -163,7 +163,7 @@ enum SyncTrayCLI {
       fallbackRemote, fallbackRemotePath, mountBackend (nfs|macfuse),
       vfsCacheMode (off|minimal|writes|full), vfsCacheMaxSize, vfsCacheMaxAge,
       vfsCachePath, allowNonEmptyMount, mountAtStartup, offlineAccessEnabled,
-      stableCacheIdentity, streamCacheOnly, isMuted, rcPort,
+      stableCacheIdentity, cacheIdentity, streamCacheOnly, isMuted, rcPort,
       downloadConnections, pinnedDirectories (comma-separated),
       warmExcludePatterns (comma-separated). Use enable/disable for isEnabled.
 
@@ -1035,6 +1035,13 @@ enum SyncTrayCLI {
         case "stableCacheIdentity":
             guard let b = bool(value) else { return "stableCacheIdentity must be true or false" }
             profile.stableCacheIdentity = b
+        case "cacheIdentity":
+            // Empty is legal and meaningful: it un-pins, falling back to the primary remote
+            // name. A non-empty value has to survive the trip into RCLONE_CONFIG_<NAME>_<KEY>.
+            guard value.isEmpty || SyncProfile.isEnvExpressibleIdentity(value) else {
+                return "cacheIdentity must be letters, digits, '_' or '-' (or empty to unpin)"
+            }
+            profile.cacheIdentity = value
         case "streamCacheOnly":
             guard let b = bool(value) else { return "streamCacheOnly must be true or false" }
             profile.streamCacheOnly = b
