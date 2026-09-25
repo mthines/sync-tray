@@ -2112,7 +2112,7 @@ enum ConfigSelfTest {
 
         guard result.mode == MountMode.cacheOnlyOffline.rawValue else {
             return report("AC-CK2", "mount-no-fallback-override", false,
-                          "(mode=\(result.mode ?? "nil") output=\(result.output))")
+                          "(mode=\(result.mode ?? "nil") output=\(result.output) log=\(result.log))")
         }
         guard result.envOverrides == 0 else {
             return report("AC-CK2", "mount-no-fallback-override", false,
@@ -2158,7 +2158,7 @@ enum ConfigSelfTest {
         // No remote defined — reachability probe fails fast; consolidation runs regardless.
         let result = dryRunMountScript(profile: profile, rcloneConfig: "")
         guard result.exitCode == 0 else {
-            return report("AC-CK3", "cache-suffix-consolidation", false, "(dry-run exited \(result.exitCode): \(result.output))")
+            return report("AC-CK3", "cache-suffix-consolidation", false, "(dry-run exited \(result.exitCode): \(result.output) log=\(result.log))")
         }
 
         let fm = FileManager.default
@@ -2216,7 +2216,7 @@ enum ConfigSelfTest {
         let result = dryRunMountScript(profile: profile, rcloneConfig: "")
 
         guard result.mode == MountMode.cacheOnlyManual.rawValue else {
-            return report("AC-CO1", "cache-only-union-config", false, "(mode=\(result.mode ?? "nil") output=\(result.output))")
+            return report("AC-CO1", "cache-only-union-config", false, "(mode=\(result.mode ?? "nil") output=\(result.output) log=\(result.log))")
         }
         guard let cmd = result.cmd else {
             return report("AC-CO1", "cache-only-union-config", false, "(no rendered command: \(result.output))")
@@ -2296,7 +2296,7 @@ enum ConfigSelfTest {
         defer { try? FileManager.default.removeItem(atPath: profile.cacheOnlyConfigPath) }
         let result = dryRunMountScript(profile: profile, rcloneConfig: "")
         guard result.mode == MountMode.cacheOnlyManual.rawValue else {
-            return report("AC-CO2", "cache-only-union-behaviour", false, "(fixture did not dry-run cache-only: \(result.output))")
+            return report("AC-CO2", "cache-only-union-behaviour", false, "(fixture did not dry-run cache-only: \(result.output) log=\(result.log))")
         }
 
         guard let rclone = RcloneLocator.resolve() else {

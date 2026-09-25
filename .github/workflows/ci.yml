@@ -195,6 +195,15 @@ jobs:
         with:
           ref: ${{ needs.detect-changes.outputs.checkout_ref }}
 
+      # The self-test suite's mount/Cache-only tests (AC-CK2, AC-CK3, AC-CO1,
+      # AC-CO2, AC-AO1) dry-run the REAL generated sync script against a REAL
+      # rclone binary — macos-latest doesn't ship one, so the script's own
+      # "rclone not found" guard would exit 1 before doing anything, and since
+      # that guard logs to the sync log file rather than stdout/stderr, the
+      # failure surfaced with no useful message at all.
+      - name: Install rclone
+        run: brew install rclone
+
       - name: Check schema in sync
         run: bash scripts/check-schema-in-sync.sh
 
