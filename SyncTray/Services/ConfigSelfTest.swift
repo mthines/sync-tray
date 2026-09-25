@@ -2757,6 +2757,26 @@ enum ConfigSelfTest {
             return report("AC-AO2", "auto-resume-decision", false, "(an idle lsof result did not resume)")
         }
 
+        // The raw lsof run → busy-check result mapping. `nil` exit = launch failure/timeout.
+        func blockers(_ exit: Int32?, _ out: String, _ err: String) -> [String] {
+            SyncManager.autoResumeBlockers(lsofOutput: SyncManager.lsofBusyCheckResult(
+                terminationStatus: exit, stdout: out, stderr: err))
+        }
+        let failed = [SyncManager.busyCheckFailedBlocker]
+        let mappingCases: [(String, [String], [String])] = [
+            ("exit 1, empty stderr (nothing open)", [], blockers(1, "", "")),
+            ("exit 1, whitespace-only stderr", [], blockers(1, "", " \n")),
+            ("exit 1, stderr 'status error' (unreadable/stale mount)", failed,
+             blockers(1, "", "lsof: status error on /Volumes/X: Stale NFS file handle\n")),
+            ("exit 0, output", ["Reaper"], blockers(0, "p1\ncReaper\n", "")),
+            ("exit 2", failed, blockers(2, "", "")),
+            ("launch failure / timeout", failed, blockers(nil, "", "")),
+        ]
+        for (label, expected, actual) in mappingCases where actual != expected {
+            return report("AC-AO2", "auto-resume-decision", false,
+                          "(lsof mapping, \(label): expected \(expected), got \(actual))")
+        }
+
         return report("AC-AO2", "auto-resume-decision", true)
     }
 

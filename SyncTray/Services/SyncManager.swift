@@ -3733,7 +3733,8 @@ final class SyncManager: ObservableObject {
         proc.arguments = ["-w", "-F", "pc", mountPoint]
         let pipe = Pipe()
         proc.standardOutput = pipe
-        proc.standardError = Pipe()
+        let errPipe = Pipe()
+        proc.standardError = errPipe
         do { try proc.run() } catch { return nil }
         let deadline = Date().addingTimeInterval(10)
         while proc.isRunning && Date() < deadline {
@@ -3743,11 +3744,28 @@ final class SyncManager: ObservableObject {
             proc.terminate()
             return nil
         }
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        // lsof exits 1 when NOTHING has the path open — that's success for our purposes,
-        // not a failure to report.
-        guard proc.terminationStatus == 0 || proc.terminationStatus == 1 else { return nil }
-        return String(data: data, encoding: .utf8) ?? ""
+        let out = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+        let err = String(data: errPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+        return lsofBusyCheckResult(terminationStatus: proc.terminationStatus, stdout: out, stderr: err)
+    }
+
+    /// Map a finished `lsof` run to the busy-check result: `nil` = "couldn't check" (the
+    /// caller fails closed to `.notify`), otherwise the `-F pc` output to parse.
+    /// `terminationStatus == nil` means lsof failed to launch or timed out.
+    nonisolated static func lsofBusyCheckResult(terminationStatus: Int32?, stdout: String, stderr: String) -> String? {
+        guard let terminationStatus else { return nil }
+        switch terminationStatus {
+        case 0:
+            return stdout
+        case 1:
+            // lsof exits 1 BOTH when nothing has the path open (silent) and when it could
+            // not examine it at all (e.g. `status error` on an unreadable/stale mount).
+            // `-w` suppresses lsof's warnings, so any stderr left means the latter:
+            // treat it as a failed check rather than "idle".
+            return stderr.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? stdout : nil
+        default:
+            return nil
+        }
     }
 
     /// Start a 5-minute session heartbeat for availability monitoring
