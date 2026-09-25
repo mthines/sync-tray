@@ -905,7 +905,22 @@ final class SyncSetupService {
 
             try:
                 vfs_base = os.path.join(cache_root, 'vfs')
+                meta_base = os.path.join(cache_root, 'vfsMeta')
                 prefix = primary + '{'
+
+                def subtree(base, name):
+                    root = os.path.join(base, name)
+                    return os.path.join(root, remote_path) if remote_path else root
+
+                def prune_ancestors(path, base):
+                    ancestor = os.path.dirname(path)
+                    while ancestor.startswith(base) and ancestor != base:
+                        try:
+                            os.rmdir(ancestor)
+                        except OSError:
+                            break
+                        ancestor = os.path.dirname(ancestor)
+
                 chosen = None
                 if os.path.isdir(vfs_base):
                     candidates = []
@@ -915,7 +930,7 @@ final class SyncSetupService {
                         suffix = name[len(prefix):-1]
                         if not suffix or not all(c.isalnum() or c in '_-' for c in suffix):
                             continue
-                        probe = os.path.join(vfs_base, name, remote_path) if remote_path else os.path.join(vfs_base, name)
+                        probe = subtree(vfs_base, name)
                         if os.path.isdir(probe):
                             try:
                                 candidates.append((name, os.path.getmtime(probe)))
@@ -924,28 +939,38 @@ final class SyncSetupService {
                     if candidates:
                         candidates.sort(key=lambda item: item[1], reverse=True)
                         chosen = candidates[0][0]
+
+                # ONE decision for the vfs/vfsMeta PAIR. The two trees are only meaningful
+                # together: rclone deletes cached data whose metadata sidecar is missing, and
+                # a sidecar without its data describes bytes that are not there. So move
+                # nothing unless BOTH source trees exist and NEITHER destination is populated,
+                # and never merge into an occupied destination.
                 if chosen:
-                    for kind in ('vfsMeta', 'vfs'):
-                        base = os.path.join(cache_root, kind)
-                        src_root = os.path.join(base, chosen)
-                        src = os.path.join(src_root, remote_path) if remote_path else src_root
-                        if not os.path.isdir(src):
-                            continue
-                        dst_root = os.path.join(base, primary)
-                        dst = os.path.join(dst_root, remote_path) if remote_path else dst_root
-                        if os.path.exists(dst):
-                            log('Cache key: leaving ' + src + ' in place (destination already populated)')
-                            continue
-                        os.makedirs(os.path.dirname(dst), exist_ok=True)
-                        os.rename(src, dst)
-                        log('Cache key: moved ' + src + ' -> ' + dst)
-                        ancestor = os.path.dirname(src)
-                        while ancestor.startswith(base) and ancestor != base:
+                    src_meta, src_vfs = subtree(meta_base, chosen), subtree(vfs_base, chosen)
+                    dst_meta, dst_vfs = subtree(meta_base, primary), subtree(vfs_base, primary)
+                    if not (os.path.isdir(src_meta) and os.path.isdir(src_vfs)):
+                        log('Cache key: leaving ' + src_vfs + ' in place (its vfs and vfsMeta trees are not both present)')
+                    elif os.path.lexists(dst_meta) or os.path.lexists(dst_vfs):
+                        log('Cache key: leaving ' + src_vfs + ' in place (destination already populated)')
+                    else:
+                        # vfsMeta first: an interruption between the two renames can only
+                        # leave metadata ahead of data, never data without its byte ranges.
+                        os.makedirs(os.path.dirname(dst_meta), exist_ok=True)
+                        os.rename(src_meta, dst_meta)
+                        try:
+                            os.makedirs(os.path.dirname(dst_vfs), exist_ok=True)
+                            os.rename(src_vfs, dst_vfs)
+                        except Exception as e:
                             try:
-                                os.rmdir(ancestor)
-                            except OSError:
-                                break
-                            ancestor = os.path.dirname(ancestor)
+                                os.rename(dst_meta, src_meta)
+                                log('Cache key: vfs move failed, rolled vfsMeta back to ' + src_meta + ': ' + str(e))
+                            except Exception as rollback_error:
+                                log('Cache key: vfs move failed AND vfsMeta rollback failed (' + dst_meta + '): ' + str(e) + ' / ' + str(rollback_error))
+                        else:
+                            log('Cache key: moved ' + src_meta + ' -> ' + dst_meta)
+                            log('Cache key: moved ' + src_vfs + ' -> ' + dst_vfs)
+                            prune_ancestors(src_meta, meta_base)
+                            prune_ancestors(src_vfs, vfs_base)
             except Exception as e:
                 log('Cache key consolidation error: ' + str(e))
             " "$REMOTE_NAME" "$REMOTE_PATH" "$VFS_CACHE_PATH" "$LOG_FILE"

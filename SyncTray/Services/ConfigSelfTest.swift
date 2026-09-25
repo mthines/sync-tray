@@ -90,6 +90,7 @@ enum ConfigSelfTest {
             testMountModeParse,
             testMountNoFallbackOverride,
             testCacheSuffixConsolidation,
+            testCacheSuffixPairSafety,
             testMountCommandQuoting,
             testCacheOnlyUnionConfig,
             testCacheOnlyUnionBehaviour,
@@ -2199,6 +2200,87 @@ enum ConfigSelfTest {
         }
 
         return report("AC-CK3", "cache-suffix-consolidation", true)
+    }
+
+    /// Run the mount script's consolidation step against a fresh fixture cache that
+    /// `setup` seeds (paths relative to the cache root), returning the cache root.
+    private static func runConsolidationScenario(
+        _ label: String, setup: (String) -> Void
+    ) -> (cache: String, result: DryRunResult) {
+        let root = "\(selfTestRoot)/\(label)-\(UUID().uuidString)"
+        let local = "\(root)/mnt", cache = "\(root)/cache"
+        try? FileManager.default.createDirectory(atPath: local, withIntermediateDirectories: true)
+        try? FileManager.default.createDirectory(atPath: cache, withIntermediateDirectories: true)
+        setup(cache)
+        let profile = mountFixtureProfile(localPath: local, cachePath: cache, remotePath: "Kaiju/KAIJU")
+        defer { try? FileManager.default.removeItem(atPath: profile.cacheOnlyConfigPath) }
+        return (cache, dryRunMountScript(profile: profile, rcloneConfig: ""))
+    }
+
+    // MARK: - AC-CK5 — suffix consolidation decides once for the vfs/vfsMeta pair
+
+    private static func testCacheSuffixPairSafety() -> Bool {
+        let fm = FileManager.default
+        let suffixed = "synology{jzZaN}/Kaiju/KAIJU"
+
+        // (c) vfs-only suffixed tree: its sidecars are gone, so rclone would discard the
+        // data anyway — moving it would only plant metadata-less data at the live key.
+        let vfsOnly = runConsolidationScenario("ck5-vfsonly") { cache in
+            writeFile("\(cache)/vfs/\(suffixed)/file.bin", "hello")
+        }
+        guard fm.fileExists(atPath: "\(vfsOnly.cache)/vfs/\(suffixed)/file.bin"),
+              !fm.fileExists(atPath: "\(vfsOnly.cache)/vfs/synology/Kaiju/KAIJU")
+        else {
+            return report("AC-CK5", "cache-suffix-pair-safety", false,
+                          "(a vfs tree without its vfsMeta was moved: \(vfsOnly.result.log))")
+        }
+
+        // (d) vfsMeta-only suffixed tree: sidecars describing bytes that are not there.
+        let metaOnly = runConsolidationScenario("ck5-metaonly") { cache in
+            writeFile("\(cache)/vfsMeta/\(suffixed)/file.bin", "{\"Size\":5}")
+        }
+        guard fm.fileExists(atPath: "\(metaOnly.cache)/vfsMeta/\(suffixed)/file.bin"),
+              !fm.fileExists(atPath: "\(metaOnly.cache)/vfsMeta/synology/Kaiju/KAIJU")
+        else {
+            return report("AC-CK5", "cache-suffix-pair-safety", false,
+                          "(a vfsMeta tree without its vfs data was moved: \(metaOnly.result.log))")
+        }
+
+        // Only the vfsMeta destination is occupied: the PAIR stays put — moving vfs alone
+        // would pair the stray data with someone else's byte-range metadata.
+        let halfOccupied = runConsolidationScenario("ck5-half") { cache in
+            writeFile("\(cache)/vfs/\(suffixed)/file.bin", "hello")
+            writeFile("\(cache)/vfsMeta/\(suffixed)/file.bin", "{\"Size\":5}")
+            writeFile("\(cache)/vfsMeta/synology/Kaiju/KAIJU/other.bin", "{\"Size\":9}")
+        }
+        guard fm.fileExists(atPath: "\(halfOccupied.cache)/vfs/\(suffixed)/file.bin"),
+              fm.fileExists(atPath: "\(halfOccupied.cache)/vfsMeta/\(suffixed)/file.bin"),
+              !fm.fileExists(atPath: "\(halfOccupied.cache)/vfs/synology/Kaiju/KAIJU")
+        else {
+            return report("AC-CK5", "cache-suffix-pair-safety", false,
+                          "(one half of the pair moved into a partly-occupied destination: \(halfOccupied.result.log))")
+        }
+
+        // vfs rename fails after vfsMeta already moved → vfsMeta is rolled back. The
+        // primary's vfs root is made read-only so creating vfs/synology/Kaiju fails.
+        var lockedDir = ""
+        let rollback = runConsolidationScenario("ck5-rollback") { cache in
+            writeFile("\(cache)/vfs/\(suffixed)/file.bin", "hello")
+            writeFile("\(cache)/vfsMeta/\(suffixed)/file.bin", "{\"Size\":5}")
+            lockedDir = "\(cache)/vfs/synology"
+            try? fm.createDirectory(atPath: lockedDir, withIntermediateDirectories: true)
+            try? fm.setAttributes([.posixPermissions: 0o555], ofItemAtPath: lockedDir)
+        }
+        try? fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: lockedDir)
+        guard fm.fileExists(atPath: "\(rollback.cache)/vfs/\(suffixed)/file.bin"),
+              fm.fileExists(atPath: "\(rollback.cache)/vfsMeta/\(suffixed)/file.bin"),
+              !fm.fileExists(atPath: "\(rollback.cache)/vfsMeta/synology/Kaiju/KAIJU"),
+              rollback.result.log.contains("rolled vfsMeta back")
+        else {
+            return report("AC-CK5", "cache-suffix-pair-safety", false,
+                          "(a failed vfs rename did not roll the vfsMeta rename back: \(rollback.result.log))")
+        }
+        return report("AC-CK5", "cache-suffix-pair-safety", true)
     }
 
     // MARK: - AC-CK4 — mount command keeps a spaced path as ONE argument
