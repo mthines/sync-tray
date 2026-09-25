@@ -102,23 +102,10 @@
       "type": "boolean",
       "description": "Whether this mount profile auto-mounts at login/app launch."
     },
-    "offlineAccessEnabled": {
-      "type": "boolean",
-      "description": "Mount mode only. When true (default), SyncTray maintains a read-only \"<mount-name> (Offline)\" folder next to the mount point that links to the VFS cache, so already-cached files stay browsable in Finder while the network is down. App-side only — not consumed by the sync script."
-    },
-    "stableCacheIdentity": {
-      "type": "boolean",
-      "default": true,
-      "description": "Mount mode only. When true (default), the VFS cache is keyed by the pinned cacheIdentity instead of by whatever rcloneRemote currently says, so one cache is shared across every remote the profile points at — changing remotes (LAN SMB at home, SFTP away) no longer re-downloads into a second tree. SyncTray mounts an env-var-defined remote under the pinned name carrying the active remote's parameters."
-    },
-    "cacheIdentity": {
-      "type": "string",
-      "description": "Mount mode only. The rclone remote name this profile's VFS cache is keyed by, pinned once and then left alone. Empty means unpinned, which resolves to the primary remote name — identical to how the cache was keyed before this field existed. SyncTray pins it to the profile's current remote name on first launch, so no cached bytes move on upgrade and an older SyncTray (which ignores this key and mounts rcloneRemote:) still finds the same cache. Must be a name expressible as RCLONE_CONFIG_<NAME>_<KEY> environment variables, i.e. letters, digits, underscore and hyphen; anything else is ignored and the primary remote name is used."
-    },
     "streamCacheOnly": {
       "type": "boolean",
       "default": false,
-      "description": "Mount mode only. Cache-Only (Offline): keep the mount up so existing absolute paths resolve, but serve it read-only from the VFS cache — fast fingerprints, no change polling, cache retention paused so nothing expires while you are offline, and short remote timeouts, with the offline warmer suppressed. Cached files open at local-disk speed; uncached files fail fast instead of downloading, and any write still queued in the cache stays queued (deferred, not lost) until this is turned off."
+      "description": "Mount mode only. Manual Cache Only: mount this profile as a writable union overlay over the VFS cache's data tree instead of streaming from the remote — new files and edits land in the overlay (never touching the cache), already-cached files open at local-disk speed, and partially-downloaded files stay hidden. Files created or changed while in this mode upload the next time the profile switches back to Streaming, or via Upload Now without leaving Cache Only. The mount also enters Cache Only AUTOMATICALLY when the primary remote is unreachable at mount time; this flag only tracks the user's manual choice — the running mount's mode file is the source of truth for which mode (including the automatic ones) is actually active."
     },
     "pinnedDirectories": {
       "type": "array",

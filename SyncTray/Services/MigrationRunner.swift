@@ -45,7 +45,7 @@ enum MigrationRunner {
         MigrationV1LegacyToMultiProfile(),
         MigrationV2FixVFSCachePath(),
         MigrationV3BlobToPerProfileFiles(),
-        MigrationV4PinCacheIdentity(),
+        MigrationV4Retired(),
     ]
 
     /// Run all pending migrations. Call this once at app startup,
@@ -351,87 +351,24 @@ struct MigrationV3BlobToPerProfileFiles: ProfileMigration {
     }
 }
 
-// MARK: - Migration V4: Pin the VFS cache identity to the current remote name
 
-/// Write each mount profile's CURRENT primary remote name into `cacheIdentity`, so the
-/// cache key stops tracking `rcloneRemote` and starts standing still.
+// MARK: - Migration V4: retired
+
+/// Retired. Previously pinned each mount profile's cache identity to its primary remote
+/// name so the VFS cache survived a remote change — a feature this build removes because
+/// mounting an env-var-defined remote makes rclone suffix the cache name
+/// (`vfs/{remote}{hash}/…`), and one shared streaming cache between SMB and SFTP is
+/// evicted by their differing modtime fingerprints. The cache is keyed by the primary
+/// remote name directly again (see `VFSCacheService.cacheRelativePath`), and a leftover
+/// suffixed tree is consolidated by the sync script on the next mount start rather than
+/// by this migration.
 ///
-/// **This migration moves no bytes, and that is the entire point.** rclone already keys a
-/// mount's cache at `{cache-dir}/vfs/{remoteName}/{remotePath}`; pinning `cacheIdentity` to
-/// that same `remoteName` reproduces the existing key exactly. What changes is only what
-/// happens NEXT: when the user re-points the profile at another remote, the mount keeps
-/// running under the pinned name (with the new remote's parameters injected as
-/// `RCLONE_CONFIG_*` variables), so the warm cache carries over instead of a second tree
-/// being downloaded from scratch.
-///
-/// Two properties follow from pinning to the existing name rather than a synthetic one:
-/// - **Upgrade is free.** No rename, no re-download, no window where the cache is in the
-///   wrong place.
-/// - **Downgrade is safe.** An older build has no `cacheIdentity` key, ignores it in the
-///   profile JSON, and mounts `rcloneRemote:` — which resolves to the same subtree these
-///   bytes are already in. Rolling back costs nothing.
-///
-/// Both profile shapes under `~/.config/synctray/profiles` are handled: the authoritative
-/// `{shortId}.profile.json` (keyed by `rcloneRemote`) and the derived, script-read
-/// `{shortId}.json` (keyed by `remote`, i.e. `name:path`). Writing the derived file too
-/// means the sharing behaviour is live from the next mount, rather than lying dormant until
-/// something happens to reinstall the profile.
-struct MigrationV4PinCacheIdentity: ProfileMigration {
+/// Kept as a no-op, not deleted, so the schema-version numbering stays monotonic for a
+/// machine that already ran v4 — deleting the slot would make its `schemaVersion == 4`
+/// skip whatever migration NEXT claims v4.
+struct MigrationV4Retired: ProfileMigration {
     let version = 4
-    let description = "Pin each mount profile's VFS cache identity to its current remote name"
+    let description = "Retired cache-pinning migration — intentionally a no-op"
 
-    func migrateUserDefaults(_ defaults: UserDefaults) throws {
-        guard var profiles = MigrationRunner.readProfileDicts(from: defaults) else { return }
-
-        var changed = false
-        for i in profiles.indices {
-            guard isMount(profiles[i]["syncMode"]),
-                  isUnset(profiles[i]["cacheIdentity"]),
-                  let remote = profiles[i]["rcloneRemote"] as? String,
-                  let identity = pinnedIdentity(fromRemoteName: remote) else { continue }
-            profiles[i]["cacheIdentity"] = identity
-            changed = true
-        }
-
-        if changed {
-            try MigrationRunner.writeProfileDicts(profiles, to: defaults)
-        }
-    }
-
-    func migrateOnDiskConfig(_ config: [String: Any]) -> [String: Any]? {
-        guard isMount(config["syncMode"]), isUnset(config["cacheIdentity"]) else { return nil }
-
-        // `{shortId}.profile.json` carries `rcloneRemote` ("synology:"); the derived
-        // `{shortId}.json` carries `remote` ("synology:Kaiju/KAIJU"). Both start with the
-        // remote name, so the same split works for either.
-        let source = (config["rcloneRemote"] as? String) ?? (config["remote"] as? String)
-        guard let source, let identity = pinnedIdentity(fromRemoteName: source) else { return nil }
-
-        var updated = config
-        updated["cacheIdentity"] = identity
-        return updated
-    }
-
-    /// Only mount profiles have a VFS cache to key. A missing `syncMode` means the
-    /// pre-`syncMode` default, bisync — skip it.
-    private func isMount(_ raw: Any?) -> Bool {
-        (raw as? String) == "mount"
-    }
-
-    /// Never overwrite an identity someone already set (a hand-edited file, or a re-run
-    /// after a partially-applied migration).
-    private func isUnset(_ raw: Any?) -> Bool {
-        ((raw as? String) ?? "").trimmingCharacters(in: .whitespaces).isEmpty
-    }
-
-    /// Take everything before the first colon and accept it only if it survives the trip
-    /// into `RCLONE_CONFIG_<NAME>_<KEY>` variables. A remote named `my.nas` cannot be
-    /// expressed that way, so it stays unpinned — which resolves to the primary remote name
-    /// anyway, i.e. today's behaviour, rather than a broken mount.
-    private func pinnedIdentity(fromRemoteName remote: String) -> String? {
-        let name = String(remote.prefix(while: { $0 != ":" }))
-            .trimmingCharacters(in: .whitespaces)
-        guard SyncProfile.isEnvExpressibleIdentity(name) else { return nil }
-        return name
-    }
+    func migrateUserDefaults(_ defaults: UserDefaults) throws {}
 }

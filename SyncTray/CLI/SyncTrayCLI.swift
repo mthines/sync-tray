@@ -162,8 +162,8 @@ enum SyncTrayCLI {
       syncDirection (localToRemote|remoteToLocal), syncIntervalMinutes,
       fallbackRemote, fallbackRemotePath, mountBackend (nfs|macfuse),
       vfsCacheMode (off|minimal|writes|full), vfsCacheMaxSize, vfsCacheMaxAge,
-      vfsCachePath, allowNonEmptyMount, mountAtStartup, offlineAccessEnabled,
-      stableCacheIdentity, cacheIdentity, streamCacheOnly, isMuted, rcPort,
+      vfsCachePath, allowNonEmptyMount, mountAtStartup,
+      streamCacheOnly, isMuted, rcPort,
       downloadConnections, pinnedDirectories (comma-separated),
       warmExcludePatterns (comma-separated). Use enable/disable for isEnabled.
 
@@ -1029,19 +1029,6 @@ enum SyncTrayCLI {
         case "mountAtStartup":
             guard let b = bool(value) else { return "mountAtStartup must be true or false" }
             profile.mountAtStartup = b
-        case "offlineAccessEnabled":
-            guard let b = bool(value) else { return "offlineAccessEnabled must be true or false" }
-            profile.offlineAccessEnabled = b
-        case "stableCacheIdentity":
-            guard let b = bool(value) else { return "stableCacheIdentity must be true or false" }
-            profile.stableCacheIdentity = b
-        case "cacheIdentity":
-            // Empty is legal and meaningful: it un-pins, falling back to the primary remote
-            // name. A non-empty value has to survive the trip into RCLONE_CONFIG_<NAME>_<KEY>.
-            guard value.isEmpty || SyncProfile.isEnvExpressibleIdentity(value) else {
-                return "cacheIdentity must be letters, digits, '_' or '-' (or empty to unpin)"
-            }
-            profile.cacheIdentity = value
         case "streamCacheOnly":
             guard let b = bool(value) else { return "streamCacheOnly must be true or false" }
             profile.streamCacheOnly = b
@@ -1135,11 +1122,7 @@ extension CLIEnvironment {
                 }
             },
             writeProfile: { profile in
-                let ok = ProfileStore.writeProfileFile(profile, in: SyncProfile.configDirectory) != nil
-                // Keep the read-only "(Offline)" browse point in sync with the written
-                // profile (create/re-point/remove) so a headless CLI edit matches the app.
-                OfflineAccessLink.apply(for: profile)
-                return ok
+                ProfileStore.writeProfileFile(profile, in: SyncProfile.configDirectory) != nil
             },
             installProfile: { profile in
                 do { try SyncSetupService.shared.install(profile: profile); return nil }
@@ -1152,8 +1135,9 @@ extension CLIEnvironment {
             deleteProfileFile: { profile in
                 let path = "\(SyncProfile.configDirectory)/\(profile.shortId).profile.json"
                 try? FileManager.default.removeItem(atPath: path)
-                // Remove the "(Offline)" browse point too (symlink only — never a real dir).
-                OfflineAccessLink.removeLink(for: profile)
+                // Clean up a legacy "(Offline)" browse point too, if the retired feature
+                // left one behind (symlink only — never a real dir).
+                LegacyOfflineLink.removeIfPresent(for: profile)
             },
             runSyncScript: { configPath in
                 let (exit, _) = CLIEnvironment.runProcess(
@@ -1317,8 +1301,11 @@ extension CLIEnvironment {
 
     /// Run rclone at its located path with a hard process-level watchdog —
     /// mirrors `RcloneLocator.resolveViaLoginShell`'s timeout pattern, since
-    /// SMB/WebDAV remotes can hang past rclone's own `--timeout`.
-    fileprivate static func runRcloneProcess(args: [String], timeout: TimeInterval) -> (Int32, String, String) {
+    /// SMB/WebDAV remotes can hang past rclone's own `--timeout`. Internal (not
+    /// `fileprivate`) so `OverlaySyncService`'s production remote client can reuse
+    /// the same pipe-deadlock-safe, hard-timeout process runner instead of
+    /// duplicating it.
+    static func runRcloneProcess(args: [String], timeout: TimeInterval) -> (Int32, String, String) {
         guard let rclonePath = RcloneLocator.resolve() else {
             return (127, "", "rclone not found")
         }

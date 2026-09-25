@@ -59,9 +59,6 @@ struct ProfileDetailView: View {
     @State private var vfsCachePath: String = ""
     @State private var allowNonEmptyMount: Bool = false
     @State private var mountAtStartup: Bool = true
-    @State private var offlineAccessEnabled: Bool = true
-    @State private var stableCacheIdentity: Bool = true
-    @State private var cacheIdentity: String = ""
     @State private var streamCacheOnly: Bool = false
     @State private var downloadConnections: Int = 2
 
@@ -187,9 +184,6 @@ struct ProfileDetailView: View {
         vfsCachePath != profile.vfsCachePath ||
         allowNonEmptyMount != profile.allowNonEmptyMount ||
         mountAtStartup != profile.mountAtStartup ||
-        offlineAccessEnabled != profile.offlineAccessEnabled ||
-        stableCacheIdentity != profile.stableCacheIdentity ||
-        cacheIdentity != profile.cacheIdentity ||
         streamCacheOnly != profile.streamCacheOnly ||
         downloadConnections != profile.downloadConnections
     }
@@ -199,17 +193,6 @@ struct ProfileDetailView: View {
     private var mountFolderName: String {
         let name = (localSyncPath as NSString).lastPathComponent
         return name.isEmpty ? "Stream" : name
-    }
-
-    /// The name the VFS cache is (or will be) keyed by, for the "Share the cache across
-    /// remotes" caption. Mirrors `SyncProfile.effectiveCacheIdentity` against the live form
-    /// fields, so an unpinned profile shows the remote name it is about to be pinned to
-    /// rather than an empty quote.
-    private var cacheIdentityDisplayName: String {
-        let pinned = cacheIdentity.trimmingCharacters(in: .whitespaces)
-        if !pinned.isEmpty { return pinned }
-        let primary = rcloneRemote.hasSuffix(":") ? String(rcloneRemote.dropLast()) : rcloneRemote
-        return primary.isEmpty ? "this profile" : primary
     }
 
     private var canInstall: Bool {
@@ -1062,30 +1045,6 @@ struct ProfileDetailView: View {
                             Text("Mount automatically on startup")
                                 .font(.subheadline)
                             Text("Mount this stream when SyncTray launches (and at login). Turn off to mount only when you click Mount.")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                        }
-                    }
-                    .toggleStyle(.switch)
-
-                    // Offline access toggle
-                    Toggle(isOn: $offlineAccessEnabled) {
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text("Offline access to cached files")
-                                .font(.subheadline)
-                            Text("Keep a read-only \u{201C}\(mountFolderName) (Offline)\u{201D} folder next to the mount that opens your already-cached files directly — browsable in Finder even with no internet, when the live stream can't reach the remote. Read-only: don't edit files there.")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                        }
-                    }
-                    .toggleStyle(.switch)
-
-                    // Share one cache across every remote this profile uses
-                    Toggle(isOn: $stableCacheIdentity) {
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text("Share the cache across remotes")
-                                .font(.subheadline)
-                            Text("Keep the cache under \u{201C}\(cacheIdentityDisplayName)\u{201D} whichever remote this profile is pointed at, so switching remotes — your LAN address at home, SFTP or QuickConnect away — keeps the files you've already downloaded instead of re-fetching them into a second cache. Nothing moves on disk when you turn this on.")
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                         }
@@ -2103,9 +2062,6 @@ struct ProfileDetailView: View {
         vfsCachePath = profile.vfsCachePath
         allowNonEmptyMount = profile.allowNonEmptyMount
         mountAtStartup = profile.mountAtStartup
-        offlineAccessEnabled = profile.offlineAccessEnabled
-        stableCacheIdentity = profile.stableCacheIdentity
-        cacheIdentity = profile.cacheIdentity
         streamCacheOnly = profile.streamCacheOnly
         downloadConnections = profile.downloadConnections
 
@@ -2140,9 +2096,6 @@ struct ProfileDetailView: View {
         updatedProfile.vfsCachePath = vfsCachePath
         updatedProfile.allowNonEmptyMount = allowNonEmptyMount
         updatedProfile.mountAtStartup = mountAtStartup
-        updatedProfile.offlineAccessEnabled = offlineAccessEnabled
-        updatedProfile.stableCacheIdentity = stableCacheIdentity
-        updatedProfile.cacheIdentity = cacheIdentity
         updatedProfile.streamCacheOnly = streamCacheOnly
         updatedProfile.downloadConnections = downloadConnections
         return updatedProfile
@@ -2214,7 +2167,6 @@ struct ProfileDetailView: View {
                 && SyncManager.reconcileAction(from: currentProfile, to: deferredProfile) == .reinstall
             profileStore.update(deferredProfile)
             syncManager.clearError(for: profile.id)
-            syncManager.maintainOfflineAccessLink(for: deferredProfile)
             cacheMovePrompt = prompt
             cacheMoveOtherFieldsNeedReinstall = deferredNeedsReinstall
             showingCacheMoveSheet = true
@@ -2231,10 +2183,6 @@ struct ProfileDetailView: View {
 
         // Clear any cached error since config changed
         syncManager.clearError(for: profile.id)
-
-        // Create / remove / re-point the read-only "(Offline)" cache browse point
-        // to match the saved profile (offline-access toggle or cache-dir change).
-        syncManager.maintainOfflineAccessLink(for: updatedProfile)
 
         // Only reinstall if sync-related settings changed
         if needsReinstall {
@@ -2255,8 +2203,6 @@ struct ProfileDetailView: View {
         }
         latest.vfsCachePath = prompt.destinationRoot
         profileStore.update(latest)
-        // Cache dir moved → re-point the offline browse point at the new location.
-        syncManager.maintainOfflineAccessLink(for: latest)
         if isInstalled {
             reinstallSync()
         }

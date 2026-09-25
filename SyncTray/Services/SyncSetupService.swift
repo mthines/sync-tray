@@ -111,25 +111,17 @@ final class SyncSetupService {
         // Create directories if needed
         try createDirectories(for: profile)
 
-        // For mount mode, ensure VFS cache directory exists
+        // For mount mode, ensure VFS cache directory exists. Consolidating any stray
+        // suffixed cache tree (see "Cache identity" in CLAUDE.md) happens in the sync
+        // script itself, on EVERY mount start (install, app launch, login, Mount
+        // button) — not here — because a login mount runs the script standalone,
+        // without the app; a Swift-only consolidation could be skipped by a mount
+        // the app never saw come up.
         if profile.isMountMode {
             let cacheDir = (profile.vfsCachePath as NSString).expandingTildeInPath
             if !FileManager.default.fileExists(atPath: cacheDir) {
                 try FileManager.default.createDirectory(
                     atPath: cacheDir, withIntermediateDirectories: true)
-            }
-
-            // Consolidate a stray cache tree into the profile's pinned identity BEFORE the
-            // mount comes up. Normally a no-op: the identity IS the primary remote name, so
-            // the bytes are already in the right place. It earns its keep when a tree exists
-            // under a DIFFERENT name the profile has used — most often the fallback's, from
-            // a failover that wrote into `vfs/{fallback}/…`. Consolidating toward the pinned
-            // name is also the direction a downgrade wants, since an older build looks under
-            // the primary name. Same-directory renames — fast even for a multi-GB cache.
-            // Never throws: a failed adoption costs a re-download, blocking the install
-            // would cost the mount.
-            CacheIdentityMigration.apply(for: profile) { message in
-                SyncTraySettings.debugLog(message)
             }
         }
 
@@ -1157,6 +1149,24 @@ final class SyncSetupService {
         return primaryConfig.provider.rcloneType != fallbackConfig.provider.rcloneType
     }
 
+    /// Cache-only / mode-signalling paths the script needs but does not derive itself
+    /// (D7) — Swift is the single source (`SyncProfile` computed paths +
+    /// `VFSCacheService.cacheSubtreeRoots`) so the script and the app can never
+    /// disagree about which directory is which. Included for every profile (harmless
+    /// for a non-mount one — the script only reads these in its mount branch).
+    private func mountCacheOnlyConfigKeys(for profile: SyncProfile) -> [String: Any] {
+        let roots = VFSCacheService.shared.cacheSubtreeRoots(for: profile)
+        return [
+            "mountModePath": profile.mountModePath,
+            "overlayPath": profile.overlayPath,
+            "cacheOnlyConfigPath": profile.cacheOnlyConfigPath,
+            "cacheOnlyExcludePath": profile.cacheOnlyExcludePath,
+            "cacheOnlyCachePath": profile.cacheOnlyCachePath,
+            "cacheDataPath": roots.data,
+            "cacheMetaPath": roots.meta,
+        ]
+    }
+
     /// Generate profile-specific JSON config.
     /// Not private — `ConfigSelfTest` calls this directly to verify the
     /// derived config's key set stays frozen (AC-2) without going through
@@ -1185,17 +1195,11 @@ final class SyncSetupService {
             "vfsCacheMaxAge": profile.vfsCacheMaxAge,
             "vfsCachePath": profile.vfsCachePath,
             "allowNonEmptyMount": profile.allowNonEmptyMount,
-            // The rclone remote name the mount must run under so its VFS cache stops
-            // tracking whichever remote is active. Empty string disables it (the script then
-            // mounts `remote:path` as before) — which is also what a name that cannot be
-            // expressed as RCLONE_CONFIG_<NAME>_<KEY> variables degrades to. The script
-            // defines this name from the active remote's config; see its mount branch.
-            "cacheIdentity": profile.scriptCacheIdentity ?? "",
             "streamCacheOnly": profile.streamCacheOnly,
             "pinnedDirectories": profile.pinnedDirectories,
             "rcPort": profile.rcPort,
             "downloadConnections": profile.downloadConnections,
-        ]
+        ].merging(mountCacheOnlyConfigKeys(for: profile)) { _, new in new }
 
         if let data = try? JSONSerialization.data(
             withJSONObject: config, options: [.prettyPrinted, .sortedKeys]),

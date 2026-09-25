@@ -994,7 +994,7 @@ final class TelemetryService {
                 // Mount-specific preferences
                 "config.mount_backend": .string(profile.isMountMode ? profile.mountBackend.rawValue : "n/a"),
                 "config.mount_at_startup": .string(profile.isMountMode ? String(profile.mountAtStartup) : "n/a"),
-                "config.offline_access": .string(profile.isMountMode ? String(profile.offlineAccessEnabled) : "n/a"),
+                "config.stream_cache_only": .string(profile.isMountMode ? String(profile.streamCacheOnly) : "n/a"),
                 "config.vfs_cache_mode": .string(profile.isMountMode ? profile.vfsCacheMode.rawValue : "n/a"),
                 "config.has_pinned_directories": .bool(!profile.pinnedDirectories.isEmpty),
                 "config.pinned_directory_count": .int(profile.pinnedDirectories.count),

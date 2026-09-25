@@ -129,8 +129,8 @@ struct ProfileListView: View {
         if SyncSetupService.shared.isInstalled(profile: profile) {
             try? SyncSetupService.shared.uninstall(profile: profile)
         }
-        // Remove the read-only "(Offline)" browse point (symlink only — never a real dir).
-        OfflineAccessLink.removeLink(for: profile)
+        // Clean up a legacy "(Offline)" browse point (symlink only — never a real dir).
+        LegacyOfflineLink.removeIfPresent(for: profile)
         profileStore.delete(id: profile.id)
     }
 

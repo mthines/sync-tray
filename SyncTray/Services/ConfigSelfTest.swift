@@ -53,8 +53,7 @@ enum ConfigSelfTest {
             testWarmSkipsCachedFiles,
             testMountMonitorAutoWarm,
             testMountPollDecision,
-            testOfflineAccessLink,
-            testOfflineAccessApply,
+            testLegacyOfflineLinkCleanup,
             testWarmReconcileTrigger,
             testMigrationIntegrity,
             testExternalCreateEnabled,
@@ -70,9 +69,7 @@ enum ConfigSelfTest {
             testDoctorPureChecks,
             testCLIResolveAndList,
             testShimInstallIdempotentNonClobber,
-            testCacheIdentity,
-            testCacheIdentityUpgradeRollback,
-            testCacheIdentityConfigEmission,
+            testCacheKeyPrimary,
             testCacheMigrationTreeKinds,
             testCacheMigrationKeyDerivation,
             testCacheMigrationOverlap,
@@ -696,72 +693,11 @@ enum ConfigSelfTest {
         return report("AC-MP1", "mount-poll-decision", true)
     }
 
-    /// The read-only "(Offline)" cache browse point: verifies the pure path
-    /// derivation (`linkPath`/`target`) and the create/remove/re-point decision
-    /// matrix (`OfflineAccessLink.action`) without touching the filesystem.
-    private static func testOfflineAccessLink() -> Bool {
-        func mk(mode: SyncMode, offline: Bool, local: String) -> SyncProfile {
-            SyncProfile(
-                name: "T", rcloneRemote: "synology:", remotePath: "Kaiju/KAIJU",
-                localSyncPath: local, syncMode: mode,
-                vfsCachePath: "/Volumes/Ext/.config/rclone", offlineAccessEnabled: offline
-            )
-        }
-        let mount = mk(mode: .mount, offline: true, local: "/Volumes/Ext/KaijuNew")
-
-        // linkPath: sibling of the mount point, "<name> (Offline)".
-        guard OfflineAccessLink.linkPath(for: mount) == "/Volumes/Ext/KaijuNew (Offline)" else {
-            return report("AC-OA1", "offline-access-link", false, "(bad linkPath: \(OfflineAccessLink.linkPath(for: mount) ?? "nil"))")
-        }
-        // No mount point → no link to compute.
-        guard OfflineAccessLink.linkPath(for: mk(mode: .mount, offline: true, local: "")) == nil else {
-            return report("AC-OA1", "offline-access-link", false, "(empty localSyncPath should yield nil linkPath)")
-        }
-        // target: {vfsCachePath}/vfs/{remote-no-colon}/{remotePath}.
-        let want = "/Volumes/Ext/.config/rclone/vfs/synology/Kaiju/KAIJU"
-        guard OfflineAccessLink.target(for: mount) == want else {
-            return report("AC-OA1", "offline-access-link", false, "(bad target: \(OfflineAccessLink.target(for: mount)))")
-        }
-
-        let link = OfflineAccessLink.linkPath(for: mount)!
-        // Enabled mount, no link yet → create.
-        guard OfflineAccessLink.action(for: mount, linkExists: false, currentTarget: nil)
-            == .create(link: link, target: want) else {
-            return report("AC-OA1", "offline-access-link", false, "(missing link should create)")
-        }
-        // Enabled mount, link already correct → nothing to do.
-        guard OfflineAccessLink.action(for: mount, linkExists: true, currentTarget: want) == .none else {
-            return report("AC-OA1", "offline-access-link", false, "(correct link should be none)")
-        }
-        // Enabled mount, link points at the wrong (old) cache dir → re-point.
-        guard OfflineAccessLink.action(for: mount, linkExists: true, currentTarget: "/old/vfs/x")
-            == .create(link: link, target: want) else {
-            return report("AC-OA1", "offline-access-link", false, "(stale-target link should re-point)")
-        }
-        // Disabled on a mount, link present → remove; absent → none.
-        let mountOff = mk(mode: .mount, offline: false, local: "/Volumes/Ext/KaijuNew")
-        guard OfflineAccessLink.action(for: mountOff, linkExists: true, currentTarget: want) == .remove(link: link) else {
-            return report("AC-OA1", "offline-access-link", false, "(disabled should remove existing link)")
-        }
-        guard OfflineAccessLink.action(for: mountOff, linkExists: false, currentTarget: nil) == .none else {
-            return report("AC-OA1", "offline-access-link", false, "(disabled + no link should be none)")
-        }
-        // Non-mount profile with a stray link (e.g. after a mode switch) → clean it up.
-        let bisync = mk(mode: .bisync, offline: true, local: "/Volumes/Ext/KaijuNew")
-        guard OfflineAccessLink.action(for: bisync, linkExists: true, currentTarget: want) == .remove(link: link) else {
-            return report("AC-OA1", "offline-access-link", false, "(non-mount stray link should remove)")
-        }
-        guard OfflineAccessLink.action(for: bisync, linkExists: false, currentTarget: nil) == .none else {
-            return report("AC-OA1", "offline-access-link", false, "(non-mount + no link should be none)")
-        }
-        return report("AC-OA1", "offline-access-link", true)
-    }
-
-    /// Exercises the real filesystem apply (`OfflineAccessLink.apply` / `removeLink`)
-    /// against a throwaway temp tree: create → idempotent re-run → re-point after a
-    /// cache-dir change → disable removes → delete removes. Covers the ~lines of
-    /// FileManager glue that AC-OA1's pure checks can't reach.
-    private static func testOfflineAccessApply() -> Bool {
+    /// Legacy "(Offline)" symlink cleanup (D13/R6): a stray symlink left by the
+    /// retired offline-browse-point feature, pointing into a `/vfs/` cache data tree,
+    /// is removed; a real directory of that name and a symlink pointing elsewhere are
+    /// both left alone. Covers the pure predicate and the real filesystem apply.
+    private static func testLegacyOfflineLinkCleanup() -> Bool {
         let fm = FileManager.default
         let root = (NSTemporaryDirectory() as NSString)
             .appendingPathComponent("synctray-oa-\(UUID().uuidString)")
@@ -769,58 +705,53 @@ enum ConfigSelfTest {
         let mountPoint = (root as NSString).appendingPathComponent("KaijuNew")
         try? fm.createDirectory(atPath: mountPoint, withIntermediateDirectories: true)
 
-        func profile(offline: Bool, cacheRoot: String) -> SyncProfile {
-            SyncProfile(
-                name: "T", rcloneRemote: "synology:", remotePath: "Kaiju/KAIJU",
-                localSyncPath: mountPoint, syncMode: .mount,
-                vfsCachePath: cacheRoot, offlineAccessEnabled: offline
-            )
-        }
-        let cacheA = (root as NSString).appendingPathComponent("cacheA")
-        let cacheB = (root as NSString).appendingPathComponent("cacheB")
-        let link = OfflineAccessLink.linkPath(for: profile(offline: true, cacheRoot: cacheA))!
-
-        func linkTarget() -> String? {
-            guard let attrs = try? fm.attributesOfItem(atPath: link),
-                  (attrs[.type] as? FileAttributeType) == .typeSymbolicLink else { return nil }
-            return try? fm.destinationOfSymbolicLink(atPath: link)
+        let profile = SyncProfile(
+            name: "T", rcloneRemote: "synology:", remotePath: "Kaiju/KAIJU",
+            localSyncPath: mountPoint, syncMode: .mount, vfsCachePath: root
+        )
+        let expectedLinkPath = (root as NSString).appendingPathComponent("KaijuNew (Offline)")
+        guard LegacyOfflineLink.linkPath(for: profile) == expectedLinkPath else {
+            return report("AC-OA3", "legacy-offline-link-cleanup", false,
+                          "(bad linkPath: \(LegacyOfflineLink.linkPath(for: profile) ?? "nil"))")
         }
 
-        // Enabled → creates a symlink at the cacheA target.
-        let pA = profile(offline: true, cacheRoot: cacheA)
-        _ = OfflineAccessLink.apply(for: pA)
-        guard linkTarget() == OfflineAccessLink.target(for: pA) else {
-            return report("AC-OA2", "offline-access-apply", false, "(create did not link to cacheA target)")
+        // Pure predicate: only a symlink into a /vfs/ tree qualifies.
+        guard LegacyOfflineLink.shouldRemoveLegacyOfflineLink(
+            isSymlink: true, destination: "\(root)/vfs/synology/Kaiju/KAIJU") else {
+            return report("AC-OA3", "legacy-offline-link-cleanup", false, "(vfs symlink should qualify for removal)")
         }
-        // Idempotent re-run → still the same link (no throw, no duplicate).
-        guard OfflineAccessLink.apply(for: pA) == .none, linkTarget() == OfflineAccessLink.target(for: pA) else {
-            return report("AC-OA2", "offline-access-apply", false, "(second apply was not a no-op)")
+        guard !LegacyOfflineLink.shouldRemoveLegacyOfflineLink(isSymlink: false, destination: "\(root)/vfs/x") else {
+            return report("AC-OA3", "legacy-offline-link-cleanup", false, "(non-symlink should never qualify)")
         }
-        // Cache dir changed → re-point to cacheB.
-        let pB = profile(offline: true, cacheRoot: cacheB)
-        _ = OfflineAccessLink.apply(for: pB)
-        guard linkTarget() == OfflineAccessLink.target(for: pB) else {
-            return report("AC-OA2", "offline-access-apply", false, "(cache change did not re-point)")
+        guard !LegacyOfflineLink.shouldRemoveLegacyOfflineLink(isSymlink: true, destination: "/somewhere/else") else {
+            return report("AC-OA3", "legacy-offline-link-cleanup", false, "(symlink outside /vfs/ should not qualify)")
         }
-        // Disabled → link removed.
-        _ = OfflineAccessLink.apply(for: profile(offline: false, cacheRoot: cacheB))
-        guard linkTarget() == nil, !fm.fileExists(atPath: link) else {
-            return report("AC-OA2", "offline-access-apply", false, "(disable did not remove the link)")
+
+        // Real filesystem apply: a symlink into /vfs/ is removed...
+        let link = LegacyOfflineLink.linkPath(for: profile)!
+        let target = (root as NSString).appendingPathComponent("vfs/synology/Kaiju/KAIJU")
+        try? fm.createDirectory(atPath: target, withIntermediateDirectories: true)
+        try? fm.createSymbolicLink(atPath: link, withDestinationPath: target)
+        guard LegacyOfflineLink.removeIfPresent(for: profile), !fm.fileExists(atPath: link) else {
+            return report("AC-OA3", "legacy-offline-link-cleanup", false, "(vfs symlink was not removed)")
         }
-        // A real (non-symlink) directory at the link path must never be clobbered.
+
+        // ...a real directory of that name is kept...
         try? fm.createDirectory(atPath: link, withIntermediateDirectories: true)
-        _ = OfflineAccessLink.apply(for: pA)  // wants to create, but a real dir sits there
-        var isDir: ObjCBool = false
-        guard fm.fileExists(atPath: link, isDirectory: &isDir), isDir.boolValue, linkTarget() == nil else {
-            return report("AC-OA2", "offline-access-apply", false, "(clobbered a real directory at the link path)")
+        guard !LegacyOfflineLink.removeIfPresent(for: profile), fm.fileExists(atPath: link) else {
+            return report("AC-OA3", "legacy-offline-link-cleanup", false, "(a real directory was removed)")
         }
         try? fm.removeItem(atPath: link)
-        // removeLink force-removes regardless of the (still-enabled) flag, symlink-only.
-        _ = OfflineAccessLink.apply(for: pA)
-        guard OfflineAccessLink.removeLink(for: pA), linkTarget() == nil else {
-            return report("AC-OA2", "offline-access-apply", false, "(removeLink did not delete the symlink)")
+
+        // ...and a symlink pointing elsewhere is kept.
+        let elsewhere = (root as NSString).appendingPathComponent("elsewhere")
+        try? fm.createDirectory(atPath: elsewhere, withIntermediateDirectories: true)
+        try? fm.createSymbolicLink(atPath: link, withDestinationPath: elsewhere)
+        guard !LegacyOfflineLink.removeIfPresent(for: profile), fm.fileExists(atPath: link) else {
+            return report("AC-OA3", "legacy-offline-link-cleanup", false, "(a symlink pointing elsewhere was removed)")
         }
-        return report("AC-OA2", "offline-access-apply", true)
+
+        return report("AC-OA3", "legacy-offline-link-cleanup", true)
     }
 
     /// A launchd/externally-mounted Stream profile (e.g. auto-mounted at login) never runs
@@ -1903,279 +1834,71 @@ enum ConfigSelfTest {
         return result.joined(separator: "\n")
     }
 
+    // MARK: - AC-CK1 — the cache key is the primary remote name again
+
+    /// The retired "Share the cache across remotes" feature is gone: the VFS cache is
+    /// keyed by the primary remote name exactly as 0.80.0 did, and a `.profile.json`
+    /// still carrying its old keys decodes fine (they're simply ignored) and no longer
+    /// round-trips them on the next write.
+    private static func testCacheKeyPrimary() -> Bool {
+        var profile = SyncProfile(
+            name: "Stream", rcloneRemote: "synology:", remotePath: "Kaiju/KAIJU",
+            localSyncPath: "/Volumes/SeagateHD/KaijuNew", syncMode: .mount
+        )
+        guard VFSCacheService.cacheRelativePath(for: profile) == "synology/Kaiju/KAIJU" else {
+            return report("AC-CK1", "cache-key-primary", false,
+                          "(key \(VFSCacheService.cacheRelativePath(for: profile)) != synology/Kaiju/KAIJU)")
+        }
+
+        // A profile file carrying the retired keys must still decode (unknown keys are
+        // simply skipped by Codable), and the re-encoded JSON must drop them.
+        let legacyJSON: [String: Any] = [
+            "id": profile.id.uuidString, "name": profile.name,
+            "rcloneRemote": profile.rcloneRemote, "remotePath": profile.remotePath,
+            "localSyncPath": profile.localSyncPath, "syncMode": "mount",
+            "stableCacheIdentity": true, "cacheIdentity": "synology", "offlineAccessEnabled": true,
+        ]
+        guard let data = try? JSONSerialization.data(withJSONObject: legacyJSON),
+              let decoded = try? JSONDecoder().decode(SyncProfile.self, from: data) else {
+            return report("AC-CK1", "cache-key-primary", false, "(profile carrying legacy keys failed to decode)")
+        }
+        profile = decoded
+        guard let reEncoded = try? JSONEncoder().encode(profile),
+              let reEncodedString = String(data: reEncoded, encoding: .utf8) else {
+            return report("AC-CK1", "cache-key-primary", false, "(re-encode failed)")
+        }
+        for key in ["stableCacheIdentity", "cacheIdentity", "offlineAccessEnabled"] where reEncodedString.contains(key) {
+            return report("AC-CK1", "cache-key-primary", false, "(re-encoded JSON still contains \(key))")
+        }
+
+        // The retired migration slot is a documented no-op — it must not throw and must
+        // not touch UserDefaults.
+        let suiteName = "synctray-selftest-ck1-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        do {
+            try MigrationV4Retired().migrateUserDefaults(defaults)
+        } catch {
+            return report("AC-CK1", "cache-key-primary", false, "(MigrationV4Retired threw: \(error))")
+        }
+
+        return report("AC-CK1", "cache-key-primary", true)
+    }
+
     /// A mount-mode profile with deterministic remote/key fields, for the
-    /// cache-migration tests below.
-    // MARK: - AC-CI1 — pinned cache identity: key derivation, rollback safety, adoption
-
-    /// The cache subtree a Stream profile owns must follow the PROFILE, not whichever remote
-    /// is reachable — otherwise re-pointing `rcloneRemote` (LAN SMB → SFTP away from home)
-    /// starts a second, empty `vfs/{remote}/…` tree and re-downloads everything.
-    ///
-    /// The identity is PINNED to the profile's own remote name rather than derived, which is
-    /// what keeps upgrade and downgrade free. This drives that invariant directly: an
-    /// unpinned profile keys exactly as the pre-identity code did, pinning reproduces the
-    /// same key, and only a later remote change diverges from it.
-    private static func testCacheIdentity() -> Bool {
-        var profile = mountProfile(remotePath: "Kaiju/KAIJU", vfsCachePath: "/tmp/ci1-root")
-        profile.rcloneRemote = "synology:"
-        profile.fallbackRemote = "synology-sftp"
-
-        // UNPINNED (a profile file written before this field existed) must key identically
-        // to every previous version — this is the upgrade-is-free property.
-        let legacyKey = "synology/Kaiju/KAIJU"
-        guard profile.cacheIdentity.isEmpty,
-              VFSCacheService.cacheRelativePath(for: profile) == legacyKey else {
-            return report("AC-CI1", "cache-identity", false,
-                          "(unpinned key \(VFSCacheService.cacheRelativePath(for: profile)) != \(legacyKey))")
-        }
-
-        // Pinning writes the SAME name the cache already lives under, so nothing moves...
-        profile.cacheIdentity = "synology"
-        guard VFSCacheService.cacheRelativePath(for: profile) == legacyKey else {
-            return report("AC-CI1", "cache-identity", false, "(pinning moved the key)")
-        }
-
-        // ...and the key then stops following the remote, which is the whole feature.
-        var switched = profile
-        switched.rcloneRemote = "synology-sftp:"
-        guard VFSCacheService.cacheRelativePath(for: switched) == legacyKey else {
-            return report("AC-CI1", "cache-identity", false, "(key moved when the remote changed)")
-        }
-        // With the identity off, it follows the remote again (the pre-existing behaviour).
-        var off = switched
-        off.stableCacheIdentity = false
-        guard VFSCacheService.cacheRelativePath(for: off) == "synology-sftp/Kaiju/KAIJU" else {
-            return report("AC-CI1", "cache-identity", false, "(identity off should track the remote)")
-        }
-
-        // A name that cannot become RCLONE_CONFIG_<NAME>_<KEY> must degrade to "no identity",
-        // never to a broken mount — and "no identity" is the same subtree anyway.
-        guard SyncProfile.isEnvExpressibleIdentity("synology-sftp"),
-              !SyncProfile.isEnvExpressibleIdentity("my.nas"),
-              !SyncProfile.isEnvExpressibleIdentity("two words"),
-              !SyncProfile.isEnvExpressibleIdentity("") else {
-            return report("AC-CI1", "cache-identity", false, "(isEnvExpressibleIdentity misclassified a name)")
-        }
-        var dotted = profile
-        dotted.cacheIdentity = "my.nas"
-        guard dotted.scriptCacheIdentity == nil,
-              VFSCacheService.cacheRelativePath(for: dotted) == legacyKey else {
-            return report("AC-CI1", "cache-identity", false, "(non-expressible identity did not degrade to the remote name)")
-        }
-
-        // Only a stray, non-identity tree is an adoption candidate. With the identity pinned
-        // to the primary name, that leaves the fallback's tree and nothing else.
-        guard CacheIdentityMigration.legacyKeys(for: profile) == ["synology-sftp/Kaiju/KAIJU"] else {
-            return report("AC-CI1", "cache-identity", false,
-                          "(legacyKeys \(CacheIdentityMigration.legacyKeys(for: profile)))")
-        }
-        var noIdentity = profile
-        noIdentity.stableCacheIdentity = false
-        guard CacheIdentityMigration.legacyKeys(for: noIdentity).isEmpty else {
-            return report("AC-CI1", "cache-identity", false, "(identity off should yield no adoption candidates)")
-        }
-
-        // Pure planner: adopt when the stray tree exists and the destination is free; never
-        // clobber an occupied destination; no-op otherwise.
-        let stray = "synology-sftp/Kaiju/KAIJU"
-        let adopt = CacheIdentityMigration.plan(
-            profile: profile, kind: .content, legacyKey: stray,
-            observation: .init(legacyExists: true, destinationExists: false))
-        guard case .adopt(let src, let dst) = adopt,
-              src == "/tmp/ci1-root/vfs/\(stray)", dst == "/tmp/ci1-root/vfs/\(legacyKey)" else {
-            return report("AC-CI1", "cache-identity", false, "(adopt plan produced \(adopt))")
-        }
-        guard case .destinationOccupied = CacheIdentityMigration.plan(
-            profile: profile, kind: .content, legacyKey: stray,
-            observation: .init(legacyExists: true, destinationExists: true)) else {
-            return report("AC-CI1", "cache-identity", false, "(occupied destination should not adopt)")
-        }
-        guard CacheIdentityMigration.plan(
-            profile: profile, kind: .content, legacyKey: stray,
-            observation: .init(legacyExists: false, destinationExists: false)) == .none else {
-            return report("AC-CI1", "cache-identity", false, "(absent stray tree should be .none)")
-        }
-
-        // Real filesystem apply: both trees move, the cached bytes survive, second run no-ops.
-        let fm = FileManager.default
-        let root = "\(selfTestRoot)/ci1-cache"
-        try? fm.removeItem(atPath: root)
-        var applied = profile
-        applied.vfsCachePath = root
-        for kind in CacheTreeKind.allCases {
-            let dir = "\(root)/\(kind.rawValue)/\(stray)"
-            try? fm.createDirectory(atPath: dir, withIntermediateDirectories: true)
-            try? "\(kind.rawValue)-payload".write(
-                toFile: "\(dir)/track.wav", atomically: true, encoding: .utf8)
-        }
-        let actions = CacheIdentityMigration.apply(for: applied, fileManager: fm)
-        guard actions.count == CacheTreeKind.allCases.count else {
-            return report("AC-CI1", "cache-identity", false, "(expected one action per tree kind, got \(actions))")
-        }
-        for kind in CacheTreeKind.allCases {
-            let moved = "\(root)/\(kind.rawValue)/\(legacyKey)/track.wav"
-            guard let body = try? String(contentsOfFile: moved, encoding: .utf8),
-                  body == "\(kind.rawValue)-payload" else {
-                return report("AC-CI1", "cache-identity", false, "(\(kind.rawValue) payload not adopted)")
-            }
-            guard !fm.fileExists(atPath: "\(root)/\(kind.rawValue)/\(stray)") else {
-                return report("AC-CI1", "cache-identity", false, "(\(kind.rawValue) stray tree left behind)")
-            }
-        }
-        guard CacheIdentityMigration.apply(for: applied, fileManager: fm).isEmpty else {
-            return report("AC-CI1", "cache-identity", false, "(second apply was not a no-op)")
-        }
-
-        return report("AC-CI1", "cache-identity", true)
-    }
-
-    // MARK: - AC-CI2 — cache identity + cache-only reach the script, and force a reinstall
-
-    /// Per CLAUDE.md, a mount setting the script consumes has to be emitted by
-    /// `generateProfileConfig` AND be in `reconcileAction`'s reinstall set — a field present
-    /// in the model and UI but missing from either silently never takes effect (the bug that
-    /// made "NFS selected but macFUSE still runs"). Assert both for the new fields.
-    private static func testCacheIdentityConfigEmission() -> Bool {
-        var profile = mountProfile(remotePath: "Kaiju/KAIJU", vfsCachePath: "/tmp/ci2-root")
-        profile.cacheIdentity = "synology"
-        profile.streamCacheOnly = true
-
-        func derived(_ p: SyncProfile) -> [String: Any] {
-            let json = SyncSetupService.shared.generateProfileConfig(for: p)
-            let data = json.data(using: .utf8) ?? Data()
-            return (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]
-        }
-
-        let on = derived(profile)
-        guard on["cacheIdentity"] as? String == "synology" else {
-            return report("AC-CI2", "cache-identity-config", false,
-                          "(cacheIdentity not emitted: \(on["cacheIdentity"] ?? "nil"))")
-        }
-        guard on["streamCacheOnly"] as? Bool == true else {
-            return report("AC-CI2", "cache-identity-config", false, "(streamCacheOnly not emitted)")
-        }
-
-        var off = profile
-        off.stableCacheIdentity = false
-        guard derived(off)["cacheIdentity"] as? String == "" else {
-            return report("AC-CI2", "cache-identity-config", false,
-                          "(identity off must emit an empty cacheIdentity, not the name)")
-        }
-
-        var enabled = profile
-        enabled.isEnabled = true
-        var identityToggled = enabled
-        identityToggled.stableCacheIdentity = false
-        guard SyncManager.reconcileAction(from: enabled, to: identityToggled) == .reinstall else {
-            return report("AC-CI2", "cache-identity-config", false, "(stableCacheIdentity change did not reinstall)")
-        }
-        var identityRenamed = enabled
-        identityRenamed.cacheIdentity = "synology-sftp"
-        guard SyncManager.reconcileAction(from: enabled, to: identityRenamed) == .reinstall else {
-            return report("AC-CI2", "cache-identity-config", false, "(cacheIdentity change did not reinstall)")
-        }
-        var cacheOnlyToggled = enabled
-        cacheOnlyToggled.streamCacheOnly = false
-        guard SyncManager.reconcileAction(from: enabled, to: cacheOnlyToggled) == .reinstall else {
-            return report("AC-CI2", "cache-identity-config", false, "(streamCacheOnly change did not reinstall)")
-        }
-
-        // Cache-only suppresses the offline warmer (its job is to download the very bytes
-        // the mode exists to stop fetching), and un-setting it re-arms the profile.
-        var warmed: Set<UUID> = []
-        guard !SyncManager.shouldAutoWarmOnMount(
-            isMounted: true, hasPinnedDirs: !["Reaper"].isEmpty && !profile.streamCacheOnly,
-            profileId: profile.id, alreadyWarmed: &warmed) else {
-            return report("AC-CI2", "cache-identity-config", false, "(cache-only profile still auto-warms)")
-        }
-        guard SyncManager.shouldAutoWarmOnMount(
-            isMounted: true, hasPinnedDirs: !["Reaper"].isEmpty && !cacheOnlyToggled.streamCacheOnly,
-            profileId: cacheOnlyToggled.id, alreadyWarmed: &warmed) else {
-            return report("AC-CI2", "cache-identity-config", false, "(non-cache-only profile should warm)")
-        }
-
-        return report("AC-CI2", "cache-identity-config", true)
-    }
-
-    // MARK: - AC-CI3 — upgrade pins without moving bytes; downgrade still finds them
-
-    /// The rollback contract. `MigrationV4PinCacheIdentity` must write the remote name the
-    /// cache is ALREADY keyed by — never a synthetic one — so that:
-    ///   upgrade  : the key before and after the migration are identical (no re-download), and
-    ///   downgrade: an older build, which drops `cacheIdentity` on the floor and mounts
-    ///              `rcloneRemote:`, resolves to that same subtree.
-    /// A regression here is expensive and silent: the user re-downloads their whole cache and
-    /// the old tree is orphaned on disk with nothing pointing at it.
-    private static func testCacheIdentityUpgradeRollback() -> Bool {
-        let migration = MigrationV4PinCacheIdentity()
-
-        // Authoritative {shortId}.profile.json — keyed by `rcloneRemote`.
-        let profileFile: [String: Any] = [
-            "id": UUID().uuidString, "name": "KaijuNew", "syncMode": "mount",
-            "rcloneRemote": "synology:", "remotePath": "Kaiju/KAIJU",
-            "localSyncPath": "/Volumes/SeagateHD/KaijuNew",
-        ]
-        guard let pinnedProfile = migration.migrateOnDiskConfig(profileFile),
-              pinnedProfile["cacheIdentity"] as? String == "synology" else {
-            return report("AC-CI3", "cache-identity-rollback", false, "(profile file not pinned to the current remote name)")
-        }
-
-        // Derived {shortId}.json — keyed by `remote` ("name:path"). Pinning this too is what
-        // makes the behaviour live after an upgrade instead of waiting for a reinstall.
-        let derivedConfig: [String: Any] = [
-            "syncMode": "mount", "remote": "synology:Kaiju/KAIJU", "remotePath": "Kaiju/KAIJU",
-        ]
-        guard let pinnedDerived = migration.migrateOnDiskConfig(derivedConfig),
-              pinnedDerived["cacheIdentity"] as? String == "synology" else {
-            return report("AC-CI3", "cache-identity-rollback", false, "(derived config not pinned)")
-        }
-
-        // Non-mount profiles have no VFS cache; an already-set identity is never overwritten;
-        // a name that can't become environment variables stays unpinned.
-        guard migration.migrateOnDiskConfig(["syncMode": "bisync", "rcloneRemote": "synology:"]) == nil,
-              migration.migrateOnDiskConfig(["rcloneRemote": "synology:"]) == nil,
-              migration.migrateOnDiskConfig(
-                ["syncMode": "mount", "rcloneRemote": "synology:", "cacheIdentity": "chosen"]) == nil,
-              migration.migrateOnDiskConfig(["syncMode": "mount", "rcloneRemote": "my.nas:"]) == nil else {
-            return report("AC-CI3", "cache-identity-rollback", false, "(migration touched a config it should have skipped)")
-        }
-
-        // The contract itself: pre-migration key == post-migration key == the key an older
-        // build computes from `rcloneRemote` alone.
-        var before = mountProfile(remotePath: "Kaiju/KAIJU", vfsCachePath: "/tmp/ci3-root")
-        before.rcloneRemote = "synology:"
-        var after = before
-        after.cacheIdentity = pinnedProfile["cacheIdentity"] as? String ?? ""
-        var oldBuild = before
-        oldBuild.stableCacheIdentity = false   // an older build has neither field
-        let keys = [before, after, oldBuild].map { VFSCacheService.cacheRelativePath(for: $0) }
-        guard Set(keys).count == 1, keys[0] == "synology/Kaiju/KAIJU" else {
-            return report("AC-CI3", "cache-identity-rollback", false,
-                          "(upgrade/rollback keys diverged: \(keys))")
-        }
-
-        return report("AC-CI3", "cache-identity-rollback", true)
-    }
-
-    /// - Parameter stableCacheIdentity: pass `false` for fixtures that need the LEGACY,
-    ///   remote-named cache key. Two profiles can only share on-disk bytes under that
-    ///   layout — with the identity on, each profile owns `vfs/synctray_{shortId}/…`, so
-    ///   nested remote paths no longer produce nested cache keys and the overlap machinery
-    ///   has nothing to classify. The overlap tests therefore pin the legacy layout, which
-    ///   remains reachable whenever a user turns the identity off.
+    /// cache-migration tests below. The cache key is always the primary remote name
+    /// (colon stripped) + remotePath — see `VFSCacheService.cacheRelativePath`.
     private static func mountProfile(
         id: UUID = UUID(),
         name: String = "Stream",
         remotePath: String,
-        vfsCachePath: String,
-        stableCacheIdentity: Bool = true
+        vfsCachePath: String
     ) -> SyncProfile {
         var profile = sampleProfile(id: id, name: name)
         profile.syncMode = .mount
         profile.rcloneRemote = "synology:"
         profile.remotePath = remotePath
         profile.vfsCachePath = vfsCachePath
-        profile.stableCacheIdentity = stableCacheIdentity
         return profile
     }
 
@@ -2203,9 +1926,6 @@ enum ConfigSelfTest {
     private static func testCacheMigrationKeyDerivation() -> Bool {
         var profile = mountProfile(remotePath: "Kaiju/KAIJU", vfsCachePath: "~/.cache/rclone")
         profile.rcloneRemote = "synology:"
-        // The legacy, remote-named layout is still what the key derives to when the
-        // profile-stable identity is off.
-        profile.stableCacheIdentity = false
 
         let key = VFSCacheService.cacheRelativePath(for: profile)
         guard key == "synology/Kaiju/KAIJU" else {
@@ -2232,14 +1952,12 @@ enum ConfigSelfTest {
     // MARK: - AC-CM3 — overlap classification: nested sibling excluded/co-migrated/disjoint
 
     private static func testCacheMigrationOverlap() -> Bool {
-        // LEGACY (remote-named) layout: only there can two profiles address the same bytes.
+        // The cache key is always the remote-named layout now, so two profiles can only
+        // address the same on-disk bytes when one remote path nests inside the other's.
         let sharedRoot = "/tmp/cm3-src"
-        let parent = mountProfile(name: "Parent", remotePath: "Kaiju/KAIJU",
-                                  vfsCachePath: sharedRoot, stableCacheIdentity: false)
-        let child = mountProfile(name: "Child", remotePath: "Kaiju/KAIJU/Reaper",
-                                 vfsCachePath: sharedRoot, stableCacheIdentity: false)
-        let disjoint = mountProfile(name: "Disjoint", remotePath: "OtherShare",
-                                    vfsCachePath: sharedRoot, stableCacheIdentity: false)
+        let parent = mountProfile(name: "Parent", remotePath: "Kaiju/KAIJU", vfsCachePath: sharedRoot)
+        let child = mountProfile(name: "Child", remotePath: "Kaiju/KAIJU/Reaper", vfsCachePath: sharedRoot)
+        let disjoint = mountProfile(name: "Disjoint", remotePath: "OtherShare", vfsCachePath: sharedRoot)
         let all = [parent, child, disjoint]
 
         switch CacheMigrationPlanner.plan(moving: parent, allProfiles: all, to: "/tmp/cm3-dest", coMigrate: []) {
@@ -2266,32 +1984,15 @@ enum ConfigSelfTest {
             return report("AC-CM3", "cache-migration-overlap", false, "(sameRootProfiles \(plan.sameRootProfiles) != [disjoint])")
         }
 
-        // A pinned cache identity keeps overlap exactly where it was when both profiles pin
-        // the SAME remote name (the usual case: the migration pins each to its own primary
-        // remote), and dissolves it when they pin DIFFERENT names — vfs/{a}/… and vfs/{b}/…
-        // are disjoint no matter how the remote paths nest. Assert both directions so a
-        // future change can neither invent a false overlap nor hide a real one.
-        var idParent = parent; idParent.stableCacheIdentity = true; idParent.cacheIdentity = "synology"
-        var idChild = child; idChild.stableCacheIdentity = true; idChild.cacheIdentity = "synology"
-        let (samePinOverlapping, _) = CacheMigrationPlanner.classifySiblings(
-            of: idParent, sourceRoot: sharedRoot, allProfiles: [idParent, idChild])
-        guard samePinOverlapping.map({ $0.id }) == [idChild.id] else {
+        // A disjoint pair (different primary remotes) is same-root at most, never overlapping.
+        var otherRemote = disjoint
+        otherRemote.rcloneRemote = "synology-sftp:"
+        otherRemote.remotePath = "Kaiju/KAIJU/Nested"
+        let (overlapping, sameRoot) = CacheMigrationPlanner.classifySiblings(
+            of: parent, sourceRoot: sharedRoot, allProfiles: [parent, otherRemote])
+        guard overlapping.isEmpty, sameRoot.map({ $0.id }) == [otherRemote.id] else {
             return report("AC-CM3", "cache-migration-overlap", false,
-                          "(nested profiles pinned to the same identity must still overlap)")
-        }
-
-        idChild.cacheIdentity = "synology-sftp"
-        let (identityOverlapping, identitySameRoot) = CacheMigrationPlanner.classifySiblings(
-            of: idParent, sourceRoot: sharedRoot, allProfiles: [idParent, idChild])
-        guard identityOverlapping.isEmpty, identitySameRoot.map({ $0.id }) == [idChild.id] else {
-            return report("AC-CM3", "cache-migration-overlap", false,
-                          "(nested profiles pinned to different identities should be same-root, not overlapping)")
-        }
-        guard case .success = CacheMigrationPlanner.plan(
-            moving: idParent, allProfiles: [idParent, idChild], to: "/tmp/cm3-dest", coMigrate: []
-        ) else {
-            return report("AC-CM3", "cache-migration-overlap", false,
-                          "(disjoint-identity move rejected for a non-existent overlap)")
+                          "(profiles on different primary remotes should be same-root, not overlapping)")
         }
 
         return report("AC-CM3", "cache-migration-overlap", true)
@@ -2877,13 +2578,11 @@ enum ConfigSelfTest {
     // MARK: - AC-CM13 — nested co-migrated subtrees never use the whole-directory fast path (finding 5)
 
     private static func testCacheMigrationNestedSubtreesUseFilePath() -> Bool {
-        // LEGACY (remote-named) layout — see `mountProfile`: nested cache subtrees, the
-        // condition this fast-path guard exists for, only occur when two profiles share a
-        // remote name.
-        let parent = mountProfile(name: "Parent", remotePath: "Kaiju/KAIJU",
-                                  vfsCachePath: "/tmp/cm13-src", stableCacheIdentity: false)
-        let child = mountProfile(name: "Child", remotePath: "Kaiju/KAIJU/Reaper",
-                                 vfsCachePath: "/tmp/cm13-src", stableCacheIdentity: false)
+        // Nested cache subtrees, the condition this fast-path guard exists for, occur
+        // whenever two profiles share a remote name (the remote-named layout, always in
+        // effect now — see `mountProfile`).
+        let parent = mountProfile(name: "Parent", remotePath: "Kaiju/KAIJU", vfsCachePath: "/tmp/cm13-src")
+        let child = mountProfile(name: "Child", remotePath: "Kaiju/KAIJU/Reaper", vfsCachePath: "/tmp/cm13-src")
         let all = [parent, child]
         guard case .success(let plan) = CacheMigrationPlanner.plan(
             moving: parent, allProfiles: all, to: "/tmp/cm13-dest", coMigrate: [child.id]

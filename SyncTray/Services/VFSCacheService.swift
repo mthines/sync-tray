@@ -37,33 +37,28 @@ final class VFSCacheService {
 
     // MARK: - Cache Directory Scanning
 
-    /// Single home for the on-disk VFS cache subtree key: the name rclone will report for
-    /// the mounted Fs, joined with the profile's remote path.
-    /// `cacheDirectory(for:)` below, `OfflineAccessLink`, `CacheIdentityMigration` and
-    /// `CacheMigrationPlanner` ALL call this, so they cannot disagree about which subtree a
-    /// profile owns (a drift there would relocate the wrong subtree during a cache move).
-    ///
-    /// The first component is `profile.effectiveCacheRemoteName`:
-    /// - `stableCacheIdentity` on (default) → `synctray_{shortId}`, a profile-owned name that
-    ///   survives re-pointing `rcloneRemote` and a fallback activation, so ONE cache is shared
-    ///   across every remote the profile uses. The mount is given an env-var-defined remote of
-    ///   that name (see `SyncSetupService`'s script), which is what makes rclone key it so.
-    /// - off → the primary remote name with its colon stripped, i.e. the pre-existing layout.
+    /// Single home for the on-disk VFS cache subtree key: the PRIMARY remote's name
+    /// (colon stripped), joined with the profile's remote path — exactly the layout rclone
+    /// uses when it mounts `rcloneRemote:remotePath` directly, and exactly what an older
+    /// build (before, and after, the retired "Share the cache across remotes" feature)
+    /// expects. `cacheDirectory(for:)` below and `CacheMigrationPlanner` ALL call this, so
+    /// they cannot disagree about which subtree a profile owns (a drift there would
+    /// relocate the wrong subtree during a cache move). See "Cache identity" in CLAUDE.md
+    /// for why a suffixed variant (`{primary}{hash}`) can also appear on disk and how the
+    /// sync script consolidates it into this unsuffixed key on every mount start.
     nonisolated static func cacheRelativePath(for profile: SyncProfile) -> String {
-        key(remoteName: profile.effectiveCacheRemoteName, remotePath: profile.remotePath)
+        key(remoteName: profile.primaryRemoteName, remotePath: profile.remotePath)
     }
 
-    /// The subtree key this profile's cache used (or would use) under the LEGACY,
-    /// remote-named layout — `{remoteName}/{remotePath}`. `remoteName` is passed in rather
-    /// than read off the profile because the bytes may sit under the primary remote's name
-    /// OR a fallback's, depending on which one was active when they were downloaded.
-    nonisolated static func legacyCacheRelativePath(
+    /// The subtree key for an ARBITRARY remote name (e.g. a fallback's), used when
+    /// classifying a stray tree that isn't necessarily the profile's primary remote.
+    nonisolated static func cacheRelativePath(
         remoteName: String, remotePath: String
     ) -> String {
         key(remoteName: remoteName.replacingOccurrences(of: ":", with: ""), remotePath: remotePath)
     }
 
-    /// Shared join so the stable and legacy keys can only differ in their first component.
+    /// Shared join so every caller can only differ in the remote-name component.
     private nonisolated static func key(remoteName: String, remotePath: String) -> String {
         let name = remoteName.replacingOccurrences(of: ":", with: "")
         return remotePath.isEmpty ? name : "\(name)/\(remotePath)"
@@ -76,13 +71,11 @@ final class VFSCacheService {
         guard fm.fileExists(atPath: baseCachePath) else { return nil }
 
         // rclone stores VFS cache in: {cache-dir}/vfs/{fs-name}/{fs-root}
-        // The fs name is the profile's cache identity (or, with the identity off, the
-        // primary remote name with its colon stripped).
+        // The fs name is the profile's primary remote name (colon stripped).
         let vfsDir = (baseCachePath as NSString).appendingPathComponent(CacheTreeKind.content.rawValue)
         guard fm.fileExists(atPath: vfsDir) else { return nil }
 
-        // Try to find the cache identity's directory
-        let remoteName = profile.effectiveCacheRemoteName.replacingOccurrences(of: ":", with: "")
+        let remoteName = profile.primaryRemoteName.replacingOccurrences(of: ":", with: "")
         let remoteDir = (vfsDir as NSString).appendingPathComponent(remoteName)
 
         if fm.fileExists(atPath: remoteDir) {
@@ -485,6 +478,19 @@ final class VFSCacheService {
         let Size: Int64
         let Rs: [Range]?
         let Dirty: Bool?
+        /// `"<size>,<remote modtime>[,<hash>]"` — rclone's record of the remote state
+        /// this cache entry was fetched against. `OverlaySyncService.parseFingerprint`
+        /// is the parser; see its doc comment for the exact modtime shape. Defaulted so
+        /// existing call sites that construct a `VFSCacheMeta` directly (pre-dating this
+        /// field) don't all need updating.
+        let Fingerprint: String?
+
+        init(Size: Int64, Rs: [Range]?, Dirty: Bool?, Fingerprint: String? = nil) {
+            self.Size = Size
+            self.Rs = Rs
+            self.Dirty = Dirty
+            self.Fingerprint = Fingerprint
+        }
     }
 
     /// Pure completeness check: does this `vfsMeta` sidecar prove the file is FULLY
