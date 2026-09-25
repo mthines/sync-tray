@@ -563,8 +563,8 @@ final class SyncSetupService {
 
     /// `OverlaySyncService.ignoredNamePatterns` rendered as a Python list literal, so the
     /// script's "is this overlay file real or Finder junk" check can never drift from the
-    /// Swift-side overlay scanner/uploader that uses the exact same list (D18 — one source
-    /// for the ignore list, never retyped in bash/Python).
+    /// Swift-side overlay scanner/uploader that uses the exact same list (one source for the
+    /// ignore list, never retyped in bash/Python).
     private var overlayIgnorePatternsPythonLiteral: String {
         "[" + OverlaySyncService.ignoredNamePatterns.map { "'\($0)'" }.joined(separator: ", ") + "]"
     }
@@ -1427,7 +1427,7 @@ final class SyncSetupService {
     }
 
     /// Cache-only / mode-signalling paths the script needs but does not derive itself
-    /// (D7) — Swift is the single source (`SyncProfile` computed paths +
+    /// — Swift is the single source (`SyncProfile` computed paths +
     /// `VFSCacheService.cacheSubtreeRoots`) so the script and the app can never
     /// disagree about which directory is which. Included for every profile (harmless
     /// for a non-mount one — the script only reads these in its mount branch).

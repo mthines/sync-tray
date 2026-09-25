@@ -40,7 +40,7 @@ struct SyncProfile: Identifiable, Codable, Equatable {
     /// while in this mode are queued for upload (`OverlaySyncService`) the next time the
     /// profile switches back to Streaming (or via "Upload Now" without switching). The mount
     /// also enters this mode AUTOMATICALLY when the primary remote is unreachable at mount
-    /// time (D4/D10 — see CLAUDE.md's "Cache-Only" section); this flag only tracks the
+    /// time (see CLAUDE.md's "Cache-Only overlay mode" section); this flag only tracks the
     /// user's MANUAL choice ("Cache Only" button) — `MountMode` (read from the running
     /// mount's state file) is the source of truth for which mode is actually active,
     /// including the automatic ones. Mount mode only; default false.

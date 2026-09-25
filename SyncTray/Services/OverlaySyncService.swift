@@ -22,7 +22,7 @@ struct OverlaySyncService {
 
     /// Names never treated as pending overlay content: pure macOS/Finder noise and
     /// rclone's own partial-transfer marker. The SAME list is interpolated into the
-    /// sync script's Python (D6/D18) so the two layers can never disagree about what
+    /// sync script's Python so the two layers can never disagree about what
     /// counts as "not really a user file".
     static let ignoredNamePatterns: [String] = [
         ".DS_Store", "._*", ".fseventsd", ".Spotlight-V100", ".Trashes", ".TemporaryItems", "*.partial",
@@ -128,7 +128,8 @@ struct OverlaySyncService {
     }
 
     /// Overlay files (ignore list applied) not yet recorded as uploaded in the
-    /// manifest — the guard R16/D12 uses to refuse a cache-directory move.
+    /// manifest — the guard that refuses a cache-directory move (or a `vfsCachePath`
+    /// re-point) while uploads are still pending.
     nonisolated static func pendingCount(
         overlayPath: String, manifest: [String: ManifestEntry], fileManager: FileManager = .default
     ) -> Int {

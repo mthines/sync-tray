@@ -948,7 +948,7 @@ enum SyncTrayCLI {
             return 0
         }
 
-        // R16: a vfsCachePath re-point on a mount profile with overlay files still waiting
+        // A vfsCachePath re-point on a mount profile with overlay files still waiting
         // to upload would silently orphan them under the OLD path — refuse, matching
         // `synctray cache move`'s guard below. Resolve via Upload Now / Resume Syncing first.
         if assignments.contains(where: { $0.key == "vfsCachePath" }), original.isMountMode {
@@ -1102,7 +1102,7 @@ enum SyncTrayCLI {
             return 1
         }
 
-        // R16: refuse a relocation while overlay files are still waiting to upload — a move
+        // Refuse a relocation while overlay files are still waiting to upload — a move
         // now would leave them addressing the OLD cache-data tree. Same guard as
         // `profile set … vfsCachePath` above.
         let manifest = OverlaySyncService.loadManifest(path: profile.overlayManifestPath)

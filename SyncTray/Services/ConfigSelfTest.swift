@@ -712,7 +712,7 @@ enum ConfigSelfTest {
         return report("AC-MP1", "mount-poll-decision", true)
     }
 
-    /// Legacy "(Offline)" symlink cleanup (D13/R6): a stray symlink left by the
+    /// Legacy "(Offline)" symlink cleanup: a stray symlink left by the
     /// retired offline-browse-point feature, pointing into a `/vfs/` cache data tree,
     /// is removed; a real directory of that name and a symlink pointing elsewhere are
     /// both left alone. Covers the pure predicate and the real filesystem apply.
@@ -2116,7 +2116,7 @@ enum ConfigSelfTest {
         // The PRIMARY is left undefined so it fails to resolve near-instantly (no real
         // network wait) — genuinely unreachable. The FALLBACK is a REAL, resolvable alias
         // remote: if the script's mount branch ever entered the "same remote name preserved"
-        // env-var-override path (the bug R2 removes), `dump_remote_as_env` would copy this
+        // env-var-override path (the regression this fixture guards), `dump_remote_as_env` would copy this
         // section's real key/value pairs into `RCLONE_CONFIG_UNREACHABLEPRIMARY_*` and
         // `envOverrides` would be > 0 — an EMPTY fallback section (as a prior version of this
         // test used) can never distinguish "the branch ran and copied nothing" from "the
