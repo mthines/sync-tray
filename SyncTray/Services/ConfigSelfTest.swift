@@ -96,6 +96,7 @@ enum ConfigSelfTest {
             testCacheOnlyUnionConfig,
             testCacheOnlyUnionBehaviour,
             testMountModeSelection,
+            testMountProbeRetry,
             testAutoResumeDecision,
             testResumeWhileUnreachableHandOff,
             testOverlayUploadPlan,
@@ -1967,12 +1968,16 @@ enum ConfigSelfTest {
     /// Render the shared script + this profile's derived config into a fresh temp dir, then
     /// run it (`bash script.sh config.json`) with `SYNCTRAY_DRY_RUN=1` and an isolated
     /// `RCLONE_CONFIG`. Blocks up to `timeout` seconds; force-terminates and returns whatever
-    /// was captured if the script somehow overruns (it never should — the reachability probe
-    /// itself is wall-clock-capped at 17s).
+    /// was captured if the script somehow overruns (it never should — the first reachability
+    /// probe is wall-clock-capped at 17s and each of its two retries at 7s plus
+    /// `probeRetryDelay`). `whileRunning` fires once the script has started, for fixtures
+    /// that change the world mid-run.
     private static func dryRunMountScript(
         profile: SyncProfile,
         rcloneConfig: String,
-        timeout: TimeInterval = 30
+        timeout: TimeInterval = 30,
+        probeRetryDelay: String = "0",
+        whileRunning: (() -> Void)? = nil
     ) -> DryRunResult {
         // `profile.logPath` is `~/.local/log/synctray-sync-{shortId}.log` — NOT
         // sandboxed under any temp dir (real per-profile paths are all under the
@@ -2008,6 +2013,10 @@ enum ConfigSelfTest {
         var env = ProcessInfo.processInfo.environment
         env["SYNCTRAY_DRY_RUN"] = "1"
         env["RCLONE_CONFIG"] = rcloneConfPath
+        // The mount branch retries an unreachable primary twice before settling on Cache
+        // Only (offline); most fixtures are unreachable ON PURPOSE, so don't pay the
+        // production ~5s gap per retry on every one of them.
+        env["SYNCTRAY_PROBE_RETRY_DELAY"] = probeRetryDelay
         proc.environment = env
         let pipe = Pipe()
         proc.standardOutput = pipe
@@ -2017,6 +2026,7 @@ enum ConfigSelfTest {
                 mode: nil, cmd: nil, envOverrides: nil, output: "failed to launch: \(error)",
                 exitCode: -1, scriptPath: scriptPath, log: "")
         }
+        whileRunning?()
         let deadline = Date().addingTimeInterval(timeout)
         while proc.isRunning && Date() < deadline {
             Thread.sleep(forTimeInterval: 0.1)
@@ -2618,6 +2628,50 @@ enum ConfigSelfTest {
             }
         }
         return report("AC-AO1", "mount-mode-selection", true)
+    }
+
+    // MARK: - AC-AO4 — mode selection retries a failed reachability probe
+
+    private static func testMountProbeRetry() -> Bool {
+        let fm = FileManager.default
+        func fixture(_ label: String) -> (SyncProfile, String) {
+            let root = "\(selfTestRoot)/ao4-\(label)-\(UUID().uuidString)"
+            try? fm.createDirectory(atPath: "\(root)/mnt", withIntermediateDirectories: true)
+            let profile = mountFixtureProfile(localPath: "\(root)/mnt", cachePath: "\(root)/cache")
+            return (profile, root)
+        }
+
+        // Still unreachable after every retry → Cache Only (offline), with each retry logged.
+        let (down, _) = fixture("down")
+        defer { try? fm.removeItem(atPath: down.cacheOnlyConfigPath) }
+        let downResult = dryRunMountScript(profile: down, rcloneConfig: "")
+        let retries = downResult.log.components(separatedBy: "retrying reachability probe").count - 1
+        guard downResult.mode == MountMode.cacheOnlyOffline.rawValue, retries == 2 else {
+            return report("AC-AO4", "mount-probe-retry", false,
+                          "(unreachable primary: mode=\(downResult.mode ?? "nil") retries=\(retries) log=\(downResult.log))")
+        }
+
+        // The network comes up during the retry window (the login race): the first probe
+        // fails because the alias target doesn't exist yet, it appears ~1s later, and the
+        // retry 3s after the first probe finds it → Streaming, not Cache Only.
+        let (late, lateRoot) = fixture("late")
+        defer { try? fm.removeItem(atPath: late.cacheOnlyConfigPath) }
+        let target = "\(lateRoot)/late-target"
+        let lateResult = dryRunMountScript(
+            profile: late, rcloneConfig: aliasRcloneConfig(name: "synology", path: target),
+            probeRetryDelay: "3",
+            whileRunning: {
+                DispatchQueue.global().asyncAfter(deadline: .now() + 1) {
+                    try? FileManager.default.createDirectory(atPath: target, withIntermediateDirectories: true)
+                }
+            })
+        guard lateResult.mode == MountMode.streaming.rawValue,
+              lateResult.log.contains("reachable on attempt 2/3")
+        else {
+            return report("AC-AO4", "mount-probe-retry", false,
+                          "(a primary that came up during the retry window did not stream: mode=\(lateResult.mode ?? "nil") log=\(lateResult.log))")
+        }
+        return report("AC-AO4", "mount-probe-retry", true)
     }
 
     // MARK: - AC-AO2 — auto-resume decision + lsof busy-process parsing

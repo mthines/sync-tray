@@ -1071,11 +1071,37 @@ final class SyncSetupService {
             print('true' if pending else 'false')
             " "$OVERLAY_PATH" "$CACHE_ONLY_CACHE_PATH")
 
+                    # Primary reachability for mode selection, with a short bounded retry.
+                    # At login launchd starts this agent (RunAtLoad) before Wi-Fi/DNS is
+                    # usually up, so a single failed probe would bring the mount up Cache
+                    # Only (offline) and leave it there until the app's 3-probe stability
+                    # streak plus an idle-mount check resumed it. Two retries ~5s apart ride
+                    # out that window; each retry is capped at 5s, so the unreachable path
+                    # adds at most ~20s and the reachable path adds nothing.
+                    # SYNCTRAY_PROBE_RETRY_DELAY overrides the gap (the self-test sets it low).
+                    mount_primary_reachable() {
+                        local delay="${SYNCTRAY_PROBE_RETRY_DELAY:-5}"
+                        [[ "$delay" =~ ^[0-9]+$ ]] || delay=5
+                        if run_with_timeout 15 $RCLONE_BIN lsd "${REMOTE_NAME}:" --contimeout 3s --timeout 8s --max-depth 0 $NO_CHECK_CERT &>/dev/null; then
+                            return 0
+                        fi
+                        local attempt
+                        for attempt in 2 3; do
+                            echo "$(date '+%Y-%m-%d %H:%M:%S') - Primary remote unreachable, retrying reachability probe in ${delay}s (attempt $attempt/3)" >> "$LOG_FILE"
+                            sleep "$delay"
+                            if run_with_timeout 5 $RCLONE_BIN lsd "${REMOTE_NAME}:" --contimeout 3s --timeout 4s --max-depth 0 $NO_CHECK_CERT &>/dev/null; then
+                                echo "$(date '+%Y-%m-%d %H:%M:%S') - Primary remote reachable on attempt $attempt/3" >> "$LOG_FILE"
+                                return 0
+                            fi
+                        done
+                        return 1
+                    }
+
                     if [[ "$STREAM_CACHE_ONLY" == "true" || "$STREAM_CACHE_ONLY" == "True" ]]; then
                         MOUNT_MODE="\(MountMode.cacheOnlyManual.rawValue)"
                     elif [[ "$OVERLAY_PENDING" == "true" ]]; then
                         MOUNT_MODE="\(MountMode.cacheOnlyPending.rawValue)"
-                    elif ! run_with_timeout 15 $RCLONE_BIN lsd "${REMOTE_NAME}:" --contimeout 3s --timeout 8s --max-depth 0 $NO_CHECK_CERT &>/dev/null; then
+                    elif ! mount_primary_reachable; then
                         MOUNT_MODE="\(MountMode.cacheOnlyOffline.rawValue)"
                     fi
                 fi
