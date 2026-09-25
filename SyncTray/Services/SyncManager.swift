@@ -3648,22 +3648,27 @@ final class SyncManager: ObservableObject {
                         return
                     }
                     self.primaryRecoveryStreak[profileId] = 0
-                    self.performAutoResumeCheck(profile: profile)
+                    self.performAutoResumeCheck(
+                        profile: profile, mode: self.profileMountModes[profileId] ?? .streaming)
                 }
             }
         }
     }
 
-    private func performAutoResumeCheck(profile: SyncProfile) {
+    /// `mode` is the live `profileMountModes` value, captured by the (main-actor) caller:
+    /// the busy check runs on a background queue, which must never read published state.
+    private func performAutoResumeCheck(profile: SyncProfile, mode: MountMode) {
+        let mountPoint = profile.localSyncPath
+        let manualCacheOnly = profile.streamCacheOnly
         DispatchQueue.global(qos: .utility).async { [weak self] in
-            guard let self else { return }
-            let lsofOutput = self.runLsofBusyCheck(mountPoint: profile.localSyncPath)
+            let lsofOutput = Self.runLsofBusyCheck(mountPoint: mountPoint)
             let decision = Self.autoResumeDecision(
-                mode: self.profileMountModes[profile.id] ?? .streaming,
-                manualCacheOnly: profile.streamCacheOnly,
+                mode: mode,
+                manualCacheOnly: manualCacheOnly,
                 primaryStable: true,
                 blockingProcesses: Self.autoResumeBlockers(lsofOutput: lsofOutput))
             DispatchQueue.main.async {
+                guard let self else { return }
                 switch decision {
                 case .resume:
                     TelemetryService.shared.recordAutoResume(
@@ -3690,7 +3695,7 @@ final class SyncManager: ObservableObject {
     /// `lsof -w -F pc <mountPoint>` under a 10s watchdog. `nil` on any failure/timeout
     /// (distinct from "reachable but nothing open" = `""`), so the caller can tell "we
     /// couldn't check" from "we checked, nothing's open".
-    private func runLsofBusyCheck(mountPoint: String) -> String? {
+    nonisolated private static func runLsofBusyCheck(mountPoint: String) -> String? {
         guard !mountPoint.isEmpty else { return "" }
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: "/usr/sbin/lsof")
