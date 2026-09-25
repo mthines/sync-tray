@@ -1976,6 +1976,16 @@ enum ConfigSelfTest {
         defer { try? FileManager.default.removeItem(atPath: profile.logPath) }
         let dir = "\(selfTestRoot)/mountscript-\(UUID().uuidString)"
         try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        // In production, `SyncSetupService.install(profile:)` always creates
+        // `~/.local/log` before the generated script ever runs. This harness skips
+        // `install()` and invokes the script directly, so on a machine that has never
+        // installed a SyncTray profile (a clean CI runner, notably) that directory
+        // doesn't exist yet and the script's very first `>> "$LOG_FILE"` write fails
+        // with "No such file or directory" — masked on a dev machine where some
+        // earlier real install already created it. Recreate that one invariant here.
+        try? FileManager.default.createDirectory(
+            atPath: (profile.logPath as NSString).deletingLastPathComponent,
+            withIntermediateDirectories: true)
 
         let scriptPath = "\(dir)/script.sh"
         try? SyncSetupService.shared.generateSyncScript().write(
