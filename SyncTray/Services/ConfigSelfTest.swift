@@ -2667,6 +2667,24 @@ enum ConfigSelfTest {
             return report("AC-AO2", "auto-resume-decision", false, "(empty lsof output produced blocking processes)")
         }
 
+        // A FAILED busy check (lsof error/timeout → nil) must fail closed: we could not
+        // confirm the mount is idle, so the user is asked instead of being remounted under.
+        let failedBlockers = SyncManager.autoResumeBlockers(lsofOutput: nil)
+        guard !failedBlockers.isEmpty,
+              SyncManager.autoResumeDecision(
+                  mode: .cacheOnlyOffline, manualCacheOnly: false, primaryStable: true,
+                  blockingProcesses: failedBlockers) == .notify
+        else {
+            return report("AC-AO2", "auto-resume-decision", false, "(a failed lsof busy check resumed instead of notifying)")
+        }
+        // …while a check that ran and found nothing open still resumes.
+        guard SyncManager.autoResumeDecision(
+            mode: .cacheOnlyOffline, manualCacheOnly: false, primaryStable: true,
+            blockingProcesses: SyncManager.autoResumeBlockers(lsofOutput: "")) == .resume
+        else {
+            return report("AC-AO2", "auto-resume-decision", false, "(an idle lsof result did not resume)")
+        }
+
         return report("AC-AO2", "auto-resume-decision", true)
     }
 

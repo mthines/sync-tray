@@ -3585,11 +3585,24 @@ final class SyncManager: ObservableObject {
         "Finder", "mds", "mds_stores", "mdworker", "mdworker_shared", "QuickLookUIService", "fseventsd",
     ]
 
+    /// Stand-in blocker reported when the `lsof` busy check itself failed or timed out.
+    nonisolated static let busyCheckFailedBlocker = "(busy check failed)"
+
+    /// Map a busy-check result to the blocker list `autoResumeDecision` consumes. A `nil`
+    /// result means `lsof` failed or timed out — we could NOT confirm nothing has the
+    /// mount open, so it fails CLOSED with a sentinel blocker: the decision becomes
+    /// `.notify` (the user decides) instead of remounting under an app that may be
+    /// mid-write, and the `busy_check_failed` telemetry branch is reached.
+    nonisolated static func autoResumeBlockers(lsofOutput: String?) -> [String] {
+        guard let lsofOutput else { return [busyCheckFailedBlocker] }
+        return blockingProcesses(lsofOutput: lsofOutput)
+    }
+
     /// Parse `lsof -w -F pc <mountpoint>` output (`-F pc` = one `p<pid>` line followed by one
     /// `c<command>` line per open file) into the list of blocking process names, with the
-    /// macOS system daemons above filtered out. Malformed/empty output yields an empty list
-    /// (fail open — a busy-check we can't parse should not indefinitely block a resume the
-    /// user is waiting on, but IS still visible via `busy_check_failed` telemetry upstream).
+    /// macOS system daemons above filtered out. Empty output (lsof ran and nothing has the
+    /// path open) yields an empty list. A FAILED lsof run never reaches here — see
+    /// `autoResumeBlockers(lsofOutput:)`.
     nonisolated static func blockingProcesses(lsofOutput: String) -> [String] {
         var names: [String] = []
         for line in lsofOutput.split(separator: "\n") {
@@ -3645,12 +3658,11 @@ final class SyncManager: ObservableObject {
         DispatchQueue.global(qos: .utility).async { [weak self] in
             guard let self else { return }
             let lsofOutput = self.runLsofBusyCheck(mountPoint: profile.localSyncPath)
-            let blocking = lsofOutput.map(Self.blockingProcesses(lsofOutput:)) ?? []
             let decision = Self.autoResumeDecision(
                 mode: self.profileMountModes[profile.id] ?? .streaming,
                 manualCacheOnly: profile.streamCacheOnly,
                 primaryStable: true,
-                blockingProcesses: lsofOutput == nil ? [] : blocking)
+                blockingProcesses: Self.autoResumeBlockers(lsofOutput: lsofOutput))
             DispatchQueue.main.async {
                 switch decision {
                 case .resume:
