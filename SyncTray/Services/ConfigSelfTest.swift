@@ -102,6 +102,7 @@ enum ConfigSelfTest {
             testOverlaySyncBack,
             testOverlayUploadNow,
             testOverlayListingFailure,
+            testUploadNowManifestRemoteState,
             testCacheMoveBlockedPending,
             testCLIProfileSetRemovedKeys,
         ]
@@ -2818,10 +2819,10 @@ enum ConfigSelfTest {
             return .success(filesByDir[remoteDir] ?? [])
         }
         func upload(localPath: String, remoteDestination: String, expectedSize: Int64)
-            -> Result<Void, OverlaySyncService.OverlayUploadError> {
+            -> Result<OverlaySyncService.RemoteState?, OverlaySyncService.OverlayUploadError> {
             uploadCount += 1
             if failUploadsFor.contains(localPath) { return .failure(.rcloneFailed(exitCode: 1)) }
-            return .success(())
+            return .success(nil)
         }
     }
 
@@ -2947,6 +2948,48 @@ enum ConfigSelfTest {
                           "(a new offline folder did not upload: \(uploaded))")
         }
         return report("AC-OU5", "overlay-listing-failure", true)
+    }
+
+    // MARK: - AC-OU6 — Upload Now records the remote's real post-upload state
+
+    private static func testUploadNowManifestRemoteState() -> Bool {
+        let fm = FileManager.default
+        let root = "\(selfTestRoot)/ou6-\(UUID().uuidString)"
+        let profile = mountFixtureProfile(localPath: "\(root)/mnt", cachePath: "\(root)/cache", remotePath: "")
+        let overlay = profile.overlayPath
+        let remoteRoot = "\(root)/remote"
+        try? fm.createDirectory(atPath: remoteRoot, withIntermediateDirectories: true)
+        guard RcloneLocator.resolve() != nil else {
+            return report("AC-OU6", "upload-now-manifest-remote-state", false, "(rclone not found)")
+        }
+        let client = OverlaySyncService.ProductionOverlayRemoteClient(remoteName: ":local", remotePath: remoteRoot)
+        let service = OverlaySyncService()
+        let remoteBase = ":local:\(remoteRoot)"
+
+        // Upload Now (keep) a file last written an hour ago; copyto preserves that modtime.
+        let old = Date().addingTimeInterval(-3600)
+        writeFile("\(overlay)/mix.txt", "first take")
+        try? fm.setAttributes([.modificationDate: old], ofItemAtPath: "\(overlay)/mix.txt")
+        let first = await_ { await service.run(
+            profile: profile, remoteBase: remoteBase, mode: .keep, transport: "primary", client: client) }
+        guard first.uploaded == 1 else {
+            return report("AC-OU6", "upload-now-manifest-remote-state", false, "(initial Upload Now failed: \(first))")
+        }
+
+        // Edit it locally; the REMOTE is untouched since our own upload. The next run must
+        // see "remote unchanged since we uploaded" → a normal upload, not a conflict copy.
+        writeFile("\(overlay)/mix.txt", "second take, longer")
+        try? fm.setAttributes([.modificationDate: old.addingTimeInterval(60)], ofItemAtPath: "\(overlay)/mix.txt")
+        let second = await_ { await service.run(
+            profile: profile, remoteBase: remoteBase, mode: .keep, transport: "primary", client: client) }
+        let conflictCopies = ((try? fm.contentsOfDirectory(atPath: remoteRoot)) ?? []).filter { $0.contains("sync-conflict") }
+        guard second.uploaded == 1, second.conflicts == 0, conflictCopies.isEmpty,
+              (try? String(contentsOfFile: "\(remoteRoot)/mix.txt")) == "second take, longer"
+        else {
+            return report("AC-OU6", "upload-now-manifest-remote-state", false,
+                          "(an edit after Upload Now was planned as a conflict: \(second), copies=\(conflictCopies))")
+        }
+        return report("AC-OU6", "upload-now-manifest-remote-state", true)
     }
 
     // MARK: - AC-OU3 — Upload Now (keep mode)

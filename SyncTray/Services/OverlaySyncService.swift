@@ -302,10 +302,11 @@ struct OverlaySyncService {
 
         /// Upload `localPath` to `remoteDestination` (a full `remote:path` string) and
         /// verify the result. Returns `.success` ONLY once the remote's reported size
-        /// after upload matches `expectedSize`.
+        /// after upload matches `expectedSize`, carrying the remote's post-upload state
+        /// (size + modtime) when the backend reported a parseable one — `nil` otherwise.
         func upload(
             localPath: String, remoteDestination: String, expectedSize: Int64
-        ) -> Result<Void, OverlayUploadError>
+        ) -> Result<RemoteState?, OverlayUploadError>
     }
 
     // MARK: - Progress / Result
@@ -438,7 +439,7 @@ struct OverlaySyncService {
                 switch client.upload(
                     localPath: file.absolutePath, remoteDestination: remoteDestination, expectedSize: file.size
                 ) {
-                case .success:
+                case .success(let uploadedState):
                     if isConflict { result.conflicts += 1 } else { result.uploaded += 1 }
                     result.bytes += file.size
                     bytesDone += file.size
@@ -458,11 +459,16 @@ struct OverlaySyncService {
                         }
                         manifest.removeValue(forKey: file.relativePath)
                     } else {
+                        // Record what the remote ACTUALLY holds now, which a later run
+                        // compares a fresh listing against. `copyto` preserves the source
+                        // modtime, so the upload time (`now`) would never match and every
+                        // later edit would be misread as a remote-side conflict. Prefer the
+                        // post-upload stat; fall back to the local modtime copyto preserved.
                         manifest[file.relativePath] = ManifestEntry(
                             localSize: file.size,
                             localModTime: file.modificationDate,
-                            remoteSize: file.size,
-                            remoteModTime: now,
+                            remoteSize: uploadedState?.size ?? file.size,
+                            remoteModTime: uploadedState?.modTime ?? file.modificationDate,
                             uploadedAs: finalDest,
                             uploadedAt: now
                         )
@@ -537,25 +543,29 @@ struct OverlaySyncService {
                   let raw = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]]
             else { return .success([]) }
 
-            let formatter = ISO8601DateFormatter()
-            formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-            let fallbackFormatter = ISO8601DateFormatter()
-            fallbackFormatter.formatOptions = [.withInternetDateTime]
-
             let entries: [RemoteEntry] = raw.compactMap { item in
                 guard let name = item["Name"] as? String,
                       let size = (item["Size"] as? NSNumber)?.int64Value,
-                      let modTimeStr = item["ModTime"] as? String,
-                      let modTime = formatter.date(from: modTimeStr) ?? fallbackFormatter.date(from: modTimeStr)
+                      let modTime = Self.parseModTime(item["ModTime"])
                 else { return nil }
                 return RemoteEntry(name: name, size: size, modTime: modTime)
             }
             return .success(entries)
         }
 
+        /// rclone `lsjson` `ModTime` (RFC 3339, with or without fractional seconds).
+        private static func parseModTime(_ value: Any?) -> Date? {
+            guard let string = value as? String else { return nil }
+            let formatter = ISO8601DateFormatter()
+            formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+            if let date = formatter.date(from: string) { return date }
+            formatter.formatOptions = [.withInternetDateTime]
+            return formatter.date(from: string)
+        }
+
         func upload(
             localPath: String, remoteDestination: String, expectedSize: Int64
-        ) -> Result<Void, OverlayUploadError> {
+        ) -> Result<RemoteState?, OverlayUploadError> {
             var args = [
                 "copyto", localPath, remoteDestination,
                 "--contimeout", "10s", "--timeout", "60s",
@@ -579,7 +589,7 @@ struct OverlaySyncService {
             guard actualSize == expectedSize else {
                 return .failure(.verifyMismatch(expected: expectedSize, actual: actualSize))
             }
-            return .success(())
+            return .success(Self.parseModTime(obj["ModTime"]).map { RemoteState(size: actualSize, modTime: $0) })
         }
     }
 }
