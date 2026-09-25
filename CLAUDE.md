@@ -245,7 +245,7 @@ status card shows and what auto-resume watches for:
 | `streaming` | default | Talking to the remote directly through the VFS cache |
 | `cache-only-manual` | the user's own "Cache Only" toggle | Never auto-exited |
 | `cache-only-pending` | AUTOMATIC — files are still queued in the overlay from a previous Cache Only session | Uploads are draining |
-| `cache-only-offline` | AUTOMATIC — the primary remote failed a `--contimeout 3s --timeout 8s` reachability probe at mount time | Primary is unreachable right now |
+| `cache-only-offline` | AUTOMATIC — the primary remote failed all 3 reachability probe attempts at mount time (a first `--contimeout 3s --timeout 8s` probe, then 2 retries ~5 s apart each capped at 5 s; the retries run only on the unreachable path, so a reachable primary adds no delay and an unreachable one at most ~20 s) | Primary is unreachable right now |
 
 A derived config written by an older app build has no cache-only keys
 (`mountModePath` empty) and degrades to streaming-only rather than half-apply a
@@ -271,7 +271,9 @@ Upload Now target even though mount mode never streams through it (see
 drain can tell an already-uploaded, unchanged file from one needing re-upload.
 
 **Automatic offline entry and exit.** The mount enters Cache Only on its own
-(`cache-only-offline`) when the primary is unreachable at mount time — no user
+(`cache-only-offline`) when the primary is still unreachable after the
+mount-time probe and its 2 retries (see the table above; the retries ride out
+the login race where launchd starts the agent before Wi-Fi/DNS is up) — no user
 action needed to keep working. On the way back, `SyncManager`'s auto-resume
 monitor (`Self.autoResumeDecision`, pure and unit-tested) only ever acts on an
 AUTOMATIC mode (never `.cacheOnlyManual` — that changes only via the user's own
@@ -281,7 +283,13 @@ minutes total) before treating the primary as back. Once stable, it checks
 `lsof` on the mount point for anything with a file open (macOS's own
 Finder/Spotlight indexing daemons are ignored, since they are always touching
 a mounted volume); nothing open resumes immediately, something open instead
-posts a one-time "Back on your network" notification and waits.
+posts a one-time "Back on your network" notification and waits. The busy check
+**fails closed**: if `lsof` cannot confirm the mount is idle — it failed to
+launch, timed out, exited with an unexpected status, or exited 1 with anything
+on stderr (e.g. `status error` on an unreadable/stale mount, as opposed to the
+silent exit 1 that means "nothing open") — the decision is `.notify`, never an
+automatic resume, so a mount is never force-unmounted under an app that might
+be mid-write (`SyncManager.lsofBusyCheckResult`, covered by AC-AO2).
 
 **Known limits** (also documented in the Advanced Options caption in the UI):
 
