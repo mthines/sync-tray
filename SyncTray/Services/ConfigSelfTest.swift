@@ -2652,24 +2652,39 @@ enum ConfigSelfTest {
         }
 
         // The network comes up during the retry window (the login race): the first probe
-        // fails because the alias target doesn't exist yet, it appears ~1s later, and the
-        // retry 3s after the first probe finds it → Streaming, not Cache Only.
+        // fails because the alias target doesn't exist yet, and the target is created only
+        // once the script has LOGGED its first retry — never on a wall-clock timer, which
+        // raced slow script startup on CI (the target existed before the first probe, so it
+        // streamed on attempt 1 with no retry at all). The retry gap only has to outlast
+        // this poller's latency (50 ms ticks), so the second probe is guaranteed to find it.
         let (late, lateRoot) = fixture("late")
         defer { try? fm.removeItem(atPath: late.cacheOnlyConfigPath) }
+        try? fm.removeItem(atPath: late.logPath)
         let target = "\(lateRoot)/late-target"
+        let logPath = late.logPath
         let lateResult = dryRunMountScript(
             profile: late, rcloneConfig: aliasRcloneConfig(name: "synology", path: target),
-            probeRetryDelay: "3",
+            probeRetryDelay: "2",
             whileRunning: {
-                DispatchQueue.global().asyncAfter(deadline: .now() + 1) {
-                    try? FileManager.default.createDirectory(atPath: target, withIntermediateDirectories: true)
+                DispatchQueue.global().async {
+                    let deadline = Date().addingTimeInterval(30)
+                    while Date() < deadline {
+                        if let log = try? String(contentsOfFile: logPath, encoding: .utf8),
+                           log.contains("retrying reachability probe") {
+                            try? FileManager.default.createDirectory(atPath: target, withIntermediateDirectories: true)
+                            return
+                        }
+                        Thread.sleep(forTimeInterval: 0.05)
+                    }
                 }
             })
+        let lateRetries = lateResult.log.components(separatedBy: "retrying reachability probe").count - 1
         guard lateResult.mode == MountMode.streaming.rawValue,
+              lateRetries == 1,
               lateResult.log.contains("reachable on attempt 2/3")
         else {
             return report("AC-AO4", "mount-probe-retry", false,
-                          "(a primary that came up during the retry window did not stream: mode=\(lateResult.mode ?? "nil") log=\(lateResult.log))")
+                          "(a primary that came up during the retry window did not stream on the retry: mode=\(lateResult.mode ?? "nil") retries=\(lateRetries) log=\(lateResult.log))")
         }
         return report("AC-AO4", "mount-probe-retry", true)
     }
