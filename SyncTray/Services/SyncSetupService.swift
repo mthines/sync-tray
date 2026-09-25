@@ -1043,7 +1043,7 @@ final class SyncSetupService {
                     # mount backends share this cache layer, so retention/eviction
                     # (--vfs-cache-max-size / --vfs-cache-max-age) behaves identically.
                     # Note: No --daemon flag - launchd manages the process lifecycle.
-                    RCLONE_CMD="$RCLONE_BIN $MOUNT_SUBCMD \"$REMOTE\" \"$LOCAL_PATH\" --vfs-cache-mode $VFS_CACHE_MODE --vfs-cache-max-size $VFS_CACHE_MAX_SIZE --cache-dir \"$VFS_CACHE_PATH\" --log-level INFO --use-json-log"
+                    RCLONE_CMD="$RCLONE_BIN $MOUNT_SUBCMD \\"$REMOTE\\" \\"$LOCAL_PATH\\" --vfs-cache-mode $VFS_CACHE_MODE --vfs-cache-max-size $VFS_CACHE_MAX_SIZE --cache-dir \\"$VFS_CACHE_PATH\\" --log-level INFO --use-json-log"
 
                     # Throughput tuning. Reading a file through the mount (streaming or
                     # offline warming) otherwise trickles: the nfsmount -> rclone-NFS-server
@@ -1081,7 +1081,7 @@ final class SyncSetupService {
                     # write becomes the overlay's job instead (Cache Only Pending) — see the
                     # automatic-entry note in CLAUDE.md.
                     RCLONE_CMD="$RCLONE_CMD --buffer-size 128M --vfs-read-ahead 256M --transfers $DOWNLOAD_CONNECTIONS --vfs-read-chunk-size 128M --vfs-read-chunk-size-limit off --attr-timeout 5s --dir-cache-time 1000h --vfs-cache-max-age $VFS_CACHE_MAX_AGE"
-                    RCLONE_CMD="$RCLONE_CMD --volname \"$MOUNT_VOLNAME\""
+                    RCLONE_CMD="$RCLONE_CMD --volname \\"$MOUNT_VOLNAME\\""
 
                     # Add RC (remote control) API for cache management. Streaming-only — a
                     # Cache Only mount never exposes the RC API (nothing there needs
@@ -1196,7 +1196,7 @@ final class SyncSetupService {
                     fh.write(chr(10))
             " "$CACHE_DATA_PATH" "$CACHE_META_PATH" "$CACHE_ONLY_EXCLUDE_PATH"
 
-                    RCLONE_CMD="$RCLONE_BIN $MOUNT_SUBCMD synctray_cacheonly: \"$LOCAL_PATH\" --config \"$CACHE_ONLY_CONFIG_PATH\" --exclude-from \"$CACHE_ONLY_EXCLUDE_PATH\" --vfs-cache-mode writes --cache-dir \"$CACHE_ONLY_CACHE_PATH\" --vfs-write-back 2s --dir-cache-time 1m --log-level INFO --use-json-log --volname \"$MOUNT_VOLNAME\""
+                    RCLONE_CMD="$RCLONE_BIN $MOUNT_SUBCMD synctray_cacheonly: \\"$LOCAL_PATH\\" --config \\"$CACHE_ONLY_CONFIG_PATH\\" --exclude-from \\"$CACHE_ONLY_EXCLUDE_PATH\\" --vfs-cache-mode writes --cache-dir \\"$CACHE_ONLY_CACHE_PATH\\" --vfs-write-back 2s --dir-cache-time 1m --log-level INFO --use-json-log --volname \\"$MOUNT_VOLNAME\\""
 
                     echo "$(date '+%Y-%m-%d %H:%M:%S') - Cache Only: union(overlay=$OVERLAY_PATH, cache=$CACHE_DATA_PATH:ro), no --rc" >> "$LOG_FILE"
                 fi

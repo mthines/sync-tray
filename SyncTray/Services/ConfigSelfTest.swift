@@ -90,6 +90,7 @@ enum ConfigSelfTest {
             testMountModeParse,
             testMountNoFallbackOverride,
             testCacheSuffixConsolidation,
+            testMountCommandQuoting,
             testCacheOnlyUnionConfig,
             testCacheOnlyUnionBehaviour,
             testMountModeSelection,
@@ -2198,6 +2199,79 @@ enum ConfigSelfTest {
         }
 
         return report("AC-CK3", "cache-suffix-consolidation", true)
+    }
+
+    // MARK: - AC-CK4 — mount command keeps a spaced path as ONE argument
+
+    /// Word-split `cmd` exactly the way the script's `eval "$RCLONE_CMD"` does, returning the
+    /// resulting argv. A path whose quotes were consumed at assignment time (a bare `"`
+    /// rendered into the script instead of `\"`) splits into several words here — the same
+    /// split rclone would receive.
+    private static func evalArgv(_ cmd: String) -> [String] {
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/bin/bash")
+        proc.arguments = ["-c", "eval \"set -- $1\"; printf '%s\\0' \"$@\"", "_", cmd]
+        let pipe = Pipe()
+        proc.standardOutput = pipe
+        do { try proc.run() } catch { return [] }
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        proc.waitUntilExit()
+        return (String(data: data, encoding: .utf8) ?? "")
+            .split(separator: "\0", omittingEmptySubsequences: false)
+            .dropLast().map(String.init)
+    }
+
+    private static func argFollowing(_ flag: String, in argv: [String]) -> String? {
+        guard let i = argv.firstIndex(of: flag), i + 1 < argv.count else { return nil }
+        return argv[i + 1]
+    }
+
+    private static func testMountCommandQuoting() -> Bool {
+        let root = "\(selfTestRoot)/ck4 spaced \(UUID().uuidString)"
+        let local = "\(root)/My Mount", cache = "\(root)/Cache Dir"
+        let fm = FileManager.default
+        try? fm.createDirectory(atPath: local, withIntermediateDirectories: true)
+        try? fm.createDirectory(atPath: cache, withIntermediateDirectories: true)
+        let target = "\(root)/remote-target"
+        try? fm.createDirectory(atPath: target, withIntermediateDirectories: true)
+
+        // Streaming: primary reachable (alias remote) → the streaming command.
+        let streaming = mountFixtureProfile(localPath: local, cachePath: cache)
+        defer { try? fm.removeItem(atPath: streaming.cacheOnlyConfigPath) }
+        let s = dryRunMountScript(
+            profile: streaming, rcloneConfig: aliasRcloneConfig(name: "synology", path: target))
+        guard s.mode == MountMode.streaming.rawValue, let sCmd = s.cmd else {
+            return report("AC-CK4", "mount-command-quoting", false,
+                          "(streaming fixture did not dry-run streaming: \(s.output) log=\(s.log))")
+        }
+        let sArgv = evalArgv(sCmd)
+        guard sArgv.contains(local),
+              argFollowing("--cache-dir", in: sArgv) == cache,
+              argFollowing("--volname", in: sArgv) == "My Mount"
+        else {
+            return report("AC-CK4", "mount-command-quoting", false,
+                          "(streaming command splits a spaced path: \(sArgv))")
+        }
+
+        // Cache Only: every path the union mount passes must survive eval as one word too.
+        let cacheOnly = mountFixtureProfile(localPath: local, cachePath: cache, streamCacheOnly: true)
+        defer { try? fm.removeItem(atPath: cacheOnly.cacheOnlyConfigPath) }
+        let c = dryRunMountScript(profile: cacheOnly, rcloneConfig: "")
+        guard c.mode == MountMode.cacheOnlyManual.rawValue, let cCmd = c.cmd else {
+            return report("AC-CK4", "mount-command-quoting", false,
+                          "(cache-only fixture did not dry-run cache-only: \(c.output) log=\(c.log))")
+        }
+        let cArgv = evalArgv(cCmd)
+        guard cArgv.contains(local),
+              argFollowing("--cache-dir", in: cArgv) == cacheOnly.cacheOnlyCachePath,
+              argFollowing("--exclude-from", in: cArgv) == cacheOnly.cacheOnlyExcludePath,
+              argFollowing("--config", in: cArgv) == cacheOnly.cacheOnlyConfigPath,
+              argFollowing("--volname", in: cArgv) == "My Mount"
+        else {
+            return report("AC-CK4", "mount-command-quoting", false,
+                          "(cache-only command splits a spaced path: \(cArgv))")
+        }
+        return report("AC-CK4", "mount-command-quoting", true)
     }
 
     // MARK: - AC-CO1 — Cache Only union config + command composition
