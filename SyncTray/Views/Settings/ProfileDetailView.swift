@@ -206,11 +206,15 @@ struct ProfileDetailView: View {
             .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
     }
 
-    /// A Stream (mount) profile shares ONE VFS cache across primary and fallback, keyed by
-    /// `{cache}/vfs/{remoteName}/{remotePath}`. A different fallback path splits that cache
-    /// into a second tree and re-downloads everything. Block the save so the user reconfigures
-    /// the fallback remote to expose the same path instead. Bisync/sync are unaffected — they
-    /// legitimately use a different path (and rebuild their listing pair) on failover.
+    /// A Stream (mount) profile never actually streams via its fallback remote — mount
+    /// mode entering Cache Only when the primary is unreachable, never resolving the
+    /// fallback into a live connection (see "Fallback Remote Pipeline" in CLAUDE.md). The
+    /// fallback remote's ONLY role for a Stream profile is as an "Upload Now" target
+    /// (`{fallbackRemote}:{remotePath}`), so it must resolve the same relative path as the
+    /// primary or an upload lands in the wrong place on the NAS. Block the save so the user
+    /// reconfigures the fallback remote to expose the same path instead. Bisync/sync are
+    /// unaffected — they legitimately use a different path (and rebuild their listing pair)
+    /// on failover.
     private var mountFallbackCacheConflict: Bool {
         syncMode == .mount
             && fallbackEnabled
@@ -1649,6 +1653,10 @@ struct ProfileDetailView: View {
                 Spacer()
             }
 
+            if isInstalled && profile.isMountMode {
+                cacheOnlyStatusCard
+            }
+
             // Why install is disabled
             if !canInstall && !isInstalled {
                 VStack(alignment: .leading, spacing: 2) {
@@ -1884,15 +1892,16 @@ struct ProfileDetailView: View {
                     .background(Color.blue.opacity(0.1), in: .rect(cornerRadius: 6))
                 }
 
-                // Stream (mount) profiles share ONE VFS cache across primary and fallback,
-                // keyed by remote name + path. A different fallback path splits the cache and
-                // re-downloads everything, so it is blocked (Save is disabled while this shows).
+                // Stream (mount) profiles never stream via the fallback remote — its only
+                // role here is as an "Upload Now" target, so it must expose the same path
+                // as the primary or an upload lands in the wrong place (Save is disabled
+                // while this shows).
                 if mountFallbackCacheConflict {
                     HStack(alignment: .top, spacing: 6) {
                         Image(systemName: "exclamationmark.triangle.fill")
                             .foregroundStyle(.orange)
                             .font(.caption)
-                        Text("Stream profiles share one offline cache across both remotes, so the fallback must expose the same path (\"\(remotePath)\"). A different path would duplicate the cache and re-download every file. Configure the fallback remote to resolve that path, or turn this off.")
+                        Text("The fallback remote for a Stream profile is only used as an \"Upload Now\" target, so it must expose the same path (\"\(remotePath)\"). A different path would upload to the wrong location on the fallback. Configure the fallback remote to resolve that path, or turn this off.")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
@@ -2115,24 +2124,70 @@ struct ProfileDetailView: View {
         }
         .disabled(isInstalling || mountState == .mounting)
         .help(isOn
-            ? "Remount with normal syncing: uncached files download again and queued recordings upload."
-            : "Remount read-only from the cache and stop checking the remote, so cached files open at local-disk speed. Uncached files won't download, and unsynced recordings stay queued until you resume.")
+            ? "Upload anything you saved while offline, then remount with normal syncing."
+            : "Remount from the cache and stop checking the remote — cached files open at local-disk speed. New files and edits land in a local overlay and upload once you resume syncing.")
     }
 
-    /// Persists ONLY `streamCacheOnly` onto the saved profile and reinstalls with exactly
-    /// that profile, so unsaved edits elsewhere in the form are neither applied nor lost.
+    /// Cache Only status card: current mode, pending-upload count, Upload Now, upload
+    /// progress, and the known-limits caption. Mounted-mode-only; shown whenever the
+    /// profile is installed and streaming/mount mode, regardless of which flavour is active,
+    /// so the caption's caveats are visible before the user ever turns it on.
+    private var cacheOnlyStatusCard: some View {
+        let mode = syncManager.mountMode(for: profile.id) ?? .streaming
+        let pending = syncManager.pendingUploadCount(for: profile.id)
+        let progress = syncManager.overlayUploadProgress[profile.id]
+
+        return VStack(alignment: .leading, spacing: 4) {
+            if mode.isCacheOnly {
+                Label(mode.displayName, systemImage: "icloud.slash")
+                    .font(.caption.weight(.medium))
+                    .foregroundColor(.orange)
+
+                if pending > 0 {
+                    HStack {
+                        Text("\(pending) \(pending == 1 ? "file" : "files") waiting to upload")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                        Button("Upload Now") { syncManager.uploadNow(profileId: profile.id) }
+                            .font(.caption)
+                            .disabled(progress != nil)
+                    }
+                } else {
+                    Text("All files uploaded")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+
+                if let progress, progress.filesTotal > 0 {
+                    ProgressView(value: Double(progress.filesDone), total: Double(progress.filesTotal))
+                        .controlSize(.small)
+                    Text("Uploading \(progress.filesDone)/\(progress.filesTotal) files…")
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                }
+            }
+
+            Text("Deleting or renaming files that were already cached isn't supported here. "
+                + "Switching modes remounts this folder — close apps that are using it first. "
+                + "Files you upload re-download the first time you open them while Streaming.")
+                .font(.caption2)
+                .foregroundColor(.secondary)
+        }
+        .padding(.vertical, 2)
+    }
+
+    /// Routes through `SyncManager.setCacheOnly`, which — unlike a plain reinstall — knows
+    /// how to leave Cache Only: probe the primary, drain the overlay (verify-then-delete,
+    /// conflict copies) before remounting Streaming, or defer if the primary isn't back yet.
+    /// Only the persisted `streamCacheOnly` field changes; unsaved form edits are untouched.
     private func setCacheOnly(_ enabled: Bool) {
-        guard var latest = profileStore.profile(for: profile.id),
+        guard let latest = profileStore.profile(for: profile.id),
               latest.streamCacheOnly != enabled else { return }
-        latest.streamCacheOnly = enabled
-        profileStore.update(latest)
         // Keep the form buffer in step, or `hasChanges` would flag it and the next Save
         // would write the stale value back.
         streamCacheOnly = enabled
         syncManager.clearError(for: profile.id)
-        if isInstalled {
-            reinstallSync(using: latest)
-        }
+        syncManager.setCacheOnly(profileId: profile.id, enabled: enabled)
     }
 
     private func saveProfile() {

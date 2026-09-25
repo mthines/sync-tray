@@ -64,7 +64,12 @@ struct MenuBarView: View {
                         // Show mount status for mount mode profiles
                         if profile.isMountMode {
                             let mountState = syncManager.mountState(for: profile.id)
-                            Text(mountState.statusText)
+                            let mode = syncManager.mountMode(for: profile.id)
+                            let pending = mode?.isCacheOnly == true
+                                ? syncManager.pendingUploadCount(for: profile.id) : 0
+                            Text(mountState.statusText
+                                + (mode?.isCacheOnly == true ? " · Cache only" : "")
+                                + (pending > 0 ? " · \(pending) to upload" : ""))
                                 .font(.system(size: 9))
                                 .foregroundColor(.secondary)
                         }

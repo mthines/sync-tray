@@ -135,6 +135,13 @@ final class TelemetryService {
     private var cacheMigrationThroughputHistogram: DoubleHistogramMeterSdk?
     private var cacheMigrationFilesCounter: LongCounterSdk?
     private var cacheMigrationBytesCounter: LongCounterSdk?
+    private var overlayUploadCountCounter: LongCounterSdk?
+    private var overlayUploadFilesCounter: LongCounterSdk?
+    private var overlayUploadBytesCounter: LongCounterSdk?
+    private var overlayUploadDurationHistogram: DoubleHistogramMeterSdk?
+    private var mountModeChangesCounter: LongCounterSdk?
+    private var mountAutoResumeCounter: LongCounterSdk?
+    private var activeOverlayUploadSpans: [UUID: any Span] = [:]
 
     // MARK: - Providers (kept alive for shutdown)
 
@@ -486,6 +493,37 @@ final class TelemetryService {
             .counterBuilder(name: "synctray.cache.migration.bytes")
             .setDescription("Bytes relocated during a cache-directory migration")
             .setUnit("By")
+            .build()
+
+        overlayUploadCountCounter = meter
+            .counterBuilder(name: "synctray.overlay.upload.count")
+            .setDescription("Cache Only overlay upload runs by trigger (resume, auto_resume, upload_now), outcome and transport")
+            .setUnit("1")
+            .build()
+        overlayUploadFilesCounter = meter
+            .counterBuilder(name: "synctray.overlay.upload.files")
+            .setDescription("Overlay files processed by an upload run, by per-file result (uploaded, conflict, already_uploaded, failed)")
+            .setUnit("1")
+            .build()
+        overlayUploadBytesCounter = meter
+            .counterBuilder(name: "synctray.overlay.upload.bytes")
+            .setDescription("Bytes uploaded from the Cache Only overlay to the remote")
+            .setUnit("By")
+            .build()
+        overlayUploadDurationHistogram = meter
+            .histogramBuilder(name: "synctray.overlay.upload.duration")
+            .setDescription("Duration of a Cache Only overlay upload run (seconds)")
+            .setUnit("s")
+            .build()
+        mountModeChangesCounter = meter
+            .counterBuilder(name: "synctray.mount.mode_changes")
+            .setDescription("Mount mode transitions observed for a Stream profile (streaming, cache_only_manual, cache_only_offline, cache_only_pending)")
+            .setUnit("1")
+            .build()
+        mountAutoResumeCounter = meter
+            .counterBuilder(name: "synctray.mount.auto_resume")
+            .setDescription("Automatic Cache Only -> Streaming resume decisions (resumed, deferred_busy, busy_check_failed)")
+            .setUnit("1")
             .build()
     }
 
@@ -2206,6 +2244,148 @@ final class TelemetryService {
         }
         let body = outcome == "completed" ? "Cache migration completed" : "Cache migration ended"
         emitLog(severity: .info, body: body, attributes: endAttrs, spanContext: token.span?.context)
+    }
+
+    // MARK: - Cache Only overlay upload
+
+    /// Start a `synctray overlay_upload` span for one upload run (a drain on Resume Syncing
+    /// / auto-resume, or a keep-mode Upload Now). `trigger` is bounded: `resume` |
+    /// `auto_resume` | `upload_now`.
+    func recordOverlayUploadStarted(profileId: UUID, profileName: String, trigger: String) {
+        guard SyncTraySettings.telemetryEnabled else { return }
+        ensureSetup()
+
+        let attrs: [String: AttributeValue] = [
+            "synctray.profile.id": .string(profileId.uuidString),
+            "synctray.profile.name": .string(profileName),
+            "upload.trigger": .string(trigger),
+        ]
+        let span = tracer?.spanBuilder(spanName: "synctray overlay_upload")
+            .setSpanKind(spanKind: .internal)
+            .startSpan()
+        if let span {
+            for (key, value) in attrs { span.setAttribute(key: key, value: value) }
+        }
+        activeOverlayUploadSpans[profileId] = span
+        emitLog(severity: .info, body: "Overlay upload started", attributes: attrs, spanContext: span?.context)
+    }
+
+    /// End the overlay-upload span and record count / files / bytes / duration metrics.
+    /// `outcome` is derived from the result: `completed` (something uploaded, nothing
+    /// failed), `partial` (some uploaded, some failed), `failed` (nothing uploaded, at
+    /// least one failure), or `nothing_to_do` (overlay was already empty/fully uploaded).
+    func recordOverlayUploadCompleted(
+        profileId: UUID,
+        profileName: String,
+        trigger: String,
+        result: OverlaySyncService.OverlayUploadResult,
+        duration: Double
+    ) {
+        guard SyncTraySettings.telemetryEnabled else { return }
+        ensureSetup()
+
+        let outcome: String
+        if result.failed > 0 {
+            outcome = (result.uploaded > 0 || result.conflicts > 0) ? "partial" : "failed"
+        } else if result.uploaded == 0 && result.conflicts == 0 && result.alreadyUploaded == 0 {
+            outcome = "nothing_to_do"
+        } else {
+            outcome = "completed"
+        }
+
+        let labels: [String: AttributeValue] = [
+            "synctray.profile.name": .string(profileName),
+            "upload.trigger": .string(trigger),
+            "upload.outcome": .string(outcome),
+            "upload.transport": .string(result.transport),
+        ]
+        overlayUploadCountCounter?.add(value: 1, attribute: labels)
+        overlayUploadDurationHistogram?.record(value: duration, attributes: labels)
+        overlayUploadBytesCounter?.add(value: Int(result.bytes), attribute: labels)
+
+        func fileLabels(_ fileResult: String) -> [String: AttributeValue] {
+            ["synctray.profile.name": .string(profileName), "upload.file_result": .string(fileResult)]
+        }
+        if result.uploaded > 0 {
+            overlayUploadFilesCounter?.add(value: result.uploaded, attribute: fileLabels("uploaded"))
+        }
+        if result.conflicts > 0 {
+            overlayUploadFilesCounter?.add(value: result.conflicts, attribute: fileLabels("conflict"))
+        }
+        if result.alreadyUploaded > 0 {
+            overlayUploadFilesCounter?.add(value: result.alreadyUploaded, attribute: fileLabels("already_uploaded"))
+        }
+        if result.failed > 0 {
+            overlayUploadFilesCounter?.add(value: result.failed, attribute: fileLabels("failed"))
+        }
+
+        let endAttrs: [String: AttributeValue] = [
+            "synctray.profile.name": .string(profileName),
+            "upload.trigger": .string(trigger),
+            "upload.outcome": .string(outcome),
+            "upload.transport": .string(result.transport),
+            "upload.uploaded": .int(result.uploaded),
+            "upload.conflicts": .int(result.conflicts),
+            "upload.already_uploaded": .int(result.alreadyUploaded),
+            "upload.failed": .int(result.failed),
+            "upload.duration_seconds": .double(duration),
+        ]
+        if let span = activeOverlayUploadSpans.removeValue(forKey: profileId) {
+            for (key, value) in endAttrs { span.setAttribute(key: key, value: value) }
+            span.status = (outcome == "failed") ? .error(description: "overlay upload failed") : .ok
+            span.end()
+        }
+        emitLog(
+            severity: outcome == "failed" ? .warn : .info, body: "Overlay upload ended",
+            attributes: endAttrs, spanContext: nil)
+    }
+
+    /// Record an overlay upload that never started because no remote (primary or
+    /// fallback) was reachable — `upload.outcome = "unreachable"`, no span (nothing ran).
+    func recordOverlayUploadUnreachable(profileId: UUID, profileName: String, trigger: String) {
+        guard SyncTraySettings.telemetryEnabled else { return }
+        ensureSetup()
+        let labels: [String: AttributeValue] = [
+            "synctray.profile.name": .string(profileName),
+            "upload.trigger": .string(trigger),
+            "upload.outcome": .string("unreachable"),
+            "upload.transport": .string("none"),
+        ]
+        overlayUploadCountCounter?.add(value: 1, attribute: labels)
+        emitLog(severity: .info, body: "Overlay upload ended", attributes: labels, spanContext: nil)
+    }
+
+    /// Record a Stream profile's mount mode transitioning (as observed by the mount-state
+    /// reconcile loop reading the mode file). `mode` values are rendered with underscores
+    /// (`cache_only_manual`, …) for the low-cardinality telemetry attribute.
+    func recordMountModeChanged(profileId: UUID, profileName: String, mode: MountMode) {
+        guard SyncTraySettings.telemetryEnabled else { return }
+        ensureSetup()
+        let attrs: [String: AttributeValue] = [
+            "synctray.profile.id": .string(profileId.uuidString),
+            "synctray.profile.name": .string(profileName),
+            "mount.mode": .string(mode.rawValue.replacingOccurrences(of: "-", with: "_")),
+        ]
+        mountModeChangesCounter?.add(value: 1, attribute: attrs)
+        emitLog(severity: .info, body: "Mount mode changed", attributes: attrs)
+    }
+
+    /// Record an automatic Cache Only -> Streaming resume decision. `result` is bounded:
+    /// `resumed` | `deferred_busy` | `busy_check_failed`.
+    func recordAutoResume(profileId: UUID, profileName: String, result: String) {
+        guard SyncTraySettings.telemetryEnabled else { return }
+        ensureSetup()
+        let attrs: [String: AttributeValue] = [
+            "synctray.profile.id": .string(profileId.uuidString),
+            "synctray.profile.name": .string(profileName),
+            "auto_resume.result": .string(result),
+        ]
+        mountAutoResumeCounter?.add(value: 1, attribute: attrs)
+        // "resumed" surfaces via the "Mount mode changed" log once the mode flips back to
+        // streaming — only the non-resuming outcomes get their own line here.
+        if result != "resumed" {
+            emitLog(severity: .warn, body: "Auto-resume deferred", attributes: attrs)
+        }
     }
 
     private func emitLog(

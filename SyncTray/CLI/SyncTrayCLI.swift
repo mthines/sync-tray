@@ -948,6 +948,20 @@ enum SyncTrayCLI {
             return 0
         }
 
+        // R16: a vfsCachePath re-point on a mount profile with overlay files still waiting
+        // to upload would silently orphan them under the OLD path — refuse, matching
+        // `synctray cache move`'s guard below. Resolve via Upload Now / Resume Syncing first.
+        if assignments.contains(where: { $0.key == "vfsCachePath" }), original.isMountMode {
+            let manifest = OverlaySyncService.loadManifest(path: original.overlayManifestPath)
+            let pending = OverlaySyncService.pendingCount(overlayPath: original.overlayPath, manifest: manifest)
+            if pending > 0 {
+                env.stderr(
+                    "error: \(pending) file(s) waiting to upload from Cache Only — "
+                        + "resolve them (Upload Now / Resume Syncing) before changing vfsCachePath\n")
+                return 1
+            }
+        }
+
         guard env.writeProfile(updated) else {
             env.stderr("error: failed to write profile file\n")
             return 1
@@ -1085,6 +1099,18 @@ enum SyncTrayCLI {
         }
         guard profile.isMountMode else {
             env.stderr("error: \"\(profile.name)\" is not a Stream (mount) profile\n")
+            return 1
+        }
+
+        // R16: refuse a relocation while overlay files are still waiting to upload — a move
+        // now would leave them addressing the OLD cache-data tree. Same guard as
+        // `profile set … vfsCachePath` above.
+        let manifest = OverlaySyncService.loadManifest(path: profile.overlayManifestPath)
+        let pending = OverlaySyncService.pendingCount(overlayPath: profile.overlayPath, manifest: manifest)
+        guard pending == 0 else {
+            env.stderr(
+                "error: \(pending) file(s) waiting to upload from Cache Only — "
+                    + "resolve them (Upload Now / Resume Syncing) before moving the cache directory\n")
             return 1
         }
 
