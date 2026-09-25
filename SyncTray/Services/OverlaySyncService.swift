@@ -374,9 +374,19 @@ struct OverlaySyncService {
             let dir = (file.relativePath as NSString).deletingLastPathComponent
             let baseName = ((file.relativePath as NSString).lastPathComponent)
                 .precomposedStringWithCanonicalMapping
-            var remoteEntry: RemoteEntry?
-            if case .success(let entries) = listing(for: dir) {
+            // A listing that FAILED (unreachable, timeout, auth) says nothing about what is
+            // on the remote, so we can't tell a new file from a conflicting one — a plain
+            // upload could overwrite someone else's newer version. Keep the overlay copy,
+            // count it failed, and let a later run retry. A directory that simply doesn't
+            // exist yet (a folder created while offline) is NOT a failure: `listFiles`
+            // reports it as an empty `.success`, so it still uploads normally.
+            let remoteEntry: RemoteEntry?
+            switch listing(for: dir) {
+            case .success(let entries):
                 remoteEntry = entries.first { $0.name.precomposedStringWithCanonicalMapping == baseName }
+            case .failure:
+                result.failed += 1
+                continue
             }
             let remoteState = remoteEntry.map { RemoteState(size: $0.size, modTime: $0.modTime) }
 

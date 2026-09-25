@@ -101,6 +101,7 @@ enum ConfigSelfTest {
             testOverlayUploadPlan,
             testOverlaySyncBack,
             testOverlayUploadNow,
+            testOverlayListingFailure,
             testCacheMoveBlockedPending,
             testCLIProfileSetRemovedKeys,
         ]
@@ -2810,9 +2811,11 @@ enum ConfigSelfTest {
     private final class FakeOverlayRemoteClient: OverlaySyncService.OverlayRemoteClient {
         var filesByDir: [String: [OverlaySyncService.RemoteEntry]] = [:]
         var failUploadsFor: Set<String> = []
+        var failListingFor: Set<String> = []
         var uploadCount = 0
         func listFiles(remoteDir: String) -> Result<[OverlaySyncService.RemoteEntry], OverlaySyncService.OverlayUploadError> {
-            .success(filesByDir[remoteDir] ?? [])
+            if failListingFor.contains(remoteDir) { return .failure(.rcloneFailed(exitCode: 1)) }
+            return .success(filesByDir[remoteDir] ?? [])
         }
         func upload(localPath: String, remoteDestination: String, expectedSize: Int64)
             -> Result<Void, OverlaySyncService.OverlayUploadError> {
@@ -2899,6 +2902,51 @@ enum ConfigSelfTest {
         }
 
         return report("AC-OU2", "overlay-sync-back", true)
+    }
+
+    // MARK: - AC-OU5 — a failed remote listing never falls through to a plain upload
+
+    private static func testOverlayListingFailure() -> Bool {
+        let fm = FileManager.default
+        let root = "\(selfTestRoot)/ou5-\(UUID().uuidString)"
+        let profile = mountFixtureProfile(localPath: "\(root)/mnt", cachePath: "\(root)/cache", remotePath: "")
+        let overlay = profile.overlayPath
+        writeFile("\(overlay)/Project/take.wav", "recorded while offline")
+
+        // Listing of the file's remote directory fails → not uploaded, not deleted, failed.
+        let client = FakeOverlayRemoteClient()
+        client.failListingFor.insert("Project")
+        let service = OverlaySyncService()
+        let failed = await_ { await service.run(
+            profile: profile, remoteBase: "testremote:", mode: .drain, transport: "primary", client: client) }
+        guard client.uploadCount == 0, failed.failed == 1, failed.uploaded == 0,
+              fm.fileExists(atPath: "\(overlay)/Project/take.wav"), failed.remainingPending >= 1
+        else {
+            return report("AC-OU5", "overlay-listing-failure", false,
+                          "(a failed listing still uploaded or dropped the file: \(failed), calls=\(client.uploadCount))")
+        }
+
+        // Real rclone: a remote directory that doesn't exist yet (folder created offline)
+        // lists as empty, NOT as a failure — the file uploads and the drain deletes it.
+        guard RcloneLocator.resolve() != nil else {
+            return report("AC-OU5", "overlay-listing-failure", false, "(rclone not found)")
+        }
+        let remoteRoot = "\(root)/remote"
+        try? fm.createDirectory(atPath: remoteRoot, withIntermediateDirectories: true)
+        let real = OverlaySyncService.ProductionOverlayRemoteClient(remoteName: ":local", remotePath: remoteRoot)
+        guard case .success(let entries) = real.listFiles(remoteDir: "Project"), entries.isEmpty else {
+            return report("AC-OU5", "overlay-listing-failure", false, "(a missing remote directory did not list as empty)")
+        }
+        let uploaded = await_ { await service.run(
+            profile: profile, remoteBase: ":local:\(remoteRoot)", mode: .drain, transport: "primary", client: real) }
+        guard uploaded.uploaded == 1, uploaded.failed == 0,
+              (try? String(contentsOfFile: "\(remoteRoot)/Project/take.wav")) == "recorded while offline",
+              !fm.fileExists(atPath: "\(overlay)/Project/take.wav")
+        else {
+            return report("AC-OU5", "overlay-listing-failure", false,
+                          "(a new offline folder did not upload: \(uploaded))")
+        }
+        return report("AC-OU5", "overlay-listing-failure", true)
     }
 
     // MARK: - AC-OU3 — Upload Now (keep mode)
