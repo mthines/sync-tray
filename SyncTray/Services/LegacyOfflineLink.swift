@@ -10,10 +10,11 @@ import Foundation
 /// type only removes what the old feature left behind — it never creates anything.
 ///
 /// Pure predicate + a thin filesystem apply, mirroring the shape the retired
-/// `OfflineAccessLink` used: `shouldRemove` computes over an observed on-disk state
-/// with no I/O (unit-testable), `removeIfPresent` is the only member that touches
-/// `FileManager`. `nonisolated` throughout so both the CLI (no actor context) and
-/// `@MainActor` call sites (`SyncManager`, `ProfileListView`) can call it directly.
+/// browse-point-management type used: `shouldRemove` computes over an observed
+/// on-disk state with no I/O (unit-testable), `removeIfPresent` is the only member
+/// that touches `FileManager`. `nonisolated` throughout so both the CLI (no actor
+/// context) and `@MainActor` call sites (`SyncManager`, `ProfileListView`) can call
+/// it directly.
 enum LegacyOfflineLink {
     /// Path of the legacy browse point: a sibling of the mount point named
     /// `"<mount-name> (Offline)"`. `nil` only when there is no mount point to sit

@@ -56,6 +56,16 @@ struct OverlaySyncService {
 
     // MARK: - Scanning
 
+    /// POSIX `realpath()` — see `scan`'s doc comment for why this, and not any Foundation
+    /// path-resolution API, is required here. Falls back to the input unchanged if the path
+    /// doesn't exist or resolution otherwise fails (matches `scan`'s own guard: a missing
+    /// root is handled by the caller, not here).
+    nonisolated static func canonicalPath(_ path: String) -> String {
+        var buffer = [Int8](repeating: 0, count: Int(PATH_MAX))
+        guard realpath(path, &buffer) != nil else { return path }
+        return String(cString: buffer)
+    }
+
     struct OverlayFile: Equatable {
         let relativePath: String  // mount-relative, no leading slash, "/" separators
         let absolutePath: String
@@ -69,15 +79,29 @@ struct OverlaySyncService {
         overlayPath: String, fileManager: FileManager = .default
     ) -> [OverlayFile] {
         guard fileManager.fileExists(atPath: overlayPath) else { return [] }
+        // Resolve symlinks in the ROOT before enumerating: `FileManager.enumerator` returns
+        // each descendant's REAL (symlink-resolved) path, e.g. under macOS's `/tmp` ->
+        // `/private/tmp` and `/var` -> `/private/var` — while a caller-supplied `overlayPath`
+        // (typically built from `NSTemporaryDirectory()` in tests, or a user-chosen cache
+        // directory that traverses a symlink) may not be. Deriving `prefixLen` from the
+        // UNresolved string while the enumerator hands back resolved paths silently
+        // mis-slices every relative path. Resolving once up front keeps the two in lockstep.
+        //
+        // Deliberately the POSIX `realpath()`, NOT `NSString.resolvingSymlinksInPath` /
+        // `URL.resolvingSymlinksInPath()` — both Foundation APIs special-case `/tmp`, `/var`,
+        // `/etc` and leave them UNresolved (a long-standing Apple compatibility carve-out),
+        // which silently reproduces this exact bug for any path built from
+        // `NSTemporaryDirectory()`. `realpath()` has no such carve-out.
+        let resolvedRoot = canonicalPath(overlayPath)
         guard let enumerator = fileManager.enumerator(
-            at: URL(fileURLWithPath: overlayPath),
+            at: URL(fileURLWithPath: resolvedRoot),
             includingPropertiesForKeys: [
                 .isRegularFileKey, .isDirectoryKey, .fileSizeKey, .contentModificationDateKey,
             ]
         ) else { return [] }
 
         var results: [OverlayFile] = []
-        let prefixLen = overlayPath.count + 1
+        let prefixLen = resolvedRoot.count + 1
         for case let url as URL in enumerator {
             let name = url.lastPathComponent
             if isIgnored(name: name) {
