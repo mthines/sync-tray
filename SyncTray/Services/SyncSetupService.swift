@@ -706,12 +706,12 @@ final class SyncSetupService {
             # password containing a double quote produced an unterminated `eval`.)
             dump_remote_as_env() {
                 python3 -c "
-import json, shlex, sys
-remote, prefix = sys.argv[1], sys.argv[2]
-for k, v in json.load(sys.stdin).get(remote, {}).items():
-    key = k.upper().replace('-', '_')
-    print('export RCLONE_CONFIG_%s_%s=%s' % (prefix, key, shlex.quote(str(v))))
-" "$1" "$2"
+            import json, shlex, sys
+            remote, prefix = sys.argv[1], sys.argv[2]
+            for k, v in json.load(sys.stdin).get(remote, {}).items():
+                key = k.upper().replace('-', '_')
+                print('export RCLONE_CONFIG_%s_%s=%s' % (prefix, key, shlex.quote(str(v))))
+            " "$1" "$2"
             }
 
             REMOTE_NAME="${REMOTE%%:*}"

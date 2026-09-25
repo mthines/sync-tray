@@ -2029,6 +2029,74 @@ enum ConfigSelfTest {
         return report("AC-CI1", "cache-identity", true)
     }
 
+    // MARK: - AC-CI2 — cache identity + cache-only reach the script, and force a reinstall
+
+    /// Per CLAUDE.md, a mount setting the script consumes has to be emitted by
+    /// `generateProfileConfig` AND be in `reconcileAction`'s reinstall set — a field present
+    /// in the model and UI but missing from either silently never takes effect (the bug that
+    /// made "NFS selected but macFUSE still runs"). Assert both for the new fields.
+    private static func testCacheIdentityConfigEmission() -> Bool {
+        var profile = mountProfile(remotePath: "Kaiju/KAIJU", vfsCachePath: "/tmp/ci2-root")
+        profile.cacheIdentity = "synology"
+        profile.streamCacheOnly = true
+
+        func derived(_ p: SyncProfile) -> [String: Any] {
+            let json = SyncSetupService.shared.generateProfileConfig(for: p)
+            let data = json.data(using: .utf8) ?? Data()
+            return (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]
+        }
+
+        let on = derived(profile)
+        guard on["cacheIdentity"] as? String == "synology" else {
+            return report("AC-CI2", "cache-identity-config", false,
+                          "(cacheIdentity not emitted: \(on["cacheIdentity"] ?? "nil"))")
+        }
+        guard on["streamCacheOnly"] as? Bool == true else {
+            return report("AC-CI2", "cache-identity-config", false, "(streamCacheOnly not emitted)")
+        }
+
+        var off = profile
+        off.stableCacheIdentity = false
+        guard derived(off)["cacheIdentity"] as? String == "" else {
+            return report("AC-CI2", "cache-identity-config", false,
+                          "(identity off must emit an empty cacheIdentity, not the name)")
+        }
+
+        var enabled = profile
+        enabled.isEnabled = true
+        var identityToggled = enabled
+        identityToggled.stableCacheIdentity = false
+        guard SyncManager.reconcileAction(from: enabled, to: identityToggled) == .reinstall else {
+            return report("AC-CI2", "cache-identity-config", false, "(stableCacheIdentity change did not reinstall)")
+        }
+        var identityRenamed = enabled
+        identityRenamed.cacheIdentity = "synology-sftp"
+        guard SyncManager.reconcileAction(from: enabled, to: identityRenamed) == .reinstall else {
+            return report("AC-CI2", "cache-identity-config", false, "(cacheIdentity change did not reinstall)")
+        }
+        var cacheOnlyToggled = enabled
+        cacheOnlyToggled.streamCacheOnly = false
+        guard SyncManager.reconcileAction(from: enabled, to: cacheOnlyToggled) == .reinstall else {
+            return report("AC-CI2", "cache-identity-config", false, "(streamCacheOnly change did not reinstall)")
+        }
+
+        // Cache-only suppresses the offline warmer (its job is to download the very bytes
+        // the mode exists to stop fetching), and un-setting it re-arms the profile.
+        var warmed: Set<UUID> = []
+        guard !SyncManager.shouldAutoWarmOnMount(
+            isMounted: true, hasPinnedDirs: !["Reaper"].isEmpty && !profile.streamCacheOnly,
+            profileId: profile.id, alreadyWarmed: &warmed) else {
+            return report("AC-CI2", "cache-identity-config", false, "(cache-only profile still auto-warms)")
+        }
+        guard SyncManager.shouldAutoWarmOnMount(
+            isMounted: true, hasPinnedDirs: !["Reaper"].isEmpty && !cacheOnlyToggled.streamCacheOnly,
+            profileId: cacheOnlyToggled.id, alreadyWarmed: &warmed) else {
+            return report("AC-CI2", "cache-identity-config", false, "(non-cache-only profile should warm)")
+        }
+
+        return report("AC-CI2", "cache-identity-config", true)
+    }
+
     // MARK: - AC-CI3 — upgrade pins without moving bytes; downgrade still finds them
 
     /// The rollback contract. `MigrationV4PinCacheIdentity` must write the remote name the
@@ -2198,25 +2266,32 @@ enum ConfigSelfTest {
             return report("AC-CM3", "cache-migration-overlap", false, "(sameRootProfiles \(plan.sameRootProfiles) != [disjoint])")
         }
 
-        // The profile-stable cache identity DISSOLVES overlap: the same nested pair now
-        // owns vfs/synctray_{shortId}/… each, which are disjoint subtrees no matter how
-        // their remote paths nest. The nested sibling must therefore classify as merely
-        // same-root (offered as an independent migration) and the move must succeed
-        // without a co-migration — asserted here so a future change can't quietly
-        // reintroduce a false overlap rejection for identity-keyed profiles.
-        var idParent = parent; idParent.stableCacheIdentity = true
-        var idChild = child; idChild.stableCacheIdentity = true
+        // A pinned cache identity keeps overlap exactly where it was when both profiles pin
+        // the SAME remote name (the usual case: the migration pins each to its own primary
+        // remote), and dissolves it when they pin DIFFERENT names — vfs/{a}/… and vfs/{b}/…
+        // are disjoint no matter how the remote paths nest. Assert both directions so a
+        // future change can neither invent a false overlap nor hide a real one.
+        var idParent = parent; idParent.stableCacheIdentity = true; idParent.cacheIdentity = "synology"
+        var idChild = child; idChild.stableCacheIdentity = true; idChild.cacheIdentity = "synology"
+        let (samePinOverlapping, _) = CacheMigrationPlanner.classifySiblings(
+            of: idParent, sourceRoot: sharedRoot, allProfiles: [idParent, idChild])
+        guard samePinOverlapping.map({ $0.id }) == [idChild.id] else {
+            return report("AC-CM3", "cache-migration-overlap", false,
+                          "(nested profiles pinned to the same identity must still overlap)")
+        }
+
+        idChild.cacheIdentity = "synology-sftp"
         let (identityOverlapping, identitySameRoot) = CacheMigrationPlanner.classifySiblings(
             of: idParent, sourceRoot: sharedRoot, allProfiles: [idParent, idChild])
         guard identityOverlapping.isEmpty, identitySameRoot.map({ $0.id }) == [idChild.id] else {
             return report("AC-CM3", "cache-migration-overlap", false,
-                          "(identity-keyed nested profiles should be same-root, not overlapping)")
+                          "(nested profiles pinned to different identities should be same-root, not overlapping)")
         }
         guard case .success = CacheMigrationPlanner.plan(
             moving: idParent, allProfiles: [idParent, idChild], to: "/tmp/cm3-dest", coMigrate: []
         ) else {
             return report("AC-CM3", "cache-migration-overlap", false,
-                          "(identity-keyed move rejected for a non-existent overlap)")
+                          "(disjoint-identity move rejected for a non-existent overlap)")
         }
 
         return report("AC-CM3", "cache-migration-overlap", true)

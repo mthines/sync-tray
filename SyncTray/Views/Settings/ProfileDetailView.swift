@@ -1092,20 +1092,6 @@ struct ProfileDetailView: View {
                     }
                     .toggleStyle(.switch)
 
-                    // Cache-only (offline) mode
-                    Toggle(isOn: $streamCacheOnly) {
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text("Cache-only (stop syncing)")
-                                .font(.subheadline)
-                            Text("Serve \u{201C}\(mountFolderName)\u{201D} read-only from what's already cached and stop checking the remote for changes. The mount stays where it is, so projects that point at these files keep opening — just without the per-file checks that make opening them slow. Cached files also stop expiring while this is on, so they're still there when you get back.")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                            Text("While it's on, files that aren't cached yet won't download, and anything you've recorded into this folder that hasn't reached the remote yet stays queued — nothing is lost, but it won't upload until you turn this off.")
-                                .font(.caption)
-                                .foregroundStyle(.orange)
-                        }
-                    }
-                    .toggleStyle(.switch)
                 }
             }
 
@@ -1618,6 +1604,18 @@ struct ProfileDetailView: View {
                 Spacer()
             }
 
+            // Cache-only is applied immediately (see `setCacheOnly`), so the persisted
+            // profile is the truth here — never the form buffer.
+            if isInstalled, profile.streamCacheOnly {
+                VStack(alignment: .leading, spacing: 2) {
+                    Label("Cache only — not syncing", systemImage: "icloud.slash")
+                        .font(.caption.weight(.medium))
+                    Text("Serving cached files read-only. Files that aren't cached won't download, and anything recorded here stays queued until you resume syncing — nothing is lost.")
+                        .font(.caption)
+                }
+                .foregroundStyle(.orange)
+            }
+
             // Mounted-at + volume details. Use the persisted profile values (what
             // the running daemon was installed with), not the form's @State edit
             // buffers, so unsaved edits don't misrepresent the live mount.
@@ -1664,6 +1662,8 @@ struct ProfileDetailView: View {
                         .buttonStyle(.borderedProminent)
                         .disabled(mountState == .mounting)
                     }
+
+                    cacheOnlyButton(mountState: mountState)
 
                     Button(action: { showingUninstallConfirm = true }) {
                         Label("Uninstall", systemImage: "trash")
@@ -2148,6 +2148,40 @@ struct ProfileDetailView: View {
         return updatedProfile
     }
 
+    /// Toggles Cache-only straight from the status card, next to Unmount — it is an
+    /// operating mode you flip when you leave or come back, not a setting to stage and
+    /// Save. Reads the PERSISTED value so the label always matches the live mount.
+    private func cacheOnlyButton(mountState: MountState) -> some View {
+        let isOn = profile.streamCacheOnly
+        return Button(action: { setCacheOnly(!isOn) }) {
+            if isOn {
+                Label("Resume Syncing", systemImage: "arrow.triangle.2.circlepath")
+            } else {
+                Label("Cache Only", systemImage: "icloud.slash")
+            }
+        }
+        .disabled(isInstalling || mountState == .mounting)
+        .help(isOn
+            ? "Remount with normal syncing: uncached files download again and queued recordings upload."
+            : "Remount read-only from the cache and stop checking the remote, so cached files open at local-disk speed. Uncached files won't download, and unsynced recordings stay queued until you resume.")
+    }
+
+    /// Persists ONLY `streamCacheOnly` onto the saved profile and reinstalls with exactly
+    /// that profile, so unsaved edits elsewhere in the form are neither applied nor lost.
+    private func setCacheOnly(_ enabled: Bool) {
+        guard var latest = profileStore.profile(for: profile.id),
+              latest.streamCacheOnly != enabled else { return }
+        latest.streamCacheOnly = enabled
+        profileStore.update(latest)
+        // Keep the form buffer in step, or `hasChanges` would flag it and the next Save
+        // would write the stale value back.
+        streamCacheOnly = enabled
+        syncManager.clearError(for: profile.id)
+        if isInstalled {
+            reinstallSync(using: latest)
+        }
+    }
+
     private func saveProfile() {
         // Backstop for the disabled Save button: never persist a Stream profile whose
         // fallback resolves to a different remote path — it would duplicate the VFS cache.
@@ -2546,6 +2580,14 @@ struct ProfileDetailView: View {
                     if needsResync {
                         // runResync will handle clearing isInstalling state and load agent on completion
                         runResync(loadAgentOnCompletion: true)
+                    } else if currentProfile.isMountMode {
+                        // See `runResync`'s mount branch for why this isn't `loadAgent`.
+                        isInstalling = false
+                        syncManager.mountProfile(enabledProfile)
+                        TelemetryService.shared.recordProfileLifecycleOperation(
+                            profileId: currentProfile.id, profileName: currentProfile.name,
+                            operation: "install", syncMode: currentProfile.syncMode.rawValue, result: "success"
+                        )
                     } else {
                         // Load the agent now that LogWatcher is ready
                         if !setupService.loadAgent(for: currentProfile) {
@@ -2961,9 +3003,11 @@ struct ProfileDetailView: View {
             showResyncOutput = true
 
             if loadAgentOnCompletion {
-                if !setupService.loadAgent(for: profile) {
-                    installError = "Failed to start mount service"
-                }
+                // Go through `mountProfile`, not a bare `loadAgent`: it holds the card in
+                // `.mounting` with progress while rclone walks the VFS cache (minutes on a
+                // large cache), and kickstarts the job so a `mountAtStartup=false` profile
+                // (RunAtLoad off) actually mounts after a reinstall.
+                syncManager.mountProfile(profileStore.profile(for: profile.id) ?? profile)
             }
             return
         }
@@ -3048,7 +3092,6 @@ struct ProfileDetailView: View {
             guard let path = rclonePath else {
                 let errMsg = "Error: rclone not found. Install with: brew install rclone"
                 writeToLog(errMsg)
-                try? fileManager.removeItem(atPath: syncLogPath)
                 DispatchQueue.main.async {
                     self.isRunningResync = false
                     self.resyncOutputLines = [errMsg]
@@ -3973,12 +4016,14 @@ struct ProfileDetailView: View {
         guard FileManager.default.fileExists(atPath: syncLogPath) else { return }
 
         // Check if SyncManager detected a running sync for this profile
-        // SyncManager uses lock file detection which is more reliable than pgrep
-        guard syncManager.state(for: profile.id) == .syncing else {
-            // No running sync - clean up stale log file
-            try? FileManager.default.removeItem(atPath: syncLogPath)
-            return
-        }
+        // SyncManager uses lock file detection which is more reliable than pgrep.
+        //
+        // Never delete the log here: `profile.logPath` is the profile's MAIN log, shared
+        // with scheduled syncs and a live mount's `tee -a`. Unlinking it while a writer
+        // holds it open sends every later line to an orphaned inode — a Stream mount's
+        // `tee` lives as long as the mount, so its log went blank from the moment the
+        // settings page was opened until the next remount.
+        guard syncManager.state(for: profile.id) == .syncing else { return }
 
         // Resume showing the output panel for the initial sync
         isRunningResync = true

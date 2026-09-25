@@ -256,8 +256,8 @@ quote produced an unterminated `eval` and silently dropped that key.
 
 #### Cache-Only (Offline) — stop syncing, serve what's cached
 
-**`streamCacheOnly` (Advanced Options, "Cache-only (stop syncing)", default
-false)** is for the case where the cache is warm and the remote is slow, far
+**`streamCacheOnly` ("Cache Only" / "Resume Syncing" button next to Unmount in
+the Stream status card, default false)** is for the case where the cache is warm and the remote is slow, far
 away, or gone: opening a Reaper project full of already-cached media should
 not be slower than opening it from a two-way-synced folder, and it is, because
 every open revalidates a fingerprint against the remote.
@@ -292,7 +292,12 @@ Two trade-offs, both why it is opt-in and reversible: an uncached file errors
 rather than downloading, and **a write still queued in the cache when the mode
 is switched on stays queued** — `--read-only` pauses the write-back, so an
 unsynced recording is deferred, not lost, and uploads when the mode is switched
-back off. The UI caption says so in orange.
+back off. The status card says so in orange while the mode is on.
+
+It is an operating mode, not a staged setting: the button applies immediately
+(`ProfileDetailView.setCacheOnly`) by persisting **only** `streamCacheOnly` onto
+the saved profile and reinstalling with exactly that profile, so unsaved edits
+elsewhere in the form are neither applied nor discarded.
 
 #### Mount preflight — never mount with the cache silently disabled
 
