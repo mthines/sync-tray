@@ -3442,9 +3442,9 @@ final class SyncManager: ObservableObject {
     /// script picks `cache-only-manual` on its next start.
     ///
     /// Turning it OFF ("Resume Syncing"): if the primary is unreachable right now, don't
-    /// unmount — persist the flag off and let the running mount keep serving Cache Only
-    /// automatically (it will re-evaluate as `cache-only-offline`/`cache-only-pending` on
-    /// its own next start once the primary returns). Otherwise: unmount, drain the overlay
+    /// unmount — persist the flag off and relabel the running mount as `cache-only-offline`
+    /// (automatic), so the auto-resume monitor drains and remounts it as Streaming once the
+    /// primary is stable again. Otherwise: unmount, drain the overlay
     /// (verify-then-delete with conflict copies), persist the flag off, then reinstall and
     /// remount. ANY file the drain could not upload keeps the mount in a Cache Only flavour
     /// on the next start — the user's edits never silently vanish from view.
@@ -3476,6 +3476,14 @@ final class SyncManager: ObservableObject {
                 TelemetryService.shared.recordSettingChanged(name: "stream_cache_only", enabled: false)
                 TelemetryService.shared.recordOverlayUploadUnreachable(
                     profileId: profile.id, profileName: profile.name, trigger: "resume")
+                // The running mount is still the MANUAL flavour, and auto-resume only ever
+                // considers automatic ones — without this hand-off the mount would sit in
+                // Cache Only until the next remount. Relabel it as the automatic offline
+                // flavour so the recovery monitor resumes it once the primary is stable.
+                if let next = Self.mountModeAfterResumeWhileUnreachable(
+                    current: self.profileMountModes[profileId]) {
+                    self.applyLiveMountMode(next, for: updated)
+                }
                 SyncTraySettings.debugLog(
                     "'\(profile.name)': primary unreachable — will switch to Streaming automatically "
                         + "once it's back")
@@ -3485,6 +3493,29 @@ final class SyncManager: ObservableObject {
             try? await Task.sleep(nanoseconds: 200_000_000)
             await self.drainAndResume(profile: profile)
         }
+    }
+
+    /// The live mode a mounted profile should switch to when the user turns Cache Only off
+    /// while the primary is unreachable: a MANUAL Cache Only mount becomes the automatic
+    /// offline flavour (same union mount, but now a candidate for auto-resume). `nil` means
+    /// leave it — not mounted, already streaming, or already automatic.
+    nonisolated static func mountModeAfterResumeWhileUnreachable(current: MountMode?) -> MountMode? {
+        current == .cacheOnlyManual ? .cacheOnlyOffline : nil
+    }
+
+    /// Relabel a RUNNING mount's mode without remounting: rewrite its per-boot mode file in
+    /// the exact format the sync script writes (`echo "$MOUNT_MODE" > "$MOUNT_MODE_PATH"`),
+    /// so the 5s mount-state reconcile reads the same value back, then publish it.
+    private func applyLiveMountMode(_ mode: MountMode, for profile: SyncProfile) {
+        if !profile.mountModePath.isEmpty {
+            try? "\(mode.rawValue)\n".write(
+                toFile: profile.mountModePath, atomically: true, encoding: .utf8)
+        }
+        guard profileMountModes[profile.id] != mode else { return }
+        notifiedBackOnNetworkEpisodes.remove(profile.id)
+        TelemetryService.shared.recordMountModeChanged(
+            profileId: profile.id, profileName: profile.name, mode: mode)
+        profileMountModes[profile.id] = mode
     }
 
     /// Unmount, drain the overlay to the primary, persist the flag off, reinstall + remount.

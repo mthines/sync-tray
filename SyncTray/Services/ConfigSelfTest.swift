@@ -97,6 +97,7 @@ enum ConfigSelfTest {
             testCacheOnlyUnionBehaviour,
             testMountModeSelection,
             testAutoResumeDecision,
+            testResumeWhileUnreachableHandOff,
             testOverlayUploadPlan,
             testOverlaySyncBack,
             testOverlayUploadNow,
@@ -2686,6 +2687,31 @@ enum ConfigSelfTest {
         }
 
         return report("AC-AO2", "auto-resume-decision", true)
+    }
+
+    // MARK: - AC-AO3 — Resume Syncing while unreachable hands off to automatic resume
+
+    private static func testResumeWhileUnreachableHandOff() -> Bool {
+        // A running MANUAL Cache Only mount must become an automatic candidate, or the
+        // recovery monitor (which only considers automatic modes) never resumes it.
+        guard let next = SyncManager.mountModeAfterResumeWhileUnreachable(current: .cacheOnlyManual),
+              next.isCacheOnly, next.isAutomatic,
+              SyncManager.autoResumeDecision(
+                  mode: next, manualCacheOnly: false, primaryStable: true, blockingProcesses: []) == .resume
+        else {
+            return report("AC-AO3", "resume-while-unreachable-handoff", false,
+                          "(manual Cache Only was not handed to automatic resume)")
+        }
+        // Nothing to relabel: not mounted, streaming, or already automatic.
+        guard SyncManager.mountModeAfterResumeWhileUnreachable(current: nil) == nil,
+              SyncManager.mountModeAfterResumeWhileUnreachable(current: .streaming) == nil,
+              SyncManager.mountModeAfterResumeWhileUnreachable(current: .cacheOnlyPending) == nil,
+              SyncManager.mountModeAfterResumeWhileUnreachable(current: .cacheOnlyOffline) == nil
+        else {
+            return report("AC-AO3", "resume-while-unreachable-handoff", false,
+                          "(a non-manual mode was relabelled)")
+        }
+        return report("AC-AO3", "resume-while-unreachable-handoff", true)
     }
 
     // MARK: - AC-OU1 — overlay upload planner (pure decision matrix)
