@@ -912,6 +912,24 @@ final class SyncSetupService {
                     root = os.path.join(base, name)
                     return os.path.join(root, remote_path) if remote_path else root
 
+                def clear_if_empty(path):
+                    # An EMPTY destination directory tree (no file anywhere under it) is
+                    # what a mount of the unsuffixed key leaves behind before any byte was
+                    # cached. Treat it as absent: remove only its empty directories, bottom
+                    # up, with os.rmdir (never rmtree). Anything that is not an empty
+                    # directory -- a file, a symlink -- makes rmdir fail, so the path still
+                    # exists afterwards and counts as populated.
+                    if os.path.islink(path) or not os.path.isdir(path):
+                        return
+                    for root, dirs, files in os.walk(path):
+                        if files:
+                            return
+                    for root, dirs, files in os.walk(path, topdown=False):
+                        try:
+                            os.rmdir(root)
+                        except OSError:
+                            return
+
                 def prune_ancestors(path, base):
                     ancestor = os.path.dirname(path)
                     while ancestor.startswith(base) and ancestor != base:
@@ -950,27 +968,30 @@ final class SyncSetupService {
                     dst_meta, dst_vfs = subtree(meta_base, primary), subtree(vfs_base, primary)
                     if not (os.path.isdir(src_meta) and os.path.isdir(src_vfs)):
                         log('Cache key: leaving ' + src_vfs + ' in place (its vfs and vfsMeta trees are not both present)')
-                    elif os.path.lexists(dst_meta) or os.path.lexists(dst_vfs):
-                        log('Cache key: leaving ' + src_vfs + ' in place (destination already populated)')
                     else:
-                        # vfsMeta first: an interruption between the two renames can only
-                        # leave metadata ahead of data, never data without its byte ranges.
-                        os.makedirs(os.path.dirname(dst_meta), exist_ok=True)
-                        os.rename(src_meta, dst_meta)
-                        try:
-                            os.makedirs(os.path.dirname(dst_vfs), exist_ok=True)
-                            os.rename(src_vfs, dst_vfs)
-                        except Exception as e:
-                            try:
-                                os.rename(dst_meta, src_meta)
-                                log('Cache key: vfs move failed, rolled vfsMeta back to ' + src_meta + ': ' + str(e))
-                            except Exception as rollback_error:
-                                log('Cache key: vfs move failed AND vfsMeta rollback failed (' + dst_meta + '): ' + str(e) + ' / ' + str(rollback_error))
+                        clear_if_empty(dst_meta)
+                        clear_if_empty(dst_vfs)
+                        if os.path.lexists(dst_meta) or os.path.lexists(dst_vfs):
+                            log('Cache key: leaving ' + src_vfs + ' in place (destination already populated)')
                         else:
-                            log('Cache key: moved ' + src_meta + ' -> ' + dst_meta)
-                            log('Cache key: moved ' + src_vfs + ' -> ' + dst_vfs)
-                            prune_ancestors(src_meta, meta_base)
-                            prune_ancestors(src_vfs, vfs_base)
+                            # vfsMeta first: an interruption between the two renames can only
+                            # leave metadata ahead of data, never data without its byte ranges.
+                            os.makedirs(os.path.dirname(dst_meta), exist_ok=True)
+                            os.rename(src_meta, dst_meta)
+                            try:
+                                os.makedirs(os.path.dirname(dst_vfs), exist_ok=True)
+                                os.rename(src_vfs, dst_vfs)
+                            except Exception as e:
+                                try:
+                                    os.rename(dst_meta, src_meta)
+                                    log('Cache key: vfs move failed, rolled vfsMeta back to ' + src_meta + ': ' + str(e))
+                                except Exception as rollback_error:
+                                    log('Cache key: vfs move failed AND vfsMeta rollback failed (' + dst_meta + '): ' + str(e) + ' / ' + str(rollback_error))
+                            else:
+                                log('Cache key: moved ' + src_meta + ' -> ' + dst_meta)
+                                log('Cache key: moved ' + src_vfs + ' -> ' + dst_vfs)
+                                prune_ancestors(src_meta, meta_base)
+                                prune_ancestors(src_vfs, vfs_base)
             except Exception as e:
                 log('Cache key consolidation error: ' + str(e))
             " "$REMOTE_NAME" "$REMOTE_PATH" "$VFS_CACHE_PATH" "$LOG_FILE"

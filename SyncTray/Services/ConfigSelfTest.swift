@@ -91,6 +91,7 @@ enum ConfigSelfTest {
             testMountNoFallbackOverride,
             testCacheSuffixConsolidation,
             testCacheSuffixPairSafety,
+            testCacheSuffixEmptyDestination,
             testMountCommandQuoting,
             testCacheOnlyUnionConfig,
             testCacheOnlyUnionBehaviour,
@@ -2205,10 +2206,10 @@ enum ConfigSelfTest {
     /// Run the mount script's consolidation step against a fresh fixture cache that
     /// `setup` seeds (paths relative to the cache root), returning the cache root.
     private static func runConsolidationScenario(
-        _ label: String, setup: (String) -> Void
+        _ label: String, cache existingCache: String? = nil, setup: (String) -> Void
     ) -> (cache: String, result: DryRunResult) {
         let root = "\(selfTestRoot)/\(label)-\(UUID().uuidString)"
-        let local = "\(root)/mnt", cache = "\(root)/cache"
+        let local = "\(root)/mnt", cache = existingCache ?? "\(root)/cache"
         try? FileManager.default.createDirectory(atPath: local, withIntermediateDirectories: true)
         try? FileManager.default.createDirectory(atPath: cache, withIntermediateDirectories: true)
         setup(cache)
@@ -2281,6 +2282,61 @@ enum ConfigSelfTest {
                           "(a failed vfs rename did not roll the vfsMeta rename back: \(rollback.result.log))")
         }
         return report("AC-CK5", "cache-suffix-pair-safety", true)
+    }
+
+    // MARK: - AC-CK6 — an EMPTY destination is absent, a destination with a file is not
+
+    private static func testCacheSuffixEmptyDestination() -> Bool {
+        let fm = FileManager.default
+        let suffixed = "synology{jzZaN}/Kaiju/KAIJU"
+        let seedPair: (String) -> Void = { cache in
+            writeFile("\(cache)/vfs/\(suffixed)/dir/file.bin", "hello")
+            writeFile("\(cache)/vfsMeta/\(suffixed)/dir/file.bin", "{\"Size\":5}")
+        }
+
+        // (a) Both destinations exist as empty directory chains — what a mount of the
+        // unsuffixed key leaves behind before caching a byte. They must not block adoption.
+        let empty = runConsolidationScenario("ck6-empty") { cache in
+            seedPair(cache)
+            try? fm.createDirectory(atPath: "\(cache)/vfs/synology/Kaiju/KAIJU/a/b", withIntermediateDirectories: true)
+            try? fm.createDirectory(atPath: "\(cache)/vfsMeta/synology/Kaiju/KAIJU/c", withIntermediateDirectories: true)
+        }
+        guard (try? String(contentsOfFile: "\(empty.cache)/vfs/synology/Kaiju/KAIJU/dir/file.bin")) == "hello",
+              (try? String(contentsOfFile: "\(empty.cache)/vfsMeta/synology/Kaiju/KAIJU/dir/file.bin")) == "{\"Size\":5}",
+              !fm.fileExists(atPath: "\(empty.cache)/vfs/synology{jzZaN}"),
+              !fm.fileExists(atPath: "\(empty.cache)/vfsMeta/synology{jzZaN}")
+        else {
+            return report("AC-CK6", "cache-suffix-empty-destination", false,
+                          "(an empty destination blocked adoption: \(empty.result.log))")
+        }
+
+        // (e) Idempotent: a second run over the consolidated cache changes nothing.
+        let rerun = runConsolidationScenario("ck6-rerun", cache: empty.cache) { _ in }
+        guard rerun.result.exitCode == 0,
+              (try? String(contentsOfFile: "\(empty.cache)/vfs/synology/Kaiju/KAIJU/dir/file.bin")) == "hello",
+              (try? String(contentsOfFile: "\(empty.cache)/vfsMeta/synology/Kaiju/KAIJU/dir/file.bin")) == "{\"Size\":5}",
+              !rerun.result.log.contains("Cache key: moved")
+        else {
+            return report("AC-CK6", "cache-suffix-empty-destination", false,
+                          "(second run over a consolidated cache was not a no-op: \(rerun.result.log))")
+        }
+
+        // (b) A destination holding any file, however deep, is populated: nothing moves and
+        // the existing file is untouched (never merged, never pruned).
+        let occupied = runConsolidationScenario("ck6-occupied") { cache in
+            seedPair(cache)
+            writeFile("\(cache)/vfs/synology/Kaiju/KAIJU/deep/er/existing.bin", "existing")
+            try? fm.createDirectory(atPath: "\(cache)/vfsMeta/synology/Kaiju/KAIJU", withIntermediateDirectories: true)
+        }
+        guard fm.fileExists(atPath: "\(occupied.cache)/vfs/\(suffixed)/dir/file.bin"),
+              fm.fileExists(atPath: "\(occupied.cache)/vfsMeta/\(suffixed)/dir/file.bin"),
+              (try? String(contentsOfFile: "\(occupied.cache)/vfs/synology/Kaiju/KAIJU/deep/er/existing.bin")) == "existing",
+              !fm.fileExists(atPath: "\(occupied.cache)/vfs/synology/Kaiju/KAIJU/dir")
+        else {
+            return report("AC-CK6", "cache-suffix-empty-destination", false,
+                          "(a destination holding a file did not leave both trees in place: \(occupied.result.log))")
+        }
+        return report("AC-CK6", "cache-suffix-empty-destination", true)
     }
 
     // MARK: - AC-CK4 — mount command keeps a spaced path as ONE argument
