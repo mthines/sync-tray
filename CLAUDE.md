@@ -123,6 +123,17 @@ is in `reconcileAction`'s reinstall set, so it remounts the stream to apply the 
 which can occasionally cause an extra re-upload after a file is merely viewed in
 Finder. `--allow-non-empty` is a FUSE-only option and is ignored for the NFS backend.
 
+**NFS read path is sensitive to the cache disk.** NFSv3 is stateless, so rclone
+serves every 32 KB READ as a full vfs open→read→close, and each open rewrites the
+file's `vfsMeta` sidecar (`vfscache.Item._save`, found by sampling
+`localhost:<rc-port>/debug/pprof/goroutine?debug=2`). On APFS that's free (A/B:
+~108 MB/s cached reads); on an exFAT/FSKit USB drive the sidecar close dominates
+(~6.6 MB/s), and a large live handle cache (~30k entries — go-nfs
+`CachingHandler.FromHandle` scans `LRU.Keys()` per READ) pushed one real mount to
+~0.2 MB/s. A "cached files are slow" report is therefore usually the cache disk, not a
+cache miss — confirm with `core/stats` bytes (0 = served from cache). User-facing
+guidance lives in README → Troubleshooting → "Mount mode: Slow file access".
+
 The **macFUSE** backend additionally requires the official rclone binary
 (Homebrew's rclone can't mount):
 
