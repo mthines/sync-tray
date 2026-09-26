@@ -69,6 +69,7 @@ enum ConfigSelfTest {
             testDoctorPureChecks,
             testCLIResolveAndList,
             testCLIStatusStates,
+            testReachabilityProbeIsPathScoped,
             testShimInstallIdempotentNonClobber,
             testCacheKeyPrimary,
             testCacheMigrationTreeKinds,
@@ -1151,6 +1152,21 @@ enum ConfigSelfTest {
     /// `status` must let an agent tell "still mounting" (rclone up, volume not
     /// attached yet) from mounted, stale, and unmounted without reading logs,
     /// and `--json` must carry the same facts as the text line.
+    /// AC-P1: the reachability probe stats the profile's own path (never lists the remote
+    /// root, which hangs on a Synology SMB share list) and treats not-found as reachable.
+    private static func testReachabilityProbeIsPathScoped() -> Bool {
+        let args = SyncManager.reachabilityProbeArguments(remote: "synology:", path: "Kaiju/KAIJU")
+        guard args == ["lsjson", "--stat", "synology:Kaiju/KAIJU", "--contimeout", "3s", "--timeout", "8s"] else {
+            return report("AC-P1", "reachability-probe-path-scoped", false, "(args=\(String(describing: args)))")
+        }
+        guard SyncManager.reachabilityProbeArguments(remote: ":", path: "x") == nil else {
+            return report("AC-P1", "reachability-probe-path-scoped", false, "(empty remote accepted)")
+        }
+        let verdicts = [Int32(0), 1, 3, 4, 5].map { SyncManager.reachabilityProbeSucceeded(exitCode: $0) }
+        return report("AC-P1", "reachability-probe-path-scoped", verdicts == [true, false, true, true, false],
+                      "(exit 0/1/3/4/5 → \(verdicts))")
+    }
+
     private static func testCLIStatusStates() -> Bool {
         func probe(_ mounted: Bool, _ running: Bool) -> MountProbe {
             MountProbe(mounted: mounted, processRunning: running, pendingUploads: 0)
@@ -2121,7 +2137,7 @@ enum ConfigSelfTest {
         rcloneConfig: String,
         timeout: TimeInterval = 30,
         probeRetryDelay: String = "0",
-        whileRunning: (() -> Void)? = nil
+        whileRunning: ((_ rcloneConfPath: String) -> Void)? = nil
     ) -> DryRunResult {
         // `profile.logPath` is `~/.local/log/synctray-sync-{shortId}.log` — NOT
         // sandboxed under any temp dir (real per-profile paths are all under the
@@ -2170,7 +2186,7 @@ enum ConfigSelfTest {
                 mode: nil, cmd: nil, envOverrides: nil, output: "failed to launch: \(error)",
                 exitCode: -1, scriptPath: scriptPath, log: "")
         }
-        whileRunning?()
+        whileRunning?(rcloneConfPath)
         let deadline = Date().addingTimeInterval(timeout)
         while proc.isRunning && Date() < deadline {
             Thread.sleep(forTimeInterval: 0.1)
@@ -2195,8 +2211,9 @@ enum ConfigSelfTest {
             exitCode: proc.terminationStatus, scriptPath: scriptPath, log: logContent)
     }
 
-    /// A minimal rclone config defining `name` as an `alias` remote rooted at `path` — `lsd
-    /// name:` (no path suffix) resolves deterministically and near-instantly to `path`,
+    /// A minimal rclone config defining `name` as an `alias` remote rooted at `path` — the
+    /// reachability probe (`lsjson --stat name:<remotePath>`) resolves deterministically and
+    /// near-instantly under `path`,
     /// regardless of the test process's cwd (unlike a bare `local` remote with no `root`,
     /// which resolves relative to cwd — see the investigation this harness's design notes
     /// came from). Used for every "primary reachable" dry-run fixture.
@@ -2796,8 +2813,10 @@ enum ConfigSelfTest {
         }
 
         // The network comes up during the retry window (the login race): the first probe
-        // fails because the alias target doesn't exist yet, and the target is created only
-        // once the script has LOGGED its first retry — never on a wall-clock timer, which
+        // fails because the alias points at a remote that isn't defined yet (a missing
+        // target DIRECTORY would not do — the probe stats the profile's path and counts
+        // not-found as reachable), and that remote is defined only once the script has
+        // LOGGED its first retry — never on a wall-clock timer, which
         // raced slow script startup on CI (the target existed before the first probe, so it
         // streamed on attempt 1 with no retry at all). The retry gap only has to outlast
         // this poller's latency (50 ms ticks), so the second probe is guaranteed to find it.
@@ -2805,17 +2824,20 @@ enum ConfigSelfTest {
         defer { try? fm.removeItem(atPath: late.cacheOnlyConfigPath) }
         try? fm.removeItem(atPath: late.logPath)
         let target = "\(lateRoot)/late-target"
+        try? fm.createDirectory(atPath: target, withIntermediateDirectories: true)
         let logPath = late.logPath
         let lateResult = dryRunMountScript(
-            profile: late, rcloneConfig: aliasRcloneConfig(name: "synology", path: target),
+            profile: late, rcloneConfig: aliasRcloneConfig(name: "synology", path: "network:"),
             probeRetryDelay: "2",
-            whileRunning: {
+            whileRunning: { rcloneConfPath in
                 DispatchQueue.global().async {
                     let deadline = Date().addingTimeInterval(30)
                     while Date() < deadline {
                         if let log = try? String(contentsOfFile: logPath, encoding: .utf8),
                            log.contains("retrying reachability probe") {
-                            try? FileManager.default.createDirectory(atPath: target, withIntermediateDirectories: true)
+                            let upstream = aliasRcloneConfig(name: "synology", path: "network:")
+                                + aliasRcloneConfig(name: "network", path: target)
+                            try? upstream.write(toFile: rcloneConfPath, atomically: true, encoding: .utf8)
                             return
                         }
                         Thread.sleep(forTimeInterval: 0.05)

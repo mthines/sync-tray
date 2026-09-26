@@ -247,6 +247,16 @@ status card shows and what auto-resume watches for:
 | `cache-only-pending` | AUTOMATIC — files are still queued in the overlay from a previous Cache Only session | Uploads are draining |
 | `cache-only-offline` | AUTOMATIC — the primary remote failed all 3 reachability probe attempts at mount time (a first `--contimeout 3s --timeout 8s` probe, then 2 retries ~5 s apart each capped at 5 s; the retries run only on the unreachable path, so a reachable primary adds no delay and an unreachable one at most ~20 s) | Primary is unreachable right now |
 
+**Every reachability probe is path-scoped** (`remote_path_reachable` in the script,
+`SyncManager.isRemoteReachable(_:path:)` in the app, AC-P1): `rclone lsjson --stat
+<remote>:<profile path>`, one round trip. It never lists the remote ROOT — `lsd remote:`
+enumerates every SMB share, which on a Synology hangs past every timeout and made a
+reachable NAS read as offline (a Stream profile came up `cache-only-offline`; a bisync
+profile skipped every run as "Remote unreachable"). rclone's not-found exits (3/4) count
+as reachable, since the remote answered — a not-yet-created bisync path still bootstraps.
+If the Cache-only partial-file list can't be generated, the mount starts with an empty
+list and logs a warning rather than letting rclone refuse `--exclude-from` a missing file.
+
 A derived config written by an older app build has no cache-only keys
 (`mountModePath` empty) and degrades to streaming-only rather than half-apply a
 mode that build doesn't know how to fully wire.
@@ -846,7 +856,7 @@ Sync script starts
         ↓
 Check if FALLBACK_REMOTE is configured (from profile JSON)
         ↓
-If set: rclone lsd primary remote (3s connect timeout)
+If set: rclone lsjson --stat primary remote:path (3s connect timeout)
         ↓
 Unreachable? → Log "using fallback: X"
     ├─ Same wire type + no path change (fallbackRequiresCacheRebuild=false):

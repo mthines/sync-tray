@@ -3217,11 +3217,12 @@ final class SyncManager: ObservableObject {
 
         for profile in candidates {
             let primaryRemote = profile.rcloneRemote
+            let primaryPath = profile.remotePath
             let profileId = profile.id
             recoveringToPrimary.insert(profileId)
             DispatchQueue.global(qos: .utility).async { [weak self] in
                 guard let self else { return }
-                let reachable = self.isRemoteReachable(primaryRemote)
+                let reachable = self.isRemoteReachable(primaryRemote, path: primaryPath)
                 DispatchQueue.main.async {
                     defer { self.recoveringToPrimary.remove(profileId) }
 
@@ -3254,17 +3255,19 @@ final class SyncManager: ObservableObject {
         }
     }
 
-    /// Quick reachability probe for a remote, with a hard timeout — some backends (SMB)
-    /// hang well past their own `--contimeout`/`--timeout`, so we also cap wall-clock.
-    private func isRemoteReachable(_ remoteName: String) -> Bool {
-        let bare = remoteName.hasSuffix(":") ? String(remoteName.dropLast()) : remoteName
-        guard !bare.isEmpty else { return false }
+    /// Quick reachability probe for a remote PATH, with a hard timeout — some backends
+    /// (SMB) hang well past their own `--contimeout`/`--timeout`, so we also cap wall-clock.
+    /// Probes the profile's own path, never the remote root: `lsd remote:` enumerates every
+    /// SMB share, which on a Synology hangs past the cap and made a reachable NAS read as
+    /// offline — so fallback recovery and Cache Only auto-resume never fired.
+    private func isRemoteReachable(_ remoteName: String, path: String) -> Bool {
+        guard let arguments = Self.reachabilityProbeArguments(remote: remoteName, path: path) else { return false }
         guard let rclone = RcloneLocator.resolve() else { return false }
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: rclone)
-        proc.arguments = ["lsd", "\(bare):", "--contimeout", "3s", "--timeout", "8s", "--max-depth", "0"]
-        proc.standardOutput = Pipe()
-        proc.standardError = Pipe()
+        proc.arguments = arguments
+        proc.standardOutput = FileHandle.nullDevice
+        proc.standardError = FileHandle.nullDevice
         do { try proc.run() } catch { return false }
         let deadline = Date().addingTimeInterval(12)
         while proc.isRunning && Date() < deadline {
@@ -3274,7 +3277,20 @@ final class SyncManager: ObservableObject {
             proc.terminate()
             return false
         }
-        return proc.terminationStatus == 0
+        return Self.reachabilityProbeSucceeded(exitCode: proc.terminationStatus)
+    }
+
+    /// `rclone lsjson --stat remote:path` — one round trip on the path itself. `nil` for an
+    /// empty remote name.
+    nonisolated static func reachabilityProbeArguments(remote: String, path: String) -> [String]? {
+        let bare = remote.hasSuffix(":") ? String(remote.dropLast()) : remote
+        guard !bare.isEmpty else { return nil }
+        return ["lsjson", "--stat", "\(bare):\(path)", "--contimeout", "3s", "--timeout", "8s"]
+    }
+
+    /// rclone's directory/file-not-found exits (3/4) still mean the remote answered.
+    nonisolated static func reachabilityProbeSucceeded(exitCode: Int32) -> Bool {
+        exitCode == 0 || exitCode == 3 || exitCode == 4
     }
 
     /// Remount a profile so the sync script re-evaluates the remote and picks the primary
@@ -3411,10 +3427,10 @@ final class SyncManager: ObservableObject {
     /// `Task` can `await` without holding up the main actor for the probe's up-to-12s
     /// wall-clock cap — the same off-actor hop `checkPrimaryRecovery` uses, just wrapped as
     /// a continuation instead of a bare `DispatchQueue.global` + `DispatchQueue.main` pair.
-    private func isRemoteReachableAsync(_ remoteName: String) async -> Bool {
+    private func isRemoteReachableAsync(_ remoteName: String, path: String) async -> Bool {
         await withCheckedContinuation { continuation in
             DispatchQueue.global(qos: .utility).async { [weak self] in
-                let reachable = self?.isRemoteReachable(remoteName) ?? false
+                let reachable = self?.isRemoteReachable(remoteName, path: path) ?? false
                 continuation.resume(returning: reachable)
             }
         }
@@ -3423,10 +3439,12 @@ final class SyncManager: ObservableObject {
     /// Resolve the first reachable remote for an overlay upload — primary, else fallback if
     /// configured. `nil` if neither answers within the probe's hard timeout.
     private func resolveUploadTransport(for profile: SyncProfile) async -> (remote: String, transport: String)? {
-        if await isRemoteReachableAsync(profile.rcloneRemote) {
+        if await isRemoteReachableAsync(profile.rcloneRemote, path: profile.remotePath) {
             return (profile.rcloneRemote, "primary")
         }
-        if profile.hasFallback, await isRemoteReachableAsync(profile.fallbackRemote) {
+        if profile.hasFallback,
+           await isRemoteReachableAsync(profile.fallbackRemote,
+                                        path: profile.fallbackRemotePath.isEmpty ? profile.remotePath : profile.fallbackRemotePath) {
             return (profile.fallbackRemote, "fallback")
         }
         return nil
@@ -3467,7 +3485,7 @@ final class SyncManager: ObservableObject {
         Task {
             defer { Task { @MainActor in self.resumingFromCacheOnly.remove(profileId) } }
 
-            let reachable = await self.isRemoteReachableAsync(profile.rcloneRemote)
+            let reachable = await self.isRemoteReachableAsync(profile.rcloneRemote, path: profile.remotePath)
             guard reachable else {
                 var updated = profile
                 updated.streamCacheOnly = false
@@ -3666,7 +3684,7 @@ final class SyncManager: ObservableObject {
             recoveringToPrimary.insert(profileId)
             DispatchQueue.global(qos: .utility).async { [weak self] in
                 guard let self else { return }
-                let reachable = self.isRemoteReachable(profile.rcloneRemote)
+                let reachable = self.isRemoteReachable(profile.rcloneRemote, path: profile.remotePath)
                 DispatchQueue.main.async {
                     defer { self.recoveringToPrimary.remove(profileId) }
                     guard reachable else {

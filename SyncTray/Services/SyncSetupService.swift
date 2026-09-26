@@ -750,6 +750,20 @@ final class SyncSetupService {
                 return $status
             }
 
+            # Reachability = "the remote answered for THIS path". Probing the remote
+            # ROOT (`lsd remote:`) enumerates every SMB share, which on a Synology
+            # hangs past any timeout and made a reachable NAS look offline (a Stream
+            # profile then came up Cache Only; bisync skipped every run). `lsjson
+            # --stat` on the profile's own path is one round trip. rclone's
+            # directory/file-not-found exits (3/4) still mean the remote answered, so
+            # a not-yet-created path counts as reachable — the bisync bootstrap needs that.
+            remote_path_reachable() {
+                local secs="$1" target="$2"; shift 2
+                run_with_timeout "$secs" $RCLONE_BIN lsjson --stat "$target" "$@" $NO_CHECK_CERT &>/dev/null
+                local rc=$?
+                [[ $rc -eq 0 || $rc -eq 3 || $rc -eq 4 ]]
+            }
+
             # Check if drive is mounted (if configured)
             if [[ -n "$DRIVE_PATH" && ! -d "$DRIVE_PATH" ]]; then
                 echo "$(date '+%Y-%m-%d %H:%M:%S') - Drive not mounted, skipping sync" >> "$LOG_FILE"
@@ -795,7 +809,7 @@ final class SyncSetupService {
             if [[ "$SYNC_MODE" != "mount" && -n "$FALLBACK_REMOTE" ]]; then
                 REMOTE_NAME="${REMOTE%%:*}"
                 # Quick reachability check on primary remote (3s connect timeout)
-                if ! run_with_timeout 15 $RCLONE_BIN lsd "${REMOTE_NAME}:" --contimeout 3s --timeout 8s --max-depth 0 $NO_CHECK_CERT &>/dev/null; then
+                if ! remote_path_reachable 15 "$REMOTE" --contimeout 3s --timeout 8s; then
                     echo "$(date '+%Y-%m-%d %H:%M:%S') - Primary remote unreachable, using fallback: $FALLBACK_REMOTE" >> "$LOG_FILE"
                     # Re-check cert setting for the fallback remote
                     NO_CHECK_CERT=$(check_no_cert "$FALLBACK_REMOTE")
@@ -1082,14 +1096,14 @@ final class SyncSetupService {
                     mount_primary_reachable() {
                         local delay="${SYNCTRAY_PROBE_RETRY_DELAY:-5}"
                         [[ "$delay" =~ ^[0-9]+$ ]] || delay=5
-                        if run_with_timeout 15 $RCLONE_BIN lsd "${REMOTE_NAME}:" --contimeout 3s --timeout 8s --max-depth 0 $NO_CHECK_CERT &>/dev/null; then
+                        if remote_path_reachable 15 "$REMOTE" --contimeout 3s --timeout 8s; then
                             return 0
                         fi
                         local attempt
                         for attempt in 2 3; do
                             echo "$(date '+%Y-%m-%d %H:%M:%S') - Primary remote unreachable, retrying reachability probe in ${delay}s (attempt $attempt/3)" >> "$LOG_FILE"
                             sleep "$delay"
-                            if run_with_timeout 5 $RCLONE_BIN lsd "${REMOTE_NAME}:" --contimeout 3s --timeout 4s --max-depth 0 $NO_CHECK_CERT &>/dev/null; then
+                            if remote_path_reachable 5 "$REMOTE" --contimeout 3s --timeout 4s; then
                                 echo "$(date '+%Y-%m-%d %H:%M:%S') - Primary remote reachable on attempt $attempt/3" >> "$LOG_FILE"
                                 return 0
                             fi
@@ -1267,6 +1281,14 @@ final class SyncSetupService {
                 if lines:
                     fh.write(chr(10))
             " "$CACHE_DATA_PATH" "$CACHE_META_PATH" "$CACHE_ONLY_EXCLUDE_PATH"
+                    # rclone refuses to start at all when --exclude-from names a missing
+                    # file, so a failed generation (e.g. an unreadable cache tree) must not
+                    # take the whole mount down: fall back to an empty list and say so.
+                    if [[ ! -f "$CACHE_ONLY_EXCLUDE_PATH" ]]; then
+                        echo "$(date '+%Y-%m-%d %H:%M:%S') - Cache Only: partial-file list unavailable, partially downloaded files may be visible" >> "$LOG_FILE"
+                        mkdir -p "$(dirname "$CACHE_ONLY_EXCLUDE_PATH")"
+                        : > "$CACHE_ONLY_EXCLUDE_PATH"
+                    fi
 
                     RCLONE_CMD="$RCLONE_BIN $MOUNT_SUBCMD synctray_cacheonly: \\"$LOCAL_PATH\\" --config \\"$CACHE_ONLY_CONFIG_PATH\\" --exclude-from \\"$CACHE_ONLY_EXCLUDE_PATH\\" --vfs-cache-mode writes --cache-dir \\"$CACHE_ONLY_CACHE_PATH\\" --vfs-write-back 2s --dir-cache-time 1m --log-level INFO --use-json-log --volname \\"$MOUNT_VOLNAME\\""
 
@@ -1307,15 +1329,14 @@ final class SyncSetupService {
                 # writing anything: if it is offline we skip this run (exit 0) rather than
                 # risk bisync acting on a phantom-empty listing, and retry next interval.
                 #
-                # We probe the remote ROOT (not the sync subpath) so a not-yet-created
-                # path on a freshly configured profile does not cause a false skip — the
-                # first run still reaches bisync and self-bootstraps via --resync.
+                # We probe the sync path itself; a not-yet-created path on a freshly
+                # configured profile still counts as reachable (see remote_path_reachable),
+                # so the first run reaches bisync and self-bootstraps via --resync.
                 #
                 # Catastrophic mass-deletion (a reachable-but-wiped side) remains guarded
                 # by bisync's own --max-delete (default 50%), which aborts with a "too
                 # many deletes" error instead of propagating the deletion.
-                PREFLIGHT_REMOTE_NAME="${REMOTE%%:*}"
-                if ! run_with_timeout 45 $RCLONE_BIN lsd "${PREFLIGHT_REMOTE_NAME}:" --max-depth 0 --contimeout 10s --timeout 30s --retries 1 --low-level-retries 1 $NO_CHECK_CERT &>/dev/null; then
+                if ! remote_path_reachable 45 "$REMOTE" --contimeout 10s --timeout 30s --retries 1 --low-level-retries 1; then
                     echo "$(date '+%Y-%m-%d %H:%M:%S') - Remote unreachable, skipping sync (will retry next interval)" >> "$LOG_FILE"
                     exit 0
                 fi

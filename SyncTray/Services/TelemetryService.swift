@@ -209,7 +209,7 @@ final class TelemetryService {
 
         meterProvider = stableMeterProvider
         OpenTelemetry.registerStableMeterProvider(meterProvider: stableMeterProvider)
-        print("[SyncTray][Telemetry] metrics exporter configured → \(metricsEndpoint) (temporality: delta, interval: 30s)")
+        Self.diagnostic("metrics exporter configured → \(metricsEndpoint) (temporality: delta, interval: 30s)")
 
         // MARK: Traces
 
@@ -1915,7 +1915,7 @@ final class TelemetryService {
         // registered), so surface the flush result here — a non-success on a live
         // run points at the OTLP /v1/metrics exchange as the real culprit.
         let metricsFlush = meterProvider?.forceFlush()
-        print("[SyncTray][Telemetry] metrics forceFlush on shutdown: \(String(describing: metricsFlush)) → \(Self.endpoint)/v1/metrics")
+        Self.diagnostic("metrics forceFlush on shutdown: \(String(describing: metricsFlush)) → \(Self.endpoint)/v1/metrics")
         _ = meterProvider?.shutdown()
         tracerProvider?.shutdown()
     }
@@ -2477,6 +2477,13 @@ final class TelemetryService {
             return "network"
         }
         return "other"
+    }
+
+    /// Setup diagnostics go to stderr, never stdout: the headless CLI configures
+    /// telemetry in-process, and a stray stdout line breaks every agent that
+    /// parses `status --json` / `profile show`.
+    private static func diagnostic(_ message: String) {
+        FileHandle.standardError.write(Data("[SyncTray][Telemetry] \(message)\n".utf8))
     }
 
     /// Loads key=value pairs from ~/.config/synctray/.env (if it exists).
