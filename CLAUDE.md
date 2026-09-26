@@ -283,8 +283,8 @@ enumerates every SMB share, which on a Synology hangs past every timeout and mad
 reachable NAS read as offline (a Stream profile came up `cache-only-offline`; a bisync
 profile skipped every run as "Remote unreachable"). rclone's not-found exits (3/4) count
 as reachable, since the remote answered — a not-yet-created bisync path still bootstraps.
-If the Cache-only partial-file list can't be generated, the mount starts with an empty
-list and logs a warning rather than letting rclone refuse `--exclude-from` a missing file.
+If the Cache-only partial-file list can't be generated, the mount falls back to the
+app-written list, or to streaming — never an unfiltered union (see "Partial files stay hidden").
 
 A derived config written by an older app build has no cache-only keys
 (`mountModePath` empty) and degrades to streaming-only rather than half-apply a
