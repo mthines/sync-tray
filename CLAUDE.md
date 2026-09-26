@@ -95,26 +95,15 @@ returns. Two things make this reliable:
   raw cache tree has no `vfsMeta` sidecar, so rclone never uploads it (the recording is
   lost), and mounting NFS onto a symlink fails with `mount_nfs` exit 66.
 
-**Offline access browse point (`offlineAccessEnabled`, Advanced Options, default true).**
-The live mount is the intended offline path, but in practice `rclone nfsmount` over SMB
-does **not** always ride out a network drop — the backend connection can die, the NFS
-server stall, and macOS drop the volume ("Server connections interrupted"), so the live
-mount is not a dependable offline-read surface on its own. When this per-profile toggle
-is on (the default), SyncTray maintains a **read-only** `"<mount-name> (Offline)"`
-directory *next to* the mount point — a plain symlink to the VFS cache **data** tree
-(`{vfsCachePath}/vfs/{key}`) — so everything already cached stays browsable in Finder
-with no internet and no rclone process involved. It is a **sibling**, never the mount
-point itself (symlink-swapping the mount point is the exit-66 crash above), and it only
-ever *reads*: writing into it edits the raw cache with no `vfsMeta`, so those bytes never
-sync — the caption and docs say read-only for that reason. The whole mechanism is pure +
-a thin filesystem apply in `OfflineAccessLink.swift` (`linkPath`/`target`/`action` are
-I/O-free and shared with `VFSCacheService.cacheRelativePath`, so the link can never point
-at the wrong subtree); `SyncManager.maintainOfflineAccessLink(for:)` /
-`maintainAllOfflineAccessLinks()` apply it at launch, on a successful mount, and after
-every profile save / external-file edit / CLI write, and remove it on disable or delete.
-App-side only — like `mountAtStartup`/`pinnedDirectories` it is **not** emitted into the
-script's `{shortId}.json`. Covered by `ConfigSelfTest` AC-OA1 (pure decision matrix) and
-AC-OA2 (real filesystem apply).
+**In practice `rclone nfsmount` over SMB does not always ride out a network drop** —
+the backend connection can die, the NFS server stall, and macOS drop the volume
+("Server connections interrupted"), so the always-up live mount is not a fully
+dependable offline surface on its own. A prior release addressed this with a
+read-only `"<mount-name> (Offline)"` symlink sitting beside the mount point; that
+sibling browse point is retired (`LegacyOfflineLink` only removes what it left
+behind on an upgrading install — see "Cache-Only overlay mode" below, which
+replaced it with a mount that keeps the SAME mount point usable, read-write, with
+no network at all).
 
 **Download connections (`downloadConnections`, default 2, range 1–16):** a per-profile
 "Download Connections" control (Advanced Options, mount mode only) that sets how many
@@ -133,6 +122,19 @@ is in `reconcileAction`'s reinstall set, so it remounts the stream to apply the 
 `full`, so this is satisfied). The NFS client couples access/modification times,
 which can occasionally cause an extra re-upload after a file is merely viewed in
 Finder. `--allow-non-empty` is a FUSE-only option and is ignored for the NFS backend.
+
+**NFS read path is sensitive to the cache disk.** NFSv3 is stateless, so rclone
+serves every 32 KB READ as a full vfs open→read→close, and each open rewrites the
+file's `vfsMeta` sidecar (`vfscache.Item._save`, found by sampling
+`localhost:<rc-port>/debug/pprof/goroutine?debug=2`). On APFS that's free (A/B:
+~108 MB/s cached reads); on an exFAT/FSKit USB drive the sidecar close dominates
+(~6.6 MB/s), and a large live handle cache (~30k entries — go-nfs
+`CachingHandler.FromHandle` scans `LRU.Keys()` per READ) pushed one real mount to
+~0.2 MB/s. A "cached files are slow" report is therefore usually the cache disk, not a
+cache miss — confirm with `core/stats` bytes (0 = served from cache), or in Dash0 via
+`synctray.mount.cached_read.throughput` grouped by `cache.fs_type` (the heartbeat's
+read-health probe, `SyncManager.probeMountReadHealth`, AC-RH1). User-facing
+guidance lives in README → Troubleshooting → "Mount mode: Slow file access".
 
 The **macFUSE** backend additionally requires the official rclone binary
 (Homebrew's rclone can't mount):
@@ -159,11 +161,230 @@ sudo chmod +x /usr/local/bin/rclone
 sidecars — under `--vfs-cache-mode full` (SyncTray's default) this includes
 the **downloaded byte-range list**, so `vfsMeta` is load-bearing, not
 incidental: relocating `vfs` without it makes rclone treat the cache as
-unpopulated and re-download everything. `{key}` is the remote name (colon
-stripped) joined with the remote path, e.g. `synology/Kaiju/KAIJU`; the
-single home for deriving it is `VFSCacheService.cacheRelativePath(for:)`,
-called by both `cacheDirectory(for:)` and `CacheMigrationPlanner` so they
-cannot disagree about which subtree a profile owns.
+unpopulated and re-download everything. `{key}` is the mounted Fs's **name**
+joined with its **root**, e.g. `synology/Kaiju/KAIJU`; the single home for
+deriving it is `VFSCacheService.cacheRelativePath(for:)`, called by
+`cacheDirectory(for:)`/`cacheSubtreeRoots(for:)`, `CacheMigrationPlanner`, and
+`ProfileDetailView`'s Cache Directory move UI, so they cannot disagree about
+which subtree a profile owns. Which *name* that first component is, is the
+subject of the next section.
+
+#### Cache key — pinned to the primary remote name, no pinning machinery needed
+
+rclone derives the cache location from the Fs it is handed, and an Fs's name is
+the **remote name**. `SyncProfile.primaryRemoteName` (the profile's
+`rcloneRemote`, colon stripped) is that name, and it is what the mount is
+ALWAYS keyed by: `{vfsCachePath}/vfs/{primaryRemoteName}/{remotePath}/…` plus the
+`vfsMeta` sidecar tree. There is no per-profile "pinned identity" field, no
+migration, and nothing to configure — the mount's Fs is always defined directly
+from the primary remote reference (`rcloneRemote:remotePath`), so the cache key
+is invariant by construction. This is also why mount mode never streams via a
+fallback remote (see "Fallback Remote Pipeline" below) — swapping the Fs is
+exactly what would make the key move.
+
+**Known failure mode this guards against.** Defining a remote through
+`RCLONE_CONFIG_<NAME>_*` environment variable overrides — the mechanism a PRIOR
+release used to keep the cache under the primary's name while actually
+connecting through a fallback's transport — makes rclone log "detected
+overridden config - adding {hash} suffix to name" and land the cache at
+`vfs/synology{jzZaN}/…` instead of `vfs/synology/…` (the retired
+`stableCacheIdentity`/`cacheIdentity` fields and `CacheIdentityMigration` type
+existed to reconcile this; both are gone). Because mount mode no longer defines
+its remote through env-var overrides at all, this can't recur for a mount
+going forward — but a tree a PAST run left behind under a suffixed name is
+still on disk for upgrading installs.
+
+**Cache key consolidation (`SyncSetupService`'s generated script, "CACHE KEY
+CONSOLIDATION").** On every mount start — install, app launch, login, or the
+Mount button, so a login mount that runs standalone under launchd (no app in
+the loop) is covered too — the script scans `{cache}/vfs/` for a directory
+matching `{primary}{suffix}` (`suffix` alphanumeric/`_`/`-`, from the
+`{hash}`-suffix pattern above), picks the most-recently-modified candidate if
+more than one exists, and renames both its `vfs` and `vfsMeta` subtree into the
+unsuffixed `{primary}` location — an atomic same-directory rename, instant even
+for a multi-GB cache. It never merges: if the unsuffixed destination is already
+populated the stray suffixed tree is left in place untouched (reconciling two
+partial `vfsMeta` byte-range sets is how you'd end up serving corrupt bytes).
+`vfsMeta` is adopted before `vfs`, so an interrupted run can only ever lose
+metadata — the direction rclone recovers from by re-fetching — never leave data
+without the byte-ranges that prove it complete. Deferred entirely (not run) while
+another rclone mount process already has the same `--cache-dir` open, since
+racing a live mount's cache with a rename mid-flight is not safe; it retries on
+the next mount start.
+
+#### Cache-Only overlay mode — a union mount that stays usable with no network
+
+**`streamCacheOnly` ("Cache Only" / "Resume Syncing" button next to Unmount in
+the Stream status card, default false)** is for the case where the cache is
+warm and the remote is slow, far away, or gone. Unlike a read-only mode, this
+mount stays fully usable: files can be created and edited while offline, and
+the SAME mount point stays valid (a project referencing absolute paths under
+the mount point never needs relinking to a sibling folder).
+
+**The mechanism is an rclone `union` remote**, `synctray_cacheonly`, generated
+per-profile into a chmod-0600 config at `cacheOnlyConfigPath`
+(`{shortId}.cacheonly.rclone.conf`, beside the other per-profile config files —
+never inside the overlay tree). Its `upstreams` list has exactly two entries,
+order load-bearing (the overlay MUST be listed first — base-first was tried and
+returned stale reads from the base):
+
+1. **`overlayPath`** (`{vfsCachePath}/synctray-overlay/{shortId}`, writable) — every
+   new file and every edit lands here. Never touches the read-only streaming
+   cache.
+2. **`{dataPath}:ro`** (the streaming cache's `vfs` data tree, read-only) —
+   already-downloaded bytes, served straight from disk.
+
+`action_policy` / `create_policy` / `search_policy` are all `ff` ("first
+found") so a listing merges both trees with no duplicates: editing a base file
+writes the edit into the overlay and reads it back from there; deleting or
+renaming a base-only file fails with a clean "permission denied" (the base is
+read-only, by design — there are no whiteout markers, so a deleted overlay
+file that shadowed a base file "undeletes" back to the base version); an
+atomic save (temp file + rename over the target, Reaper's own pattern) works
+because both halves land in the overlay.
+
+**Partial files stay hidden.** `cacheOnlyExcludePath` (`{shortId}.exclude.txt`)
+lists one `--exclude-from` line per cached data file whose `vfsMeta` byte ranges
+don't cover it (no sidecar, size mismatch, or a gap; `Dirty` is ignored so an
+unsaved local edit stays visible), so a truncated read never surfaces through
+the union mount. It has two writers producing the same lines:
+
+- **The script**, at every Cache-only mount start. Its walk is fail-loud — an
+  unreadable directory aborts it rather than yield a list missing that
+  directory's partial files.
+- **The app** (`VFSCacheService.writeCacheOnlyExcludeList`), because under
+  launchd the script's `/usr/bin/python3` is denied read access to a cache on an
+  external drive (macOS privacy controls grant the app, not the interpreter).
+  `SyncManager.refreshCacheOnlyExcludeLists` writes it at launch, on the
+  heartbeat every 15 min while the profile is mounted **streaming** (the only
+  time the cache changes), and right before a manual switch to Cache Only. A
+  failed app walk deletes the list rather than leave one it can't vouch for.
+
+When the script can't build the list it uses the app's copy; with no copy at
+all it mounts **streaming** instead (logging "Cache Only unavailable") — never a
+union mount without the filter. Covered by `ConfigSelfTest` AC-CO3.
+
+**Four mount-mode tokens** (`MountMode` in `SyncState.swift`), written to
+`mountModePath` (`/tmp/synctray-mount-{shortId}.mode`) right before rclone
+starts, all mounting the SAME union remote — the token only changes what the
+status card shows and what auto-resume watches for:
+
+| Token | Entered by | Meaning |
+|-------|-----------|---------|
+| `streaming` | default | Talking to the remote directly through the VFS cache |
+| `cache-only-manual` | the user's own "Cache Only" toggle | Never auto-exited |
+| `cache-only-pending` | AUTOMATIC — files are still queued in the overlay from a previous Cache Only session | Uploads are draining |
+| `cache-only-offline` | AUTOMATIC — the primary remote failed all 3 reachability probe attempts at mount time (a first `--contimeout 3s --timeout 8s` probe, then 2 retries ~5 s apart each capped at 5 s; the retries run only on the unreachable path, so a reachable primary adds no delay and an unreachable one at most ~20 s) | Primary is unreachable right now |
+
+**Every reachability probe is path-scoped** (`remote_path_reachable` in the script,
+`SyncManager.isRemoteReachable(_:path:)` in the app, AC-P1): `rclone lsjson --stat
+<remote>:<profile path>`, one round trip. It never lists the remote ROOT — `lsd remote:`
+enumerates every SMB share, which on a Synology hangs past every timeout and made a
+reachable NAS read as offline (a Stream profile came up `cache-only-offline`; a bisync
+profile skipped every run as "Remote unreachable"). rclone's not-found exits (3/4) count
+as reachable, since the remote answered — a not-yet-created bisync path still bootstraps.
+If the Cache-only partial-file list can't be generated, the mount falls back to the
+app-written list, or to streaming — never an unfiltered union (see "Partial files stay hidden").
+
+A derived config written by an older app build has no cache-only keys
+(`mountModePath` empty) and degrades to streaming-only rather than half-apply a
+mode that build doesn't know how to fully wire.
+
+**Sync-back (`OverlaySyncService`).** Switching Cache Only → Streaming (the
+"Resume Syncing" button, or automatically — see below) detaches the union
+mount and uploads the overlay with a Swift engine before remounting Streaming:
+verify-then-delete per file (an overlay file is deleted only after its upload
+is confirmed, so a failed or partial upload just leaves it queued — visible as
+a pending-upload count in the status card and menu bar), and a conflict check
+against the remote's current fingerprint. If the remote's version differs from
+the version recorded at cache time (or at the last upload), the local copy
+uploads as a **conflict copy** named
+`dir/stem.sync-conflict-YYYYMMDD-HHMMSS.ext` (local time, last extension only,
+`-2`/`-3`… appended on a name collision) and the remote's version is left
+alone — never silently overwritten. **Upload Now** pushes the overlay to the
+remote WITHOUT leaving Cache Only — it resolves whichever of primary/fallback
+is reachable (`resolveUploadTransport`), so a fallback remote can serve as an
+Upload Now target even though mount mode never streams through it (see
+"Fallback Remote Pipeline" below) — tracked in `overlayManifestPath`
+(`{shortId}.manifest.json`, path + size + mtime at upload time) so a later
+drain can tell an already-uploaded, unchanged file from one needing re-upload.
+
+**Automatic offline entry and exit.** The mount enters Cache Only on its own
+(`cache-only-offline`) when the primary is still unreachable after the
+mount-time probe and its 2 retries (see the table above; the retries ride out
+the login race where launchd starts the agent before Wi-Fi/DNS is up) — no user
+action needed to keep working. On the way back, `SyncManager`'s auto-resume
+monitor (`Self.autoResumeDecision`, pure and unit-tested) only ever acts on an
+AUTOMATIC mode (never `.cacheOnlyManual` — that changes only via the user's own
+toggle): it reuses the same primary-reachability probe as fallback recovery,
+running every **2 minutes**, and requires 3 consecutive stable probes (~6
+minutes total) before treating the primary as back. Once stable, it checks
+`lsof` on the mount point for anything with a file open (macOS's own
+Finder/Spotlight indexing daemons are ignored, since they are always touching
+a mounted volume); nothing open resumes immediately, something open instead
+posts a one-time "Back on your network" notification and waits. The busy check
+**fails closed**: if `lsof` cannot confirm the mount is idle — it failed to
+launch, timed out, exited with an unexpected status, or exited 1 with anything
+on stderr (e.g. `status error` on an unreadable/stale mount, as opposed to the
+silent exit 1 that means "nothing open") — the decision is `.notify`, never an
+automatic resume, so a mount is never force-unmounted under an app that might
+be mid-write (`SyncManager.lsofBusyCheckResult`, covered by AC-AO2).
+
+**Known limits** (also documented in the Advanced Options caption in the UI):
+
+- The app-written partial-file list can lag the cache by up to one 15-min refresh:
+  a file first partly downloaded after the last refresh, followed by a launchd
+  offline mount start where the script can't read the cache, isn't on the list.
+- Overlay-pending detection (`cache-only-pending`) is still script-side only, so
+  under the same launchd read denial it can miss files queued in the overlay and
+  mount streaming, which hides them from the mount (they stay queued on disk,
+  not lost) until the next Cache Only session. Known follow-up.
+
+- Deleting or renaming an already-cached (base) file is unsupported while in
+  Cache Only — the base upstream is read-only by rclone's own `union`
+  semantics, so this always fails with "permission denied", not a SyncTray bug.
+- Switching modes remounts the union/streaming rclone process, which is a
+  brief hiccup — not seamless.
+- A file uploaded via Upload Now or on resume is **not** carried forward into
+  the streaming VFS cache — after remounting Streaming, opening that same file
+  re-downloads it once, since the bytes only ever lived in the overlay, not in
+  `vfs/`.
+- Reaper's `.rpp-bak` backup-file behaviour while saving inside Cache Only has
+  not been independently verified — treat it as unconfirmed until checked
+  against a real project.
+- The pre-existing bisync/sync fallback's cache-suffix issue (documented in
+  "Fallback Remote Pipeline" below) is unrelated to and unaffected by any of
+  the above — it only affects bisync/sync profiles, never mount mode.
+
+It is an operating mode, not a staged setting: the button applies immediately
+(`ProfileDetailView.setCacheOnly`) by persisting **only** `streamCacheOnly` onto
+the saved profile and reinstalling with exactly that profile, so unsaved edits
+elsewhere in the form are neither applied nor discarded. A **cache-directory
+move is refused** while the overlay has pending (undrained) files — both the
+CLI (`cache move`) and the save-time prompt check `OverlaySyncService.pendingCount`
+and error out rather than relocating an overlay that still owes an upload.
+
+#### Mount preflight — never mount with the cache silently disabled
+
+When `--cache-dir` is not writable, rclone logs `Failed to create vfs cache -
+disabling` and **mounts anyway, with no cache at all**. Every read becomes a
+remote round trip, which presents as "streaming got mysteriously slow" rather
+than as a failure. The usual trigger is a cache directory on an external drive
+that is not attached: `/Volumes/<Drive>` is then a root-owned placeholder and
+the `mkdir` fails with EPERM. The script's mount branch now preflights the
+cache directory and refuses the mount with a logged error instead; launchd's
+`KeepAlive` brings the profile up by itself once the drive is back, cache
+intact. It releases the lock file *before* its back-off sleep, so a manual
+Mount during that window isn't silently swallowed.
+
+The script also expands a leading `~` in `vfsCachePath` **once**, up front, and
+uses the result for both the preflight and `--cache-dir`. The field is stored
+raw (the CLI and file-backed config keep a user-written `~`, and Swift read
+sites expand on read), but the shell passes it through quoted — so an
+unexpanded value made rclone create a directory literally named `~` in its
+working directory, putting the cache somewhere neither the app nor the
+preflight looks. Checking one path while rclone uses another would have made
+the preflight worse than useless.
 
 Changing a Stream profile's Cache Directory only re-points rclone by
 default — the already-downloaded bytes at the old location are abandoned.
@@ -385,7 +606,7 @@ the warmer reads as before — safe degradation.
 | File | Purpose |
 |------|---------|
 | `SyncProfile.swift` | Profile model with sync paths, remote config, fallback remote config, computed file paths |
-| `SyncState.swift` | Sync state enum, progress struct, file change model, `ActiveTransport`, `SyncLogPatterns` for log parsing |
+| `SyncState.swift` | Sync state enum, progress struct, file change model, `ActiveTransport`, `MountMode` (the four Cache-only-aware mount states), `SyncLogPatterns` for log parsing |
 | `RcloneLogEntry.swift` | JSON models for parsing rclone `--use-json-log` output |
 | `Settings.swift` | Global app settings (debug logging toggle, auto-fix sync issues toggle) |
 | `CacheMigrationProgress.swift` | Published per-profile progress for a cache-directory move (`CacheMigrationProgress`, shared `TransferFormat` byte/rate/elapsed helpers) |
@@ -407,8 +628,10 @@ the warmer reads as before — safe degradation.
 | `ConfigSelfTest.swift` | `#if DEBUG` host self-test suite (`SyncTray --self-test`) — round-trip (incl. `warmExcludePatterns`), migration + migration-integrity, reconcile-delta, warm-reconcile-trigger, warm-skips-cached, self-write, isolated-login, external-create, and CLI assertions |
 | `NotificationService.swift` | Batched macOS notifications with action support |
 | `TelemetryService.swift` | Opt-in OTel telemetry (traces, metrics, logs) via OTLP/HTTP |
-| `CacheMigrationPlanner.swift` | Pure cache-directory-move planning — `CacheTreeKind` (`vfs`/`vfsMeta`), subtree/overlap/exclusion resolution, no I/O |
+| `CacheMigrationPlanner.swift` | Pure cache-directory-move planning — `CacheTreeKind` (`vfs`/`vfsMeta`), subtree/overlap/exclusion resolution, no I/O; refuses a move while the profile's Cache-only overlay has pending files |
 | `CacheMigrationService.swift` | The cache-move engine — injected `CacheMigrationFileSystem`, free-space preflight, copy → verify → delete per file with a same-volume rename fast path, cancellation, resume, rollback |
+| `OverlaySyncService.swift` | Cache-only overlay sync-back engine — scans the overlay, plans per-file upload/conflict decisions (`plan`), uploads with verify-then-delete (`run`, `.drain`/`.keep` modes), conflict-copy naming, and the manifest read/write "Upload Now" relies on |
+| `LegacyOfflineLink.swift` | Cleans up the retired "(Offline)" sibling browse point left behind by an upgrading install; never creates anything |
 
 ### CLI/
 
@@ -484,6 +707,12 @@ read-write via `SMAppService.register`/`unregister`, applied through
 profile state — a thrown `SMAppService` error can never corrupt profile
 reconcile or another setting.
 
+**Migration v4 — retired.** `MigrationV4Retired` (`MigrationRunner.swift`) is a
+kept-but-no-op placeholder for the removed cache-pinning migration (see "Cache
+key" above) — kept, not deleted, so the schema-version numbering stays
+monotonic for a machine that already ran v4; deleting the slot would make its
+`schemaVersion == 4` skip whatever migration claims v4 next.
+
 **Migration.** `MigrationV3BlobToPerProfileFiles` (`MigrationRunner.swift`)
 moves the legacy `syncProfiles` UserDefaults blob to per-profile files on
 first launch. The blob is retained as a write-only mirror for one release
@@ -555,7 +784,7 @@ isn't SyncTray's own.
 | Command | Purpose |
 |---------|---------|
 | `synctray doctor` | Health report: rclone found + version, config schemas installed, per-profile derived-config presence, launchd agent loaded (enabled profiles), stale lock files, remote reachability. Exits non-zero iff any check is `[fail]`; `[warn]` never fails the run. |
-| `synctray status [name\|shortId]` | One tab-separated line per profile (or a single one): `enabled=`, `agent=loaded\|unloaded\|n/a`, `running=` (lock present), `last=started\|completed\|failed\|none` (from the log tail via the shared `SyncLogPatterns`). |
+| `synctray status [name\|shortId] [--json]` | One tab-separated line per profile (or a single one): `enabled=`, `agent=loaded\|unloaded\|n/a`, `running=` (lock present), `last=started\|completed\|failed\|none` (from the log tail via the shared `SyncLogPatterns`), and `state=` — the field an agent should branch on. Stream profiles: `mounting` (rclone running, volume not attached yet — the startup cache scan takes minutes on a large cache), `mounted`, `stale` (volume in the mount table but no rclone serving it), `unmounted`, `disabled`; they also carry `mode=` (the `MountMode` token, `none` when rclone isn't running, `unknown` when the derived config predates Cache Only) and `pending_uploads=`. Sync profiles: `syncing` (lock held), `idle`, `disabled`. `--json` prints the same facts as a sorted-key array (`state`, `mountMode`, `pendingUploads`, `syncMode`, …). `status <name|shortId> --wait <state>[,<state>] [--timeout s]` (default 600s) blocks until the profile reaches one of those states — exit 0 when reached, 1 on timeout, printing the last observed state either way. State derivation is the pure `SyncTrayCLI.runtimeState` (AC-CLI10); the mount table and the rclone process are sampled together because a `KeepAlive` agent stays loaded through every mount state. |
 | `synctray profiles` | List every profile: name, shortId, mode, `enabled=`, `remote=` — no secrets. (`profile list` is an alias.) |
 | `synctray profile show <name\|shortId>` | Print one profile's FULL config as pretty, sorted-key JSON — the same shape as its `.profile.json`, so an agent can `show` → edit → `profile create`/`profile set` round-trip. No secrets (credentials live in `rclone.conf`). |
 | `synctray logs <name\|shortId> [--follow]` | Print (or `tail -f`) that profile's sync log. |
@@ -579,7 +808,7 @@ isn't SyncTray's own.
 | Command | Purpose |
 |---------|---------|
 | `synctray sync <name\|shortId>` | Run one sync now and BLOCK until it finishes, returning the script's exit code — exactly what the app's `triggerManualSync` runs (`bash <sharedScript> <configPath>`), lock-file-guarded against a concurrent scheduled run. Refuses a Stream (mount) profile (use `mount`). |
-| `synctray mount <name\|shortId>` | Mount a Stream (mount-mode) profile now — `loadAgent` + `startAgent` (`launchctl kickstart -k`, the same pair the app's `mountProfile` uses) — then BLOCK polling `isMounted` up to ~60s. Returns `nil`/exit 0 on a confirmed mount (or if already mounted), else exits non-zero with the tail of the sync log so the real reason (auth, unreachable remote) is visible. Refuses a non-mount profile. |
+| `synctray mount <name\|shortId> [--timeout s]` | Mount a Stream (mount-mode) profile now — `loadAgent` + `startAgent` (`launchctl kickstart -k`, the same pair the app's `mountProfile` uses) — then BLOCK until it attaches, up to `--timeout` (default 600s: the startup VFS cache scan alone takes minutes on a ~100 GB cache, so the old fixed 60s reported failure on a mount that was merely still scanning). Exit 0 on a confirmed mount (or if already mounted). On timeout it distinguishes *still mounting* (rclone running — resume with `status --wait mounted`) from a mount that never came up; if rclone isn't running for 60 consecutive seconds it fails early with the tail of the sync log so the real reason (auth, unreachable remote, unwritable cache dir) is visible. The wait loop lives in the pure core over `probeMount`, covered by AC-CLI10. Refuses a non-mount profile. |
 | `synctray unmount <name\|shortId>` | Unmount a mounted Stream profile — graceful+forced `diskutil unmount` then unload the agent so `rclone nfsmount` actually exits (`SyncSetupService.unmount`). Refuses a non-mount profile. |
 | `synctray cache move <name\|shortId> --to <path> [--include-overlapping]` | Relocate a Stream profile's rclone VFS cache (both the `vfs` content tree and the `vfsMeta` byte-range-list tree) to `<path>` and BLOCK until it finishes, returning non-zero on rejection or failure. Detaches/reinstalls around the move like the app does. Refuses a non-mount profile, and refuses an overlapping sibling profile (same on-disk bytes) unless `--include-overlapping` is passed — there's nobody to prompt non-interactively. See "Cache Directory Migration" above. |
 
@@ -664,7 +893,7 @@ Sync script starts
         ↓
 Check if FALLBACK_REMOTE is configured (from profile JSON)
         ↓
-If set: rclone lsd primary remote (3s connect timeout)
+If set: rclone lsjson --stat primary remote:path (3s connect timeout)
         ↓
 Unreachable? → Log "using fallback: X"
     ├─ Same wire type + no path change (fallbackRequiresCacheRebuild=false):
@@ -706,22 +935,23 @@ poisoning from byte-level filename encoding differences (macOS SMB normalises to
 NFD; SFTP passes NFC verbatim — same human-readable name, different byte
 sequence).
 
-**Mount mode is the exception: it ALWAYS keeps the primary remote name (env-var
-overrides), even across wire types.** The VFS cache is keyed by
-`{vfsCachePath}/vfs/{remote-name}/{remote-path}/…`, so a full remote swap would
-land the fallback's cache in a second `vfs/{fallback}/` tree and re-download every
-file (observed: `vfs/synology` 640K vs `vfs/synology-sftp` 6.7G for one profile).
-The full-swap branch exists only to protect bisync's *listing* cache from NFD/NFC
-divergence, which a live mount has no equivalent of. So the script and
-`SyncManager.resolveActiveRemote` both guard the full-swap branch with
-`syncMode != mount`; a mount failover overrides only the connection params and
-keeps the primary `remote:path` reference. Because the cache subtree also keys on
-the remote **path**, the fallback must resolve the *same* path as the primary — so
-the profile editor blocks saving a Stream profile whose `fallbackRemotePath`
-differs from `remotePath` (`mountFallbackCacheConflict` in `ProfileDetailView`),
-and a genuinely different path is a config error to fix on the fallback remote, not
-a supported layout. `fallbackRemotePath` therefore stays meaningful only for
-bisync/sync profiles.
+**Mount mode is excluded from this branch entirely — it never streams via a
+fallback remote, full stop.** The script guards the whole fallback block with
+`SYNC_MODE != "mount"`, so a mount's Fs is always defined directly from the
+primary `rcloneRemote:remotePath` reference; there is no env-var-override path
+and no full-remote-swap path for mount. This is deliberate: the VFS cache is
+keyed by `{vfsCachePath}/vfs/{primaryRemoteName}/{remotePath}/…` (see "Cache
+key" above), and EITHER kind of remote swap would risk moving that key —
+env-var overrides make rclone suffix the cache name (`vfs/synology{jzZaN}/…`,
+the failure mode "Cache key consolidation" cleans up), and a full swap would
+land the fallback's cache in a second `vfs/{fallback}/` tree and re-download
+every file (observed: `vfs/synology` 640K vs `vfs/synology-sftp` 6.7G for one
+profile). A mount with a fallback configured instead reacts to an unreachable
+primary by entering `cache-only-offline` (see "Cache-Only overlay mode" above)
+— it stays mounted on the primary's own Fs, never resolving the fallback into
+a connection at all. `fallbackRemotePath` therefore stays meaningful only for
+bisync/sync profiles, whose fallback branching is unchanged and still carries
+the NFD/NFC cache-suffix caveat documented below.
 
 The branching condition is determined at profile install/save time by comparing
 `provider.rcloneType` for the primary and fallback remotes (read via
@@ -973,5 +1203,11 @@ Priority: process env vars > `~/.config/synctray/.env` > Info.plist. Key vars: `
 | `~/Library/LaunchAgents/com.synctray.sync.{shortId}.plist` | launchd schedule |
 | `~/.local/log/synctray-sync-{shortId}.log` | Sync logs |
 | `/tmp/synctray-sync-{shortId}.lock` | Lock file (prevents concurrent syncs) |
-| `{vfsCachePath}/vfs/{remote}/{path}/…` | Mount mode only — VFS cached file **data** |
-| `{vfsCachePath}/vfsMeta/{remote}/{path}/…` | Mount mode only — VFS metadata sidecars, including the `--vfs-cache-mode full` downloaded byte-range list. Load-bearing for Cache Directory Migration: moving `vfs` without `vfsMeta` makes rclone re-download everything. |
+| `/tmp/synctray-mount-{shortId}.mode` | Mount mode only — the currently active `MountMode` token (`streaming`/`cache-only-manual`/`cache-only-pending`/`cache-only-offline`), rewritten on every mount start |
+| `~/.config/synctray/profiles/{shortId}.cacheonly.rclone.conf` | Mount mode only — chmod-0600 `union` remote config for the Cache-only overlay mount |
+| `{vfsCachePath}/vfs/{primaryRemoteName}/{path}/…` | Mount mode only — VFS cached file **data**, keyed by the profile's own primary remote name (see "Cache key" above) |
+| `{vfsCachePath}/vfsMeta/{primaryRemoteName}/{path}/…` | Mount mode only — VFS metadata sidecars, including the `--vfs-cache-mode full` downloaded byte-range list. Load-bearing for Cache Directory Migration: moving `vfs` without `vfsMeta` makes rclone re-download everything. |
+| `{vfsCachePath}/synctray-overlay/{shortId}/…` | Mount mode only — the Cache-only overlay: every file created or edited while in Cache Only, until uploaded |
+| `{vfsCachePath}/synctray-overlay/{shortId}.manifest.json` | Mount mode only — Upload Now's manifest (path + size + mtime at upload time) |
+| `{vfsCachePath}/synctray-overlay/{shortId}.exclude.txt` | Mount mode only — partial-file exclude list, regenerated on every Cache-only mount start |
+| `{vfsCachePath}/synctray-overlay/{shortId}.vfscache` | Mount mode only — the Cache-only union mount's own small `--vfs-cache-mode writes` bookkeeping directory (never the streaming cache) |

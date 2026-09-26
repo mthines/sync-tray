@@ -126,6 +126,9 @@ final class TelemetryService {
     private var rcloneDiscoveryCounter: LongCounterSdk?
     private var warmDurationHistogram: DoubleHistogramMeterSdk?
     private var warmThroughputHistogram: DoubleHistogramMeterSdk?
+    private var cachedReadThroughputHistogram: DoubleHistogramMeterSdk?
+    private var cachedReadFirstByteHistogram: DoubleHistogramMeterSdk?
+    private var cachedReadProbeCounter: LongCounterSdk?
     private var warmFilesCounter: LongCounterSdk?
     private var warmBytesCounter: LongCounterSdk?
     private var externalConfigEditCounter: LongCounterSdk?
@@ -135,6 +138,13 @@ final class TelemetryService {
     private var cacheMigrationThroughputHistogram: DoubleHistogramMeterSdk?
     private var cacheMigrationFilesCounter: LongCounterSdk?
     private var cacheMigrationBytesCounter: LongCounterSdk?
+    private var overlayUploadCountCounter: LongCounterSdk?
+    private var overlayUploadFilesCounter: LongCounterSdk?
+    private var overlayUploadBytesCounter: LongCounterSdk?
+    private var overlayUploadDurationHistogram: DoubleHistogramMeterSdk?
+    private var mountModeChangesCounter: LongCounterSdk?
+    private var mountAutoResumeCounter: LongCounterSdk?
+    private var activeOverlayUploadSpans: [UUID: any Span] = [:]
 
     // MARK: - Providers (kept alive for shutdown)
 
@@ -202,7 +212,7 @@ final class TelemetryService {
 
         meterProvider = stableMeterProvider
         OpenTelemetry.registerStableMeterProvider(meterProvider: stableMeterProvider)
-        print("[SyncTray][Telemetry] metrics exporter configured → \(metricsEndpoint) (temporality: delta, interval: 30s)")
+        Self.diagnostic("metrics exporter configured → \(metricsEndpoint) (temporality: delta, interval: 30s)")
 
         // MARK: Traces
 
@@ -439,6 +449,21 @@ final class TelemetryService {
             .setDescription("Average read throughput of an offline-file warming run (MB/s) — the signal for slow-fallback diagnosis")
             .setUnit("MBy/s")
             .build()
+        cachedReadThroughputHistogram = meter
+            .histogramBuilder(name: "synctray.mount.cached_read.throughput")
+            .setDescription("Throughput of a timed read of an already fully-cached file through a Stream mount (MB/s) — the signal for slow cache-served reads")
+            .setUnit("MBy/s")
+            .build()
+        cachedReadFirstByteHistogram = meter
+            .histogramBuilder(name: "synctray.mount.cached_read.first_byte")
+            .setDescription("Time from open to the first 64 KB of a fully-cached file through a Stream mount (seconds)")
+            .setUnit("s")
+            .build()
+        cachedReadProbeCounter = meter
+            .counterBuilder(name: "synctray.mount.cached_read.probes")
+            .setDescription("Mount read-health probes by result (healthy/slow/degraded/remote_fetch/no_candidate/failed)")
+            .setUnit("1")
+            .build()
         warmFilesCounter = meter
             .counterBuilder(name: "synctray.offline.warm.files")
             .setDescription("Files warmed into the VFS content cache")
@@ -486,6 +511,37 @@ final class TelemetryService {
             .counterBuilder(name: "synctray.cache.migration.bytes")
             .setDescription("Bytes relocated during a cache-directory migration")
             .setUnit("By")
+            .build()
+
+        overlayUploadCountCounter = meter
+            .counterBuilder(name: "synctray.overlay.upload.count")
+            .setDescription("Cache Only overlay upload runs by trigger (resume, auto_resume, upload_now), outcome and transport")
+            .setUnit("1")
+            .build()
+        overlayUploadFilesCounter = meter
+            .counterBuilder(name: "synctray.overlay.upload.files")
+            .setDescription("Overlay files processed by an upload run, by per-file result (uploaded, conflict, already_uploaded, failed)")
+            .setUnit("1")
+            .build()
+        overlayUploadBytesCounter = meter
+            .counterBuilder(name: "synctray.overlay.upload.bytes")
+            .setDescription("Bytes uploaded from the Cache Only overlay to the remote")
+            .setUnit("By")
+            .build()
+        overlayUploadDurationHistogram = meter
+            .histogramBuilder(name: "synctray.overlay.upload.duration")
+            .setDescription("Duration of a Cache Only overlay upload run (seconds)")
+            .setUnit("s")
+            .build()
+        mountModeChangesCounter = meter
+            .counterBuilder(name: "synctray.mount.mode_changes")
+            .setDescription("Mount mode transitions observed for a Stream profile (streaming, cache_only_manual, cache_only_offline, cache_only_pending)")
+            .setUnit("1")
+            .build()
+        mountAutoResumeCounter = meter
+            .counterBuilder(name: "synctray.mount.auto_resume")
+            .setDescription("Automatic Cache Only -> Streaming resume decisions (resumed, deferred_busy, busy_check_failed)")
+            .setUnit("1")
             .build()
     }
 
@@ -975,6 +1031,9 @@ final class TelemetryService {
         guard SyncTraySettings.telemetryEnabled else { return }
         ensureSetup()
 
+        let cacheVolume = profile.isMountMode
+            ? VFSCacheService.shared.cacheVolumeInfo(path: profile.vfsCachePath) : nil
+
         let intervalBucket = bucketSyncInterval(profile.syncIntervalMinutes)
 
         emitLog(
@@ -994,14 +1053,66 @@ final class TelemetryService {
                 // Mount-specific preferences
                 "config.mount_backend": .string(profile.isMountMode ? profile.mountBackend.rawValue : "n/a"),
                 "config.mount_at_startup": .string(profile.isMountMode ? String(profile.mountAtStartup) : "n/a"),
-                "config.offline_access": .string(profile.isMountMode ? String(profile.offlineAccessEnabled) : "n/a"),
+                "config.stream_cache_only": .string(profile.isMountMode ? String(profile.streamCacheOnly) : "n/a"),
                 "config.vfs_cache_mode": .string(profile.isMountMode ? profile.vfsCacheMode.rawValue : "n/a"),
                 "config.has_pinned_directories": .bool(!profile.pinnedDirectories.isEmpty),
                 "config.pinned_directory_count": .int(profile.pinnedDirectories.count),
                 "config.allow_non_empty_mount": .bool(profile.allowNonEmptyMount),
                 "config.download_connections": .int(profile.isMountMode ? profile.downloadConnections : 0),
+                "config.cache_fs_type": .string(cacheVolume?.fsType ?? "n/a"),
+                "config.cache_volume": .string(cacheVolume?.volume ?? "n/a"),
             ]
         )
+    }
+
+    // MARK: - Mount read health
+
+    /// Record one mount read-health probe (`VFSCacheService.probeMountRead`). `result` nil
+    /// means no probe ran: `outcome` is then `no_candidate` (nothing fully cached large
+    /// enough to time) or `failed` (the file couldn't be opened/read through the mount).
+    /// Never carries a path or file name — only the bounded cache-volume buckets.
+    func recordMountReadProbe(
+        profileId: UUID,
+        profileName: String,
+        mountBackend: String,
+        cacheFsType: String,
+        cacheVolume: String,
+        vfsCacheFiles: Int?,
+        result: MountReadProbeResult?,
+        outcome: String? = nil
+    ) {
+        guard SyncTraySettings.telemetryEnabled else { return }
+        ensureSetup()
+
+        let health = result.map(VFSCacheService.readHealth) ?? (outcome ?? "failed")
+        let labels: [String: AttributeValue] = [
+            "synctray.profile.name": .string(profileName),
+            "sync.mode": .string("mount"),
+            "mount.backend": .string(mountBackend),
+            "cache.fs_type": .string(cacheFsType),
+            "cache.volume": .string(cacheVolume),
+            "mount.read_health": .string(health),
+        ]
+        cachedReadProbeCounter?.add(value: 1, attribute: labels)
+
+        var attrs = labels
+        attrs["synctray.profile.id"] = .string(profileId.uuidString)
+        if let vfsCacheFiles { attrs["vfs.cache_files"] = .int(vfsCacheFiles) }
+        guard let result else {
+            emitLog(severity: .warn, body: "Mount read health probe skipped", attributes: attrs)
+            return
+        }
+        var metricLabels = labels
+        metricLabels["mount.read_health"] = nil  // the value is the measurement; don't split it by its own bucket
+        cachedReadThroughputHistogram?.record(value: result.throughputMBps, attributes: metricLabels)
+        cachedReadFirstByteHistogram?.record(value: result.firstByteSeconds, attributes: metricLabels)
+
+        attrs["probe.bytes"] = .int(result.bytes)
+        attrs["probe.duration_seconds"] = .double(result.seconds)
+        attrs["probe.first_byte_seconds"] = .double(result.firstByteSeconds)
+        attrs["probe.throughput_mbps"] = .double(result.throughputMBps)
+        attrs["probe.remote_bytes"] = .int(result.remoteBytes)
+        emitLog(severity: health == "healthy" ? .info : .warn, body: "Mount read health", attributes: attrs)
     }
 
     /// Emit a full snapshot of all profile configurations. Call on app launch.
@@ -1877,7 +1988,7 @@ final class TelemetryService {
         // registered), so surface the flush result here — a non-success on a live
         // run points at the OTLP /v1/metrics exchange as the real culprit.
         let metricsFlush = meterProvider?.forceFlush()
-        print("[SyncTray][Telemetry] metrics forceFlush on shutdown: \(String(describing: metricsFlush)) → \(Self.endpoint)/v1/metrics")
+        Self.diagnostic("metrics forceFlush on shutdown: \(String(describing: metricsFlush)) → \(Self.endpoint)/v1/metrics")
         _ = meterProvider?.shutdown()
         tracerProvider?.shutdown()
     }
@@ -2208,6 +2319,148 @@ final class TelemetryService {
         emitLog(severity: .info, body: body, attributes: endAttrs, spanContext: token.span?.context)
     }
 
+    // MARK: - Cache Only overlay upload
+
+    /// Start a `synctray overlay_upload` span for one upload run (a drain on Resume Syncing
+    /// / auto-resume, or a keep-mode Upload Now). `trigger` is bounded: `resume` |
+    /// `auto_resume` | `upload_now`.
+    func recordOverlayUploadStarted(profileId: UUID, profileName: String, trigger: String) {
+        guard SyncTraySettings.telemetryEnabled else { return }
+        ensureSetup()
+
+        let attrs: [String: AttributeValue] = [
+            "synctray.profile.id": .string(profileId.uuidString),
+            "synctray.profile.name": .string(profileName),
+            "upload.trigger": .string(trigger),
+        ]
+        let span = tracer?.spanBuilder(spanName: "synctray overlay_upload")
+            .setSpanKind(spanKind: .internal)
+            .startSpan()
+        if let span {
+            for (key, value) in attrs { span.setAttribute(key: key, value: value) }
+        }
+        activeOverlayUploadSpans[profileId] = span
+        emitLog(severity: .info, body: "Overlay upload started", attributes: attrs, spanContext: span?.context)
+    }
+
+    /// End the overlay-upload span and record count / files / bytes / duration metrics.
+    /// `outcome` is derived from the result: `completed` (something uploaded, nothing
+    /// failed), `partial` (some uploaded, some failed), `failed` (nothing uploaded, at
+    /// least one failure), or `nothing_to_do` (overlay was already empty/fully uploaded).
+    func recordOverlayUploadCompleted(
+        profileId: UUID,
+        profileName: String,
+        trigger: String,
+        result: OverlaySyncService.OverlayUploadResult,
+        duration: Double
+    ) {
+        guard SyncTraySettings.telemetryEnabled else { return }
+        ensureSetup()
+
+        let outcome: String
+        if result.failed > 0 {
+            outcome = (result.uploaded > 0 || result.conflicts > 0) ? "partial" : "failed"
+        } else if result.uploaded == 0 && result.conflicts == 0 && result.alreadyUploaded == 0 {
+            outcome = "nothing_to_do"
+        } else {
+            outcome = "completed"
+        }
+
+        let labels: [String: AttributeValue] = [
+            "synctray.profile.name": .string(profileName),
+            "upload.trigger": .string(trigger),
+            "upload.outcome": .string(outcome),
+            "upload.transport": .string(result.transport),
+        ]
+        overlayUploadCountCounter?.add(value: 1, attribute: labels)
+        overlayUploadDurationHistogram?.record(value: duration, attributes: labels)
+        overlayUploadBytesCounter?.add(value: Int(result.bytes), attribute: labels)
+
+        func fileLabels(_ fileResult: String) -> [String: AttributeValue] {
+            ["synctray.profile.name": .string(profileName), "upload.file_result": .string(fileResult)]
+        }
+        if result.uploaded > 0 {
+            overlayUploadFilesCounter?.add(value: result.uploaded, attribute: fileLabels("uploaded"))
+        }
+        if result.conflicts > 0 {
+            overlayUploadFilesCounter?.add(value: result.conflicts, attribute: fileLabels("conflict"))
+        }
+        if result.alreadyUploaded > 0 {
+            overlayUploadFilesCounter?.add(value: result.alreadyUploaded, attribute: fileLabels("already_uploaded"))
+        }
+        if result.failed > 0 {
+            overlayUploadFilesCounter?.add(value: result.failed, attribute: fileLabels("failed"))
+        }
+
+        let endAttrs: [String: AttributeValue] = [
+            "synctray.profile.name": .string(profileName),
+            "upload.trigger": .string(trigger),
+            "upload.outcome": .string(outcome),
+            "upload.transport": .string(result.transport),
+            "upload.uploaded": .int(result.uploaded),
+            "upload.conflicts": .int(result.conflicts),
+            "upload.already_uploaded": .int(result.alreadyUploaded),
+            "upload.failed": .int(result.failed),
+            "upload.duration_seconds": .double(duration),
+        ]
+        if let span = activeOverlayUploadSpans.removeValue(forKey: profileId) {
+            for (key, value) in endAttrs { span.setAttribute(key: key, value: value) }
+            span.status = (outcome == "failed") ? .error(description: "overlay upload failed") : .ok
+            span.end()
+        }
+        emitLog(
+            severity: outcome == "failed" ? .warn : .info, body: "Overlay upload ended",
+            attributes: endAttrs, spanContext: nil)
+    }
+
+    /// Record an overlay upload that never started because no remote (primary or
+    /// fallback) was reachable — `upload.outcome = "unreachable"`, no span (nothing ran).
+    func recordOverlayUploadUnreachable(profileId: UUID, profileName: String, trigger: String) {
+        guard SyncTraySettings.telemetryEnabled else { return }
+        ensureSetup()
+        let labels: [String: AttributeValue] = [
+            "synctray.profile.name": .string(profileName),
+            "upload.trigger": .string(trigger),
+            "upload.outcome": .string("unreachable"),
+            "upload.transport": .string("none"),
+        ]
+        overlayUploadCountCounter?.add(value: 1, attribute: labels)
+        emitLog(severity: .info, body: "Overlay upload ended", attributes: labels, spanContext: nil)
+    }
+
+    /// Record a Stream profile's mount mode transitioning (as observed by the mount-state
+    /// reconcile loop reading the mode file). `mode` values are rendered with underscores
+    /// (`cache_only_manual`, …) for the low-cardinality telemetry attribute.
+    func recordMountModeChanged(profileId: UUID, profileName: String, mode: MountMode) {
+        guard SyncTraySettings.telemetryEnabled else { return }
+        ensureSetup()
+        let attrs: [String: AttributeValue] = [
+            "synctray.profile.id": .string(profileId.uuidString),
+            "synctray.profile.name": .string(profileName),
+            "mount.mode": .string(mode.rawValue.replacingOccurrences(of: "-", with: "_")),
+        ]
+        mountModeChangesCounter?.add(value: 1, attribute: attrs)
+        emitLog(severity: .info, body: "Mount mode changed", attributes: attrs)
+    }
+
+    /// Record an automatic Cache Only -> Streaming resume decision. `result` is bounded:
+    /// `resumed` | `deferred_busy` | `busy_check_failed`.
+    func recordAutoResume(profileId: UUID, profileName: String, result: String) {
+        guard SyncTraySettings.telemetryEnabled else { return }
+        ensureSetup()
+        let attrs: [String: AttributeValue] = [
+            "synctray.profile.id": .string(profileId.uuidString),
+            "synctray.profile.name": .string(profileName),
+            "auto_resume.result": .string(result),
+        ]
+        mountAutoResumeCounter?.add(value: 1, attribute: attrs)
+        // "resumed" surfaces via the "Mount mode changed" log once the mode flips back to
+        // streaming — only the non-resuming outcomes get their own line here.
+        if result != "resumed" {
+            emitLog(severity: .warn, body: "Auto-resume deferred", attributes: attrs)
+        }
+    }
+
     private func emitLog(
         severity: Severity,
         body: String,
@@ -2297,6 +2550,13 @@ final class TelemetryService {
             return "network"
         }
         return "other"
+    }
+
+    /// Setup diagnostics go to stderr, never stdout: the headless CLI configures
+    /// telemetry in-process, and a stray stdout line breaks every agent that
+    /// parses `status --json` / `profile show`.
+    private static func diagnostic(_ message: String) {
+        FileHandle.standardError.write(Data("[SyncTray][Telemetry] \(message)\n".utf8))
     }
 
     /// Loads key=value pairs from ~/.config/synctray/.env (if it exists).

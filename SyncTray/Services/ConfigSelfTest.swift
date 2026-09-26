@@ -53,8 +53,7 @@ enum ConfigSelfTest {
             testWarmSkipsCachedFiles,
             testMountMonitorAutoWarm,
             testMountPollDecision,
-            testOfflineAccessLink,
-            testOfflineAccessApply,
+            testLegacyOfflineLinkCleanup,
             testWarmReconcileTrigger,
             testMigrationIntegrity,
             testExternalCreateEnabled,
@@ -69,7 +68,12 @@ enum ConfigSelfTest {
             testCLIProfileSetAndShow,
             testDoctorPureChecks,
             testCLIResolveAndList,
+            testCLIStatusStates,
+            testReachabilityProbeIsPathScoped,
+            testMountReadHealth,
+            testCacheOnlyAppWrittenList,
             testShimInstallIdempotentNonClobber,
+            testCacheKeyPrimary,
             testCacheMigrationTreeKinds,
             testCacheMigrationKeyDerivation,
             testCacheMigrationOverlap,
@@ -87,6 +91,25 @@ enum ConfigSelfTest {
             testCacheMigrationUIFixes,
             testCacheMigrationTelemetrySpanStatus,
             testCacheMigrationCLI,
+            testMountModeParse,
+            testMountNoFallbackOverride,
+            testCacheSuffixConsolidation,
+            testCacheSuffixPairSafety,
+            testCacheSuffixEmptyDestination,
+            testMountCommandQuoting,
+            testCacheOnlyUnionConfig,
+            testCacheOnlyUnionBehaviour,
+            testMountModeSelection,
+            testMountProbeRetry,
+            testAutoResumeDecision,
+            testResumeWhileUnreachableHandOff,
+            testOverlayUploadPlan,
+            testOverlaySyncBack,
+            testOverlayUploadNow,
+            testOverlayListingFailure,
+            testUploadNowManifestRemoteState,
+            testCacheMoveBlockedPending,
+            testCLIProfileSetRemovedKeys,
         ]
 
         for check in checks {
@@ -693,72 +716,11 @@ enum ConfigSelfTest {
         return report("AC-MP1", "mount-poll-decision", true)
     }
 
-    /// The read-only "(Offline)" cache browse point: verifies the pure path
-    /// derivation (`linkPath`/`target`) and the create/remove/re-point decision
-    /// matrix (`OfflineAccessLink.action`) without touching the filesystem.
-    private static func testOfflineAccessLink() -> Bool {
-        func mk(mode: SyncMode, offline: Bool, local: String) -> SyncProfile {
-            SyncProfile(
-                name: "T", rcloneRemote: "synology:", remotePath: "Kaiju/KAIJU",
-                localSyncPath: local, syncMode: mode,
-                vfsCachePath: "/Volumes/Ext/.config/rclone", offlineAccessEnabled: offline
-            )
-        }
-        let mount = mk(mode: .mount, offline: true, local: "/Volumes/Ext/KaijuNew")
-
-        // linkPath: sibling of the mount point, "<name> (Offline)".
-        guard OfflineAccessLink.linkPath(for: mount) == "/Volumes/Ext/KaijuNew (Offline)" else {
-            return report("AC-OA1", "offline-access-link", false, "(bad linkPath: \(OfflineAccessLink.linkPath(for: mount) ?? "nil"))")
-        }
-        // No mount point → no link to compute.
-        guard OfflineAccessLink.linkPath(for: mk(mode: .mount, offline: true, local: "")) == nil else {
-            return report("AC-OA1", "offline-access-link", false, "(empty localSyncPath should yield nil linkPath)")
-        }
-        // target: {vfsCachePath}/vfs/{remote-no-colon}/{remotePath}.
-        let want = "/Volumes/Ext/.config/rclone/vfs/synology/Kaiju/KAIJU"
-        guard OfflineAccessLink.target(for: mount) == want else {
-            return report("AC-OA1", "offline-access-link", false, "(bad target: \(OfflineAccessLink.target(for: mount)))")
-        }
-
-        let link = OfflineAccessLink.linkPath(for: mount)!
-        // Enabled mount, no link yet → create.
-        guard OfflineAccessLink.action(for: mount, linkExists: false, currentTarget: nil)
-            == .create(link: link, target: want) else {
-            return report("AC-OA1", "offline-access-link", false, "(missing link should create)")
-        }
-        // Enabled mount, link already correct → nothing to do.
-        guard OfflineAccessLink.action(for: mount, linkExists: true, currentTarget: want) == .none else {
-            return report("AC-OA1", "offline-access-link", false, "(correct link should be none)")
-        }
-        // Enabled mount, link points at the wrong (old) cache dir → re-point.
-        guard OfflineAccessLink.action(for: mount, linkExists: true, currentTarget: "/old/vfs/x")
-            == .create(link: link, target: want) else {
-            return report("AC-OA1", "offline-access-link", false, "(stale-target link should re-point)")
-        }
-        // Disabled on a mount, link present → remove; absent → none.
-        let mountOff = mk(mode: .mount, offline: false, local: "/Volumes/Ext/KaijuNew")
-        guard OfflineAccessLink.action(for: mountOff, linkExists: true, currentTarget: want) == .remove(link: link) else {
-            return report("AC-OA1", "offline-access-link", false, "(disabled should remove existing link)")
-        }
-        guard OfflineAccessLink.action(for: mountOff, linkExists: false, currentTarget: nil) == .none else {
-            return report("AC-OA1", "offline-access-link", false, "(disabled + no link should be none)")
-        }
-        // Non-mount profile with a stray link (e.g. after a mode switch) → clean it up.
-        let bisync = mk(mode: .bisync, offline: true, local: "/Volumes/Ext/KaijuNew")
-        guard OfflineAccessLink.action(for: bisync, linkExists: true, currentTarget: want) == .remove(link: link) else {
-            return report("AC-OA1", "offline-access-link", false, "(non-mount stray link should remove)")
-        }
-        guard OfflineAccessLink.action(for: bisync, linkExists: false, currentTarget: nil) == .none else {
-            return report("AC-OA1", "offline-access-link", false, "(non-mount + no link should be none)")
-        }
-        return report("AC-OA1", "offline-access-link", true)
-    }
-
-    /// Exercises the real filesystem apply (`OfflineAccessLink.apply` / `removeLink`)
-    /// against a throwaway temp tree: create → idempotent re-run → re-point after a
-    /// cache-dir change → disable removes → delete removes. Covers the ~lines of
-    /// FileManager glue that AC-OA1's pure checks can't reach.
-    private static func testOfflineAccessApply() -> Bool {
+    /// Legacy "(Offline)" symlink cleanup: a stray symlink left by the
+    /// retired offline-browse-point feature, pointing into a `/vfs/` cache data tree,
+    /// is removed; a real directory of that name and a symlink pointing elsewhere are
+    /// both left alone. Covers the pure predicate and the real filesystem apply.
+    private static func testLegacyOfflineLinkCleanup() -> Bool {
         let fm = FileManager.default
         let root = (NSTemporaryDirectory() as NSString)
             .appendingPathComponent("synctray-oa-\(UUID().uuidString)")
@@ -766,58 +728,53 @@ enum ConfigSelfTest {
         let mountPoint = (root as NSString).appendingPathComponent("KaijuNew")
         try? fm.createDirectory(atPath: mountPoint, withIntermediateDirectories: true)
 
-        func profile(offline: Bool, cacheRoot: String) -> SyncProfile {
-            SyncProfile(
-                name: "T", rcloneRemote: "synology:", remotePath: "Kaiju/KAIJU",
-                localSyncPath: mountPoint, syncMode: .mount,
-                vfsCachePath: cacheRoot, offlineAccessEnabled: offline
-            )
-        }
-        let cacheA = (root as NSString).appendingPathComponent("cacheA")
-        let cacheB = (root as NSString).appendingPathComponent("cacheB")
-        let link = OfflineAccessLink.linkPath(for: profile(offline: true, cacheRoot: cacheA))!
-
-        func linkTarget() -> String? {
-            guard let attrs = try? fm.attributesOfItem(atPath: link),
-                  (attrs[.type] as? FileAttributeType) == .typeSymbolicLink else { return nil }
-            return try? fm.destinationOfSymbolicLink(atPath: link)
+        let profile = SyncProfile(
+            name: "T", rcloneRemote: "synology:", remotePath: "Kaiju/KAIJU",
+            localSyncPath: mountPoint, syncMode: .mount, vfsCachePath: root
+        )
+        let expectedLinkPath = (root as NSString).appendingPathComponent("KaijuNew (Offline)")
+        guard LegacyOfflineLink.linkPath(for: profile) == expectedLinkPath else {
+            return report("AC-OA3", "legacy-offline-link-cleanup", false,
+                          "(bad linkPath: \(LegacyOfflineLink.linkPath(for: profile) ?? "nil"))")
         }
 
-        // Enabled → creates a symlink at the cacheA target.
-        let pA = profile(offline: true, cacheRoot: cacheA)
-        _ = OfflineAccessLink.apply(for: pA)
-        guard linkTarget() == OfflineAccessLink.target(for: pA) else {
-            return report("AC-OA2", "offline-access-apply", false, "(create did not link to cacheA target)")
+        // Pure predicate: only a symlink into a /vfs/ tree qualifies.
+        guard LegacyOfflineLink.shouldRemoveLegacyOfflineLink(
+            isSymlink: true, destination: "\(root)/vfs/synology/Kaiju/KAIJU") else {
+            return report("AC-OA3", "legacy-offline-link-cleanup", false, "(vfs symlink should qualify for removal)")
         }
-        // Idempotent re-run → still the same link (no throw, no duplicate).
-        guard OfflineAccessLink.apply(for: pA) == .none, linkTarget() == OfflineAccessLink.target(for: pA) else {
-            return report("AC-OA2", "offline-access-apply", false, "(second apply was not a no-op)")
+        guard !LegacyOfflineLink.shouldRemoveLegacyOfflineLink(isSymlink: false, destination: "\(root)/vfs/x") else {
+            return report("AC-OA3", "legacy-offline-link-cleanup", false, "(non-symlink should never qualify)")
         }
-        // Cache dir changed → re-point to cacheB.
-        let pB = profile(offline: true, cacheRoot: cacheB)
-        _ = OfflineAccessLink.apply(for: pB)
-        guard linkTarget() == OfflineAccessLink.target(for: pB) else {
-            return report("AC-OA2", "offline-access-apply", false, "(cache change did not re-point)")
+        guard !LegacyOfflineLink.shouldRemoveLegacyOfflineLink(isSymlink: true, destination: "/somewhere/else") else {
+            return report("AC-OA3", "legacy-offline-link-cleanup", false, "(symlink outside /vfs/ should not qualify)")
         }
-        // Disabled → link removed.
-        _ = OfflineAccessLink.apply(for: profile(offline: false, cacheRoot: cacheB))
-        guard linkTarget() == nil, !fm.fileExists(atPath: link) else {
-            return report("AC-OA2", "offline-access-apply", false, "(disable did not remove the link)")
+
+        // Real filesystem apply: a symlink into /vfs/ is removed...
+        let link = LegacyOfflineLink.linkPath(for: profile)!
+        let target = (root as NSString).appendingPathComponent("vfs/synology/Kaiju/KAIJU")
+        try? fm.createDirectory(atPath: target, withIntermediateDirectories: true)
+        try? fm.createSymbolicLink(atPath: link, withDestinationPath: target)
+        guard LegacyOfflineLink.removeIfPresent(for: profile), !fm.fileExists(atPath: link) else {
+            return report("AC-OA3", "legacy-offline-link-cleanup", false, "(vfs symlink was not removed)")
         }
-        // A real (non-symlink) directory at the link path must never be clobbered.
+
+        // ...a real directory of that name is kept...
         try? fm.createDirectory(atPath: link, withIntermediateDirectories: true)
-        _ = OfflineAccessLink.apply(for: pA)  // wants to create, but a real dir sits there
-        var isDir: ObjCBool = false
-        guard fm.fileExists(atPath: link, isDirectory: &isDir), isDir.boolValue, linkTarget() == nil else {
-            return report("AC-OA2", "offline-access-apply", false, "(clobbered a real directory at the link path)")
+        guard !LegacyOfflineLink.removeIfPresent(for: profile), fm.fileExists(atPath: link) else {
+            return report("AC-OA3", "legacy-offline-link-cleanup", false, "(a real directory was removed)")
         }
         try? fm.removeItem(atPath: link)
-        // removeLink force-removes regardless of the (still-enabled) flag, symlink-only.
-        _ = OfflineAccessLink.apply(for: pA)
-        guard OfflineAccessLink.removeLink(for: pA), linkTarget() == nil else {
-            return report("AC-OA2", "offline-access-apply", false, "(removeLink did not delete the symlink)")
+
+        // ...and a symlink pointing elsewhere is kept.
+        let elsewhere = (root as NSString).appendingPathComponent("elsewhere")
+        try? fm.createDirectory(atPath: elsewhere, withIntermediateDirectories: true)
+        try? fm.createSymbolicLink(atPath: link, withDestinationPath: elsewhere)
+        guard !LegacyOfflineLink.removeIfPresent(for: profile), fm.fileExists(atPath: link) else {
+            return report("AC-OA3", "legacy-offline-link-cleanup", false, "(a symlink pointing elsewhere was removed)")
         }
-        return report("AC-OA2", "offline-access-apply", true)
+
+        return report("AC-OA3", "legacy-offline-link-cleanup", true)
     }
 
     /// A launchd/externally-mounted Stream profile (e.g. auto-mounted at login) never runs
@@ -1158,6 +1115,10 @@ enum ConfigSelfTest {
         unmountProfile: @escaping (SyncProfile) -> String? = { _ in nil },
         readStdin: @escaping () -> String? = { nil },
         readFile: @escaping (String) -> String? = { _ in nil },
+        probeMount: @escaping (SyncProfile) -> MountProbe = { _ in
+            MountProbe(mounted: false, processRunning: false, pendingUploads: 0)
+        },
+        sleep: @escaping (TimeInterval) -> Void = { _ in },
         stdout: @escaping (String) -> Void = { _ in },
         stderr: @escaping (String) -> Void = { _ in },
         migrateCache: @escaping (SyncProfile, String, Bool) -> CacheMigrationCLIResult = { _, _, _ in
@@ -1180,10 +1141,197 @@ enum ConfigSelfTest {
             migrateCache: migrateCache,
             readStdin: readStdin,
             readFile: readFile,
+            probeMount: probeMount,
+            sleep: sleep,
             stdout: stdout,
             stderr: stderr,
             now: { Date() }
         )
+    }
+
+    // MARK: - AC-CLI10 — status: runtime state matrix + text/JSON rendering
+
+    /// `status` must let an agent tell "still mounting" (rclone up, volume not
+    /// attached yet) from mounted, stale, and unmounted without reading logs,
+    /// and `--json` must carry the same facts as the text line.
+    /// AC-RH1: mount read-health probe — bounded filesystem buckets, health classification
+    /// (a remote fetch outranks any speed), and the probe schedule gate.
+    private static func testMountReadHealth() -> Bool {
+        let buckets = ["apfs", "APFS", "exfat", "msdos", "smbfs", "zfs", ""].map(VFSCacheService.cacheFilesystemBucket)
+        guard buckets == ["apfs", "apfs", "exfat", "fat", "network", "other", "unknown"] else {
+            return report("AC-RH1", "mount-read-health", false, "(fs buckets=\(buckets))")
+        }
+        func r(_ mb: Double, remote: Int = 0) -> MountReadProbeResult {
+            MountReadProbeResult(bytes: Int(mb * 1_000_000), seconds: 1, firstByteSeconds: 0.01, remoteBytes: remote)
+        }
+        let health = [r(108), r(6.6), r(0.2), r(108, remote: 1)].map(VFSCacheService.readHealth)
+        guard health == ["healthy", "slow", "degraded", "remote_fetch"] else {
+            return report("AC-RH1", "mount-read-health", false, "(health=\(health))")
+        }
+        let now = Date()
+        let long = now.addingTimeInterval(-SyncManager.mountReadProbeInterval - 1)
+        let recent = now.addingTimeInterval(-60)
+        func gate(_ mounted: Bool, _ mode: MountMode?, warm: Bool = false, busy: Bool = false, last: Date?) -> Bool {
+            SyncManager.shouldProbeMountRead(isMounted: mounted, mode: mode, warmActive: warm,
+                                             inFlight: busy, lastProbe: last, now: now)
+        }
+        let gates = [
+            gate(true, .streaming, last: nil),        // first probe
+            gate(true, nil, last: long),              // mode file unknown → treated as streaming, due
+            gate(true, .streaming, last: recent),     // not due yet
+            gate(false, .streaming, last: nil),       // not mounted
+            gate(true, .cacheOnlyOffline, last: nil), // Cache Only serves a different tree
+            gate(true, .streaming, warm: true, last: nil),
+            gate(true, .streaming, busy: true, last: nil),
+        ]
+        return report("AC-RH1", "mount-read-health", gates == [true, true, false, false, false, false, false],
+                      "(gates=\(gates))")
+    }
+
+    /// AC-P1: the reachability probe stats the profile's own path (never lists the remote
+    /// root, which hangs on a Synology SMB share list) and treats not-found as reachable.
+    private static func testReachabilityProbeIsPathScoped() -> Bool {
+        let args = SyncManager.reachabilityProbeArguments(remote: "synology:", path: "Kaiju/KAIJU")
+        guard args == ["lsjson", "--stat", "synology:Kaiju/KAIJU", "--contimeout", "3s", "--timeout", "8s"] else {
+            return report("AC-P1", "reachability-probe-path-scoped", false, "(args=\(String(describing: args)))")
+        }
+        guard SyncManager.reachabilityProbeArguments(remote: ":", path: "x") == nil else {
+            return report("AC-P1", "reachability-probe-path-scoped", false, "(empty remote accepted)")
+        }
+        let verdicts = [Int32(0), 1, 3, 4, 5].map { SyncManager.reachabilityProbeSucceeded(exitCode: $0) }
+        return report("AC-P1", "reachability-probe-path-scoped", verdicts == [true, false, true, true, false],
+                      "(exit 0/1/3/4/5 → \(verdicts))")
+    }
+
+    private static func testCLIStatusStates() -> Bool {
+        func probe(_ mounted: Bool, _ running: Bool) -> MountProbe {
+            MountProbe(mounted: mounted, processRunning: running, pendingUploads: 0)
+        }
+        let matrix: [(Bool, Bool, Bool, MountProbe?, ProfileRuntimeState)] = [
+            (false, true, false, probe(true, true), .disabled),
+            (true, true, false, probe(true, true), .mounted),
+            (true, true, false, probe(false, true), .mounting),
+            (true, true, false, probe(true, false), .stale),
+            (true, true, false, probe(false, false), .unmounted),
+            (true, false, true, nil, .syncing),
+            (true, false, false, nil, .idle),
+        ]
+        for (enabled, isMount, lock, p, expected) in matrix {
+            let got = SyncTrayCLI.runtimeState(isEnabled: enabled, isMountMode: isMount, lockPresent: lock, probe: p)
+            if got != expected {
+                return report("AC-CLI10", "cli-status-states", false,
+                              "(enabled=\(enabled) mount=\(isMount) lock=\(lock) probe=\(String(describing: p)) → \(got), want \(expected))")
+            }
+        }
+
+        guard SyncTrayCLI.parse(["status", "KaijuNew", "--json"]) == .success(.status(target: "KaijuNew", json: true, wait: nil)),
+              SyncTrayCLI.parse(["status"]) == .success(.status(target: nil, json: false, wait: nil)) else {
+            return report("AC-CLI10", "cli-status-states", false, "(status --json did not parse)")
+        }
+
+        var stream = sampleProfile(id: UUID(), name: "Streamer", isEnabled: true)
+        stream.syncMode = .mount
+        var out = ""
+        let env = fakeCLIEnvironment(
+            readProfiles: { [stream] },
+            runLaunchctl: { _ in (0, "state = running") },
+            readFile: { path in path == stream.mountModePath ? "cache-only-offline\n" : nil },
+            probeMount: { _ in MountProbe(mounted: false, processRunning: true, pendingUploads: 3) },
+            stdout: { out += $0 }
+        )
+        _ = SyncTrayCLI.run(.status(target: nil, json: false, wait: nil), env: env)
+        guard out.contains("state=mounting"), out.contains("mode=cache-only-offline"),
+              out.contains("pending_uploads=3") else {
+            return report("AC-CLI10", "cli-status-states", false, "(text line missing state/mode/pending: \(out))")
+        }
+
+        out = ""
+        _ = SyncTrayCLI.run(.status(target: nil, json: true, wait: nil), env: env)
+        guard let data = out.data(using: .utf8),
+              let rows = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]],
+              let row = rows.first,
+              row["state"] as? String == "mounting",
+              row["mountMode"] as? String == "cache-only-offline",
+              row["pendingUploads"] as? Int == 3,
+              row["syncMode"] as? String == "mount" else {
+            return report("AC-CLI10", "cli-status-states", false, "(json output wrong: \(out))")
+        }
+
+        // The mode file survives in /tmp after rclone exits — it must not be reported then.
+        out = ""
+        let stopped = fakeCLIEnvironment(
+            readProfiles: { [stream] },
+            readFile: { _ in "streaming" },
+            probeMount: { _ in MountProbe(mounted: false, processRunning: false, pendingUploads: 0) },
+            stdout: { out += $0 }
+        )
+        _ = SyncTrayCLI.run(.status(target: nil, json: false, wait: nil), env: stopped)
+        guard out.contains("state=unmounted"), out.contains("mode=none") else {
+            return report("AC-CLI10", "cli-status-states", false, "(stopped mount reported a stale mode: \(out))")
+        }
+        // --wait: flag values are never taken as the target, and bad states are refused.
+        guard SyncTrayCLI.parse(["status", "--wait", "mounted,stale", "KaijuNew", "--timeout", "30"])
+                == .success(.status(target: "KaijuNew", json: false,
+                                    wait: StatusWait(states: [.mounted, .stale], timeout: 30))),
+              case .failure = SyncTrayCLI.parse(["status", "KaijuNew", "--wait", "bogus"]),
+              case .failure = SyncTrayCLI.parse(["status", "--wait", "mounted"]),
+              case .success(.mount("KaijuNew", 45)) = SyncTrayCLI.parse(["mount", "--timeout=45", "KaijuNew"]) else {
+            return report("AC-CLI10", "cli-status-states", false, "(--wait/--timeout did not parse)")
+        }
+
+        // --wait reaches mounted after a few "mounting" polls → exit 0.
+        var polls = 0
+        let waitEnv = fakeCLIEnvironment(
+            readProfiles: { [stream] },
+            probeMount: { _ in
+                polls += 1
+                return MountProbe(mounted: polls >= 4, processRunning: true, pendingUploads: 0)
+            }
+        )
+        guard SyncTrayCLI.run(.status(target: "Streamer", json: false,
+                                      wait: StatusWait(states: [.mounted], timeout: 60)), env: waitEnv) == 0,
+              polls == 4 else {
+            return report("AC-CLI10", "cli-status-states", false, "(--wait did not return on reaching mounted, polls=\(polls))")
+        }
+        // --wait that never gets there → exit 1 after the timeout, not a hang.
+        var timeoutErr = ""
+        let stuckEnv = fakeCLIEnvironment(
+            readProfiles: { [stream] },
+            probeMount: { _ in MountProbe(mounted: false, processRunning: true, pendingUploads: 0) },
+            stderr: { timeoutErr += $0 }
+        )
+        guard SyncTrayCLI.run(.status(target: "Streamer", json: false,
+                                      wait: StatusWait(states: [.mounted], timeout: 10)), env: stuckEnv) == 1,
+              timeoutErr.contains("state=mounting") else {
+            return report("AC-CLI10", "cli-status-states", false, "(--wait timeout wrong: \(timeoutErr))")
+        }
+
+        // mount: a slow cache scan (rclone running, not attached) outlasting the
+        // timeout says "still mounting"; rclone never starting fails early with the log.
+        var slowErr = ""
+        let slowEnv = fakeCLIEnvironment(
+            readProfiles: { [stream] },
+            probeMount: { _ in MountProbe(mounted: false, processRunning: true, pendingUploads: 0) },
+            stderr: { slowErr += $0 }
+        )
+        guard SyncTrayCLI.run(.mount("Streamer", timeout: 120), env: slowEnv) == 1,
+              slowErr.contains("still mounting") else {
+            return report("AC-CLI10", "cli-status-states", false, "(slow mount not reported as still mounting: \(slowErr))")
+        }
+        var deadErr = ""
+        var deadPolls = 0
+        let deadEnv = fakeCLIEnvironment(
+            readProfiles: { [stream] },
+            readFile: { $0 == stream.logPath ? "Error: cache dir not writable\n" : nil },
+            probeMount: { _ in deadPolls += 1; return MountProbe(mounted: false, processRunning: false, pendingUploads: 0) },
+            stderr: { deadErr += $0 }
+        )
+        guard SyncTrayCLI.run(.mount("Streamer", timeout: 600), env: deadEnv) == 1,
+              deadErr.contains("not running"), deadErr.contains("cache dir not writable"),
+              deadPolls < 100 else {
+            return report("AC-CLI10", "cli-status-states", false, "(dead mount not failed early with log: polls=\(deadPolls) \(deadErr))")
+        }
+        return report("AC-CLI10", "cli-status-states", true)
     }
 
     // MARK: - AC-CLI5 — dispatch gate: bare tokens are subcommands, flags/no-args fall to the GUI
@@ -1332,7 +1480,7 @@ enum ConfigSelfTest {
     /// telemetry verbs.
     private static func testCLILifecycleCommands() -> Bool {
         // Parse.
-        guard case .success(.mount("s")) = SyncTrayCLI.parse(["mount", "s"]),
+        guard case .success(.mount("s", 600)) = SyncTrayCLI.parse(["mount", "s"]),
               case .success(.unmount("s")) = SyncTrayCLI.parse(["unmount", "s"]),
               case .success(.reinstall("s")) = SyncTrayCLI.parse(["reinstall", "s"]),
               case .success(.install("s")) = SyncTrayCLI.parse(["install", "s"]) else {
@@ -1347,13 +1495,14 @@ enum ConfigSelfTest {
 
         // mount → mountProfile closure fires for a mount profile.
         var mounted = false
-        let mountEnv = fakeCLIEnvironment(readProfiles: { [stream] }, mountProfile: { _ in mounted = true; return nil })
+        let mountEnv = fakeCLIEnvironment(readProfiles: { [stream] }, mountProfile: { _ in mounted = true; return nil },
+                                           probeMount: { _ in MountProbe(mounted: mounted, processRunning: mounted, pendingUploads: 0) })
         guard SyncTrayCLI.execute(["mount", stream.shortId], env: mountEnv) == 0, mounted else {
             return report("AC-CLI7", "cli-lifecycle-commands", false, "(mount did not fire mountProfile)")
         }
 
         // mount → surfaces the closure's error as a non-zero exit.
-        let mountFailEnv = fakeCLIEnvironment(readProfiles: { [stream] }, mountProfile: { _ in "mount did not establish within 60s" })
+        let mountFailEnv = fakeCLIEnvironment(readProfiles: { [stream] }, mountProfile: { _ in "launchctl could not start" })
         guard SyncTrayCLI.execute(["mount", stream.shortId], env: mountFailEnv) != 0 else {
             return report("AC-CLI7", "cli-lifecycle-commands", false, "(mount did not propagate a mount failure)")
         }
@@ -1900,15 +2049,1521 @@ enum ConfigSelfTest {
         return result.joined(separator: "\n")
     }
 
+    // MARK: - AC-CK1 — the cache key is the primary remote name again
+
+    /// The retired "Share the cache across remotes" feature is gone: the VFS cache is
+    /// keyed by the primary remote name exactly as 0.80.0 did, and a `.profile.json`
+    /// still carrying its old keys decodes fine (they're simply ignored) and no longer
+    /// round-trips them on the next write.
+    private static func testCacheKeyPrimary() -> Bool {
+        var profile = SyncProfile(
+            name: "Stream", rcloneRemote: "synology:", remotePath: "Kaiju/KAIJU",
+            localSyncPath: "/Volumes/SeagateHD/KaijuNew", syncMode: .mount
+        )
+        guard VFSCacheService.cacheRelativePath(for: profile) == "synology/Kaiju/KAIJU" else {
+            return report("AC-CK1", "cache-key-primary", false,
+                          "(key \(VFSCacheService.cacheRelativePath(for: profile)) != synology/Kaiju/KAIJU)")
+        }
+
+        // A profile file carrying the retired keys must still decode (unknown keys are
+        // simply skipped by Codable), and the re-encoded JSON must drop them.
+        let legacyJSON: [String: Any] = [
+            "id": profile.id.uuidString, "name": profile.name,
+            "rcloneRemote": profile.rcloneRemote, "remotePath": profile.remotePath,
+            "localSyncPath": profile.localSyncPath, "syncMode": "mount",
+            "stableCacheIdentity": true, "cacheIdentity": "synology", "offlineAccessEnabled": true,
+        ]
+        guard let data = try? JSONSerialization.data(withJSONObject: legacyJSON),
+              let decoded = try? JSONDecoder().decode(SyncProfile.self, from: data) else {
+            return report("AC-CK1", "cache-key-primary", false, "(profile carrying legacy keys failed to decode)")
+        }
+        profile = decoded
+        guard let reEncoded = try? JSONEncoder().encode(profile),
+              let reEncodedString = String(data: reEncoded, encoding: .utf8) else {
+            return report("AC-CK1", "cache-key-primary", false, "(re-encode failed)")
+        }
+        for key in ["stableCacheIdentity", "cacheIdentity", "offlineAccessEnabled"] where reEncodedString.contains(key) {
+            return report("AC-CK1", "cache-key-primary", false, "(re-encoded JSON still contains \(key))")
+        }
+
+        // The retired migration slot is a documented no-op — it must not throw and must
+        // not touch UserDefaults.
+        let suiteName = "synctray-selftest-ck1-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        do {
+            try MigrationV4Retired().migrateUserDefaults(defaults)
+        } catch {
+            return report("AC-CK1", "cache-key-primary", false, "(MigrationV4Retired threw: \(error))")
+        }
+
+        return report("AC-CK1", "cache-key-primary", true)
+    }
+
     /// A mount-mode profile with deterministic remote/key fields, for the
-    /// cache-migration tests below.
-    private static func mountProfile(id: UUID = UUID(), name: String = "Stream", remotePath: String, vfsCachePath: String) -> SyncProfile {
+    /// cache-migration tests below. The cache key is always the primary remote name
+    /// (colon stripped) + remotePath — see `VFSCacheService.cacheRelativePath`.
+    private static func mountProfile(
+        id: UUID = UUID(),
+        name: String = "Stream",
+        remotePath: String,
+        vfsCachePath: String
+    ) -> SyncProfile {
         var profile = sampleProfile(id: id, name: name)
         profile.syncMode = .mount
         profile.rcloneRemote = "synology:"
         profile.remotePath = remotePath
         profile.vfsCachePath = vfsCachePath
         return profile
+    }
+
+    // MARK: - Mount-branch script dry-run harness
+    //
+    // `SyncSetupService.generateSyncScript()` renders the ONE shared shell script every
+    // mount-mode profile runs under launchd. This process cannot read a real NFS/FUSE mount
+    // (TCC denies it — see CLAUDE.md's Testing section), so these self-tests never mount
+    // anything: they render the script to a temp file, run it for real up through
+    // consolidation + mode selection + (for Cache Only) config/exclude generation, then hit
+    // the `SYNCTRAY_DRY_RUN=1` seam, which prints the resolved mode/command and exits before
+    // ever calling `eval` on the rclone command. Everything the script touches — cache dirs,
+    // mount point, config file, `RCLONE_CONFIG` — is an isolated temp fixture.
+
+    private static func mountFixtureProfile(
+        localPath: String,
+        cachePath: String,
+        rcloneRemote: String = "synology:",
+        remotePath: String = "Kaiju/KAIJU",
+        fallbackRemote: String = "",
+        streamCacheOnly: Bool = false
+    ) -> SyncProfile {
+        var profile = sampleProfile(name: "MountFixture")
+        profile.syncMode = .mount
+        profile.rcloneRemote = rcloneRemote
+        profile.remotePath = remotePath
+        profile.localSyncPath = localPath
+        profile.vfsCachePath = cachePath
+        profile.fallbackRemote = fallbackRemote
+        profile.streamCacheOnly = streamCacheOnly
+        return profile
+    }
+
+    private struct DryRunResult {
+        let mode: String?
+        let cmd: String?
+        let envOverrides: Int?
+        let output: String
+        let exitCode: Int32
+        let scriptPath: String
+        /// Contents of the real `~/.local/log/synctray-sync-{shortId}.log` the dry run wrote
+        /// to, captured BEFORE `dryRunMountScript`'s own cleanup deletes it — the log carries
+        /// runtime decisions (e.g. "using fallback: X") that never surface in `cmd` for a
+        /// mode (like Cache Only) whose rendered command doesn't reference the remote name.
+        let log: String
+    }
+
+    /// Render the shared script + this profile's derived config into a fresh temp dir, then
+    /// run it (`bash script.sh config.json`) with `SYNCTRAY_DRY_RUN=1` and an isolated
+    /// `RCLONE_CONFIG`. Blocks up to `timeout` seconds; force-terminates and returns whatever
+    /// was captured if the script somehow overruns (it never should — the first reachability
+    /// probe is wall-clock-capped at 17s and each of its two retries at 7s plus
+    /// `probeRetryDelay`). `whileRunning` fires once the script has started, for fixtures
+    /// that change the world mid-run.
+    private static func dryRunMountScript(
+        profile: SyncProfile,
+        rcloneConfig: String,
+        timeout: TimeInterval = 30,
+        probeRetryDelay: String = "0",
+        whileRunning: ((_ rcloneConfPath: String) -> Void)? = nil
+    ) -> DryRunResult {
+        // `profile.logPath` is `~/.local/log/synctray-sync-{shortId}.log` — NOT
+        // sandboxed under any temp dir (real per-profile paths are all under the
+        // user's real home, by production design), so the dry-run script's real
+        // writes to it must be cleaned up here, the single place every dry-run
+        // test funnels through, rather than duplicated per call site.
+        defer { try? FileManager.default.removeItem(atPath: profile.logPath) }
+        let dir = "\(selfTestRoot)/mountscript-\(UUID().uuidString)"
+        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        // In production, `SyncSetupService.install(profile:)` always creates
+        // `~/.local/log` before the generated script ever runs. This harness skips
+        // `install()` and invokes the script directly, so on a machine that has never
+        // installed a SyncTray profile (a clean CI runner, notably) that directory
+        // doesn't exist yet and the script's very first `>> "$LOG_FILE"` write fails
+        // with "No such file or directory" — masked on a dev machine where some
+        // earlier real install already created it. Recreate that one invariant here.
+        try? FileManager.default.createDirectory(
+            atPath: (profile.logPath as NSString).deletingLastPathComponent,
+            withIntermediateDirectories: true)
+
+        let scriptPath = "\(dir)/script.sh"
+        try? SyncSetupService.shared.generateSyncScript().write(
+            toFile: scriptPath, atomically: true, encoding: .utf8)
+        let configPath = "\(dir)/config.json"
+        try? SyncSetupService.shared.generateProfileConfig(for: profile).write(
+            toFile: configPath, atomically: true, encoding: .utf8)
+        let rcloneConfPath = "\(dir)/rclone.conf"
+        try? rcloneConfig.write(toFile: rcloneConfPath, atomically: true, encoding: .utf8)
+
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/bin/bash")
+        proc.arguments = [scriptPath, configPath]
+        var env = ProcessInfo.processInfo.environment
+        env["SYNCTRAY_DRY_RUN"] = "1"
+        env["RCLONE_CONFIG"] = rcloneConfPath
+        // The mount branch retries an unreachable primary twice before settling on Cache
+        // Only (offline); most fixtures are unreachable ON PURPOSE, so don't pay the
+        // production ~5s gap per retry on every one of them.
+        env["SYNCTRAY_PROBE_RETRY_DELAY"] = probeRetryDelay
+        proc.environment = env
+        let pipe = Pipe()
+        proc.standardOutput = pipe
+        proc.standardError = pipe
+        do { try proc.run() } catch {
+            return DryRunResult(
+                mode: nil, cmd: nil, envOverrides: nil, output: "failed to launch: \(error)",
+                exitCode: -1, scriptPath: scriptPath, log: "")
+        }
+        whileRunning?(rcloneConfPath)
+        let deadline = Date().addingTimeInterval(timeout)
+        while proc.isRunning && Date() < deadline {
+            Thread.sleep(forTimeInterval: 0.1)
+        }
+        if proc.isRunning { proc.terminate() }
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        let output = String(data: data, encoding: .utf8) ?? ""
+
+        var mode: String?, cmd: String?, envOverrides: Int?
+        for line in output.split(separator: "\n", omittingEmptySubsequences: false) {
+            if line.hasPrefix("SYNCTRAY_DRY_RUN_MODE=") {
+                mode = String(line.dropFirst("SYNCTRAY_DRY_RUN_MODE=".count))
+            } else if line.hasPrefix("SYNCTRAY_DRY_RUN_CMD=") {
+                cmd = String(line.dropFirst("SYNCTRAY_DRY_RUN_CMD=".count))
+            } else if line.hasPrefix("SYNCTRAY_DRY_RUN_ENV_OVERRIDES=") {
+                envOverrides = Int(line.dropFirst("SYNCTRAY_DRY_RUN_ENV_OVERRIDES=".count))
+            }
+        }
+        let logContent = (try? String(contentsOfFile: profile.logPath, encoding: .utf8)) ?? ""
+        return DryRunResult(
+            mode: mode, cmd: cmd, envOverrides: envOverrides, output: output,
+            exitCode: proc.terminationStatus, scriptPath: scriptPath, log: logContent)
+    }
+
+    /// A minimal rclone config defining `name` as an `alias` remote rooted at `path` — the
+    /// reachability probe (`lsjson --stat name:<remotePath>`) resolves deterministically and
+    /// near-instantly under `path`,
+    /// regardless of the test process's cwd (unlike a bare `local` remote with no `root`,
+    /// which resolves relative to cwd — see the investigation this harness's design notes
+    /// came from). Used for every "primary reachable" dry-run fixture.
+    private static func aliasRcloneConfig(name: String, path: String) -> String {
+        "[\(name)]\ntype = alias\nremote = \(path)\n"
+    }
+
+    // MARK: - AC-MM1 — mount mode token parsing + display names
+
+    private static func testMountModeParse() -> Bool {
+        guard MountMode.parse("streaming") == .streaming,
+              MountMode.parse("cache-only-manual") == .cacheOnlyManual,
+              MountMode.parse("cache-only-pending") == .cacheOnlyPending,
+              MountMode.parse("cache-only-offline") == .cacheOnlyOffline,
+              MountMode.parse("  streaming\n") == .streaming,
+              MountMode.parse("bogus-token") == nil,
+              MountMode.parse("") == nil
+        else {
+            return report("AC-MM1", "mount-mode-parse", false, "(token parse/reject mismatch)")
+        }
+        guard MountMode.streaming.displayName == "Streaming",
+              MountMode.cacheOnlyManual.displayName == "Cache only (manual)",
+              MountMode.cacheOnlyPending.displayName == "Cache only (uploads pending, automatic)",
+              MountMode.cacheOnlyOffline.displayName == "Cache only (offline, automatic)"
+        else {
+            return report("AC-MM1", "mount-mode-parse", false, "(display name mismatch)")
+        }
+        guard !MountMode.streaming.isCacheOnly, MountMode.cacheOnlyManual.isCacheOnly,
+              MountMode.cacheOnlyPending.isCacheOnly, MountMode.cacheOnlyOffline.isCacheOnly,
+              !MountMode.cacheOnlyManual.isAutomatic, MountMode.cacheOnlyPending.isAutomatic,
+              MountMode.cacheOnlyOffline.isAutomatic
+        else {
+            return report("AC-MM1", "mount-mode-parse", false, "(isCacheOnly/isAutomatic mismatch)")
+        }
+        return report("AC-MM1", "mount-mode-parse", true)
+    }
+
+    // MARK: - AC-CK2 — mount mode never streams through the fallback
+
+    private static func testMountNoFallbackOverride() -> Bool {
+        let dir = "\(selfTestRoot)/ck2-\(UUID().uuidString)"
+        let local = "\(dir)/mnt", cache = "\(dir)/cache"
+        try? FileManager.default.createDirectory(atPath: local, withIntermediateDirectories: true)
+        try? FileManager.default.createDirectory(atPath: cache, withIntermediateDirectories: true)
+
+        let profile = mountFixtureProfile(
+            localPath: local, cachePath: cache,
+            rcloneRemote: "unreachableprimary:", remotePath: "Kaiju",
+            // `fallbackRemote` conventionally has NO trailing colon (see the
+            // `SyncProfile.fallbackRemote` doc comment, e.g. "synology-sftp") — unlike
+            // `rcloneRemote`. Getting this wrong makes `dump_remote_as_env`'s `.get(remote,
+            // {})` JSON lookup silently miss the config section (its key has no colon
+            // either), so any mutation of the mount-fallback guard below would go
+            // undetected — the earlier version of this fixture had exactly that bug.
+            fallbackRemote: "fixturefallback")
+        // `cacheOnlyConfigPath` is deliberately NOT under `vfsCachePath` (it lives beside the
+        // other real per-profile config files under `~/.config/synctray/profiles/` — see
+        // CLAUDE.md's "Cache-Only" section) — a non-streaming mode's dry run writes a REAL
+        // file there. Clean it up so no self-test artifact survives outside the temp sandbox.
+        defer { try? FileManager.default.removeItem(atPath: profile.cacheOnlyConfigPath) }
+        // The PRIMARY is left undefined so it fails to resolve near-instantly (no real
+        // network wait) — genuinely unreachable. The FALLBACK is a REAL, resolvable alias
+        // remote: if the script's mount branch ever entered the "same remote name preserved"
+        // env-var-override path (the regression this fixture guards), `dump_remote_as_env` would copy this
+        // section's real key/value pairs into `RCLONE_CONFIG_UNREACHABLEPRIMARY_*` and
+        // `envOverrides` would be > 0 — an EMPTY fallback section (as a prior version of this
+        // test used) can never distinguish "the branch ran and copied nothing" from "the
+        // branch never ran", which would make this assertion vacuous.
+        let fallbackTarget = "\(dir)/fallback-target"
+        try? FileManager.default.createDirectory(atPath: fallbackTarget, withIntermediateDirectories: true)
+        let result = dryRunMountScript(
+            profile: profile, rcloneConfig: aliasRcloneConfig(name: "fixturefallback", path: fallbackTarget))
+
+        guard result.mode == MountMode.cacheOnlyOffline.rawValue else {
+            return report("AC-CK2", "mount-no-fallback-override", false,
+                          "(mode=\(result.mode ?? "nil") output=\(result.output) log=\(result.log))")
+        }
+        guard result.envOverrides == 0 else {
+            return report("AC-CK2", "mount-no-fallback-override", false,
+                          "(expected 0 RCLONE_CONFIG_ overrides, got \(result.envOverrides ?? -1))")
+        }
+        guard let cmd = result.cmd, !cmd.contains("fixturefallback") else {
+            return report("AC-CK2", "mount-no-fallback-override", false,
+                          "(rendered command names the fallback remote: \(result.cmd ?? "nil"))")
+        }
+        // The decisive check: Cache Only's rendered command mounts the union remote
+        // (`synctray_cacheonly:`), which never echoes `$REMOTE` by name — so a
+        // reintroduced fallback branch would pass every check above while still having
+        // run. The one place that branch is unconditionally observable is the log line
+        // it writes BEFORE mode selection ever runs.
+        guard !result.log.contains("using fallback:") else {
+            return report("AC-CK2", "mount-no-fallback-override", false,
+                          "(log shows the fallback branch ran for a mount profile: \(result.log))")
+        }
+        return report("AC-CK2", "mount-no-fallback-override", true)
+    }
+
+    // MARK: - AC-CK3 — suffixed vfs/vfsMeta cache-key consolidation
+
+    private static func writeFile(_ path: String, _ contents: String) {
+        try? FileManager.default.createDirectory(
+            atPath: (path as NSString).deletingLastPathComponent, withIntermediateDirectories: true)
+        try? contents.write(toFile: path, atomically: true, encoding: .utf8)
+    }
+
+    private static func testCacheSuffixConsolidation() -> Bool {
+        let root = "\(selfTestRoot)/ck3-\(UUID().uuidString)"
+        let local = "\(root)/mnt", cache = "\(root)/cache"
+        try? FileManager.default.createDirectory(atPath: local, withIntermediateDirectories: true)
+
+        // Suffixed source tree, matching the real "detected overridden config" shape.
+        writeFile("\(cache)/vfs/synology{jzZaN}/Kaiju/KAIJU/file.bin", "hello")
+        writeFile("\(cache)/vfsMeta/synology{jzZaN}/Kaiju/KAIJU/file.bin", "{\"Size\":5}")
+
+        let profile = mountFixtureProfile(localPath: local, cachePath: cache, remotePath: "Kaiju/KAIJU")
+        // See AC-CK2's identical comment: this dry run is unreachable → non-streaming mode →
+        // a REAL file under ~/.config/synctray/profiles/ gets written; clean it up.
+        defer { try? FileManager.default.removeItem(atPath: profile.cacheOnlyConfigPath) }
+        // No remote defined — reachability probe fails fast; consolidation runs regardless.
+        let result = dryRunMountScript(profile: profile, rcloneConfig: "")
+        guard result.exitCode == 0 else {
+            return report("AC-CK3", "cache-suffix-consolidation", false, "(dry-run exited \(result.exitCode): \(result.output) log=\(result.log))")
+        }
+
+        let fm = FileManager.default
+        guard fm.fileExists(atPath: "\(cache)/vfs/synology/Kaiju/KAIJU/file.bin"),
+              (try? String(contentsOfFile: "\(cache)/vfs/synology/Kaiju/KAIJU/file.bin")) == "hello",
+              fm.fileExists(atPath: "\(cache)/vfsMeta/synology/Kaiju/KAIJU/file.bin")
+        else {
+            return report("AC-CK3", "cache-suffix-consolidation", false,
+                          "(suffixed tree was not consolidated into the unsuffixed location: \(result.output))")
+        }
+        guard !fm.fileExists(atPath: "\(cache)/vfs/synology{jzZaN}") else {
+            return report("AC-CK3", "cache-suffix-consolidation", false, "(emptied suffixed ancestor was not pruned)")
+        }
+
+        // Rerun on an already-consolidated tree: no candidate left, must be a harmless no-op.
+        let rerun = dryRunMountScript(profile: profile, rcloneConfig: "")
+        guard rerun.exitCode == 0,
+              (try? String(contentsOfFile: "\(cache)/vfs/synology/Kaiju/KAIJU/file.bin")) == "hello"
+        else {
+            return report("AC-CK3", "cache-suffix-consolidation", false, "(rerun on a consolidated tree was not a no-op)")
+        }
+
+        // Occupied destination: a second profile whose destination already has real data —
+        // the stray suffixed tree must be LEFT ALONE, not merged or overwritten.
+        let cache2 = "\(root)/cache2"
+        writeFile("\(cache2)/vfs/synology{jzZaN}/Elsewhere/PATH/stray.bin", "stray")
+        writeFile("\(cache2)/vfs/synology/Elsewhere/PATH/existing.bin", "existing")
+        let profile2 = mountFixtureProfile(localPath: "\(root)/mnt2", cachePath: cache2, remotePath: "Elsewhere/PATH")
+        defer { try? FileManager.default.removeItem(atPath: profile2.cacheOnlyConfigPath) }
+        try? FileManager.default.createDirectory(atPath: "\(root)/mnt2", withIntermediateDirectories: true)
+        _ = dryRunMountScript(profile: profile2, rcloneConfig: "")
+        guard fm.fileExists(atPath: "\(cache2)/vfs/synology{jzZaN}/Elsewhere/PATH/stray.bin"),
+              fm.fileExists(atPath: "\(cache2)/vfs/synology/Elsewhere/PATH/existing.bin")
+        else {
+            return report("AC-CK3", "cache-suffix-consolidation", false,
+                          "(an occupied destination did not leave both trees in place)")
+        }
+
+        return report("AC-CK3", "cache-suffix-consolidation", true)
+    }
+
+    /// Run the mount script's consolidation step against a fresh fixture cache that
+    /// `setup` seeds (paths relative to the cache root), returning the cache root.
+    private static func runConsolidationScenario(
+        _ label: String, cache existingCache: String? = nil, setup: (String) -> Void
+    ) -> (cache: String, result: DryRunResult) {
+        let root = "\(selfTestRoot)/\(label)-\(UUID().uuidString)"
+        let local = "\(root)/mnt", cache = existingCache ?? "\(root)/cache"
+        try? FileManager.default.createDirectory(atPath: local, withIntermediateDirectories: true)
+        try? FileManager.default.createDirectory(atPath: cache, withIntermediateDirectories: true)
+        setup(cache)
+        let profile = mountFixtureProfile(localPath: local, cachePath: cache, remotePath: "Kaiju/KAIJU")
+        defer { try? FileManager.default.removeItem(atPath: profile.cacheOnlyConfigPath) }
+        return (cache, dryRunMountScript(profile: profile, rcloneConfig: ""))
+    }
+
+    // MARK: - AC-CK5 — suffix consolidation decides once for the vfs/vfsMeta pair
+
+    private static func testCacheSuffixPairSafety() -> Bool {
+        let fm = FileManager.default
+        let suffixed = "synology{jzZaN}/Kaiju/KAIJU"
+
+        // (c) vfs-only suffixed tree: its sidecars are gone, so rclone would discard the
+        // data anyway — moving it would only plant metadata-less data at the live key.
+        let vfsOnly = runConsolidationScenario("ck5-vfsonly") { cache in
+            writeFile("\(cache)/vfs/\(suffixed)/file.bin", "hello")
+        }
+        guard fm.fileExists(atPath: "\(vfsOnly.cache)/vfs/\(suffixed)/file.bin"),
+              !fm.fileExists(atPath: "\(vfsOnly.cache)/vfs/synology/Kaiju/KAIJU")
+        else {
+            return report("AC-CK5", "cache-suffix-pair-safety", false,
+                          "(a vfs tree without its vfsMeta was moved: \(vfsOnly.result.log))")
+        }
+
+        // (d) vfsMeta-only suffixed tree: sidecars describing bytes that are not there.
+        let metaOnly = runConsolidationScenario("ck5-metaonly") { cache in
+            writeFile("\(cache)/vfsMeta/\(suffixed)/file.bin", "{\"Size\":5}")
+        }
+        guard fm.fileExists(atPath: "\(metaOnly.cache)/vfsMeta/\(suffixed)/file.bin"),
+              !fm.fileExists(atPath: "\(metaOnly.cache)/vfsMeta/synology/Kaiju/KAIJU")
+        else {
+            return report("AC-CK5", "cache-suffix-pair-safety", false,
+                          "(a vfsMeta tree without its vfs data was moved: \(metaOnly.result.log))")
+        }
+
+        // Only the vfsMeta destination is occupied: the PAIR stays put — moving vfs alone
+        // would pair the stray data with someone else's byte-range metadata.
+        let halfOccupied = runConsolidationScenario("ck5-half") { cache in
+            writeFile("\(cache)/vfs/\(suffixed)/file.bin", "hello")
+            writeFile("\(cache)/vfsMeta/\(suffixed)/file.bin", "{\"Size\":5}")
+            writeFile("\(cache)/vfsMeta/synology/Kaiju/KAIJU/other.bin", "{\"Size\":9}")
+        }
+        guard fm.fileExists(atPath: "\(halfOccupied.cache)/vfs/\(suffixed)/file.bin"),
+              fm.fileExists(atPath: "\(halfOccupied.cache)/vfsMeta/\(suffixed)/file.bin"),
+              !fm.fileExists(atPath: "\(halfOccupied.cache)/vfs/synology/Kaiju/KAIJU")
+        else {
+            return report("AC-CK5", "cache-suffix-pair-safety", false,
+                          "(one half of the pair moved into a partly-occupied destination: \(halfOccupied.result.log))")
+        }
+
+        // vfs rename fails after vfsMeta already moved → vfsMeta is rolled back. The
+        // primary's vfs root is made read-only so creating vfs/synology/Kaiju fails.
+        var lockedDir = ""
+        let rollback = runConsolidationScenario("ck5-rollback") { cache in
+            writeFile("\(cache)/vfs/\(suffixed)/file.bin", "hello")
+            writeFile("\(cache)/vfsMeta/\(suffixed)/file.bin", "{\"Size\":5}")
+            lockedDir = "\(cache)/vfs/synology"
+            try? fm.createDirectory(atPath: lockedDir, withIntermediateDirectories: true)
+            try? fm.setAttributes([.posixPermissions: 0o555], ofItemAtPath: lockedDir)
+        }
+        try? fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: lockedDir)
+        guard fm.fileExists(atPath: "\(rollback.cache)/vfs/\(suffixed)/file.bin"),
+              fm.fileExists(atPath: "\(rollback.cache)/vfsMeta/\(suffixed)/file.bin"),
+              !fm.fileExists(atPath: "\(rollback.cache)/vfsMeta/synology/Kaiju/KAIJU"),
+              rollback.result.log.contains("rolled vfsMeta back")
+        else {
+            return report("AC-CK5", "cache-suffix-pair-safety", false,
+                          "(a failed vfs rename did not roll the vfsMeta rename back: \(rollback.result.log))")
+        }
+        return report("AC-CK5", "cache-suffix-pair-safety", true)
+    }
+
+    // MARK: - AC-CK6 — an EMPTY destination is absent, a destination with a file is not
+
+    private static func testCacheSuffixEmptyDestination() -> Bool {
+        let fm = FileManager.default
+        let suffixed = "synology{jzZaN}/Kaiju/KAIJU"
+        let seedPair: (String) -> Void = { cache in
+            writeFile("\(cache)/vfs/\(suffixed)/dir/file.bin", "hello")
+            writeFile("\(cache)/vfsMeta/\(suffixed)/dir/file.bin", "{\"Size\":5}")
+        }
+
+        // (a) Both destinations exist as empty directory chains — what a mount of the
+        // unsuffixed key leaves behind before caching a byte. They must not block adoption.
+        let empty = runConsolidationScenario("ck6-empty") { cache in
+            seedPair(cache)
+            try? fm.createDirectory(atPath: "\(cache)/vfs/synology/Kaiju/KAIJU/a/b", withIntermediateDirectories: true)
+            try? fm.createDirectory(atPath: "\(cache)/vfsMeta/synology/Kaiju/KAIJU/c", withIntermediateDirectories: true)
+        }
+        guard (try? String(contentsOfFile: "\(empty.cache)/vfs/synology/Kaiju/KAIJU/dir/file.bin")) == "hello",
+              (try? String(contentsOfFile: "\(empty.cache)/vfsMeta/synology/Kaiju/KAIJU/dir/file.bin")) == "{\"Size\":5}",
+              !fm.fileExists(atPath: "\(empty.cache)/vfs/synology{jzZaN}"),
+              !fm.fileExists(atPath: "\(empty.cache)/vfsMeta/synology{jzZaN}")
+        else {
+            return report("AC-CK6", "cache-suffix-empty-destination", false,
+                          "(an empty destination blocked adoption: \(empty.result.log))")
+        }
+
+        // (e) Idempotent: a second run over the consolidated cache changes nothing.
+        let rerun = runConsolidationScenario("ck6-rerun", cache: empty.cache) { _ in }
+        guard rerun.result.exitCode == 0,
+              (try? String(contentsOfFile: "\(empty.cache)/vfs/synology/Kaiju/KAIJU/dir/file.bin")) == "hello",
+              (try? String(contentsOfFile: "\(empty.cache)/vfsMeta/synology/Kaiju/KAIJU/dir/file.bin")) == "{\"Size\":5}",
+              !rerun.result.log.contains("Cache key: moved")
+        else {
+            return report("AC-CK6", "cache-suffix-empty-destination", false,
+                          "(second run over a consolidated cache was not a no-op: \(rerun.result.log))")
+        }
+
+        // (b) A destination holding any file, however deep, is populated: nothing moves and
+        // the existing file is untouched (never merged, never pruned).
+        let occupied = runConsolidationScenario("ck6-occupied") { cache in
+            seedPair(cache)
+            writeFile("\(cache)/vfs/synology/Kaiju/KAIJU/deep/er/existing.bin", "existing")
+            try? fm.createDirectory(atPath: "\(cache)/vfsMeta/synology/Kaiju/KAIJU", withIntermediateDirectories: true)
+        }
+        guard fm.fileExists(atPath: "\(occupied.cache)/vfs/\(suffixed)/dir/file.bin"),
+              fm.fileExists(atPath: "\(occupied.cache)/vfsMeta/\(suffixed)/dir/file.bin"),
+              (try? String(contentsOfFile: "\(occupied.cache)/vfs/synology/Kaiju/KAIJU/deep/er/existing.bin")) == "existing",
+              !fm.fileExists(atPath: "\(occupied.cache)/vfs/synology/Kaiju/KAIJU/dir")
+        else {
+            return report("AC-CK6", "cache-suffix-empty-destination", false,
+                          "(a destination holding a file did not leave both trees in place: \(occupied.result.log))")
+        }
+        return report("AC-CK6", "cache-suffix-empty-destination", true)
+    }
+
+    // MARK: - AC-CK4 — mount command keeps a spaced path as ONE argument
+
+    /// Word-split `cmd` exactly the way the script's `eval "$RCLONE_CMD"` does, returning the
+    /// resulting argv. A path whose quotes were consumed at assignment time (a bare `"`
+    /// rendered into the script instead of `\"`) splits into several words here — the same
+    /// split rclone would receive.
+    private static func evalArgv(_ cmd: String) -> [String] {
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/bin/bash")
+        proc.arguments = ["-c", "eval \"set -- $1\"; printf '%s\\0' \"$@\"", "_", cmd]
+        let pipe = Pipe()
+        proc.standardOutput = pipe
+        do { try proc.run() } catch { return [] }
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        proc.waitUntilExit()
+        return (String(data: data, encoding: .utf8) ?? "")
+            .split(separator: "\0", omittingEmptySubsequences: false)
+            .dropLast().map(String.init)
+    }
+
+    private static func argFollowing(_ flag: String, in argv: [String]) -> String? {
+        guard let i = argv.firstIndex(of: flag), i + 1 < argv.count else { return nil }
+        return argv[i + 1]
+    }
+
+    private static func testMountCommandQuoting() -> Bool {
+        let root = "\(selfTestRoot)/ck4 spaced \(UUID().uuidString)"
+        let local = "\(root)/My Mount", cache = "\(root)/Cache Dir"
+        let fm = FileManager.default
+        try? fm.createDirectory(atPath: local, withIntermediateDirectories: true)
+        try? fm.createDirectory(atPath: cache, withIntermediateDirectories: true)
+        let target = "\(root)/remote-target"
+        try? fm.createDirectory(atPath: target, withIntermediateDirectories: true)
+
+        // Streaming: primary reachable (alias remote) → the streaming command.
+        let streaming = mountFixtureProfile(localPath: local, cachePath: cache)
+        defer { try? fm.removeItem(atPath: streaming.cacheOnlyConfigPath) }
+        let s = dryRunMountScript(
+            profile: streaming, rcloneConfig: aliasRcloneConfig(name: "synology", path: target))
+        guard s.mode == MountMode.streaming.rawValue, let sCmd = s.cmd else {
+            return report("AC-CK4", "mount-command-quoting", false,
+                          "(streaming fixture did not dry-run streaming: \(s.output) log=\(s.log))")
+        }
+        let sArgv = evalArgv(sCmd)
+        guard sArgv.contains(local),
+              argFollowing("--cache-dir", in: sArgv) == cache,
+              argFollowing("--volname", in: sArgv) == "My Mount"
+        else {
+            return report("AC-CK4", "mount-command-quoting", false,
+                          "(streaming command splits a spaced path: \(sArgv))")
+        }
+
+        // Cache Only: every path the union mount passes must survive eval as one word too.
+        let cacheOnly = mountFixtureProfile(localPath: local, cachePath: cache, streamCacheOnly: true)
+        defer { try? fm.removeItem(atPath: cacheOnly.cacheOnlyConfigPath) }
+        let c = dryRunMountScript(profile: cacheOnly, rcloneConfig: "")
+        guard c.mode == MountMode.cacheOnlyManual.rawValue, let cCmd = c.cmd else {
+            return report("AC-CK4", "mount-command-quoting", false,
+                          "(cache-only fixture did not dry-run cache-only: \(c.output) log=\(c.log))")
+        }
+        let cArgv = evalArgv(cCmd)
+        guard cArgv.contains(local),
+              argFollowing("--cache-dir", in: cArgv) == cacheOnly.cacheOnlyCachePath,
+              argFollowing("--exclude-from", in: cArgv) == cacheOnly.cacheOnlyExcludePath,
+              argFollowing("--config", in: cArgv) == cacheOnly.cacheOnlyConfigPath,
+              argFollowing("--volname", in: cArgv) == "My Mount"
+        else {
+            return report("AC-CK4", "mount-command-quoting", false,
+                          "(cache-only command splits a spaced path: \(cArgv))")
+        }
+        return report("AC-CK4", "mount-command-quoting", true)
+    }
+
+    // MARK: - AC-CO1 — Cache Only union config + command composition
+
+    private static func testCacheOnlyUnionConfig() -> Bool {
+        let root = "\(selfTestRoot)/co1-\(UUID().uuidString)"
+        let local = "\(root)/mnt", cache = "\(root)/cache"
+        try? FileManager.default.createDirectory(atPath: local, withIntermediateDirectories: true)
+        try? FileManager.default.createDirectory(atPath: cache, withIntermediateDirectories: true)
+
+        let profile = mountFixtureProfile(localPath: local, cachePath: cache, streamCacheOnly: true)
+        // See AC-CK2's comment: Cache Only writes a REAL file under
+        // ~/.config/synctray/profiles/ (by design — see CLAUDE.md). Clean it up so this
+        // self-test leaves nothing behind outside the temp sandbox.
+        defer { try? FileManager.default.removeItem(atPath: profile.cacheOnlyConfigPath) }
+        let result = dryRunMountScript(profile: profile, rcloneConfig: "")
+
+        guard result.mode == MountMode.cacheOnlyManual.rawValue else {
+            return report("AC-CO1", "cache-only-union-config", false, "(mode=\(result.mode ?? "nil") output=\(result.output) log=\(result.log))")
+        }
+        guard let cmd = result.cmd else {
+            return report("AC-CO1", "cache-only-union-config", false, "(no rendered command: \(result.output))")
+        }
+        guard cmd.contains("--config"), cmd.contains("--vfs-cache-mode writes"),
+              cmd.contains("--volname"), !cmd.contains("--rc")
+        else {
+            return report("AC-CO1", "cache-only-union-config", false, "(command missing expected flags: \(cmd))")
+        }
+        guard !cmd.contains("--cache-dir \"\(cache)\"") else {
+            return report("AC-CO1", "cache-only-union-config", false, "(cache-only mount reused the streaming --cache-dir)")
+        }
+
+        let confPath = profile.cacheOnlyConfigPath
+        guard let confText = try? String(contentsOfFile: confPath, encoding: .utf8) else {
+            return report("AC-CO1", "cache-only-union-config", false, "(union config was not written)")
+        }
+        guard confText.contains("type = union"),
+              confText.contains("action_policy = ff"), confText.contains("create_policy = ff"),
+              confText.contains("search_policy = ff")
+        else {
+            return report("AC-CO1", "cache-only-union-config", false, "(union config missing expected keys: \(confText)")
+        }
+        guard let overlayRange = confText.range(of: profile.overlayPath),
+              let dataRange = confText.range(of: "\(cache)/vfs/synology/Kaiju/KAIJU:ro"),
+              overlayRange.lowerBound < dataRange.lowerBound
+        else {
+            return report("AC-CO1", "cache-only-union-config", false,
+                          "(overlay upstream is not listed before the read-only cache upstream: \(confText))")
+        }
+        let attrs = try? FileManager.default.attributesOfItem(atPath: confPath)
+        guard let perms = attrs?[.posixPermissions] as? NSNumber, perms.uint16Value & 0o777 == 0o600 else {
+            return report("AC-CO1", "cache-only-union-config", false, "(union config is not 0600)")
+        }
+
+        // `bash -n` on the rendered SCRIPT file itself (syntax check only, never executes).
+        let syntaxCheck = Process()
+        syntaxCheck.executableURL = URL(fileURLWithPath: "/bin/bash")
+        syntaxCheck.arguments = ["-n", result.scriptPath]
+        let syntaxPipe = Pipe()
+        syntaxCheck.standardError = syntaxPipe
+        try? syntaxCheck.run()
+        syntaxCheck.waitUntilExit()
+        guard syntaxCheck.terminationStatus == 0 else {
+            let errText = String(data: syntaxPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+            return report("AC-CO1", "cache-only-union-config", false, "(bash -n failed: \(errText))")
+        }
+
+        return report("AC-CO1", "cache-only-union-config", true)
+    }
+
+    // MARK: - AC-CO2 — real rclone against the generated union config + exclude list
+
+    private static func testCacheOnlyUnionBehaviour() -> Bool {
+        let root = "\(selfTestRoot)/co2-\(UUID().uuidString)"
+        let local = "\(root)/mnt", cache = "\(root)/cache"
+        let dataDir = "\(cache)/vfs/synology/Kaiju/KAIJU"
+        let metaDir = "\(cache)/vfsMeta/synology/Kaiju/KAIJU"
+        try? FileManager.default.createDirectory(atPath: local, withIntermediateDirectories: true)
+
+        // complete.txt: full byte-range coverage, Dirty:false — must SHOW.
+        writeFile("\(dataDir)/complete.txt", "hello")
+        writeFile("\(metaDir)/complete.txt", "{\"Size\":5,\"Rs\":[{\"Pos\":0,\"Size\":5}],\"Dirty\":false}")
+        // dirty.txt: full coverage but Dirty:true — Dirty is deliberately ignored — must SHOW.
+        writeFile("\(dataDir)/dirty.txt", "world")
+        writeFile("\(metaDir)/dirty.txt", "{\"Size\":5,\"Rs\":[{\"Pos\":0,\"Size\":5}],\"Dirty\":true}")
+        // partial.txt: sidecar covers only 4 of 10 bytes — must HIDE.
+        writeFile("\(dataDir)/partial.txt", "0123456789")
+        writeFile("\(metaDir)/partial.txt", "{\"Size\":10,\"Rs\":[{\"Pos\":0,\"Size\":4}],\"Dirty\":false}")
+        // nometa.txt: no sidecar at all — must HIDE.
+        writeFile("\(dataDir)/nometa.txt", "no sidecar here")
+
+        let profile = mountFixtureProfile(localPath: local, cachePath: cache, streamCacheOnly: true)
+        // See AC-CK2's comment: cleans up the REAL ~/.config/synctray/profiles/ file this
+        // dry run writes (by design). Deferred to the end of this function since the direct
+        // rclone calls below still need to read it.
+        defer { try? FileManager.default.removeItem(atPath: profile.cacheOnlyConfigPath) }
+        let result = dryRunMountScript(profile: profile, rcloneConfig: "")
+        guard result.mode == MountMode.cacheOnlyManual.rawValue else {
+            return report("AC-CO2", "cache-only-union-behaviour", false, "(fixture did not dry-run cache-only: \(result.output) log=\(result.log))")
+        }
+
+        guard let rclone = RcloneLocator.resolve() else {
+            return report("AC-CO2", "cache-only-union-behaviour", false, "(rclone not found)")
+        }
+        func runRclone(_ args: [String]) -> (Int32, String, String) {
+            let p = Process()
+            p.executableURL = URL(fileURLWithPath: rclone)
+            p.arguments = args
+            let out = Pipe(), err = Pipe()
+            p.standardOutput = out
+            p.standardError = err
+            do { try p.run() } catch { return (-1, "", "\(error)") }
+            p.waitUntilExit()
+            let o = String(data: out.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+            let e = String(data: err.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+            return (p.terminationStatus, o, e)
+        }
+
+        let confArgs = ["--config", profile.cacheOnlyConfigPath]
+        let excludeArgs = ["--exclude-from", profile.cacheOnlyExcludePath]
+
+        // Complete + complete-dirty show; partial + missing-sidecar hide.
+        let (lsExit, lsOut, lsErr) = runRclone(confArgs + excludeArgs + ["lsf", "synctray_cacheonly:"])
+        guard lsExit == 0 else {
+            return report("AC-CO2", "cache-only-union-behaviour", false, "(lsf failed: \(lsErr))")
+        }
+        let listed = Set(lsOut.split(separator: "\n").map(String.init))
+        guard listed.contains("complete.txt"), listed.contains("dirty.txt"),
+              !listed.contains("partial.txt"), !listed.contains("nometa.txt")
+        else {
+            return report("AC-CO2", "cache-only-union-behaviour", false, "(unexpected listing: \(listed))")
+        }
+
+        // Writes land in the overlay, never the read-only cache tree. `copyto` from a real
+        // local source file, not `rcat` — `rcat` reads stdin, which this non-interactive
+        // process has none of (`nothing to read from standard input`).
+        let sourceFile = "\(root)/new-source.txt"
+        writeFile(sourceFile, "new content")
+        let (_, _, copyErr) = runRclone(confArgs + ["copyto", sourceFile, "synctray_cacheonly:new.txt"])
+        guard FileManager.default.fileExists(atPath: "\(profile.overlayPath)/new.txt"),
+              !FileManager.default.fileExists(atPath: "\(dataDir)/new.txt")
+        else {
+            return report("AC-CO2", "cache-only-union-behaviour", false, "(write did not land in the overlay: \(copyErr))")
+        }
+
+        // Deleting a base (read-only) file must fail.
+        let (delExit, _, _) = runRclone(confArgs + ["deletefile", "synctray_cacheonly:complete.txt"])
+        guard delExit != 0, FileManager.default.fileExists(atPath: "\(dataDir)/complete.txt") else {
+            return report("AC-CO2", "cache-only-union-behaviour", false, "(deleting a read-only base file did not fail)")
+        }
+
+        return report("AC-CO2", "cache-only-union-behaviour", true)
+    }
+
+    // MARK: - AC-CO3 — app-written partial-file list + the script's fallback to it
+
+    /// The app builds the same list the script does (escaping included), a failed walk
+    /// never leaves a list behind, and when the script can't read the cache itself it uses
+    /// the app's list — or mounts streaming when there is none, never Cache Only unfiltered.
+    private static func testCacheOnlyAppWrittenList() -> Bool {
+        let name = "AC-CO3", slug = "cache-only-app-written-list"
+        // Pure helpers.
+        guard VFSCacheService.cacheOnlyExcludeLine("a/[x]*{y}?.wav") == "/a/\\[x\\]\\*\\{y\\}\\?.wav",
+              VFSCacheService.cacheOnlyExcludeLine("a\\b") == "/a\\\\b",
+              VFSCacheService.cacheOnlyExcludeLines("plain.txt") == ["/plain.txt"],
+              VFSCacheService.cacheOnlyExcludeLines("Caf\u{E9}.wav").count == 2
+        else { return report(name, slug, false, "(line escaping / NFC-NFD forms)") }
+        func meta(_ size: Int, _ ranges: [(Int, Int)], dirty: Bool = false) -> Data {
+            let rs = ranges.map { "{\"Pos\":\($0.0),\"Size\":\($0.1)}" }.joined(separator: ",")
+            return Data("{\"Size\":\(size),\"Rs\":[\(rs)],\"Dirty\":\(dirty)}".utf8)
+        }
+        let partial = [
+            VFSCacheService.isPartialForCacheOnly(metaJSON: meta(5, [(0, 5)]), dataSize: 5),
+            VFSCacheService.isPartialForCacheOnly(metaJSON: meta(5, [(0, 5)], dirty: true), dataSize: 5),
+            VFSCacheService.isPartialForCacheOnly(metaJSON: meta(10, [(0, 4)]), dataSize: 10),
+            VFSCacheService.isPartialForCacheOnly(metaJSON: meta(10, [(0, 4), (6, 4)]), dataSize: 10),
+            VFSCacheService.isPartialForCacheOnly(metaJSON: meta(5, [(0, 5)]), dataSize: 7),
+            VFSCacheService.isPartialForCacheOnly(metaJSON: nil, dataSize: 5),
+            VFSCacheService.isPartialForCacheOnly(metaJSON: Data("junk".utf8), dataSize: 5),
+        ]
+        guard partial == [false, false, true, true, true, true, true] else {
+            return report(name, slug, false, "(isPartialForCacheOnly=\(partial))")
+        }
+
+        let root = "\(selfTestRoot)/co3-\(UUID().uuidString)"
+        let local = "\(root)/mnt", cache = "\(root)/cache"
+        let dataDir = "\(cache)/vfs/synology/Kaiju/KAIJU"
+        let metaDir = "\(cache)/vfsMeta/synology/Kaiju/KAIJU"
+        try? FileManager.default.createDirectory(atPath: local, withIntermediateDirectories: true)
+        writeFile("\(dataDir)/complete.txt", "hello")
+        writeFile("\(metaDir)/complete.txt", "{\"Size\":5,\"Rs\":[{\"Pos\":0,\"Size\":5}],\"Dirty\":false}")
+        writeFile("\(dataDir)/sub/[take 1].wav", "0123456789")
+        writeFile("\(metaDir)/sub/[take 1].wav", "{\"Size\":10,\"Rs\":[{\"Pos\":0,\"Size\":4}],\"Dirty\":false}")
+        writeFile("\(dataDir)/nometa.txt", "no sidecar")
+        let profile = mountFixtureProfile(localPath: local, cachePath: cache, streamCacheOnly: true)
+        defer { try? FileManager.default.removeItem(atPath: profile.cacheOnlyConfigPath) }
+        func readList() -> Set<String>? {
+            (try? String(contentsOfFile: profile.cacheOnlyExcludePath, encoding: .utf8))
+                .map { Set($0.split(separator: "\n").map(String.init)) }
+        }
+
+        // Parity: the app's list equals the one the script generates for the same cache.
+        let written: Int
+        do { written = try VFSCacheService.shared.writeCacheOnlyExcludeList(for: profile) } catch {
+            return report(name, slug, false, "(app list write threw: \(error))")
+        }
+        guard written == 2, let appList = readList() else {
+            return report(name, slug, false, "(app list count=\(written) list=\(String(describing: readList())))")
+        }
+        let expected: Set<String> = ["/sub/\\[take 1\\].wav", "/nometa.txt"]
+        guard appList == expected else { return report(name, slug, false, "(app list=\(appList))") }
+        let direct = dryRunMountScript(profile: profile, rcloneConfig: "")
+        guard direct.mode == MountMode.cacheOnlyManual.rawValue, readList() == expected else {
+            return report(name, slug, false, "(script list=\(String(describing: readList())) log=\(direct.log))")
+        }
+
+        // Make the cache unreadable below the root, as launchd's python3 sees an
+        // external drive it has no privacy grant for.
+        let locked = "\(dataDir)/sub"
+        chmod(locked, 0o000)
+        defer { chmod(locked, 0o755) }
+        // The app's own walk fails too → throws and removes the list rather than keep one
+        // it can't vouch for.
+        guard (try? VFSCacheService.shared.writeCacheOnlyExcludeList(for: profile)) == nil,
+              !FileManager.default.fileExists(atPath: profile.cacheOnlyExcludePath) else {
+            return report(name, slug, false, "(failed app walk left a list behind)")
+        }
+        // No list + script can't read → streaming, not an unfiltered union mount.
+        let noList = dryRunMountScript(profile: profile, rcloneConfig: "")
+        guard noList.mode == MountMode.streaming.rawValue,
+              noList.log.contains("Cache Only unavailable") else {
+            return report(name, slug, false, "(no-list mode=\(noList.mode ?? "nil") log=\(noList.log))")
+        }
+        // An app-written list present → the script uses it as-is.
+        writeFile(profile.cacheOnlyExcludePath, expected.sorted().joined(separator: "\n") + "\n")
+        let fallback = dryRunMountScript(profile: profile, rcloneConfig: "")
+        guard fallback.mode == MountMode.cacheOnlyManual.rawValue,
+              fallback.log.contains("using the app-written partial-file list"),
+              readList() == expected else {
+            return report(name, slug, false, "(fallback mode=\(fallback.mode ?? "nil") log=\(fallback.log))")
+        }
+
+        // Refresh gate: always when missing; otherwise only mounted-streaming and due.
+        let now = Date()
+        let old = now.addingTimeInterval(-SyncManager.cacheOnlyListRefreshInterval - 1)
+        func gate(_ exists: Bool, _ mounted: Bool, _ mode: MountMode?, busy: Bool = false, last: Date?) -> Bool {
+            SyncManager.shouldRefreshCacheOnlyList(listExists: exists, isMounted: mounted, mode: mode,
+                                                   inFlight: busy, lastWrite: last, now: now)
+        }
+        let gates = [
+            gate(false, false, nil, last: now),               // missing → write even unmounted
+            gate(true, true, .streaming, last: nil),          // first refresh this session
+            gate(true, true, nil, last: old),                 // unknown mode = streaming, due
+            gate(true, true, .streaming, last: now),          // not due
+            gate(true, false, .streaming, last: old),         // unmounted: cache is static
+            gate(true, true, .cacheOnlyManual, last: old),    // Cache Only: cache is static
+            gate(false, true, .streaming, busy: true, last: nil),
+        ]
+        return report(name, slug, gates == [true, true, true, false, false, false, false], "(gates=\(gates))")
+    }
+
+    // MARK: - AC-AO1 — mount mode selection across the six fixture situations
+
+    private static func testMountModeSelection() -> Bool {
+        func scenario(
+            _ label: String,
+            reachable: Bool,
+            overlayFile: String? = nil,
+            dirtySidecar: Bool = false,
+            streamCacheOnly: Bool = false
+        ) -> String? {
+            let root = "\(selfTestRoot)/ao1-\(UUID().uuidString)"
+            let local = "\(root)/mnt", cache = "\(root)/cache"
+            try? FileManager.default.createDirectory(atPath: local, withIntermediateDirectories: true)
+            let profile = mountFixtureProfile(
+                localPath: local, cachePath: cache, rcloneRemote: "synology:", streamCacheOnly: streamCacheOnly)
+            // See AC-CK2's comment: any non-streaming outcome below writes a REAL file under
+            // ~/.config/synctray/profiles/ (by design). Clean it up per scenario.
+            defer { try? FileManager.default.removeItem(atPath: profile.cacheOnlyConfigPath) }
+            if let overlayFile {
+                writeFile("\(profile.overlayPath)/\(overlayFile)", "content")
+            }
+            if dirtySidecar {
+                writeFile("\(profile.cacheOnlyCachePath)/vfsMeta/dirty.txt", "{\"Dirty\":true}")
+            }
+            let conf = reachable ? aliasRcloneConfig(name: "synology", path: "\(root)/reachable-target") : ""
+            if reachable { try? FileManager.default.createDirectory(atPath: "\(root)/reachable-target", withIntermediateDirectories: true) }
+            let result = dryRunMountScript(profile: profile, rcloneConfig: conf)
+            return result.mode
+        }
+
+        let cases: [(String, String?, String?)] = [
+            ("primary unreachable", MountMode.cacheOnlyOffline.rawValue,
+             { scenario("offline", reachable: false) }()),
+            ("reachable, empty overlay", MountMode.streaming.rawValue,
+             { scenario("empty", reachable: true) }()),
+            ("reachable, real overlay file", MountMode.cacheOnlyPending.rawValue,
+             { scenario("pending", reachable: true, overlayFile: "note.txt") }()),
+            ("reachable, only .DS_Store in overlay", MountMode.streaming.rawValue,
+             { scenario("dsstore", reachable: true, overlayFile: ".DS_Store") }()),
+            ("reachable, Dirty sidecar in writes cache", MountMode.cacheOnlyPending.rawValue,
+             { scenario("dirty", reachable: true, dirtySidecar: true) }()),
+            ("streamCacheOnly true", MountMode.cacheOnlyManual.rawValue,
+             { scenario("manual", reachable: true, streamCacheOnly: true) }()),
+        ]
+
+        for (label, expected, actual) in cases {
+            guard actual == expected else {
+                return report("AC-AO1", "mount-mode-selection", false, "(\(label): expected \(expected), got \(actual ?? "nil"))")
+            }
+        }
+        return report("AC-AO1", "mount-mode-selection", true)
+    }
+
+    // MARK: - AC-AO4 — mode selection retries a failed reachability probe
+
+    private static func testMountProbeRetry() -> Bool {
+        let fm = FileManager.default
+        func fixture(_ label: String) -> (SyncProfile, String) {
+            let root = "\(selfTestRoot)/ao4-\(label)-\(UUID().uuidString)"
+            try? fm.createDirectory(atPath: "\(root)/mnt", withIntermediateDirectories: true)
+            let profile = mountFixtureProfile(localPath: "\(root)/mnt", cachePath: "\(root)/cache")
+            return (profile, root)
+        }
+
+        // Still unreachable after every retry → Cache Only (offline), with each retry logged.
+        let (down, _) = fixture("down")
+        defer { try? fm.removeItem(atPath: down.cacheOnlyConfigPath) }
+        let downResult = dryRunMountScript(profile: down, rcloneConfig: "")
+        let retries = downResult.log.components(separatedBy: "retrying reachability probe").count - 1
+        guard downResult.mode == MountMode.cacheOnlyOffline.rawValue, retries == 2 else {
+            return report("AC-AO4", "mount-probe-retry", false,
+                          "(unreachable primary: mode=\(downResult.mode ?? "nil") retries=\(retries) log=\(downResult.log))")
+        }
+
+        // The network comes up during the retry window (the login race): the first probe
+        // fails because the alias points at a remote that isn't defined yet (a missing
+        // target DIRECTORY would not do — the probe stats the profile's path and counts
+        // not-found as reachable), and that remote is defined only once the script has
+        // LOGGED its first retry — never on a wall-clock timer, which
+        // raced slow script startup on CI (the target existed before the first probe, so it
+        // streamed on attempt 1 with no retry at all). The retry gap only has to outlast
+        // this poller's latency (50 ms ticks), so the second probe is guaranteed to find it.
+        let (late, lateRoot) = fixture("late")
+        defer { try? fm.removeItem(atPath: late.cacheOnlyConfigPath) }
+        try? fm.removeItem(atPath: late.logPath)
+        let target = "\(lateRoot)/late-target"
+        try? fm.createDirectory(atPath: target, withIntermediateDirectories: true)
+        let logPath = late.logPath
+        let lateResult = dryRunMountScript(
+            profile: late, rcloneConfig: aliasRcloneConfig(name: "synology", path: "network:"),
+            probeRetryDelay: "2",
+            whileRunning: { rcloneConfPath in
+                DispatchQueue.global().async {
+                    let deadline = Date().addingTimeInterval(30)
+                    while Date() < deadline {
+                        if let log = try? String(contentsOfFile: logPath, encoding: .utf8),
+                           log.contains("retrying reachability probe") {
+                            let upstream = aliasRcloneConfig(name: "synology", path: "network:")
+                                + aliasRcloneConfig(name: "network", path: target)
+                            try? upstream.write(toFile: rcloneConfPath, atomically: true, encoding: .utf8)
+                            return
+                        }
+                        Thread.sleep(forTimeInterval: 0.05)
+                    }
+                }
+            })
+        let lateRetries = lateResult.log.components(separatedBy: "retrying reachability probe").count - 1
+        guard lateResult.mode == MountMode.streaming.rawValue,
+              lateRetries == 1,
+              lateResult.log.contains("reachable on attempt 2/3")
+        else {
+            return report("AC-AO4", "mount-probe-retry", false,
+                          "(a primary that came up during the retry window did not stream on the retry: mode=\(lateResult.mode ?? "nil") retries=\(lateRetries) log=\(lateResult.log))")
+        }
+        return report("AC-AO4", "mount-probe-retry", true)
+    }
+
+    // MARK: - AC-AO2 — auto-resume decision + lsof busy-process parsing
+
+    private static func testAutoResumeDecision() -> Bool {
+        // Manual Cache Only is never a candidate, regardless of stability/busy state.
+        guard SyncManager.autoResumeDecision(
+            mode: .cacheOnlyManual, manualCacheOnly: true, primaryStable: true, blockingProcesses: []
+        ) == .wait else {
+            return report("AC-AO2", "auto-resume-decision", false, "(manual mode resumed automatically)")
+        }
+        // Streaming is never a candidate (nothing to resume FROM).
+        guard SyncManager.autoResumeDecision(
+            mode: .streaming, manualCacheOnly: false, primaryStable: true, blockingProcesses: []
+        ) == .wait else {
+            return report("AC-AO2", "auto-resume-decision", false, "(streaming mode was treated as resumable)")
+        }
+        // Automatic mode, primary not yet stable → wait.
+        guard SyncManager.autoResumeDecision(
+            mode: .cacheOnlyOffline, manualCacheOnly: false, primaryStable: false, blockingProcesses: []
+        ) == .wait else {
+            return report("AC-AO2", "auto-resume-decision", false, "(unstable primary resumed anyway)")
+        }
+        // Automatic, stable, nothing open → resume.
+        guard SyncManager.autoResumeDecision(
+            mode: .cacheOnlyOffline, manualCacheOnly: false, primaryStable: true, blockingProcesses: []
+        ) == .resume else {
+            return report("AC-AO2", "auto-resume-decision", false, "(stable + idle did not resume)")
+        }
+        guard SyncManager.autoResumeDecision(
+            mode: .cacheOnlyPending, manualCacheOnly: false, primaryStable: true, blockingProcesses: []
+        ) == .resume else {
+            return report("AC-AO2", "auto-resume-decision", false, "(pending mode, stable + idle did not resume)")
+        }
+        // Automatic, stable, something open → notify (not resume, not silent wait).
+        guard SyncManager.autoResumeDecision(
+            mode: .cacheOnlyOffline, manualCacheOnly: false, primaryStable: true, blockingProcesses: ["Reaper"]
+        ) == .notify else {
+            return report("AC-AO2", "auto-resume-decision", false, "(busy mount resumed instead of notifying)")
+        }
+
+        // lsof -F pc parsing: 'p<pid>' lines are ignored, 'c<command>' lines are the answer,
+        // and macOS's own indexing/preview daemons never count as "busy".
+        let lsof = "p111\ncFinder\np222\ncmds\np333\ncReaper\np444\ncmdworker_shared\n"
+        let blocking = SyncManager.blockingProcesses(lsofOutput: lsof)
+        guard blocking == ["Reaper"] else {
+            return report("AC-AO2", "auto-resume-decision", false, "(lsof parse: expected [Reaper], got \(blocking))")
+        }
+        guard SyncManager.blockingProcesses(lsofOutput: "") == [] else {
+            return report("AC-AO2", "auto-resume-decision", false, "(empty lsof output produced blocking processes)")
+        }
+
+        // A FAILED busy check (lsof error/timeout → nil) must fail closed: we could not
+        // confirm the mount is idle, so the user is asked instead of being remounted under.
+        let failedBlockers = SyncManager.autoResumeBlockers(lsofOutput: nil)
+        guard !failedBlockers.isEmpty,
+              SyncManager.autoResumeDecision(
+                  mode: .cacheOnlyOffline, manualCacheOnly: false, primaryStable: true,
+                  blockingProcesses: failedBlockers) == .notify
+        else {
+            return report("AC-AO2", "auto-resume-decision", false, "(a failed lsof busy check resumed instead of notifying)")
+        }
+        // …while a check that ran and found nothing open still resumes.
+        guard SyncManager.autoResumeDecision(
+            mode: .cacheOnlyOffline, manualCacheOnly: false, primaryStable: true,
+            blockingProcesses: SyncManager.autoResumeBlockers(lsofOutput: "")) == .resume
+        else {
+            return report("AC-AO2", "auto-resume-decision", false, "(an idle lsof result did not resume)")
+        }
+
+        // The raw lsof run → busy-check result mapping. `nil` exit = launch failure/timeout.
+        func blockers(_ exit: Int32?, _ out: String, _ err: String) -> [String] {
+            SyncManager.autoResumeBlockers(lsofOutput: SyncManager.lsofBusyCheckResult(
+                terminationStatus: exit, stdout: out, stderr: err))
+        }
+        let failed = [SyncManager.busyCheckFailedBlocker]
+        let mappingCases: [(String, [String], [String])] = [
+            ("exit 1, empty stderr (nothing open)", [], blockers(1, "", "")),
+            ("exit 1, whitespace-only stderr", [], blockers(1, "", " \n")),
+            ("exit 1, stderr 'status error' (unreadable/stale mount)", failed,
+             blockers(1, "", "lsof: status error on /Volumes/X: Stale NFS file handle\n")),
+            ("exit 0, output", ["Reaper"], blockers(0, "p1\ncReaper\n", "")),
+            ("exit 2", failed, blockers(2, "", "")),
+            ("launch failure / timeout", failed, blockers(nil, "", "")),
+        ]
+        for (label, expected, actual) in mappingCases where actual != expected {
+            return report("AC-AO2", "auto-resume-decision", false,
+                          "(lsof mapping, \(label): expected \(expected), got \(actual))")
+        }
+
+        return report("AC-AO2", "auto-resume-decision", true)
+    }
+
+    // MARK: - AC-AO3 — Resume Syncing while unreachable hands off to automatic resume
+
+    private static func testResumeWhileUnreachableHandOff() -> Bool {
+        // A running MANUAL Cache Only mount must become an automatic candidate, or the
+        // recovery monitor (which only considers automatic modes) never resumes it.
+        guard let next = SyncManager.mountModeAfterResumeWhileUnreachable(current: .cacheOnlyManual),
+              next.isCacheOnly, next.isAutomatic,
+              SyncManager.autoResumeDecision(
+                  mode: next, manualCacheOnly: false, primaryStable: true, blockingProcesses: []) == .resume
+        else {
+            return report("AC-AO3", "resume-while-unreachable-handoff", false,
+                          "(manual Cache Only was not handed to automatic resume)")
+        }
+        // Nothing to relabel: not mounted, streaming, or already automatic.
+        guard SyncManager.mountModeAfterResumeWhileUnreachable(current: nil) == nil,
+              SyncManager.mountModeAfterResumeWhileUnreachable(current: .streaming) == nil,
+              SyncManager.mountModeAfterResumeWhileUnreachable(current: .cacheOnlyPending) == nil,
+              SyncManager.mountModeAfterResumeWhileUnreachable(current: .cacheOnlyOffline) == nil
+        else {
+            return report("AC-AO3", "resume-while-unreachable-handoff", false,
+                          "(a non-manual mode was relabelled)")
+        }
+        return report("AC-AO3", "resume-while-unreachable-handoff", true)
+    }
+
+    // MARK: - AC-OU1 — overlay upload planner (pure decision matrix)
+
+    private static func testOverlayUploadPlan() -> Bool {
+        let now = Date()
+        let file = OverlaySyncService.OverlayFile(
+            relativePath: "notes.txt", absolutePath: "/tmp/notes.txt", size: 100, modificationDate: now)
+
+        // No manifest entry, no remote entry at all → plain upload (brand new file).
+        guard OverlaySyncService.plan(file: file, manifestEntry: nil, expected: nil, remote: nil, now: now)
+            == .upload(dest: "notes.txt")
+        else {
+            return report("AC-OU1", "overlay-upload-plan", false, "(new file did not plan as a plain upload)")
+        }
+
+        // Remote has SOMETHING there, but we have no fingerprint to compare against → conflict
+        // (safe direction: never silently overwrite an unknown remote version).
+        let remoteState = OverlaySyncService.RemoteState(size: 999, modTime: now)
+        guard case .uploadConflict(dest: "notes.txt") = OverlaySyncService.plan(
+            file: file, manifestEntry: nil, expected: nil, remote: remoteState, now: now)
+        else {
+            return report("AC-OU1", "overlay-upload-plan", false, "(unparseable expected + present remote did not conflict)")
+        }
+
+        // Remote matches the expected fingerprint (size + modtime within 1s) → plain upload.
+        let expected = OverlaySyncService.RemoteState(size: 999, modTime: now)
+        let matchingRemote = OverlaySyncService.RemoteState(size: 999, modTime: now.addingTimeInterval(0.5))
+        guard OverlaySyncService.plan(file: file, manifestEntry: nil, expected: expected, remote: matchingRemote, now: now)
+            == .upload(dest: "notes.txt")
+        else {
+            return report("AC-OU1", "overlay-upload-plan", false, "(matching fingerprint within 1s did not plan as upload)")
+        }
+
+        // Remote diverges from expected → conflict.
+        let divergedRemote = OverlaySyncService.RemoteState(size: 999, modTime: now.addingTimeInterval(60))
+        guard case .uploadConflict(dest: "notes.txt") = OverlaySyncService.plan(
+            file: file, manifestEntry: nil, expected: expected, remote: divergedRemote, now: now)
+        else {
+            return report("AC-OU1", "overlay-upload-plan", false, "(diverged remote fingerprint did not conflict)")
+        }
+
+        // Manifest entry matches the file exactly (size + modtime within 1s) → already uploaded.
+        let matchingManifest = OverlaySyncService.ManifestEntry(
+            localSize: 100, localModTime: now.addingTimeInterval(0.4), remoteSize: 100, remoteModTime: now,
+            uploadedAs: "notes.txt", uploadedAt: now)
+        guard OverlaySyncService.plan(file: file, manifestEntry: matchingManifest, expected: nil, remote: nil, now: now)
+            == .alreadyUploaded
+        else {
+            return report("AC-OU1", "overlay-upload-plan", false, "(matching manifest entry was not alreadyUploaded)")
+        }
+        // A manifest entry that no longer matches (file changed since) must NOT short-circuit.
+        let staleManifest = OverlaySyncService.ManifestEntry(
+            localSize: 50, localModTime: now.addingTimeInterval(-500), remoteSize: 50, remoteModTime: now,
+            uploadedAs: "notes.txt", uploadedAt: now)
+        guard OverlaySyncService.plan(file: file, manifestEntry: staleManifest, expected: nil, remote: nil, now: now)
+            != .alreadyUploaded
+        else {
+            return report("AC-OU1", "overlay-upload-plan", false, "(stale manifest entry was still alreadyUploaded)")
+        }
+
+        // Conflict naming: stem.sync-conflict-YYYYMMDD-HHMMSS.ext, with -2/-3 disambiguation.
+        let date = Date(timeIntervalSince1970: 1_700_000_000)  // 2023-11-14 22:13:20 UTC
+        let name1 = OverlaySyncService.conflictName(for: "docs/report.txt", date: date) { _ in false }
+        guard name1.hasPrefix("docs/report.sync-conflict-"), name1.hasSuffix(".txt") else {
+            return report("AC-OU1", "overlay-upload-plan", false, "(conflict name shape wrong: \(name1))")
+        }
+        var seen = Set<String>()
+        let name2 = OverlaySyncService.conflictName(for: "docs/report.txt", date: date) { seen.contains($0) || $0 == name1 }
+        seen.insert(name1)
+        guard name2 != name1, name2.contains("-2") else {
+            return report("AC-OU1", "overlay-upload-plan", false, "(conflict name did not disambiguate: \(name1) vs \(name2))")
+        }
+
+        // Ignore list: Finder/rclone noise never counts as overlay content.
+        guard OverlaySyncService.isIgnored(name: ".DS_Store"), OverlaySyncService.isIgnored(name: "._resource"),
+              OverlaySyncService.isIgnored(name: "half.partial"), !OverlaySyncService.isIgnored(name: "real.txt")
+        else {
+            return report("AC-OU1", "overlay-upload-plan", false, "(ignore list matching is wrong)")
+        }
+        let scanDir = "\(selfTestRoot)/ou1-scan-\(UUID().uuidString)"
+        writeFile("\(scanDir)/.DS_Store", "junk")
+        writeFile("\(scanDir)/real.txt", "content")
+        let scanned = OverlaySyncService.scan(overlayPath: scanDir)
+        guard scanned.map({ $0.relativePath }) == ["real.txt"] else {
+            return report("AC-OU1", "overlay-upload-plan", false, "(scan did not skip ignored names: \(scanned))")
+        }
+
+        return report("AC-OU1", "overlay-upload-plan", true)
+    }
+
+    /// Minimal in-process `OverlayRemoteClient` for engine-level tests that need
+    /// deterministic control over listing/upload outcomes (a real network failure isn't
+    /// reproducible hermetically) — `run()`'s decision/bookkeeping logic is under test here,
+    /// not rclone's wire behaviour (that's AC-OU2/AC-CO2's job against real rclone).
+    private final class FakeOverlayRemoteClient: OverlaySyncService.OverlayRemoteClient {
+        var filesByDir: [String: [OverlaySyncService.RemoteEntry]] = [:]
+        var failUploadsFor: Set<String> = []
+        var failListingFor: Set<String> = []
+        var uploadCount = 0
+        func listFiles(remoteDir: String) -> Result<[OverlaySyncService.RemoteEntry], OverlaySyncService.OverlayUploadError> {
+            if failListingFor.contains(remoteDir) { return .failure(.rcloneFailed(exitCode: 1)) }
+            return .success(filesByDir[remoteDir] ?? [])
+        }
+        func upload(localPath: String, remoteDestination: String, expectedSize: Int64)
+            -> Result<OverlaySyncService.RemoteState?, OverlaySyncService.OverlayUploadError> {
+            uploadCount += 1
+            if failUploadsFor.contains(localPath) { return .failure(.rcloneFailed(exitCode: 1)) }
+            return .success(nil)
+        }
+    }
+
+    // MARK: - AC-OU2 — overlay sync-back (drain)
+
+    private static func testOverlaySyncBack() -> Bool {
+        let root = "\(selfTestRoot)/ou2-\(UUID().uuidString)"
+        let profile = mountFixtureProfile(
+            localPath: "\(root)/mnt", cachePath: "\(root)/cache", remotePath: "")
+        let overlay = profile.overlayPath
+        let dataDir = "\(root)/cache/vfs/synology"
+        let metaDir = "\(root)/cache/vfsMeta/synology"
+
+        writeFile("\(overlay)/new.txt", "brand new")
+        writeFile("\(overlay)/dirtybase.txt", "edited while cache-only")
+        writeFile("\(dataDir)/dirtybase.txt", "original streamed copy")
+        writeFile("\(metaDir)/dirtybase.txt", "{\"Size\":23,\"Dirty\":true,\"Fingerprint\":\"23,2024-01-01 00:00:00 +0000 UTC\"}")
+
+        let client = FakeOverlayRemoteClient()
+        client.filesByDir[""] = [
+            OverlaySyncService.RemoteEntry(name: "dirtybase.txt", size: 23, modTime: Date(timeIntervalSince1970: 1_704_067_200)),
+        ]
+        let service = OverlaySyncService()
+        let result1 = await_ { await service.run(
+            profile: profile, remoteBase: "testremote:", mode: .drain, transport: "primary", client: client) }
+
+        guard result1.uploaded >= 1 else {
+            return report("AC-OU2", "overlay-sync-back", false, "(new.txt was not uploaded: \(result1))")
+        }
+        guard !FileManager.default.fileExists(atPath: "\(overlay)/new.txt"),
+              !FileManager.default.fileExists(atPath: "\(overlay)/dirtybase.txt")
+        else {
+            return report("AC-OU2", "overlay-sync-back", false, "(uploaded overlay files were not deleted after verify)")
+        }
+        // dirtybase.txt's remote fingerprint MATCHED the recorded expected state (not a
+        // conflict) — but the base cache entry is Dirty (an unsynced streaming recording),
+        // so it must survive the drain untouched.
+        guard FileManager.default.fileExists(atPath: "\(dataDir)/dirtybase.txt"),
+              FileManager.default.fileExists(atPath: "\(metaDir)/dirtybase.txt")
+        else {
+            return report("AC-OU2", "overlay-sync-back", false, "(a Dirty base cache entry was deleted by the drain)")
+        }
+
+        // Conflict path: remote has a DIFFERENT, unexpected version → conflict copy, original
+        // remote entry untouched (simulated by the fake: only the conflict-named upload is
+        // ever attempted, never the plain name).
+        writeFile("\(overlay)/edited.txt", "my local edit")
+        client.filesByDir[""] = [
+            OverlaySyncService.RemoteEntry(name: "edited.txt", size: 999, modTime: Date()),
+        ]
+        let result2 = await_ { await service.run(
+            profile: profile, remoteBase: "testremote:", mode: .drain, transport: "primary", client: client) }
+        guard result2.conflicts == 1 else {
+            return report("AC-OU2", "overlay-sync-back", false, "(unexpected remote version did not upload as a conflict: \(result2))")
+        }
+
+        // Failed upload: retained in the overlay, remainingPending reflects it, and a RERUN
+        // (once the failure clears) picks it up and finishes the job — resumable, not lost.
+        writeFile("\(overlay)/willfail.txt", "not yet uploaded")
+        // Keyed on the RESOLVED (realpath'd) form: `scan()` reports `absolutePath` resolved
+        // (see its doc comment — `/var`/`/tmp` are real symlinks Foundation's own path APIs
+        // leave unresolved), so the unresolved `overlay` string here would never match what
+        // `run()` actually passes to `upload(localPath:...)`.
+        client.failUploadsFor.insert("\(OverlaySyncService.canonicalPath(overlay))/willfail.txt")
+        client.filesByDir[""] = []
+        let result3 = await_ { await service.run(
+            profile: profile, remoteBase: "testremote:", mode: .drain, transport: "primary", client: client) }
+        guard result3.failed == 1, FileManager.default.fileExists(atPath: "\(overlay)/willfail.txt"),
+              result3.remainingPending >= 1
+        else {
+            return report("AC-OU2", "overlay-sync-back", false, "(failed upload was not retained: \(result3))")
+        }
+        client.failUploadsFor.removeAll()
+        let result4 = await_ { await service.run(
+            profile: profile, remoteBase: "testremote:", mode: .drain, transport: "primary", client: client) }
+        guard result4.uploaded == 1, !FileManager.default.fileExists(atPath: "\(overlay)/willfail.txt") else {
+            return report("AC-OU2", "overlay-sync-back", false, "(rerun after the failure cleared did not finish the upload)")
+        }
+
+        return report("AC-OU2", "overlay-sync-back", true)
+    }
+
+    // MARK: - AC-OU5 — a failed remote listing never falls through to a plain upload
+
+    private static func testOverlayListingFailure() -> Bool {
+        let fm = FileManager.default
+        let root = "\(selfTestRoot)/ou5-\(UUID().uuidString)"
+        let profile = mountFixtureProfile(localPath: "\(root)/mnt", cachePath: "\(root)/cache", remotePath: "")
+        let overlay = profile.overlayPath
+        writeFile("\(overlay)/Project/take.wav", "recorded while offline")
+
+        // Listing of the file's remote directory fails → not uploaded, not deleted, failed.
+        let client = FakeOverlayRemoteClient()
+        client.failListingFor.insert("Project")
+        let service = OverlaySyncService()
+        let failed = await_ { await service.run(
+            profile: profile, remoteBase: "testremote:", mode: .drain, transport: "primary", client: client) }
+        guard client.uploadCount == 0, failed.failed == 1, failed.uploaded == 0,
+              fm.fileExists(atPath: "\(overlay)/Project/take.wav"), failed.remainingPending >= 1
+        else {
+            return report("AC-OU5", "overlay-listing-failure", false,
+                          "(a failed listing still uploaded or dropped the file: \(failed), calls=\(client.uploadCount))")
+        }
+
+        // Real rclone: a remote directory that doesn't exist yet (folder created offline)
+        // lists as empty, NOT as a failure — the file uploads and the drain deletes it.
+        guard RcloneLocator.resolve() != nil else {
+            return report("AC-OU5", "overlay-listing-failure", false, "(rclone not found)")
+        }
+        let remoteRoot = "\(root)/remote"
+        try? fm.createDirectory(atPath: remoteRoot, withIntermediateDirectories: true)
+        let real = OverlaySyncService.ProductionOverlayRemoteClient(remoteName: ":local", remotePath: remoteRoot)
+        guard case .success(let entries) = real.listFiles(remoteDir: "Project"), entries.isEmpty else {
+            return report("AC-OU5", "overlay-listing-failure", false, "(a missing remote directory did not list as empty)")
+        }
+        let uploaded = await_ { await service.run(
+            profile: profile, remoteBase: ":local:\(remoteRoot)", mode: .drain, transport: "primary", client: real) }
+        guard uploaded.uploaded == 1, uploaded.failed == 0,
+              (try? String(contentsOfFile: "\(remoteRoot)/Project/take.wav")) == "recorded while offline",
+              !fm.fileExists(atPath: "\(overlay)/Project/take.wav")
+        else {
+            return report("AC-OU5", "overlay-listing-failure", false,
+                          "(a new offline folder did not upload: \(uploaded))")
+        }
+        return report("AC-OU5", "overlay-listing-failure", true)
+    }
+
+    // MARK: - AC-OU6 — Upload Now records the remote's real post-upload state
+
+    private static func testUploadNowManifestRemoteState() -> Bool {
+        let fm = FileManager.default
+        let root = "\(selfTestRoot)/ou6-\(UUID().uuidString)"
+        let profile = mountFixtureProfile(localPath: "\(root)/mnt", cachePath: "\(root)/cache", remotePath: "")
+        let overlay = profile.overlayPath
+        let remoteRoot = "\(root)/remote"
+        try? fm.createDirectory(atPath: remoteRoot, withIntermediateDirectories: true)
+        guard RcloneLocator.resolve() != nil else {
+            return report("AC-OU6", "upload-now-manifest-remote-state", false, "(rclone not found)")
+        }
+        let client = OverlaySyncService.ProductionOverlayRemoteClient(remoteName: ":local", remotePath: remoteRoot)
+        let service = OverlaySyncService()
+        let remoteBase = ":local:\(remoteRoot)"
+
+        // Upload Now (keep) a file last written an hour ago; copyto preserves that modtime.
+        let old = Date().addingTimeInterval(-3600)
+        writeFile("\(overlay)/mix.txt", "first take")
+        try? fm.setAttributes([.modificationDate: old], ofItemAtPath: "\(overlay)/mix.txt")
+        let first = await_ { await service.run(
+            profile: profile, remoteBase: remoteBase, mode: .keep, transport: "primary", client: client) }
+        guard first.uploaded == 1 else {
+            return report("AC-OU6", "upload-now-manifest-remote-state", false, "(initial Upload Now failed: \(first))")
+        }
+
+        // Edit it locally; the REMOTE is untouched since our own upload. The next run must
+        // see "remote unchanged since we uploaded" → a normal upload, not a conflict copy.
+        writeFile("\(overlay)/mix.txt", "second take, longer")
+        try? fm.setAttributes([.modificationDate: old.addingTimeInterval(60)], ofItemAtPath: "\(overlay)/mix.txt")
+        let second = await_ { await service.run(
+            profile: profile, remoteBase: remoteBase, mode: .keep, transport: "primary", client: client) }
+        let conflictCopies = ((try? fm.contentsOfDirectory(atPath: remoteRoot)) ?? []).filter { $0.contains("sync-conflict") }
+        guard second.uploaded == 1, second.conflicts == 0, conflictCopies.isEmpty,
+              (try? String(contentsOfFile: "\(remoteRoot)/mix.txt")) == "second take, longer"
+        else {
+            return report("AC-OU6", "upload-now-manifest-remote-state", false,
+                          "(an edit after Upload Now was planned as a conflict: \(second), copies=\(conflictCopies))")
+        }
+        return report("AC-OU6", "upload-now-manifest-remote-state", true)
+    }
+
+    // MARK: - AC-OU3 — Upload Now (keep mode)
+
+    private static func testOverlayUploadNow() -> Bool {
+        let root = "\(selfTestRoot)/ou3-\(UUID().uuidString)"
+        let profile = mountFixtureProfile(localPath: "\(root)/mnt", cachePath: "\(root)/cache", remotePath: "")
+        let overlay = profile.overlayPath
+
+        let old = Date().addingTimeInterval(-3600)
+        writeFile("\(overlay)/keep.txt", "upload me but keep me")
+        try? FileManager.default.setAttributes([.modificationDate: old], ofItemAtPath: "\(overlay)/keep.txt")
+
+        // Still being written (modified <30s ago) — must be deferred, not uploaded yet.
+        writeFile("\(overlay)/toorecent.txt", "still saving")
+
+        let client = FakeOverlayRemoteClient()
+        let service = OverlaySyncService()
+        let result1 = await_ { await service.run(
+            profile: profile, remoteBase: "testremote:", mode: .keep, transport: "primary", client: client) }
+        guard result1.uploaded == 1, client.uploadCount == 1 else {
+            return report("AC-OU3", "overlay-upload-now", false, "(keep-mode did not upload exactly the eligible file: \(result1))")
+        }
+        guard FileManager.default.fileExists(atPath: "\(overlay)/keep.txt") else {
+            return report("AC-OU3", "overlay-upload-now", false, "(keep mode deleted the overlay file)")
+        }
+        // Its job (proving the recency filter defers it, confirmed by `client.uploadCount ==
+        // 1` above) is done — remove it so it doesn't also get swept up by a LATER `.drain`
+        // call, which unlike `.keep` applies no recency filter and would otherwise upload it
+        // too, throwing off every uploaded/alreadyUploaded count asserted below.
+        try? FileManager.default.removeItem(atPath: "\(overlay)/toorecent.txt")
+
+        // Unchanged since the upload → already-uploaded, no re-upload, file stays.
+        let result2 = await_ { await service.run(
+            profile: profile, remoteBase: "testremote:", mode: .keep, transport: "primary", client: client) }
+        guard result2.alreadyUploaded >= 1, client.uploadCount == 1 else {
+            return report("AC-OU3", "overlay-upload-now", false, "(unchanged file was re-uploaded: \(result2), calls=\(client.uploadCount))")
+        }
+
+        // Changed since the manifest was recorded → re-uploaded. Reset the modtime to
+        // stale-again (a fresh write is <30s old, which the `.keep` recency filter would
+        // otherwise defer to the NEXT run, silently passing this assertion for the wrong
+        // reason).
+        writeFile("\(overlay)/keep.txt", "changed content, different size!!")
+        try? FileManager.default.setAttributes([.modificationDate: old], ofItemAtPath: "\(overlay)/keep.txt")
+        let result3 = await_ { await service.run(
+            profile: profile, remoteBase: "testremote:", mode: .keep, transport: "primary", client: client) }
+        guard result3.uploaded >= 1, client.uploadCount == 2 else {
+            return report("AC-OU3", "overlay-upload-now", false, "(changed file was not re-uploaded: \(result3))")
+        }
+
+        // A later DRAIN of the same unchanged (already-uploaded) file deletes it WITHOUT
+        // re-uploading — Upload Now's manifest is honoured by the eventual Resume Syncing.
+        let beforeDrainCalls = client.uploadCount
+        let drainResult = await_ { await service.run(
+            profile: profile, remoteBase: "testremote:", mode: .drain, transport: "primary", client: client) }
+        guard !FileManager.default.fileExists(atPath: "\(overlay)/keep.txt"), client.uploadCount == beforeDrainCalls else {
+            return report("AC-OU3", "overlay-upload-now", false, "(later drain re-uploaded an Upload-Now-kept file: \(drainResult))")
+        }
+
+        return report("AC-OU3", "overlay-upload-now", true)
+    }
+
+    // MARK: - AC-OU4 — cache move / vfsCachePath refused while overlay files are pending
+
+    private static func testCacheMoveBlockedPending() -> Bool {
+        let root = "\(selfTestRoot)/ou4-\(UUID().uuidString)"
+        var profile = mountFixtureProfile(localPath: "\(root)/mnt", cachePath: "\(root)/cache")
+        profile.isEnabled = true
+        writeFile("\(profile.overlayPath)/pending.txt", "not yet uploaded")
+
+        var migrateCalled = false
+        var stderrText = ""
+        let moveEnv = fakeCLIEnvironment(
+            readProfiles: { [profile] },
+            stderr: { stderrText += $0 },
+            migrateCache: { _, _, _ in migrateCalled = true; return .completed(files: 0, bytes: 0, sameVolume: true) })
+        let moveExit = SyncTrayCLI.execute(["cache", "move", profile.shortId, "--to", "\(root)/newcache"], env: moveEnv)
+        guard moveExit != 0, !migrateCalled, stderrText.lowercased().contains("waiting to upload") else {
+            return report("AC-OU4", "cache-move-blocked-pending", false,
+                          "(cache move was not refused while overlay files are pending: exit=\(moveExit) stderr=\(stderrText))")
+        }
+
+        var wroteProfile = false
+        var setStderr = ""
+        let setEnv = fakeCLIEnvironment(
+            readProfiles: { [profile] },
+            writeProfile: { _ in wroteProfile = true; return true },
+            stderr: { setStderr += $0 })
+        let setExit = SyncTrayCLI.execute(
+            ["profile", "set", profile.shortId, "vfsCachePath", "\(root)/othercache"], env: setEnv)
+        guard setExit != 0, !wroteProfile, setStderr.lowercased().contains("waiting to upload") else {
+            return report("AC-OU4", "cache-move-blocked-pending", false,
+                          "(profile set vfsCachePath was not refused while overlay files are pending: exit=\(setExit))")
+        }
+
+        // Negative check: once the overlay is empty, both commands proceed normally.
+        try? FileManager.default.removeItem(atPath: "\(profile.overlayPath)/pending.txt")
+        var migrateCalledAfter = false
+        let moveEnv2 = fakeCLIEnvironment(
+            readProfiles: { [profile] },
+            migrateCache: { _, _, _ in migrateCalledAfter = true; return .completed(files: 0, bytes: 0, sameVolume: true) })
+        _ = SyncTrayCLI.execute(["cache", "move", profile.shortId, "--to", "\(root)/newcache2"], env: moveEnv2)
+        guard migrateCalledAfter else {
+            return report("AC-OU4", "cache-move-blocked-pending", false, "(cache move stayed blocked with an empty overlay)")
+        }
+
+        return report("AC-OU4", "cache-move-blocked-pending", true)
+    }
+
+    // MARK: - AC-CLI9 — profile set rejects the retired keys; streamCacheOnly still works
+
+    private static func testCLIProfileSetRemovedKeys() -> Bool {
+        var p = sampleProfile(name: "RemovedKeys")
+        for badKey in ["cacheIdentity", "stableCacheIdentity", "offlineAccessEnabled"] {
+            guard SyncTrayCLI.applyProfileAssignment(&p, key: badKey, value: "x") != nil else {
+                return report("AC-CLI9", "cli-profile-set-removed-keys", false, "(retired key \"\(badKey)\" was accepted)")
+            }
+        }
+        guard SyncTrayCLI.applyProfileAssignment(&p, key: "streamCacheOnly", value: "true") == nil,
+              p.streamCacheOnly == true
+        else {
+            return report("AC-CLI9", "cli-profile-set-removed-keys", false, "(streamCacheOnly was rejected)")
+        }
+
+        var wrote = false
+        let env = fakeCLIEnvironment(readProfiles: { [p] }, writeProfile: { _ in wrote = true; return true })
+        let exit = SyncTrayCLI.execute(["profile", "set", p.shortId, "cacheIdentity", "synology"], env: env)
+        guard exit == 65, !wrote else {
+            return report("AC-CLI9", "cli-profile-set-removed-keys", false, "(execute did not exit 65 / wrote a file for a retired key)")
+        }
+
+        guard Self.usageMentionsNoRemovedKeys() else {
+            return report("AC-CLI9", "cli-profile-set-removed-keys", false, "(help text still mentions a retired key)")
+        }
+        return report("AC-CLI9", "cli-profile-set-removed-keys", true)
+    }
+
+    private static func usageMentionsNoRemovedKeys() -> Bool {
+        for key in ["cacheIdentity", "stableCacheIdentity", "offlineAccessEnabled"] where SyncTrayCLI.usage.contains(key) {
+            return false
+        }
+        return true
+    }
+
+    /// `OverlaySyncService.run` is `async`; these self-tests are synchronous, so bridge with
+    /// a semaphore rather than threading `async`/`await` through the whole self-test suite.
+    /// Call as `await_ { await someAsyncCall(...) }` — a plain `@escaping` closure, not
+    /// `@autoclosure`, since Swift rejects an `async` autoclosure inside a non-`async`
+    /// function.
+    ///
+    /// **Cannot be a bare blocking `semaphore.wait()` on the calling thread.** This runs
+    /// from `ConfigSelfTest.run()`, called synchronously from `SyncTrayApp.init()` —
+    /// BEFORE `NSApplicationMain`/the app's run loop ever starts. Empirically (verified with
+    /// a minimal standalone repro), Swift Concurrency's global executor does not resume a
+    /// `Task` at all at this point in process startup if the thread that created it is
+    /// blocked in a raw `dispatch_semaphore_wait` — even a `Task.detached` whose body never
+    /// awaits anything real hangs forever. Moving the actual wait to a background thread and
+    /// pumping `RunLoop.current` on the calling thread instead (a resource the executor
+    /// apparently DOES need serviced this early) unblocks it reliably.
+    private static func await_<T>(_ operation: @escaping () async -> T) -> T {
+        let semaphore = DispatchSemaphore(value: 0)
+        var result: T!
+        Task.detached {
+            result = await operation()
+            semaphore.signal()
+        }
+        var done = false
+        DispatchQueue.global().async {
+            semaphore.wait()
+            done = true
+        }
+        while !done {
+            RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.05))
+        }
+        return result
     }
 
     // MARK: - AC-CM1 — tree kinds: vfs + vfsMeta, one CacheSubtree pair per migrating profile
@@ -1961,6 +3616,8 @@ enum ConfigSelfTest {
     // MARK: - AC-CM3 — overlap classification: nested sibling excluded/co-migrated/disjoint
 
     private static func testCacheMigrationOverlap() -> Bool {
+        // The cache key is always the remote-named layout now, so two profiles can only
+        // address the same on-disk bytes when one remote path nests inside the other's.
         let sharedRoot = "/tmp/cm3-src"
         let parent = mountProfile(name: "Parent", remotePath: "Kaiju/KAIJU", vfsCachePath: sharedRoot)
         let child = mountProfile(name: "Child", remotePath: "Kaiju/KAIJU/Reaper", vfsCachePath: sharedRoot)
@@ -1990,6 +3647,18 @@ enum ConfigSelfTest {
         guard plan.sameRootProfiles == [disjoint.id] else {
             return report("AC-CM3", "cache-migration-overlap", false, "(sameRootProfiles \(plan.sameRootProfiles) != [disjoint])")
         }
+
+        // A disjoint pair (different primary remotes) is same-root at most, never overlapping.
+        var otherRemote = disjoint
+        otherRemote.rcloneRemote = "synology-sftp:"
+        otherRemote.remotePath = "Kaiju/KAIJU/Nested"
+        let (overlapping, sameRoot) = CacheMigrationPlanner.classifySiblings(
+            of: parent, sourceRoot: sharedRoot, allProfiles: [parent, otherRemote])
+        guard overlapping.isEmpty, sameRoot.map({ $0.id }) == [otherRemote.id] else {
+            return report("AC-CM3", "cache-migration-overlap", false,
+                          "(profiles on different primary remotes should be same-root, not overlapping)")
+        }
+
         return report("AC-CM3", "cache-migration-overlap", true)
     }
 
@@ -2573,6 +4242,9 @@ enum ConfigSelfTest {
     // MARK: - AC-CM13 — nested co-migrated subtrees never use the whole-directory fast path (finding 5)
 
     private static func testCacheMigrationNestedSubtreesUseFilePath() -> Bool {
+        // Nested cache subtrees, the condition this fast-path guard exists for, occur
+        // whenever two profiles share a remote name (the remote-named layout, always in
+        // effect now — see `mountProfile`).
         let parent = mountProfile(name: "Parent", remotePath: "Kaiju/KAIJU", vfsCachePath: "/tmp/cm13-src")
         let child = mountProfile(name: "Child", remotePath: "Kaiju/KAIJU/Reaper", vfsCachePath: "/tmp/cm13-src")
         let all = [parent, child]

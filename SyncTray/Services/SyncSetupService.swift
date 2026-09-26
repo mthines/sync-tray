@@ -111,7 +111,12 @@ final class SyncSetupService {
         // Create directories if needed
         try createDirectories(for: profile)
 
-        // For mount mode, ensure VFS cache directory exists
+        // For mount mode, ensure VFS cache directory exists. Consolidating any stray
+        // suffixed cache tree (see "Cache identity" in CLAUDE.md) happens in the sync
+        // script itself, on EVERY mount start (install, app launch, login, Mount
+        // button) — not here — because a login mount runs the script standalone,
+        // without the app; a Swift-only consolidation could be skipped by a mount
+        // the app never saw come up.
         if profile.isMountMode {
             let cacheDir = (profile.vfsCachePath as NSString).expandingTildeInPath
             if !FileManager.default.fileExists(atPath: cacheDir) {
@@ -556,9 +561,21 @@ final class SyncSetupService {
 
     // MARK: - Script Generation
 
+    /// `OverlaySyncService.ignoredNamePatterns` rendered as a Python list literal, so the
+    /// script's "is this overlay file real or Finder junk" check can never drift from the
+    /// Swift-side overlay scanner/uploader that uses the exact same list (one source for the
+    /// ignore list, never retyped in bash/Python).
+    private var overlayIgnorePatternsPythonLiteral: String {
+        "[" + OverlaySyncService.ignoredNamePatterns.map { "'\($0)'" }.joined(separator: ", ") + "]"
+    }
+
     /// Generate the shared sync script that reads config from JSON
-    /// Supports bisync (two-way), sync (one-way), and mount (streaming) modes
-    private func generateSyncScript() -> String {
+    /// Supports bisync (two-way), sync (one-way), and mount (streaming, or a Cache Only
+    /// union-overlay mount) modes. Internal (not `private`) so the self-test harness can
+    /// render it directly and dry-run it end to end (`SYNCTRAY_DRY_RUN=1`) without going
+    /// through `install`/`launchctl` — this codebase has no XCTest target, so exercising the
+    /// generated script IS the test for the mount branch's mode-selection and command logic.
+    func generateSyncScript() -> String {
         return """
             #!/bin/bash
             # SyncTray Sync Script
@@ -607,6 +624,29 @@ final class SyncSetupService {
             VFS_CACHE_MAX_SIZE=$(parse_json "vfsCacheMaxSize" "10G")
             VFS_CACHE_MAX_AGE=$(parse_json "vfsCacheMaxAge" "168h")
             VFS_CACHE_PATH=$(parse_json "vfsCachePath" "$HOME/.cache/rclone")
+            # Expand a leading `~` ONCE, here, and use the result everywhere below.
+            # `vfsCachePath` is stored raw (the CLI and the file-backed config both keep a
+            # user-written `~`) and every Swift read site expands on read, but the shell
+            # passes it through quoted — so an unexpanded value made rclone create a
+            # directory literally named `~` in its working directory, silently putting the
+            # cache somewhere neither the app nor the preflight looks.
+            VFS_CACHE_PATH="${VFS_CACHE_PATH/#\\~/$HOME}"
+            # Cache Only: the user's MANUAL choice (persisted). The script may also pick
+            # a Cache Only flavour on its own — see mode selection below — regardless of
+            # this flag.
+            STREAM_CACHE_ONLY=$(parse_json "streamCacheOnly" "false")
+            # Cache-only / mode-signalling paths — Swift is the single source of these
+            # (SyncProfile computed paths + VFSCacheService.cacheSubtreeRoots), so the
+            # script and the app can never disagree about which directory is which.
+            # Empty defaults keep an old derived config (predating these keys) mounting
+            # streaming-only, with a warning, instead of failing outright.
+            MOUNT_MODE_PATH=$(parse_json "mountModePath" "")
+            OVERLAY_PATH=$(parse_json "overlayPath" "")
+            CACHE_ONLY_CONFIG_PATH=$(parse_json "cacheOnlyConfigPath" "")
+            CACHE_ONLY_EXCLUDE_PATH=$(parse_json "cacheOnlyExcludePath" "")
+            CACHE_ONLY_CACHE_PATH=$(parse_json "cacheOnlyCachePath" "")
+            CACHE_DATA_PATH=$(parse_json "cacheDataPath" "")
+            CACHE_META_PATH=$(parse_json "cacheMetaPath" "")
             # Parallel downloaders. Defaults to 2 — a safe value on a contended Wi-Fi/mesh
             # link (or spinning-disk cache) where extra streams contend and collapse
             # aggregate throughput. Raise it (up to 16) for a fast wired link.
@@ -668,6 +708,26 @@ final class SyncSetupService {
                 fi
             }
 
+            # Re-emit one remote's stored rclone config as RCLONE_CONFIG_<NAME>_<KEY> export
+            # lines, reading `rclone config dump` JSON on stdin.
+            #   $1 — remote to read FROM (as it appears in rclone.conf)
+            #   $2 — already upper-cased/underscored name to export UNDER
+            # The caller `eval`s the output. Both arguments are passed as argv, never
+            # interpolated into the Python source, and every value goes through
+            # `shlex.quote`, so a config value containing a quote, a space, a backslash or a
+            # `$` round-trips intact. (It previously did not: the `\\"` escapes were consumed
+            # by the enclosing double-quoted shell string before Python ever saw them, so a
+            # password containing a double quote produced an unterminated `eval`.)
+            dump_remote_as_env() {
+                python3 -c "
+            import json, shlex, sys
+            remote, prefix = sys.argv[1], sys.argv[2]
+            for k, v in json.load(sys.stdin).get(remote, {}).items():
+                key = k.upper().replace('-', '_')
+                print('export RCLONE_CONFIG_%s_%s=%s' % (prefix, key, shlex.quote(str(v))))
+            " "$1" "$2"
+            }
+
             REMOTE_NAME="${REMOTE%%:*}"
             NO_CHECK_CERT=$(check_no_cert "$REMOTE_NAME")
 
@@ -688,6 +748,20 @@ final class SyncSetupService {
                 kill "$watchdog_pid" 2>/dev/null
                 wait "$watchdog_pid" 2>/dev/null
                 return $status
+            }
+
+            # Reachability = "the remote answered for THIS path". Probing the remote
+            # ROOT (`lsd remote:`) enumerates every SMB share, which on a Synology
+            # hangs past any timeout and made a reachable NAS look offline (a Stream
+            # profile then came up Cache Only; bisync skipped every run). `lsjson
+            # --stat` on the profile's own path is one round trip. rclone's
+            # directory/file-not-found exits (3/4) still mean the remote answered, so
+            # a not-yet-created path counts as reachable — the bisync bootstrap needs that.
+            remote_path_reachable() {
+                local secs="$1" target="$2"; shift 2
+                run_with_timeout "$secs" $RCLONE_BIN lsjson --stat "$target" "$@" $NO_CHECK_CERT &>/dev/null
+                local rc=$?
+                [[ $rc -eq 0 || $rc -eq 3 || $rc -eq 4 ]]
             }
 
             # Check if drive is mounted (if configured)
@@ -725,35 +799,26 @@ final class SyncSetupService {
             # Ensure local sync directory exists
             mkdir -p "$LOCAL_PATH"
 
-            # Remote fallback: if primary remote is unreachable, try fallback remote
-            if [[ -n "$FALLBACK_REMOTE" ]]; then
+            # Remote fallback: if primary remote is unreachable, try fallback remote.
+            # NEVER for mount mode — a Stream profile picks its rclone mode (streaming /
+            # cache-only-*) independently below, and its fallback remote is only ever an
+            # Upload Now target driven from the app side. Failing a MOUNT over here would
+            # need a second vfs/{fallback}/… cache tree (the subtree keys on remote name
+            # + path), which is exactly the bug this whole change removes — see "Cache
+            # identity" in CLAUDE.md.
+            if [[ "$SYNC_MODE" != "mount" && -n "$FALLBACK_REMOTE" ]]; then
                 REMOTE_NAME="${REMOTE%%:*}"
                 # Quick reachability check on primary remote (3s connect timeout)
-                if ! run_with_timeout 15 $RCLONE_BIN lsd "${REMOTE_NAME}:" --contimeout 3s --timeout 8s --max-depth 0 $NO_CHECK_CERT &>/dev/null; then
+                if ! remote_path_reachable 15 "$REMOTE" --contimeout 3s --timeout 8s; then
                     echo "$(date '+%Y-%m-%d %H:%M:%S') - Primary remote unreachable, using fallback: $FALLBACK_REMOTE" >> "$LOG_FILE"
                     # Re-check cert setting for the fallback remote
                     NO_CHECK_CERT=$(check_no_cert "$FALLBACK_REMOTE")
 
-                    # Mount mode ALWAYS uses env-var overrides, even across wire types.
-                    # The VFS cache is keyed by remote name ({cache}/vfs/{name}/…), so keeping
-                    # the primary name shares one cache across primary and fallback instead of
-                    # re-downloading into a second vfs/{fallback} tree. The full-swap branch below
-                    # exists only to protect bisync's listing cache from NFD/NFC divergence, which
-                    # a mount has no equivalent of. FALLBACK_PATH is ignored here on purpose: the
-                    # cache subtree keys on the remote path too, so the fallback must resolve the
-                    # SAME path as the primary (the profile editor blocks a mismatched mount path).
-                    if [[ "$SYNC_MODE" == "mount" || ( -z "$FALLBACK_PATH" && "$FALLBACK_REQUIRES_CACHE_REBUILD" != "true" && "$FALLBACK_REQUIRES_CACHE_REBUILD" != "True" ) ]]; then
+                    if [[ -z "$FALLBACK_PATH" && "$FALLBACK_REQUIRES_CACHE_REBUILD" != "true" && "$FALLBACK_REQUIRES_CACHE_REBUILD" != "True" ]]; then
                         # Same remote name preserved: use env var overrides to swap transport.
-                        # This preserves the VFS/bisync cache since the remote name stays the same.
+                        # This preserves the bisync listing cache since the remote name stays the same.
                         UPPER_NAME=$(echo "$REMOTE_NAME" | tr '[:lower:]' '[:upper:]' | tr '-' '_')
-                        eval "$($RCLONE_BIN config dump 2>/dev/null | python3 -c "
-            import json, sys
-            d = json.load(sys.stdin).get('${FALLBACK_REMOTE}', {})
-            name = '${UPPER_NAME}'
-            for k, v in d.items():
-                safe_k = k.upper().replace('-', '_')
-                print(f'export RCLONE_CONFIG_{name}_{safe_k}=\\\"' + str(v).replace('\\\"', '\\\\\\\"') + '\\\"')
-            ")"
+                        eval "$($RCLONE_BIN config dump 2>/dev/null | dump_remote_as_env "$FALLBACK_REMOTE" "$UPPER_NAME")"
                     else
                         # Different wire type OR explicit path change: swap entire REMOTE reference.
                         # bisync will rebuild listings on first switch (~12s for 85K files).
@@ -768,6 +833,32 @@ final class SyncSetupService {
             if [[ "$SYNC_MODE" == "mount" ]]; then
                 # Mount mode - stream files on-demand
                 echo "$(date '+%Y-%m-%d %H:%M:%S') - Starting mount" >> "$LOG_FILE"
+
+                # VFS CACHE PREFLIGHT
+                #
+                # When --cache-dir is not writable, rclone logs "Failed to create vfs cache -
+                # disabling" and then MOUNTS ANYWAY with no cache at all. Every read becomes a
+                # remote round trip, which reads to a user as "streaming got mysteriously
+                # slow" rather than as a failure. The common trigger is a cache directory on
+                # an external drive that isn't attached: /Volumes/<Drive> is then a
+                # root-owned placeholder and the mkdir fails with EPERM.
+                #
+                # Refuse the mount instead. launchd's KeepAlive retries, so the profile comes
+                # up by itself once the drive is back — with its cache intact.
+                #
+                # This checks the SAME path that goes to --cache-dir (both expanded above),
+                # so the preflight can't pass while rclone caches somewhere else.
+                if ! mkdir -p "$VFS_CACHE_PATH" 2>/dev/null || [[ ! -w "$VFS_CACHE_PATH" ]]; then
+                    echo "$(date '+%Y-%m-%d %H:%M:%S') - Error: VFS cache directory not writable: $VFS_CACHE_PATH - refusing to mount uncached" >> "$LOG_FILE"
+                    # Release the lock BEFORE backing off. KeepAlive restarts us on exit, so
+                    # the sleep only exists to stop a hot respawn loop while the drive is
+                    # away — holding the lock through it would silently swallow a manual
+                    # Mount (the app's trigger takes the same lock) for 30s at a time.
+                    rm -f "$LOCK_FILE"
+                    trap - EXIT
+                    sleep 30
+                    exit 1
+                fi
 
                 # Ensure mount point exists
                 mkdir -p "$LOCAL_PATH"
@@ -796,6 +887,130 @@ final class SyncSetupService {
                     sleep 2
                 fi
 
+                # CACHE KEY CONSOLIDATION
+                #
+                # Defining a remote via RCLONE_CONFIG_<NAME>_* environment variables used to
+                # make rclone suffix the cache directory name ("detected overridden config -
+                # adding {hash} suffix to name"), landing the cache at vfs/{primary}{hash}/…
+                # instead of vfs/{primary}/…. That env-var trick is gone from this script
+                # (mount mode no longer swaps remotes — see the removed fallback branch above
+                # and CLAUDE.md's "Cache identity" section), but a tree a PAST run left behind
+                # under a suffixed name is still on disk. Consolidate it into the unsuffixed
+                # location on every mount start, before rclone comes up, so a leftover
+                # suffixed tree is adopted rather than abandoned and re-downloaded.
+                #
+                # Deferred (not run at all) while another rclone mount process is using the
+                # SAME --cache-dir: two nested profiles can share one suffixed tree, and
+                # racing a live mount's cache with a rename mid-flight is not safe.
+                if pgrep -f "cache-dir ${VFS_CACHE_PATH} " >/dev/null 2>&1; then
+                    echo "$(date '+%Y-%m-%d %H:%M:%S') - Cache key consolidation deferred (another rclone mount is using this cache dir)" >> "$LOG_FILE"
+                else
+                    python3 -c "
+            import os, sys
+
+            primary, remote_path, cache_root, log_file = sys.argv[1:5]
+
+            def log(msg):
+                try:
+                    with open(log_file, 'a') as f:
+                        f.write(msg + chr(10))
+                except Exception:
+                    pass
+
+            try:
+                vfs_base = os.path.join(cache_root, 'vfs')
+                meta_base = os.path.join(cache_root, 'vfsMeta')
+                prefix = primary + '{'
+
+                def subtree(base, name):
+                    root = os.path.join(base, name)
+                    return os.path.join(root, remote_path) if remote_path else root
+
+                def clear_if_empty(path):
+                    # An EMPTY destination directory tree (no file anywhere under it) is
+                    # what a mount of the unsuffixed key leaves behind before any byte was
+                    # cached. Treat it as absent: remove only its empty directories, bottom
+                    # up, with os.rmdir (never rmtree). Anything that is not an empty
+                    # directory -- a file, a symlink -- makes rmdir fail, so the path still
+                    # exists afterwards and counts as populated.
+                    if os.path.islink(path) or not os.path.isdir(path):
+                        return
+                    for root, dirs, files in os.walk(path):
+                        if files:
+                            return
+                    for root, dirs, files in os.walk(path, topdown=False):
+                        try:
+                            os.rmdir(root)
+                        except OSError:
+                            return
+
+                def prune_ancestors(path, base):
+                    ancestor = os.path.dirname(path)
+                    while ancestor.startswith(base) and ancestor != base:
+                        try:
+                            os.rmdir(ancestor)
+                        except OSError:
+                            break
+                        ancestor = os.path.dirname(ancestor)
+
+                chosen = None
+                if os.path.isdir(vfs_base):
+                    candidates = []
+                    for name in os.listdir(vfs_base):
+                        if not (name.startswith(prefix) and name.endswith('}')):
+                            continue
+                        suffix = name[len(prefix):-1]
+                        if not suffix or not all(c.isalnum() or c in '_-' for c in suffix):
+                            continue
+                        probe = subtree(vfs_base, name)
+                        if os.path.isdir(probe):
+                            try:
+                                candidates.append((name, os.path.getmtime(probe)))
+                            except OSError:
+                                pass
+                    if candidates:
+                        candidates.sort(key=lambda item: item[1], reverse=True)
+                        chosen = candidates[0][0]
+
+                # ONE decision for the vfs/vfsMeta PAIR. The two trees are only meaningful
+                # together: rclone deletes cached data whose metadata sidecar is missing, and
+                # a sidecar without its data describes bytes that are not there. So move
+                # nothing unless BOTH source trees exist and NEITHER destination is populated,
+                # and never merge into an occupied destination.
+                if chosen:
+                    src_meta, src_vfs = subtree(meta_base, chosen), subtree(vfs_base, chosen)
+                    dst_meta, dst_vfs = subtree(meta_base, primary), subtree(vfs_base, primary)
+                    if not (os.path.isdir(src_meta) and os.path.isdir(src_vfs)):
+                        log('Cache key: leaving ' + src_vfs + ' in place (its vfs and vfsMeta trees are not both present)')
+                    else:
+                        clear_if_empty(dst_meta)
+                        clear_if_empty(dst_vfs)
+                        if os.path.lexists(dst_meta) or os.path.lexists(dst_vfs):
+                            log('Cache key: leaving ' + src_vfs + ' in place (destination already populated)')
+                        else:
+                            # vfsMeta first: an interruption between the two renames can only
+                            # leave metadata ahead of data, never data without its byte ranges.
+                            os.makedirs(os.path.dirname(dst_meta), exist_ok=True)
+                            os.rename(src_meta, dst_meta)
+                            try:
+                                os.makedirs(os.path.dirname(dst_vfs), exist_ok=True)
+                                os.rename(src_vfs, dst_vfs)
+                            except Exception as e:
+                                try:
+                                    os.rename(dst_meta, src_meta)
+                                    log('Cache key: vfs move failed, rolled vfsMeta back to ' + src_meta + ': ' + str(e))
+                                except Exception as rollback_error:
+                                    log('Cache key: vfs move failed AND vfsMeta rollback failed (' + dst_meta + '): ' + str(e) + ' / ' + str(rollback_error))
+                            else:
+                                log('Cache key: moved ' + src_meta + ' -> ' + dst_meta)
+                                log('Cache key: moved ' + src_vfs + ' -> ' + dst_vfs)
+                                prune_ancestors(src_meta, meta_base)
+                                prune_ancestors(src_vfs, vfs_base)
+            except Exception as e:
+                log('Cache key consolidation error: ' + str(e))
+            " "$REMOTE_NAME" "$REMOTE_PATH" "$VFS_CACHE_PATH" "$LOG_FILE"
+                fi
+
                 # Choose the mount backend:
                 #   nfs     -> rclone nfsmount (built-in NFS server + native macOS NFS
                 #              client). Kext-free: needs no macFUSE, works on locked-down
@@ -808,67 +1023,321 @@ final class SyncSetupService {
                 fi
                 echo "$(date '+%Y-%m-%d %H:%M:%S') - Mount backend: $MOUNT_BACKEND ($MOUNT_SUBCMD)" >> "$LOG_FILE"
 
-                # Mount command with VFS cache settings.
-                # Both backends share the same VFS cache layer, so retention/eviction
-                # (--vfs-cache-max-size / --vfs-cache-max-age) behaves identically.
-                # Note: No --daemon flag - launchd manages the process lifecycle.
-                RCLONE_CMD="$RCLONE_BIN $MOUNT_SUBCMD \\"$REMOTE\\" \\"$LOCAL_PATH\\" --vfs-cache-mode $VFS_CACHE_MODE --vfs-cache-max-size $VFS_CACHE_MAX_SIZE --vfs-cache-max-age $VFS_CACHE_MAX_AGE --cache-dir \\"$VFS_CACHE_PATH\\" --log-level INFO --use-json-log"
-
-                # Throughput tuning. Reading a file through the mount (streaming or offline
-                # warming) otherwise trickles: the nfsmount -> rclone-NFS-server -> VFS hop
-                # paces the backend download at the slow NFS read rate instead of racing
-                # ahead at line speed. Measured on a DS223 over SMB: a raw single stream does
-                # ~17 MB/s and 4 parallel ~37 MB/s, yet an untuned warm delivered ~1.2 MB/s.
-                #   --vfs-read-ahead / --buffer-size : download far ahead of the reader so the
-                #       cache fills at backend speed, decoupled from the NFS read latency.
-                #   --transfers : parallel VFS cache downloaders, from the profile's
-                #       downloadConnections setting (kept in lockstep with the app-side warm
-                #       concurrency in VFSCacheService — both read the same per-profile value).
-                #       Fewer streams win on a contended wireless/mesh link; more on fast wired.
-                #   --vfs-read-chunk-size(-limit) : large, growing range reads = fewer round
-                #       trips on high-latency backends.
-                #   --dir-cache-time / --attr-timeout : fewer metadata round trips.
-                # Cost: --buffer-size is per open file, so an active warm of N files uses up to
-                # N x 128M RAM (transient; released when the files close).
-                #
-                # --dir-cache-time 1000h (~41 days): folder LISTINGS must survive a long
-                # OFFLINE period. When the remote is unreachable, rclone serves fully-cached
-                # file *data* from disk regardless — but Finder browsing also needs the
-                # directory listing, and once dir-cache-time expires rclone tries to re-list
-                # from the (unreachable) remote. A short window (rclone's 5m default, or the
-                # old 12h) would expire mid-trip and break offline browsing. This is the
-                # concert case: full warm cache, no internet, read + record, sync on return.
-                # Freshness tradeoff — and it applies ONLINE too, not only offline: a longer
-                # dir-cache-time also raises the ceiling on how long an OUT-OF-BAND remote
-                # change (a file added from another device or the NAS web UI) stays invisible
-                # in Finder while the mount is up. It now surfaces on the next explicit
-                # recursive /vfs/refresh (startup/mount, and offline-warm via VFSCacheService)
-                # instead of within the old 12h auto-expiry. Accepted here because: (a) the
-                # primary use is single-user, (b) changes made THROUGH the mount are visible
-                # immediately — the VFS tracks its own writes, and (c) SMB has no
-                # --poll-interval to notify of remote-side changes anyway, so even 12h was a
-                # coarse polling ceiling, never live propagation. Offline WRITES need no flag
-                # here: under --vfs-cache-mode full a write while the remote is down lands in
-                # the VFS cache as dirty and rclone retries the write-back until it returns.
-                RCLONE_CMD="$RCLONE_CMD --buffer-size 128M --vfs-read-ahead 256M --transfers $DOWNLOAD_CONNECTIONS --vfs-read-chunk-size 128M --vfs-read-chunk-size-limit off --dir-cache-time 1000h --attr-timeout 5s"
-
                 # Name the mounted volume after the mount-point folder so Finder
                 # shows e.g. "Temp" instead of the auto-generated NFS share name
                 # ("localhost:/synology home Reaper"). macFUSE already derives the
                 # volume name from the mountpoint; the NFS backend does not, so set
-                # it explicitly. --volname is supported on macOS for both backends.
+                # it explicitly. --volname is supported on macOS for both backends,
+                # and both streaming and Cache Only mounts want it.
                 MOUNT_VOLNAME=$(basename "$LOCAL_PATH")
-                RCLONE_CMD="$RCLONE_CMD --volname \\"$MOUNT_VOLNAME\\""
 
-                # Add RC (remote control) API for cache management
-                if [[ "$RC_PORT" != "0" && -n "$RC_PORT" ]]; then
-                    RCLONE_CMD="$RCLONE_CMD --rc --rc-addr=localhost:$RC_PORT --rc-no-auth"
+                # MOUNT MODE SELECTION
+                #
+                # Four tokens (MountMode in SyncState.swift): "streaming", or one of three
+                # Cache Only flavours — "cache-only-manual" (the user's own toggle),
+                # "cache-only-pending" (files are queued in the overlay from a previous Cache
+                # Only session and haven't finished uploading), and "cache-only-offline" (the
+                # primary remote is unreachable right now). Any Cache Only flavour mounts the
+                # SAME union remote; the token only changes what the status card shows and
+                # what auto-resume watches for.
+                #
+                # A derived config written by an OLDER app build has none of the cache-only
+                # keys (mountModePath is empty) — degrade to streaming-only rather than
+                # half-apply a mode this script version doesn't know how to fully wire.
+                MOUNT_MODE="\(MountMode.streaming.rawValue)"
+                if [[ -z "$MOUNT_MODE_PATH" ]]; then
+                    echo "$(date '+%Y-%m-%d %H:%M:%S') - Cache Only unavailable (config predates this feature) - streaming only" >> "$LOG_FILE"
+                else
+                    OVERLAY_PENDING=$(python3 -c "
+            import fnmatch, json, os, sys
+
+            overlay_path, cache_path = sys.argv[1], sys.argv[2]
+            ignore_patterns = \(overlayIgnorePatternsPythonLiteral)
+
+            def is_ignored(name):
+                return any(fnmatch.fnmatchcase(name, p) for p in ignore_patterns)
+
+            pending = False
+
+            if overlay_path and os.path.isdir(overlay_path):
+                for root, dirs, files in os.walk(overlay_path):
+                    dirs[:] = [d for d in dirs if not is_ignored(d)]
+                    if any(not is_ignored(f) for f in files):
+                        pending = True
+                        break
+
+            if not pending and cache_path:
+                meta_dir = os.path.join(cache_path, 'vfsMeta')
+                if os.path.isdir(meta_dir):
+                    for root, dirs, files in os.walk(meta_dir):
+                        for f in files:
+                            try:
+                                with open(os.path.join(root, f)) as fh:
+                                    meta = json.load(fh)
+                            except Exception:
+                                continue
+                            if meta.get('Dirty') is True:
+                                pending = True
+                                break
+                        if pending:
+                            break
+
+            print('true' if pending else 'false')
+            " "$OVERLAY_PATH" "$CACHE_ONLY_CACHE_PATH")
+
+                    # Primary reachability for mode selection, with a short bounded retry.
+                    # At login launchd starts this agent (RunAtLoad) before Wi-Fi/DNS is
+                    # usually up, so a single failed probe would bring the mount up Cache
+                    # Only (offline) and leave it there until the app's 3-probe stability
+                    # streak plus an idle-mount check resumed it. Two retries ~5s apart ride
+                    # out that window; each retry is capped at 5s, so the unreachable path
+                    # adds at most ~20s and the reachable path adds nothing.
+                    # SYNCTRAY_PROBE_RETRY_DELAY overrides the gap (the self-test sets it low).
+                    mount_primary_reachable() {
+                        local delay="${SYNCTRAY_PROBE_RETRY_DELAY:-5}"
+                        [[ "$delay" =~ ^[0-9]+$ ]] || delay=5
+                        if remote_path_reachable 15 "$REMOTE" --contimeout 3s --timeout 8s; then
+                            return 0
+                        fi
+                        local attempt
+                        for attempt in 2 3; do
+                            echo "$(date '+%Y-%m-%d %H:%M:%S') - Primary remote unreachable, retrying reachability probe in ${delay}s (attempt $attempt/3)" >> "$LOG_FILE"
+                            sleep "$delay"
+                            if remote_path_reachable 5 "$REMOTE" --contimeout 3s --timeout 4s; then
+                                echo "$(date '+%Y-%m-%d %H:%M:%S') - Primary remote reachable on attempt $attempt/3" >> "$LOG_FILE"
+                                return 0
+                            fi
+                        done
+                        return 1
+                    }
+
+                    if [[ "$STREAM_CACHE_ONLY" == "true" || "$STREAM_CACHE_ONLY" == "True" ]]; then
+                        MOUNT_MODE="\(MountMode.cacheOnlyManual.rawValue)"
+                    elif [[ "$OVERLAY_PENDING" == "true" ]]; then
+                        MOUNT_MODE="\(MountMode.cacheOnlyPending.rawValue)"
+                    elif ! mount_primary_reachable; then
+                        MOUNT_MODE="\(MountMode.cacheOnlyOffline.rawValue)"
+                    fi
+                fi
+                # Partial-file list for Cache Only (one exclude line per cached data file
+                # whose bytes aren't provably complete), rebuilt here on every Cache Only
+                # mount start. Under launchd this python3 can be denied read access to a
+                # cache on an external drive (macOS privacy controls grant the app, not the
+                # interpreter), so on failure use the copy the app writes on launch, on
+                # install and periodically (VFSCacheService.writeCacheOnlyExcludeList). With
+                # neither, mount STREAMING: a union mount without the list would serve a
+                # half-downloaded file as complete, with zeros where the missing bytes are.
+                if [[ "$MOUNT_MODE" != "\(MountMode.streaming.rawValue)" ]]; then
+                    if python3 -c "
+            import json, os, sys
+
+            data_root, meta_root, exclude_path = sys.argv[1:4]
+            backslash = chr(92)
+
+            def is_complete(meta, expected_size):
+                if meta.get('Size') != expected_size:
+                    return False
+                if expected_size == 0:
+                    return True
+                ranges = meta.get('Rs') or []
+                if not ranges:
+                    return False
+                covered = 0
+                for r in sorted(ranges, key=lambda x: x.get('Pos', 0)):
+                    pos, size = r.get('Pos', 0), r.get('Size', 0)
+                    if pos < 0 or size < 0 or pos > covered:
+                        return False
+                    covered = max(covered, pos + size)
+                return covered >= expected_size
+
+            def escape(rel):
+                rel = rel.replace(backslash, backslash + backslash)
+                for ch in ('*', '?', '[', ']', '{', '}'):
+                    rel = rel.replace(ch, backslash + ch)
+                return rel
+
+            # Fail LOUDLY on anything unreadable: os.walk skips an unreadable directory
+            # silently and os.path.isdir answers False on a permission error, and either
+            # would produce a short list that looks like success. Only a truly absent data
+            # tree (nothing cached yet) means an empty list.
+            def fail(err):
+                raise err
+
+            try:
+                os.stat(data_root)
+                have_data = bool(data_root)
+            except FileNotFoundError:
+                have_data = False
+
+            lines = []
+            if have_data:
+                for root, dirs, files in os.walk(data_root, onerror=fail):
+                    for name in files:
+                        full = os.path.join(root, name)
+                        rel = os.path.relpath(full, data_root)
+                        try:
+                            size = os.path.getsize(full)
+                        except OSError:
+                            lines.append('/' + escape(rel))
+                            continue
+                        complete = False
+                        try:
+                            with open(os.path.join(meta_root, rel)) as fh:
+                                meta = json.load(fh)
+                            complete = is_complete(meta, size)
+                        except Exception:
+                            complete = False
+                        if not complete:
+                            lines.append('/' + escape(rel))
+
+            os.makedirs(os.path.dirname(exclude_path), exist_ok=True)
+            with open(exclude_path, 'w') as fh:
+                fh.write(chr(10).join(lines))
+                if lines:
+                    fh.write(chr(10))
+            " "$CACHE_DATA_PATH" "$CACHE_META_PATH" "$CACHE_ONLY_EXCLUDE_PATH" 2>/dev/null; then
+                        :
+                    elif [[ -f "$CACHE_ONLY_EXCLUDE_PATH" ]]; then
+                        echo "$(date '+%Y-%m-%d %H:%M:%S') - Cache Only: cache not readable by the script, using the app-written partial-file list" >> "$LOG_FILE"
+                    else
+                        echo "$(date '+%Y-%m-%d %H:%M:%S') - Cache Only unavailable: partial-file list could not be built (cache not readable by the script, no app-written list) - streaming instead" >> "$LOG_FILE"
+                        MOUNT_MODE="\(MountMode.streaming.rawValue)"
+                    fi
+                fi
+                echo "$(date '+%Y-%m-%d %H:%M:%S') - Mount mode: $MOUNT_MODE" >> "$LOG_FILE"
+                if [[ -n "$MOUNT_MODE_PATH" ]]; then
+                    echo "$MOUNT_MODE" > "$MOUNT_MODE_PATH"
+                fi
+
+                if [[ "$MOUNT_MODE" == "\(MountMode.streaming.rawValue)" ]]; then
+                    # STREAMING — talk to the remote directly through the VFS cache. Both
+                    # mount backends share this cache layer, so retention/eviction
+                    # (--vfs-cache-max-size / --vfs-cache-max-age) behaves identically.
+                    # Note: No --daemon flag - launchd manages the process lifecycle.
+                    RCLONE_CMD="$RCLONE_BIN $MOUNT_SUBCMD \\"$REMOTE\\" \\"$LOCAL_PATH\\" --vfs-cache-mode $VFS_CACHE_MODE --vfs-cache-max-size $VFS_CACHE_MAX_SIZE --cache-dir \\"$VFS_CACHE_PATH\\" --log-level INFO --use-json-log"
+
+                    # Throughput tuning. Reading a file through the mount (streaming or
+                    # offline warming) otherwise trickles: the nfsmount -> rclone-NFS-server
+                    # -> VFS hop paces the backend download at the slow NFS read rate instead
+                    # of racing ahead at line speed. Measured on a DS223 over SMB: a raw
+                    # single stream does ~17 MB/s and 4 parallel ~37 MB/s, yet an untuned warm
+                    # delivered ~1.2 MB/s.
+                    #   --vfs-read-ahead / --buffer-size : download far ahead of the reader so
+                    #       the cache fills at backend speed, decoupled from NFS read latency.
+                    #   --transfers : parallel VFS cache downloaders, from the profile's
+                    #       downloadConnections setting (kept in lockstep with the app-side
+                    #       warm concurrency in VFSCacheService). Fewer streams win on a
+                    #       contended wireless/mesh link; more on fast wired.
+                    #   --vfs-read-chunk-size(-limit) : large, growing range reads = fewer
+                    #       round trips on high-latency backends.
+                    #   --dir-cache-time / --attr-timeout : fewer metadata round trips.
+                    # Cost: --buffer-size is per open file, so an active warm of N files uses
+                    # up to N x 128M RAM (transient; released when the files close).
+                    #
+                    # --dir-cache-time 1000h (~41 days): folder LISTINGS must survive a long
+                    # OFFLINE period. When the remote is unreachable, rclone serves fully-cached
+                    # file *data* from disk regardless — but Finder browsing also needs the
+                    # directory listing, and once dir-cache-time expires rclone tries to
+                    # re-list from the (unreachable) remote. A short window (rclone's 5m
+                    # default, or the old 12h) would expire mid-trip and break offline
+                    # browsing. Freshness tradeoff — and it applies ONLINE too: a longer
+                    # dir-cache-time also raises the ceiling on how long an out-of-band remote
+                    # change stays invisible in Finder while the mount is up; it surfaces on
+                    # the next explicit recursive /vfs/refresh (startup/mount, and
+                    # offline-warm) instead of within a shorter auto-expiry. Offline WRITES
+                    # need no flag here: under --vfs-cache-mode full a write while the remote
+                    # is down lands in the VFS cache as dirty and rclone retries the
+                    # write-back until it returns. If the remote stays down long enough for
+                    # the mode selection above to notice on the NEXT mount start, that queued
+                    # write becomes the overlay's job instead (Cache Only Pending) — see the
+                    # automatic-entry note in CLAUDE.md.
+                    RCLONE_CMD="$RCLONE_CMD --buffer-size 128M --vfs-read-ahead 256M --transfers $DOWNLOAD_CONNECTIONS --vfs-read-chunk-size 128M --vfs-read-chunk-size-limit off --attr-timeout 5s --dir-cache-time 1000h --vfs-cache-max-age $VFS_CACHE_MAX_AGE"
+                    RCLONE_CMD="$RCLONE_CMD --volname \\"$MOUNT_VOLNAME\\""
+
+                    # Add RC (remote control) API for cache management. Streaming-only — a
+                    # Cache Only mount never exposes the RC API (nothing there needs
+                    # refreshing/warming while the mount is deliberately not talking to the
+                    # remote).
+                    if [[ "$RC_PORT" != "0" && -n "$RC_PORT" ]]; then
+                        RCLONE_CMD="$RCLONE_CMD --rc --rc-addr=localhost:$RC_PORT --rc-no-auth"
+                    fi
+                else
+                    # CACHE ONLY — a writable "synctray-overlay" directory layered in FRONT of
+                    # the read-only streaming cache's DATA tree via an rclone `union` remote
+                    # (search/create/action_policy = ff, first-found wins), at the SAME mount
+                    # point the streaming mount uses. This is why the mount still comes up:
+                    # every absolute path a running app already has open keeps resolving,
+                    # which a separate read-only sibling folder cannot give you.
+                    #   - A read sees the overlay copy first if one exists, else the cache.
+                    #   - A write/create/delete always lands in the overlay — the cache tree
+                    #     is mounted `:ro` and is never touched.
+                    # Partially-downloaded cache files are hidden via --exclude-from so a
+                    # half-fetched file never presents as if it were complete.
+                    mkdir -p "$OVERLAY_PATH"
+                    mkdir -p "$CACHE_ONLY_CACHE_PATH"
+
+                    python3 -c "
+            import os, sys
+
+            overlay_path, data_path, conf_path = sys.argv[1:4]
+            backslash = chr(92)
+            dquote = chr(34)
+
+            # rclone's upstreams list is space-separated with double-quoting for a path
+            # containing a space (NOT Python's repr() -- its single-quote wrapping is never
+            # unwrapped by rclone's config parser, so the literal quote characters become
+            # part of the path and every listing/read fails with directory-not-found).
+            # Built from chr(34)/chr(92), never a literal quote or backslash character typed
+            # directly, since this whole block is itself embedded inside a bash
+            # double-quoted string (python3 -c followed by a quote). A literal quote
+            # character here would close THAT string early, leaving the rest of this block
+            # to be parsed as bash -- exactly the bug this comment is here to prevent
+            # reintroducing.
+            def quote(path):
+                return dquote + path.replace(backslash, backslash + backslash).replace(dquote, backslash + dquote) + dquote
+
+            lines = [
+                '[synctray_cacheonly]',
+                'type = union',
+                'upstreams = ' + quote(overlay_path) + ' ' + quote(data_path + ':ro'),
+                'action_policy = ff',
+                'create_policy = ff',
+                'search_policy = ff',
+            ]
+            os.makedirs(os.path.dirname(conf_path), exist_ok=True)
+            with open(conf_path, 'w') as fh:
+                fh.write(chr(10).join(lines) + chr(10))
+            os.chmod(conf_path, 0o600)
+            " "$OVERLAY_PATH" "$CACHE_DATA_PATH" "$CACHE_ONLY_CONFIG_PATH"
+
+                    RCLONE_CMD="$RCLONE_BIN $MOUNT_SUBCMD synctray_cacheonly: \\"$LOCAL_PATH\\" --config \\"$CACHE_ONLY_CONFIG_PATH\\" --exclude-from \\"$CACHE_ONLY_EXCLUDE_PATH\\" --vfs-cache-mode writes --cache-dir \\"$CACHE_ONLY_CACHE_PATH\\" --vfs-write-back 2s --dir-cache-time 1m --log-level INFO --use-json-log --volname \\"$MOUNT_VOLNAME\\""
+
+                    echo "$(date '+%Y-%m-%d %H:%M:%S') - Cache Only: union(overlay=$OVERLAY_PATH, cache=$CACHE_DATA_PATH:ro), no --rc" >> "$LOG_FILE"
                 fi
 
                 # --allow-non-empty is a FUSE mount option; it is not valid for the
-                # NFS backend, so only pass it when mounting via macFUSE.
+                # NFS backend, so only pass it when mounting via macFUSE. Needed by
+                # both streaming and Cache Only.
                 if [[ "$MOUNT_SUBCMD" == "mount" && ( "$ALLOW_NON_EMPTY" == "true" || "$ALLOW_NON_EMPTY" == "True" || "$ALLOW_NON_EMPTY" == "1" ) ]]; then
                     RCLONE_CMD="$RCLONE_CMD --allow-non-empty"
+                fi
+
+                # DRY-RUN TEST SEAM
+                #
+                # Reading through a real NFS/FUSE mount requires an actual rclone mount and
+                # macOS-level permissions this project's self-test harness cannot assume (and
+                # this codebase has no XCTest target - see CLAUDE.md's Testing section). Set
+                # SYNCTRAY_DRY_RUN=1 to render the fully-resolved mode + command instead of
+                # calling rclone, so ConfigSelfTest can assert on script BEHAVIOR (mode
+                # selection, union config, exclude list, flag composition) without ever
+                # mounting anything.
+                if [[ "$SYNCTRAY_DRY_RUN" == "1" ]]; then
+                    echo "SYNCTRAY_DRY_RUN_MODE=$MOUNT_MODE"
+                    echo "SYNCTRAY_DRY_RUN_CMD=$RCLONE_CMD"
+                    echo "SYNCTRAY_DRY_RUN_ENV_OVERRIDES=$(env | grep -c '^RCLONE_CONFIG_' || true)"
+                    rm -f "$LOCK_FILE"
+                    trap - EXIT
+                    exit 0
                 fi
             elif [[ "$SYNC_MODE" == "bisync" ]]; then
                 # Two-way bidirectional sync
@@ -880,15 +1349,14 @@ final class SyncSetupService {
                 # writing anything: if it is offline we skip this run (exit 0) rather than
                 # risk bisync acting on a phantom-empty listing, and retry next interval.
                 #
-                # We probe the remote ROOT (not the sync subpath) so a not-yet-created
-                # path on a freshly configured profile does not cause a false skip — the
-                # first run still reaches bisync and self-bootstraps via --resync.
+                # We probe the sync path itself; a not-yet-created path on a freshly
+                # configured profile still counts as reachable (see remote_path_reachable),
+                # so the first run reaches bisync and self-bootstraps via --resync.
                 #
                 # Catastrophic mass-deletion (a reachable-but-wiped side) remains guarded
                 # by bisync's own --max-delete (default 50%), which aborts with a "too
                 # many deletes" error instead of propagating the deletion.
-                PREFLIGHT_REMOTE_NAME="${REMOTE%%:*}"
-                if ! run_with_timeout 45 $RCLONE_BIN lsd "${PREFLIGHT_REMOTE_NAME}:" --max-depth 0 --contimeout 10s --timeout 30s --retries 1 --low-level-retries 1 $NO_CHECK_CERT &>/dev/null; then
+                if ! remote_path_reachable 45 "$REMOTE" --contimeout 10s --timeout 30s --retries 1 --low-level-retries 1; then
                     echo "$(date '+%Y-%m-%d %H:%M:%S') - Remote unreachable, skipping sync (will retry next interval)" >> "$LOG_FILE"
                     exit 0
                 fi
@@ -999,6 +1467,24 @@ final class SyncSetupService {
         return primaryConfig.provider.rcloneType != fallbackConfig.provider.rcloneType
     }
 
+    /// Cache-only / mode-signalling paths the script needs but does not derive itself
+    /// — Swift is the single source (`SyncProfile` computed paths +
+    /// `VFSCacheService.cacheSubtreeRoots`) so the script and the app can never
+    /// disagree about which directory is which. Included for every profile (harmless
+    /// for a non-mount one — the script only reads these in its mount branch).
+    private func mountCacheOnlyConfigKeys(for profile: SyncProfile) -> [String: Any] {
+        let roots = VFSCacheService.shared.cacheSubtreeRoots(for: profile)
+        return [
+            "mountModePath": profile.mountModePath,
+            "overlayPath": profile.overlayPath,
+            "cacheOnlyConfigPath": profile.cacheOnlyConfigPath,
+            "cacheOnlyExcludePath": profile.cacheOnlyExcludePath,
+            "cacheOnlyCachePath": profile.cacheOnlyCachePath,
+            "cacheDataPath": roots.data,
+            "cacheMetaPath": roots.meta,
+        ]
+    }
+
     /// Generate profile-specific JSON config.
     /// Not private — `ConfigSelfTest` calls this directly to verify the
     /// derived config's key set stays frozen (AC-2) without going through
@@ -1027,10 +1513,11 @@ final class SyncSetupService {
             "vfsCacheMaxAge": profile.vfsCacheMaxAge,
             "vfsCachePath": profile.vfsCachePath,
             "allowNonEmptyMount": profile.allowNonEmptyMount,
+            "streamCacheOnly": profile.streamCacheOnly,
             "pinnedDirectories": profile.pinnedDirectories,
             "rcPort": profile.rcPort,
             "downloadConnections": profile.downloadConnections,
-        ]
+        ].merging(mountCacheOnlyConfigKeys(for: profile)) { _, new in new }
 
         if let data = try? JSONSerialization.data(
             withJSONObject: config, options: [.prettyPrinted, .sortedKeys]),

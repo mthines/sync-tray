@@ -233,6 +233,57 @@ enum MountState: Equatable {
     }
 }
 
+/// The actual mode a Stream (mount) profile's rclone process is running in RIGHT NOW,
+/// read from the per-boot state file (`SyncProfile.mountModePath`) the sync script
+/// writes right before starting rclone. Distinct from `SyncProfile.streamCacheOnly`,
+/// which only tracks the user's MANUAL choice — this is the source of truth for the
+/// mode actually active, including the two AUTOMATIC ones the script can pick on its
+/// own (offline / pending) that the persisted flag knows nothing about.
+enum MountMode: String, Equatable, CaseIterable {
+    case streaming = "streaming"
+    case cacheOnlyManual = "cache-only-manual"
+    case cacheOnlyPending = "cache-only-pending"
+    case cacheOnlyOffline = "cache-only-offline"
+
+    /// Parse a mode-file token, trimming surrounding whitespace/newlines (the script
+    /// writes it with `echo`, which appends a trailing newline). Anything that isn't
+    /// one of the four known tokens is rejected (`nil`), which callers treat as
+    /// "mode unknown" rather than guessing.
+    static func parse(_ text: String) -> MountMode? {
+        MountMode(rawValue: text.trimmingCharacters(in: .whitespacesAndNewlines))
+    }
+
+    /// Whether this mode is any flavour of Cache Only (manual or automatic).
+    var isCacheOnly: Bool {
+        self != .streaming
+    }
+
+    /// Whether this mode was entered BY THE SCRIPT on its own (the primary was
+    /// unreachable, or the overlay had pending files at mount time) rather than by the
+    /// user clicking "Cache Only". Only `.cacheOnlyManual` is a manual choice.
+    var isAutomatic: Bool {
+        switch self {
+        case .cacheOnlyOffline, .cacheOnlyPending: return true
+        case .streaming, .cacheOnlyManual: return false
+        }
+    }
+
+    /// User-facing label for the Stream status card and menu bar.
+    var displayName: String {
+        switch self {
+        case .streaming: return "Streaming"
+        case .cacheOnlyManual: return "Cache only (manual)"
+        case .cacheOnlyPending: return "Cache only (uploads pending, automatic)"
+        case .cacheOnlyOffline: return "Cache only (offline, automatic)"
+        }
+    }
+
+    /// Low-cardinality telemetry value — same spelling as `rawValue` today, called out
+    /// separately so a future UI-only rename of `displayName` can never leak into
+    /// telemetry attributes.
+    var telemetryValue: String { rawValue }
+}
+
 /// Which transport is currently active for a profile's sync
 enum ActiveTransport: Equatable {
     case primary

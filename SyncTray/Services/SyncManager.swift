@@ -69,6 +69,12 @@ final class SyncManager: ObservableObject {
     /// supersedes rather than coalesces). Re-armed when the profile is seen unmounted, so a
     /// later remount warms again and picks up files added on the remote in the meantime.
     private var autoWarmedMounts: Set<UUID> = []
+    // Mount read-health probe bookkeeping (in-memory; see `probeMountReadHealth`).
+    private var lastMountReadProbe: [UUID: Date] = [:]
+    // Last time this app session wrote each profile's Cache Only partial-file list.
+    private var lastCacheOnlyListWrite: [UUID: Date] = [:]
+    private var cacheOnlyListWritesInFlight: Set<UUID> = []
+    private var mountReadProbesInFlight: Set<UUID> = []
 
     /// Live progress of an in-flight cache-directory move, keyed by the
     /// profile whose Cache Directory is changing. Drives `CacheMoveSheet`'s
@@ -78,6 +84,28 @@ final class SyncManager: ObservableObject {
     /// In-flight cache-migration tasks, so a second start supersedes and
     /// cancel can stop one.
     private var cacheMigrationTasks: [UUID: Task<CacheMigrationOutcome, Never>] = [:]
+
+    /// The mount mode the sync script actually picked for a mounted Stream profile, read
+    /// from its per-boot mode file (`SyncProfile.mountModePath`) by the mount-state
+    /// reconcile tick. `nil` while unmounted or before the first tick has read it.
+    @Published private(set) var profileMountModes: [UUID: MountMode] = [:]
+
+    /// Live progress of an in-flight overlay upload (Resume Syncing's drain, or Upload
+    /// Now's keep), keyed by profile. Drives the Cache Only status card's progress bar.
+    @Published private(set) var overlayUploadProgress: [UUID: OverlaySyncService.OverlayUploadProgress] = [:]
+
+    /// In-flight overlay-upload tasks, so a second start (e.g. a rapid double-tap of
+    /// "Upload Now") supersedes rather than races the previous one.
+    private var overlayUploadTasks: [UUID: Task<Void, Never>] = [:]
+
+    /// Profiles currently transitioning out of Cache Only (drain in progress), so the
+    /// auto-resume monitor and a manual "Resume Syncing" tap can't both act at once.
+    private var resumingFromCacheOnly: Set<UUID> = []
+
+    /// Profiles already notified "Back on your network" for the CURRENT busy episode, so a
+    /// repeated 2-minute tick while something keeps the mount open doesn't renotify. Cleared
+    /// whenever the mode changes or the profile unmounts, so a later episode notifies again.
+    private var notifiedBackOnNetworkEpisodes: Set<UUID> = []
 
     let profileStore: ProfileStore
 
@@ -188,11 +216,12 @@ final class SyncManager: ObservableObject {
         TelemetryService.shared.recordProfileCount(self.profileStore.enabledProfiles.count)
         TelemetryService.shared.recordAllProfileConfigurations(self.profileStore.profiles)
         startSessionHeartbeat()
+        refreshCacheOnlyExcludeLists()
         startMountStateMonitor()
         startMountProgressMonitor()
         startPrimaryRecoveryMonitor()
         mountProfilesAtStartup()
-        maintainAllOfflineAccessLinks()  // Read-only offline cache browse points, independent of mount success
+        removeAllLegacyOfflineLinks()  // Clean up any (Offline) symlink left by the retired feature
         setupFinderSyncIPC()
         updateAppGroupMountPaths()
         refreshSettingsFile()
@@ -320,28 +349,27 @@ final class SyncManager: ObservableObject {
         }
     }
 
-    // MARK: - Offline Access Browse Point
+    // MARK: - Legacy Offline Access Browse Point Cleanup
 
-    /// Maintain the read-only "<mount-name> (Offline)" cache browse point for one
-    /// profile: create it (or re-point it after a `vfsCachePath` change) when the
-    /// profile is a mount with `offlineAccessEnabled`, remove a stale one otherwise.
-    /// The filesystem work runs off the main actor because it touches the profile's
-    /// (possibly slow, external) cache volume and needs no main-actor state — the
-    /// decision is pure (`OfflineAccessLink`) and the profile is a value type.
-    func maintainOfflineAccessLink(for profile: SyncProfile) {
+    /// Remove a legacy "<mount-name> (Offline)" symlink for one profile, if the
+    /// retired offline-browse-point feature left one behind. The filesystem work runs
+    /// off the main actor because it touches the profile's (possibly slow, external)
+    /// cache volume and needs no main-actor state — the decision is pure
+    /// (`LegacyOfflineLink`) and the profile is a value type.
+    func removeLegacyOfflineLink(for profile: SyncProfile) {
         DispatchQueue.global(qos: .utility).async {
-            OfflineAccessLink.apply(for: profile) { SyncTraySettings.debugLog($0) }
+            LegacyOfflineLink.removeIfPresent(for: profile)
         }
     }
 
-    /// Maintain the offline browse point for **every** profile — mount profiles gain
-    /// or keep their link, non-mount profiles have any stale link cleaned up. Called
-    /// at launch and after profile mutations so the on-disk links always match config.
-    func maintainAllOfflineAccessLinks() {
+    /// Remove a legacy offline-browse-point symlink for **every** profile. Called at
+    /// launch and on profile delete so a leftover from the retired feature is cleaned
+    /// up without any live mount depending on its presence.
+    func removeAllLegacyOfflineLinks() {
         let profiles = profileStore.profiles
         DispatchQueue.global(qos: .utility).async {
             for profile in profiles {
-                OfflineAccessLink.apply(for: profile) { SyncTraySettings.debugLog($0) }
+                LegacyOfflineLink.removeIfPresent(for: profile)
             }
         }
     }
@@ -474,9 +502,6 @@ final class SyncManager: ObservableObject {
                             // Update App Group mount paths so the FinderSync extension
                             // registers this newly mounted directory.
                             updateAppGroupMountPaths()
-                            // Ensure the read-only "(Offline)" browse point exists now that
-                            // the cache dir is (or is about to be) populated.
-                            maintainOfflineAccessLink(for: profile)
                             // Auto-refresh pinned directories after successful mount
                             if !profile.pinnedDirectories.isEmpty {
                                 // Claim the warm here so the mount monitor's own
@@ -780,11 +805,6 @@ final class SyncManager: ObservableObject {
             self?.applyWarmReconcile(for: id, trigger: "external_edit")
         }
 
-        // Offline browse point: create / remove / re-point per the edited profile
-        // (a toggled `offlineAccessEnabled` yields `action == .none`, and a changed
-        // `vfsCachePath` a `.reinstall`; either way the link must follow config).
-        maintainOfflineAccessLink(for: updatedProfile)
-
         updateAggregateState()
         TelemetryService.shared.recordExternalConfigEdit(kind: "profile")
     }
@@ -808,7 +828,6 @@ final class SyncManager: ObservableObject {
             persist: { [weak self] profile in
                 self?.profileStore.add(profile)
                 self?.clearError(for: profile.id)
-                self?.maintainOfflineAccessLink(for: profile)
 
                 let canonicalFilename = "\(profile.shortId).profile.json"
                 let sourceFilename = (sourcePath as NSString).lastPathComponent
@@ -1050,13 +1069,11 @@ final class SyncManager: ObservableObject {
             return (primaryRemotePath, [:])
         }
 
-        // Mount mode always preserves the primary remote name (env-var overrides), so the
-        // VFS cache — keyed by {cache}/vfs/{name}/… — is shared across primary and fallback
-        // rather than duplicated into a second vfs/{fallback} tree. The full-swap branch is
-        // for bisync's listing cache only; a mount has no equivalent to protect. Mirrors the
-        // `SYNC_MODE == "mount"` guard in the sync script.
-        if profile.syncMode != .mount,
-           profile.fallbackRequiresCacheRebuild || !profile.fallbackRemotePath.isEmpty {
+        // This function backs `performResync`, which only ever runs for bisync/sync
+        // profiles (mount has no --resync concept and never streams via a fallback —
+        // see "Fallback Remote Pipeline" in CLAUDE.md), so there is no mount-mode
+        // branch here to preserve.
+        if profile.fallbackRequiresCacheRebuild || !profile.fallbackRemotePath.isEmpty {
             // Different wire type OR explicit path: swap full remote reference.
             // bisync uses a separate listing pair — consistent with the script.
             let effectiveFallbackPath = profile.fallbackRemotePath.isEmpty
@@ -3207,11 +3224,12 @@ final class SyncManager: ObservableObject {
 
         for profile in candidates {
             let primaryRemote = profile.rcloneRemote
+            let primaryPath = profile.remotePath
             let profileId = profile.id
             recoveringToPrimary.insert(profileId)
             DispatchQueue.global(qos: .utility).async { [weak self] in
                 guard let self else { return }
-                let reachable = self.isRemoteReachable(primaryRemote)
+                let reachable = self.isRemoteReachable(primaryRemote, path: primaryPath)
                 DispatchQueue.main.async {
                     defer { self.recoveringToPrimary.remove(profileId) }
 
@@ -3244,17 +3262,19 @@ final class SyncManager: ObservableObject {
         }
     }
 
-    /// Quick reachability probe for a remote, with a hard timeout — some backends (SMB)
-    /// hang well past their own `--contimeout`/`--timeout`, so we also cap wall-clock.
-    private func isRemoteReachable(_ remoteName: String) -> Bool {
-        let bare = remoteName.hasSuffix(":") ? String(remoteName.dropLast()) : remoteName
-        guard !bare.isEmpty else { return false }
+    /// Quick reachability probe for a remote PATH, with a hard timeout — some backends
+    /// (SMB) hang well past their own `--contimeout`/`--timeout`, so we also cap wall-clock.
+    /// Probes the profile's own path, never the remote root: `lsd remote:` enumerates every
+    /// SMB share, which on a Synology hangs past the cap and made a reachable NAS read as
+    /// offline — so fallback recovery and Cache Only auto-resume never fired.
+    private func isRemoteReachable(_ remoteName: String, path: String) -> Bool {
+        guard let arguments = Self.reachabilityProbeArguments(remote: remoteName, path: path) else { return false }
         guard let rclone = RcloneLocator.resolve() else { return false }
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: rclone)
-        proc.arguments = ["lsd", "\(bare):", "--contimeout", "3s", "--timeout", "8s", "--max-depth", "0"]
-        proc.standardOutput = Pipe()
-        proc.standardError = Pipe()
+        proc.arguments = arguments
+        proc.standardOutput = FileHandle.nullDevice
+        proc.standardError = FileHandle.nullDevice
         do { try proc.run() } catch { return false }
         let deadline = Date().addingTimeInterval(12)
         while proc.isRunning && Date() < deadline {
@@ -3264,7 +3284,20 @@ final class SyncManager: ObservableObject {
             proc.terminate()
             return false
         }
-        return proc.terminationStatus == 0
+        return Self.reachabilityProbeSucceeded(exitCode: proc.terminationStatus)
+    }
+
+    /// `rclone lsjson --stat remote:path` — one round trip on the path itself. `nil` for an
+    /// empty remote name.
+    nonisolated static func reachabilityProbeArguments(remote: String, path: String) -> [String]? {
+        let bare = remote.hasSuffix(":") ? String(remote.dropLast()) : remote
+        guard !bare.isEmpty else { return nil }
+        return ["lsjson", "--stat", "\(bare):\(path)", "--contimeout", "3s", "--timeout", "8s"]
+    }
+
+    /// rclone's directory/file-not-found exits (3/4) still mean the remote answered.
+    nonisolated static func reachabilityProbeSucceeded(exitCode: Int32) -> Bool {
+        exitCode == 0 || exitCode == 3 || exitCode == 4
     }
 
     /// Remount a profile so the sync script re-evaluates the remote and picks the primary
@@ -3315,6 +3348,17 @@ final class SyncManager: ObservableObject {
             let mounted = mountProfiles.reduce(into: [UUID: Bool]()) { acc, profile in
                 acc[profile.id] = self.setupService.isMounted(profile: profile)
             }
+            // Read each mounted profile's mode file off-main — a tiny text-file read, but
+            // still I/O, and this whole reconcile exists precisely to keep I/O off the UI
+            // thread. A profile that isn't mounted (or whose mode file is missing/stale)
+            // reads nil rather than an error.
+            let modes = mountProfiles.reduce(into: [UUID: MountMode]()) { acc, profile in
+                guard mounted[profile.id] == true, !profile.mountModePath.isEmpty,
+                      let raw = try? String(contentsOfFile: profile.mountModePath, encoding: .utf8),
+                      let mode = MountMode.parse(raw)
+                else { return }
+                acc[profile.id] = mode
+            }
             DispatchQueue.main.async {
                 let before = Set(self.profileMountStates.filter { $0.value == .mounted }.keys)
                 for profile in mountProfiles {
@@ -3325,6 +3369,17 @@ final class SyncManager: ObservableObject {
                                 || self.profileMountStates[profile.id] == .mounted {
                         self.profileMountStates[profile.id] = .unmounted
                     }
+
+                    let newMode = isMounted ? modes[profile.id] : nil
+                    if newMode != self.profileMountModes[profile.id] {
+                        self.notifiedBackOnNetworkEpisodes.remove(profile.id)
+                        if let newMode {
+                            TelemetryService.shared.recordMountModeChanged(
+                                profileId: profile.id, profileName: profile.name, mode: newMode)
+                        }
+                    }
+                    self.profileMountModes[profile.id] = newMode
+
                     // A launchd mount at login/reboot (RunAtLoad), an externally-driven mount,
                     // or a slow fallback that established after mountProfile's poll gave up
                     // never ran a warm, so new remote files were never pulled into the offline
@@ -3332,9 +3387,13 @@ final class SyncManager: ObservableObject {
                     // the same flag so this can't double-fire. Decided independently of the
                     // UI-state transition above, so a profile stuck in `.failed` still re-arms
                     // once it is actually unmounted.
+                    // Cache-Only means "stop chasing the remote": the warmer's whole job is
+                    // to pull uncached bytes down through the mount, which is exactly what
+                    // the mode exists to stop. Treat it as having nothing pinned so the
+                    // profile still re-arms normally when the mode is switched back off.
                     if Self.shouldAutoWarmOnMount(
                         isMounted: isMounted,
-                        hasPinnedDirs: !profile.pinnedDirectories.isEmpty,
+                        hasPinnedDirs: !profile.pinnedDirectories.isEmpty && (newMode ?? .streaming) == .streaming,
                         profileId: profile.id,
                         alreadyWarmed: &self.autoWarmedMounts
                     ) {
@@ -3350,7 +3409,393 @@ final class SyncManager: ObservableObject {
                 if before != after {
                     self.updateAppGroupMountPaths()
                 }
+                self.checkAutoResume(mountProfiles: mountProfiles)
             }
+        }
+    }
+
+    // MARK: - Cache Only
+
+    /// The mount mode the sync script picked the last time this profile's mount state was
+    /// reconciled — `nil` while unmounted or before the first reconcile tick.
+    func mountMode(for profileId: UUID) -> MountMode? {
+        profileMountModes[profileId]
+    }
+
+    /// Overlay files not yet recorded as uploaded — the count the status card and menu bar
+    /// show as "N files waiting to upload".
+    func pendingUploadCount(for profileId: UUID) -> Int {
+        guard let profile = profileStore.profile(for: profileId) else { return 0 }
+        let manifest = OverlaySyncService.loadManifest(path: profile.overlayManifestPath)
+        return OverlaySyncService.pendingCount(overlayPath: profile.overlayPath, manifest: manifest)
+    }
+
+    /// Bridge `isRemoteReachable`'s blocking, MainActor-isolated probe into something a
+    /// `Task` can `await` without holding up the main actor for the probe's up-to-12s
+    /// wall-clock cap — the same off-actor hop `checkPrimaryRecovery` uses, just wrapped as
+    /// a continuation instead of a bare `DispatchQueue.global` + `DispatchQueue.main` pair.
+    private func isRemoteReachableAsync(_ remoteName: String, path: String) async -> Bool {
+        await withCheckedContinuation { continuation in
+            DispatchQueue.global(qos: .utility).async { [weak self] in
+                let reachable = self?.isRemoteReachable(remoteName, path: path) ?? false
+                continuation.resume(returning: reachable)
+            }
+        }
+    }
+
+    /// Resolve the first reachable remote for an overlay upload — primary, else fallback if
+    /// configured. `nil` if neither answers within the probe's hard timeout.
+    private func resolveUploadTransport(for profile: SyncProfile) async -> (remote: String, transport: String)? {
+        if await isRemoteReachableAsync(profile.rcloneRemote, path: profile.remotePath) {
+            return (profile.rcloneRemote, "primary")
+        }
+        if profile.hasFallback,
+           await isRemoteReachableAsync(profile.fallbackRemote,
+                                        path: profile.fallbackRemotePath.isEmpty ? profile.remotePath : profile.fallbackRemotePath) {
+            return (profile.fallbackRemote, "fallback")
+        }
+        return nil
+    }
+
+    private func bareRemoteName(_ remote: String) -> String {
+        remote.hasSuffix(":") ? String(remote.dropLast()) : remote
+    }
+
+    /// Toggle a Stream profile's Cache Only mode.
+    ///
+    /// Turning it ON: persist the manual flag, push the derived config, and remount — the
+    /// script picks `cache-only-manual` on its next start.
+    ///
+    /// Turning it OFF ("Resume Syncing"): if the primary is unreachable right now, don't
+    /// unmount — persist the flag off and relabel the running mount as `cache-only-offline`
+    /// (automatic), so the auto-resume monitor drains and remounts it as Streaming once the
+    /// primary is stable again. Otherwise: unmount, drain the overlay
+    /// (verify-then-delete with conflict copies), persist the flag off, then reinstall and
+    /// remount. ANY file the drain could not upload keeps the mount in a Cache Only flavour
+    /// on the next start — the user's edits never silently vanish from view.
+    func setCacheOnly(profileId: UUID, enabled: Bool) {
+        guard let profile = profileStore.profile(for: profileId), profile.isMountMode else { return }
+
+        if enabled {
+            var updated = profile
+            updated.streamCacheOnly = true
+            profileStore.update(updated)
+            try? setupService.updateConfig(for: updated)
+            TelemetryService.shared.recordSettingChanged(name: "stream_cache_only", enabled: true)
+            // Freshen the partial-file list from the streaming cache as it is right now,
+            // before the remount: the script falls back to this copy when it can't read the
+            // cache itself (see `refreshCacheOnlyExcludeLists`).
+            Task.detached(priority: .userInitiated) { [weak self] in
+                Self.writeCacheOnlyExcludeList(for: updated)
+                await MainActor.run { self?.remountForModeChange(updated) }
+            }
+            return
+        }
+
+        guard !resumingFromCacheOnly.contains(profileId) else { return }
+        resumingFromCacheOnly.insert(profileId)
+
+        Task {
+            defer { Task { @MainActor in self.resumingFromCacheOnly.remove(profileId) } }
+
+            let reachable = await self.isRemoteReachableAsync(profile.rcloneRemote, path: profile.remotePath)
+            guard reachable else {
+                var updated = profile
+                updated.streamCacheOnly = false
+                self.profileStore.update(updated)
+                try? self.setupService.updateConfig(for: updated)
+                TelemetryService.shared.recordSettingChanged(name: "stream_cache_only", enabled: false)
+                TelemetryService.shared.recordOverlayUploadUnreachable(
+                    profileId: profile.id, profileName: profile.name, trigger: "resume")
+                // The running mount is still the MANUAL flavour, and auto-resume only ever
+                // considers automatic ones — without this hand-off the mount would sit in
+                // Cache Only until the next remount. Relabel it as the automatic offline
+                // flavour so the recovery monitor resumes it once the primary is stable.
+                if let next = Self.mountModeAfterResumeWhileUnreachable(
+                    current: self.profileMountModes[profileId]) {
+                    self.applyLiveMountMode(next, for: updated)
+                }
+                SyncTraySettings.debugLog(
+                    "'\(profile.name)': primary unreachable — will switch to Streaming automatically "
+                        + "once it's back")
+                return
+            }
+
+            try? await Task.sleep(nanoseconds: 200_000_000)
+            await self.drainAndResume(profile: profile)
+        }
+    }
+
+    /// The live mode a mounted profile should switch to when the user turns Cache Only off
+    /// while the primary is unreachable: a MANUAL Cache Only mount becomes the automatic
+    /// offline flavour (same union mount, but now a candidate for auto-resume). `nil` means
+    /// leave it — not mounted, already streaming, or already automatic.
+    nonisolated static func mountModeAfterResumeWhileUnreachable(current: MountMode?) -> MountMode? {
+        current == .cacheOnlyManual ? .cacheOnlyOffline : nil
+    }
+
+    /// Relabel a RUNNING mount's mode without remounting: rewrite its per-boot mode file in
+    /// the exact format the sync script writes (`echo "$MOUNT_MODE" > "$MOUNT_MODE_PATH"`),
+    /// so the 5s mount-state reconcile reads the same value back, then publish it.
+    private func applyLiveMountMode(_ mode: MountMode, for profile: SyncProfile) {
+        if !profile.mountModePath.isEmpty {
+            try? "\(mode.rawValue)\n".write(
+                toFile: profile.mountModePath, atomically: true, encoding: .utf8)
+        }
+        guard profileMountModes[profile.id] != mode else { return }
+        notifiedBackOnNetworkEpisodes.remove(profile.id)
+        TelemetryService.shared.recordMountModeChanged(
+            profileId: profile.id, profileName: profile.name, mode: mode)
+        profileMountModes[profile.id] = mode
+    }
+
+    /// Unmount, drain the overlay to the primary, persist the flag off, reinstall + remount.
+    private func drainAndResume(profile: SyncProfile, trigger: String = "resume") async {
+        try? setupService.unmount(profile: profile)
+        try? await Task.sleep(nanoseconds: 1_000_000_000)
+
+        let client = OverlaySyncService.ProductionOverlayRemoteClient(
+            remoteName: bareRemoteName(profile.rcloneRemote), remotePath: profile.remotePath)
+        let service = OverlaySyncService()
+        let start = Date()
+        TelemetryService.shared.recordOverlayUploadStarted(
+            profileId: profile.id, profileName: profile.name, trigger: trigger)
+        let result = await service.run(
+            profile: profile, remoteBase: "\(bareRemoteName(profile.rcloneRemote)):\(profile.remotePath)",
+            mode: .drain, transport: "primary", client: client,
+            progress: { [weak self] p in
+                Task { @MainActor in self?.overlayUploadProgress[profile.id] = p }
+            })
+        TelemetryService.shared.recordOverlayUploadCompleted(
+            profileId: profile.id, profileName: profile.name, trigger: trigger, result: result,
+            duration: Date().timeIntervalSince(start))
+        overlayUploadProgress[profile.id] = nil
+
+        var updated = profile
+        updated.streamCacheOnly = false
+        profileStore.update(updated)
+        try? setupService.updateConfig(for: updated)
+        TelemetryService.shared.recordSettingChanged(name: "stream_cache_only", enabled: false)
+
+        if result.failed > 0 || result.remainingPending > 0 {
+            notificationService.notifyOverlayUploadIssue(
+                profileName: profile.name, remaining: result.remainingPending + result.failed)
+        }
+
+        try? setupService.install(profile: updated)
+        mountProfile(updated)
+    }
+
+    /// "Upload Now" — push overlay files to the remote WITHOUT leaving Cache Only.
+    func uploadNow(profileId: UUID) {
+        guard let profile = profileStore.profile(for: profileId), profile.isMountMode else { return }
+        overlayUploadTasks[profileId]?.cancel()
+        overlayUploadTasks[profileId] = Task {
+            guard let resolved = await resolveUploadTransport(for: profile) else {
+                SyncTraySettings.debugLog("'\(profile.name)': Upload Now found no reachable remote")
+                TelemetryService.shared.recordOverlayUploadUnreachable(
+                    profileId: profile.id, profileName: profile.name, trigger: "upload_now")
+                return
+            }
+            let client = OverlaySyncService.ProductionOverlayRemoteClient(
+                remoteName: bareRemoteName(resolved.remote), remotePath: profile.remotePath)
+            let service = OverlaySyncService()
+            let start = Date()
+            TelemetryService.shared.recordOverlayUploadStarted(
+                profileId: profile.id, profileName: profile.name, trigger: "upload_now")
+            let result = await service.run(
+                profile: profile, remoteBase: "\(bareRemoteName(resolved.remote)):\(profile.remotePath)",
+                mode: .keep, transport: resolved.transport, client: client,
+                progress: { [weak self] p in
+                    Task { @MainActor in self?.overlayUploadProgress[profile.id] = p }
+                })
+            TelemetryService.shared.recordOverlayUploadCompleted(
+                profileId: profile.id, profileName: profile.name, trigger: "upload_now", result: result,
+                duration: Date().timeIntervalSince(start))
+            self.overlayUploadProgress[profile.id] = nil
+        }
+    }
+
+    /// Detach and remount so the sync script re-evaluates mode/remote on the next start.
+    private func remountForModeChange(_ profile: SyncProfile) {
+        Task {
+            try? self.setupService.unmount(profile: profile)
+            try? await Task.sleep(nanoseconds: 1_000_000_000)
+            await MainActor.run { self.mountProfile(profile) }
+        }
+    }
+
+    /// One of the four decisions the auto-resume monitor can reach for a mounted, AUTOMATIC
+    /// Cache Only profile (never for `.cacheOnlyManual` — that only ever changes via the
+    /// user's own toggle). Pure and static: the monitor supplies the mode, whether the
+    /// primary has been stable across the required probe streak, and the blocking-process
+    /// list from a real `lsof` run — no I/O here, so the decision itself is unit-testable.
+    enum AutoResumeDecision: Equatable { case resume, notify, wait }
+
+    nonisolated static func autoResumeDecision(
+        mode: MountMode, manualCacheOnly: Bool, primaryStable: Bool, blockingProcesses: [String]
+    ) -> AutoResumeDecision {
+        guard mode.isCacheOnly, mode.isAutomatic, !manualCacheOnly else { return .wait }
+        guard primaryStable else { return .wait }
+        return blockingProcesses.isEmpty ? .resume : .notify
+    }
+
+    /// Process names `lsof -w -F pc <mountpoint>` considers "busy" for auto-resume purposes —
+    /// everything except macOS's own indexing/Finder-preview daemons, which are always
+    /// touching a mounted volume and would otherwise block auto-resume forever.
+    private static let autoResumeIgnoredProcessNames: Set<String> = [
+        "Finder", "mds", "mds_stores", "mdworker", "mdworker_shared", "QuickLookUIService", "fseventsd",
+    ]
+
+    /// Stand-in blocker reported when the `lsof` busy check itself failed or timed out.
+    nonisolated static let busyCheckFailedBlocker = "(busy check failed)"
+
+    /// Map a busy-check result to the blocker list `autoResumeDecision` consumes. A `nil`
+    /// result means `lsof` failed or timed out — we could NOT confirm nothing has the
+    /// mount open, so it fails CLOSED with a sentinel blocker: the decision becomes
+    /// `.notify` (the user decides) instead of remounting under an app that may be
+    /// mid-write, and the `busy_check_failed` telemetry branch is reached.
+    nonisolated static func autoResumeBlockers(lsofOutput: String?) -> [String] {
+        guard let lsofOutput else { return [busyCheckFailedBlocker] }
+        return blockingProcesses(lsofOutput: lsofOutput)
+    }
+
+    /// Parse `lsof -w -F pc <mountpoint>` output (`-F pc` = one `p<pid>` line followed by one
+    /// `c<command>` line per open file) into the list of blocking process names, with the
+    /// macOS system daemons above filtered out. Empty output (lsof ran and nothing has the
+    /// path open) yields an empty list. A FAILED lsof run never reaches here — see
+    /// `autoResumeBlockers(lsofOutput:)`.
+    nonisolated static func blockingProcesses(lsofOutput: String) -> [String] {
+        var names: [String] = []
+        for line in lsofOutput.split(separator: "\n") {
+            guard let first = line.first, first == "c" else { continue }
+            let name = String(line.dropFirst())
+            if !name.isEmpty, !autoResumeIgnoredProcessNames.contains(name), !names.contains(name) {
+                names.append(name)
+            }
+        }
+        return names
+    }
+
+    /// For each mounted profile in an AUTOMATIC Cache Only mode, probe the primary (reusing
+    /// the same stability streak as fallback recovery) and, once stable, check whether
+    /// anything has the mount point open before resuming. Manual Cache Only is never a
+    /// candidate — only the user's own toggle changes it.
+    private func checkAutoResume(mountProfiles: [SyncProfile]) {
+        let candidates = mountProfiles.filter {
+            profileMountStates[$0.id] == .mounted
+                && (profileMountModes[$0.id]?.isCacheOnly ?? false)
+                && (profileMountModes[$0.id]?.isAutomatic ?? false)
+                && !$0.streamCacheOnly
+                && !resumingFromCacheOnly.contains($0.id)
+                && !recoveringToPrimary.contains($0.id)
+        }
+        guard !candidates.isEmpty else { return }
+
+        for profile in candidates {
+            let profileId = profile.id
+            recoveringToPrimary.insert(profileId)
+            DispatchQueue.global(qos: .utility).async { [weak self] in
+                guard let self else { return }
+                let reachable = self.isRemoteReachable(profile.rcloneRemote, path: profile.remotePath)
+                DispatchQueue.main.async {
+                    defer { self.recoveringToPrimary.remove(profileId) }
+                    guard reachable else {
+                        self.primaryRecoveryStreak[profileId] = 0
+                        return
+                    }
+                    let streak = (self.primaryRecoveryStreak[profileId] ?? 0) + 1
+                    guard streak >= self.primaryRecoveryRequiredStreak else {
+                        self.primaryRecoveryStreak[profileId] = streak
+                        return
+                    }
+                    self.primaryRecoveryStreak[profileId] = 0
+                    self.performAutoResumeCheck(
+                        profile: profile, mode: self.profileMountModes[profileId] ?? .streaming)
+                }
+            }
+        }
+    }
+
+    /// `mode` is the live `profileMountModes` value, captured by the (main-actor) caller:
+    /// the busy check runs on a background queue, which must never read published state.
+    private func performAutoResumeCheck(profile: SyncProfile, mode: MountMode) {
+        let mountPoint = profile.localSyncPath
+        let manualCacheOnly = profile.streamCacheOnly
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let lsofOutput = Self.runLsofBusyCheck(mountPoint: mountPoint)
+            let decision = Self.autoResumeDecision(
+                mode: mode,
+                manualCacheOnly: manualCacheOnly,
+                primaryStable: true,
+                blockingProcesses: Self.autoResumeBlockers(lsofOutput: lsofOutput))
+            DispatchQueue.main.async {
+                guard let self else { return }
+                switch decision {
+                case .resume:
+                    TelemetryService.shared.recordAutoResume(
+                        profileId: profile.id, profileName: profile.name, result: "resumed")
+                    self.resumingFromCacheOnly.insert(profile.id)
+                    Task {
+                        defer { Task { @MainActor in self.resumingFromCacheOnly.remove(profile.id) } }
+                        await self.drainAndResume(profile: profile, trigger: "auto_resume")
+                    }
+                case .notify:
+                    TelemetryService.shared.recordAutoResume(
+                        profileId: profile.id, profileName: profile.name,
+                        result: lsofOutput == nil ? "busy_check_failed" : "deferred_busy")
+                    if self.notifiedBackOnNetworkEpisodes.insert(profile.id).inserted {
+                        self.notificationService.notifyBackOnNetwork(profileName: profile.name)
+                    }
+                case .wait:
+                    break
+                }
+            }
+        }
+    }
+
+    /// `lsof -w -F pc <mountPoint>` under a 10s watchdog. `nil` on any failure/timeout
+    /// (distinct from "reachable but nothing open" = `""`), so the caller can tell "we
+    /// couldn't check" from "we checked, nothing's open".
+    nonisolated private static func runLsofBusyCheck(mountPoint: String) -> String? {
+        guard !mountPoint.isEmpty else { return "" }
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/usr/sbin/lsof")
+        proc.arguments = ["-w", "-F", "pc", mountPoint]
+        let pipe = Pipe()
+        proc.standardOutput = pipe
+        let errPipe = Pipe()
+        proc.standardError = errPipe
+        do { try proc.run() } catch { return nil }
+        let deadline = Date().addingTimeInterval(10)
+        while proc.isRunning && Date() < deadline {
+            Thread.sleep(forTimeInterval: 0.2)
+        }
+        if proc.isRunning {
+            proc.terminate()
+            return nil
+        }
+        let out = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+        let err = String(data: errPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+        return lsofBusyCheckResult(terminationStatus: proc.terminationStatus, stdout: out, stderr: err)
+    }
+
+    /// Map a finished `lsof` run to the busy-check result: `nil` = "couldn't check" (the
+    /// caller fails closed to `.notify`), otherwise the `-F pc` output to parse.
+    /// `terminationStatus == nil` means lsof failed to launch or timed out.
+    nonisolated static func lsofBusyCheckResult(terminationStatus: Int32?, stdout: String, stderr: String) -> String? {
+        guard let terminationStatus else { return nil }
+        switch terminationStatus {
+        case 0:
+            return stdout
+        case 1:
+            // lsof exits 1 BOTH when nothing has the path open (silent) and when it could
+            // not examine it at all (e.g. `status error` on an unreadable/stale mount).
+            // `-w` suppresses lsof's warnings, so any stderr left means the latter:
+            // treat it as a failed check rather than "idle".
+            return stderr.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? stdout : nil
+        default:
+            return nil
         }
     }
 
@@ -3374,10 +3819,124 @@ final class SyncManager: ObservableObject {
                     pausedProfiles: paused,
                     errorProfiles: errors
                 )
+                self.probeMountReadHealth()
+                self.refreshCacheOnlyExcludeLists()
             }
         }
         heartbeatTimer = timer
         timer.resume()
+    }
+
+    /// How often a streaming profile's Cache Only partial-file list is rebuilt.
+    static let cacheOnlyListRefreshInterval: TimeInterval = 15 * 60
+
+    /// Pure: should the app (re)write this profile's Cache Only partial-file list now?
+    /// Always when no list exists. Otherwise only while it is mounted STREAMING — that's
+    /// the only time the streaming cache changes (downloads land); in Cache Only or
+    /// unmounted it is static, so the last list stays exact — and at most once per interval.
+    nonisolated static func shouldRefreshCacheOnlyList(
+        listExists: Bool, isMounted: Bool, mode: MountMode?, inFlight: Bool,
+        lastWrite: Date?, now: Date
+    ) -> Bool {
+        guard !inFlight else { return false }
+        guard listExists else { return true }
+        guard isMounted, (mode ?? .streaming) == .streaming else { return false }
+        guard let lastWrite else { return true }
+        return now.timeIntervalSince(lastWrite) >= cacheOnlyListRefreshInterval
+    }
+
+    /// Keep every Stream profile's Cache Only partial-file list present and recent.
+    ///
+    /// The sync script rebuilds this list itself at each Cache Only mount start, but under
+    /// launchd its `python3` can be denied read access to a cache on an external drive
+    /// (macOS privacy controls grant this app, not the interpreter). The script then uses
+    /// this copy, and with no copy at all mounts streaming instead — a union mount without
+    /// the list would serve partly-downloaded files as complete. Runs off the main actor;
+    /// NOT gated on telemetry, since it's a correctness input, not a signal.
+    ///
+    /// Known window: a file first partly downloaded after the last write, followed by an
+    /// offline mount start before the next one, isn't on the list. At most one refresh
+    /// interval while the app runs.
+    private func refreshCacheOnlyExcludeLists() {
+        let now = Date()
+        for profile in profileStore.enabledProfiles where profile.isMountMode && !profile.mountModePath.isEmpty {
+            guard Self.shouldRefreshCacheOnlyList(
+                listExists: FileManager.default.fileExists(atPath: profile.cacheOnlyExcludePath),
+                isMounted: profileMountStates[profile.id] == .mounted,
+                mode: profileMountModes[profile.id],
+                inFlight: cacheOnlyListWritesInFlight.contains(profile.id),
+                lastWrite: lastCacheOnlyListWrite[profile.id], now: now
+            ) else { continue }
+            cacheOnlyListWritesInFlight.insert(profile.id)
+            lastCacheOnlyListWrite[profile.id] = now
+            let captured = profile
+            Task.detached(priority: .utility) { [weak self] in
+                Self.writeCacheOnlyExcludeList(for: captured)
+                await MainActor.run { _ = self?.cacheOnlyListWritesInFlight.remove(captured.id) }
+            }
+        }
+    }
+
+    /// Write one profile's list, logging (never throwing) on failure — a failed walk has
+    /// already removed any stale copy, so the script falls back to streaming.
+    nonisolated private static func writeCacheOnlyExcludeList(for profile: SyncProfile) {
+        do {
+            let count = try VFSCacheService.shared.writeCacheOnlyExcludeList(for: profile)
+            SyncTraySettings.debugLog("'\(profile.name)': Cache Only partial-file list written (\(count) excluded)")
+        } catch {
+            SyncTraySettings.debugLog("'\(profile.name)': Cache Only partial-file list failed: \(error.localizedDescription)")
+        }
+    }
+
+    /// How often a mounted Stream profile's cached-read speed is sampled.
+    static let mountReadProbeInterval: TimeInterval = 30 * 60
+
+    /// Pure: should this profile get a read-health probe now? Only a mounted profile in
+    /// STREAMING mode (Cache Only serves a different, union tree), never while an offline
+    /// warm is reading through the same mount (it would skew the timing and the remote-byte
+    /// delta), never twice at once, and at most once per `mountReadProbeInterval`.
+    nonisolated static func shouldProbeMountRead(
+        isMounted: Bool, mode: MountMode?, warmActive: Bool, inFlight: Bool,
+        lastProbe: Date?, now: Date
+    ) -> Bool {
+        guard isMounted, (mode ?? .streaming) == .streaming, !warmActive, !inFlight else { return false }
+        guard let lastProbe else { return true }
+        return now.timeIntervalSince(lastProbe) >= mountReadProbeInterval
+    }
+
+    /// Time a cached read through each eligible Stream mount and record it
+    /// (`TelemetryService.recordMountReadProbe`). Gated on the telemetry opt-in: the probe
+    /// exists only to produce the signal, so it does no I/O for a user who opted out.
+    private func probeMountReadHealth() {
+        guard SyncTraySettings.telemetryEnabled else { return }
+        let now = Date()
+        for profile in profileStore.enabledProfiles where profile.isMountMode {
+            guard Self.shouldProbeMountRead(
+                isMounted: profileMountStates[profile.id] == .mounted,
+                mode: profileMountModes[profile.id],
+                warmActive: warmProgress[profile.id]?.isActive == true,
+                inFlight: mountReadProbesInFlight.contains(profile.id),
+                lastProbe: lastMountReadProbe[profile.id], now: now
+            ) else { continue }
+            mountReadProbesInFlight.insert(profile.id)
+            lastMountReadProbe[profile.id] = now
+            let captured = profile
+            Task.detached(priority: .utility) { [weak self] in
+                let service = VFSCacheService.shared
+                let volume = service.cacheVolumeInfo(path: captured.vfsCachePath)
+                let cacheFiles = await service.rcDiskCache(port: captured.rcPort)?.files
+                let pick = service.pickReadProbeFile(for: captured)
+                var result: MountReadProbeResult?
+                if let pick { result = await service.probeMountRead(for: captured, pick: pick) }
+                TelemetryService.shared.recordMountReadProbe(
+                    profileId: captured.id, profileName: captured.name,
+                    mountBackend: captured.mountBackend.rawValue,
+                    cacheFsType: volume.fsType, cacheVolume: volume.volume,
+                    vfsCacheFiles: cacheFiles, result: result,
+                    outcome: pick == nil ? "no_candidate" : "failed")
+                await MainActor.run { _ = self?.mountReadProbesInFlight.remove(captured.id) }
+            }
+        }
     }
 
     /// Find which profile a log watcher belongs to

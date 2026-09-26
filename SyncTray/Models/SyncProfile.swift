@@ -32,13 +32,19 @@ struct SyncProfile: Identifiable, Codable, Equatable {
     var vfsCachePath: String            // Cache directory path (default: ~/.cache/rclone)
     var allowNonEmptyMount: Bool        // Allow mounting to non-empty folders (default: false)
     var mountAtStartup: Bool            // Auto-mount when SyncTray launches (mount mode, default: true)
-    /// Maintain a read-only "<mount-name> (Offline)" browse point next to the mount that
-    /// links straight to the VFS cache DATA tree, so already-cached files stay readable in
-    /// Finder even when the network is down and the live `rclone nfsmount` has stalled/dropped
-    /// (rclone's streaming VFS cannot itself serve purely-from-cache offline). App-side only —
-    /// never written to the script's `{shortId}.json`. Mount mode; default: true. See the
-    /// "Offline access" section in CLAUDE.md.
-    var offlineAccessEnabled: Bool
+    /// Cache-Only: mount this Stream profile as a writable union overlay over the VFS
+    /// cache's DATA tree instead of streaming from the remote. The overlay directory is
+    /// checked FIRST (so new files and edits land there, never touching the cache) and the
+    /// read-only cache tree SECOND; the script hides partially-downloaded files. Reads of
+    /// already-cached files are served at local-disk speed, and files created or edited
+    /// while in this mode are queued for upload (`OverlaySyncService`) the next time the
+    /// profile switches back to Streaming (or via "Upload Now" without switching). The mount
+    /// also enters this mode AUTOMATICALLY when the primary remote is unreachable at mount
+    /// time (see CLAUDE.md's "Cache-Only overlay mode" section); this flag only tracks the
+    /// user's MANUAL choice ("Cache Only" button) — `MountMode` (read from the running
+    /// mount's state file) is the source of truth for which mode is actually active,
+    /// including the automatic ones. Mount mode only; default false.
+    var streamCacheOnly: Bool
     var pinnedDirectories: [String]     // Directories to automatically cache offline (mount mode)
     /// Glob patterns excluded from offline warming, matched **case-sensitively** against each
     /// file's name and its path relative to the pinned dir. Supports `*` (within a segment),
@@ -64,6 +70,16 @@ struct SyncProfile: Identifiable, Codable, Equatable {
     /// Returns true if this profile is in mount mode
     var isMountMode: Bool {
         syncMode == .mount
+    }
+
+    // MARK: - Cache Identity
+
+    /// Remote name (colon stripped) of the profile's PRIMARY remote — the name rclone
+    /// keys the VFS cache by (`{cache}/vfs/{primaryRemoteName}/{remotePath}`), exactly
+    /// as it did before the (removed) "Share the cache across remotes" feature and
+    /// exactly as an older build still expects. See "Cache identity" in CLAUDE.md.
+    var primaryRemoteName: String {
+        rcloneRemote.hasSuffix(":") ? String(rcloneRemote.dropLast()) : rcloneRemote
     }
 
     // MARK: - Computed Paths
@@ -113,6 +129,60 @@ struct SyncProfile: Identifiable, Codable, Equatable {
 
     var lockFilePath: String {
         "/tmp/synctray-sync-\(shortId).lock"
+    }
+
+    // MARK: - Cache-Only overlay paths
+
+    /// Root directory for every profile's Cache-only overlay/writes-cache/exclude-list —
+    /// a sibling of the streaming `vfs`/`vfsMeta` trees, never inside either, so none of
+    /// this state can ever appear as a file inside the union mount.
+    var overlayRootPath: String {
+        let base = (vfsCachePath as NSString).expandingTildeInPath
+        return (base as NSString).appendingPathComponent("synctray-overlay")
+    }
+
+    /// The writable Cache-only overlay directory for THIS profile — the union mount's
+    /// FIRST upstream, so every new file and every edit lands here, never touching the
+    /// read-only streaming cache.
+    var overlayPath: String {
+        (overlayRootPath as NSString).appendingPathComponent(shortId)
+    }
+
+    /// Upload-tracking manifest (path + size + mtime AT UPLOAD TIME) for overlay files
+    /// already pushed to the remote by "Upload Now" without leaving Cache-only, so a
+    /// later drain/keep run can tell an unchanged uploaded file from one needing
+    /// re-upload. Swift-only — the script never reads or writes it.
+    var overlayManifestPath: String {
+        "\(overlayRootPath)/\(shortId).manifest.json"
+    }
+
+    /// Regenerated on every Cache-only mount start: one line per partially-downloaded
+    /// file under the streaming cache's data tree, so it stays hidden in the union mount
+    /// instead of surfacing a truncated read.
+    var cacheOnlyExcludePath: String {
+        "\(overlayRootPath)/\(shortId).exclude.txt"
+    }
+
+    /// A SEPARATE, small VFS cache directory for the cache-only union mount's own
+    /// `--vfs-cache-mode writes` bookkeeping (dirty-write tracking for saves into the
+    /// overlay). Never the streaming `--cache-dir` — a write here must never touch the
+    /// read-only data tree the same mount also serves.
+    var cacheOnlyCachePath: String {
+        "\(overlayRootPath)/\(shortId).vfscache"
+    }
+
+    /// Per-profile rclone config (chmod 0600) defining the `union` remote the cache-only
+    /// mount runs under. Lives beside the other per-profile config files, outside the
+    /// overlay tree.
+    var cacheOnlyConfigPath: String {
+        "\(Self.configDirectory)/\(shortId).cacheonly.rclone.conf"
+    }
+
+    /// Per-boot mode-signalling file the sync script writes right before starting rclone
+    /// — one of `MountMode`'s raw values. Lives in `/tmp` (like the lock file), never
+    /// under `~/.config/synctray`, which `MigrationRunner` walks as profile/settings JSON.
+    var mountModePath: String {
+        "/tmp/synctray-mount-\(shortId).mode"
     }
 
     // MARK: - Full Remote Path
@@ -195,7 +265,7 @@ struct SyncProfile: Identifiable, Codable, Equatable {
         vfsCachePath: String = "",
         allowNonEmptyMount: Bool = false,
         mountAtStartup: Bool = true,
-        offlineAccessEnabled: Bool = true,
+        streamCacheOnly: Bool = false,
         pinnedDirectories: [String] = [],
         warmExcludePatterns: [String] = [],
         rcPort: Int = 0,
@@ -223,7 +293,7 @@ struct SyncProfile: Identifiable, Codable, Equatable {
         self.vfsCachePath = vfsCachePath.isEmpty ? "\(NSHomeDirectory())/.cache/rclone" : vfsCachePath
         self.allowNonEmptyMount = allowNonEmptyMount
         self.mountAtStartup = mountAtStartup
-        self.offlineAccessEnabled = offlineAccessEnabled
+        self.streamCacheOnly = streamCacheOnly
         self.pinnedDirectories = pinnedDirectories
         self.warmExcludePatterns = warmExcludePatterns
         self.rcPort = rcPort > 0 ? rcPort : SyncProfile.defaultRCPort(for: id)
@@ -257,7 +327,8 @@ extension SyncProfile {
         case fallbackRemote, fallbackRemotePath, fallbackRequiresCacheRebuild
         case mountBackend
         case vfsCacheMode, vfsCacheMaxSize, vfsCacheMaxAge, vfsCachePath, allowNonEmptyMount
-        case mountAtStartup, offlineAccessEnabled
+        case mountAtStartup
+        case streamCacheOnly
         case pinnedDirectories, warmExcludePatterns, rcPort
         case downloadConnections
     }
@@ -306,10 +377,12 @@ extension SyncProfile {
         // Backwards compatibility: auto-mount on startup defaults to true (matches the
         // pre-existing behaviour where an installed mount profile always came up on launch)
         mountAtStartup = try container.decodeIfPresent(Bool.self, forKey: .mountAtStartup) ?? true
-        // Backwards compatibility: offline access defaults to true, so a profile
-        // persisted before this field existed gains the read-only "(Offline)" browse
-        // point on its next mount (the VFS cache is shared, so nothing re-downloads).
-        offlineAccessEnabled = try container.decodeIfPresent(Bool.self, forKey: .offlineAccessEnabled) ?? true
+        // Note: the retired cache-pinning and offline-browse-point keys from a
+        // superseded feature (see the retired migration slot) are simply ignored if
+        // present in an old profile file — no CodingKey, no decode.
+        // Backwards compatibility: cache-only is opt-in, so an existing profile keeps
+        // streaming from the remote exactly as before.
+        streamCacheOnly = try container.decodeIfPresent(Bool.self, forKey: .streamCacheOnly) ?? false
         // Backwards compatibility: default to empty array if not present
         pinnedDirectories = try container.decodeIfPresent([String].self, forKey: .pinnedDirectories) ?? []
         // Backwards compatibility: default to empty array if not present
