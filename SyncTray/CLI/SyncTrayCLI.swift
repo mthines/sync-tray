@@ -14,6 +14,12 @@ struct ProfileAssignment: Equatable {
     let value: String
 }
 
+/// `status --wait`: block until the profile reaches one of `states`.
+struct StatusWait: Equatable {
+    let states: Set<ProfileRuntimeState>
+    let timeout: TimeInterval
+}
+
 /// Parsed CLI subcommand — the pure, testable result of `SyncTrayCLI.parse`.
 enum CLICommand: Equatable {
     case doctor
@@ -21,9 +27,9 @@ enum CLICommand: Equatable {
     case logs(target: String, follow: Bool)
     case listRemotes
     case profiles
-    case status(target: String?)
+    case status(target: String?, json: Bool, wait: StatusWait?)
     case sync(String)
-    case mount(String)
+    case mount(String, timeout: TimeInterval)
     case unmount(String)
     case reinstall(String)
     case install(String)
@@ -65,6 +71,34 @@ struct DoctorCheck: Equatable {
 /// Every impure operation the CLI touches, injected so `execute`/`doctorChecks`
 /// are pure over `env` and fully exercisable by `ConfigSelfTest` with fakes —
 /// no real `Process`, `FileManager`, or stdio needed to test dispatch logic.
+/// Raw runtime facts about one Stream profile, sampled by `CLIEnvironment.probeMount`
+/// and turned into a `ProfileRuntimeState` by the pure `SyncTrayCLI.runtimeState`.
+struct MountProbe: Equatable {
+    /// The mount point is in the mount table (`/sbin/mount`).
+    var mounted: Bool
+    /// An rclone mount process is running for this mount point.
+    var processRunning: Bool
+    /// Overlay files still waiting to upload from Cache Only.
+    var pendingUploads: Int
+}
+
+/// The one-word state `synctray status` reports per profile, so an agent can
+/// branch on it instead of reading logs.
+enum ProfileRuntimeState: String, CaseIterable {
+    case disabled
+    /// Stream: rclone is running but the volume isn't attached yet — usually the
+    /// VFS cache scan at startup, which takes minutes on a large cache.
+    case mounting
+    case mounted
+    /// Stream: the volume is in the mount table but no rclone is serving it
+    /// (a dead NFS server — Finder's "Server connections interrupted").
+    case stale
+    case unmounted
+    /// Sync/bisync: a run holds the lock file.
+    case syncing
+    case idle
+}
+
 struct CLIEnvironment {
     /// Run rclone with `args`, hard-killed after `timeout` seconds if still
     /// running. Returns `(exitCode, stdout, stderr)`.
@@ -90,10 +124,10 @@ struct CLIEnvironment {
     /// Run the shared sync script against a profile's derived config path,
     /// blocking until it exits. Returns the script's exit code.
     var runSyncScript: (_ configPath: String) -> Int32
-    /// Mount a Stream (mount-mode) profile now (load + kickstart its agent) and
-    /// BLOCK until the volume attaches or a timeout elapses. Returns `nil` on a
-    /// confirmed mount, or an error message (with the real reason from the log
-    /// tail) on failure. The mount-only guard is enforced by the caller.
+    /// Start a Stream (mount-mode) profile's mount now (load + kickstart its
+    /// agent). Returns once launchd has the job — `runMount` then waits on
+    /// `probeMount`, so the wait is covered by the self-test. `nil` on success
+    /// or an error message. The mount-only guard is enforced by the caller.
     var mountProfile: (SyncProfile) -> String?
     /// Unmount a mounted Stream profile (graceful+forced detach, then unload the
     /// agent so `rclone nfsmount` actually exits). Returns `nil` on success or an
@@ -108,6 +142,12 @@ struct CLIEnvironment {
     var readStdin: () -> String?
     /// Read a file's contents as UTF-8 text. `nil` if missing/unreadable.
     var readFile: (String) -> String?
+    /// Sample a Stream profile's runtime facts (mount table, rclone process,
+    /// pending overlay uploads) for `status`. Never called for sync profiles.
+    var probeMount: (SyncProfile) -> MountProbe
+    /// Pause between polls in `status --wait` / `mount`. Injected so the
+    /// self-test's wait loops run instantly.
+    var sleep: (TimeInterval) -> Void
     var stdout: (String) -> Void
     var stderr: (String) -> Void
     var now: () -> Date
@@ -132,7 +172,9 @@ enum SyncTrayCLI {
 
     Inspect:
       doctor                       Run a health check and print a report
-      status [name|id]             Show live state for one or all profiles
+      status [name|id] [--json]    Show live state for one or all profiles
+      status <name|id> --wait <state>[,<state>] [--timeout s]
+                                   Block until the profile reaches a state (default timeout 600s)
       profiles                     List configured SyncTray profiles
       profile show <name|id>       Print one profile's full config as JSON
       logs <name|id> [--follow]    Print or tail a profile's sync log
@@ -152,7 +194,7 @@ enum SyncTrayCLI {
 
     Operate:
       sync <name|id>                          Run a sync now and wait for it to finish
-      mount <name|id>                         Mount a Stream profile now and wait for it to attach
+      mount <name|id> [--timeout s]           Mount a Stream profile now and wait for it to attach (default 600s)
       unmount <name|id>                       Unmount a mounted Stream profile
       cache move <name|id> --to <path> [--include-overlapping]
                                               Move a Stream profile's VFS cache and wait for it to finish
@@ -263,7 +305,27 @@ enum SyncTrayCLI {
             return .success(.profiles)
 
         case "status":
-            return .success(.status(target: rest.first(where: { !$0.hasPrefix("-") })))
+            let flags = parseFlags(rest, valueFlags: ["--wait", "--timeout"])
+            let target = flags.positionals.first
+            let timeout: TimeInterval
+            switch parseTimeout(flags.values["--timeout"], default: 600) {
+            case .success(let value): timeout = value
+            case .failure(let error): return .failure(error)
+            }
+            var wait: StatusWait?
+            if let raw = flags.values["--wait"] {
+                let tokens = raw.split(separator: ",").map { String($0).trimmingCharacters(in: .whitespaces) }
+                let states = tokens.compactMap(ProfileRuntimeState.init(rawValue:))
+                guard !tokens.isEmpty, states.count == tokens.count else {
+                    let valid = ProfileRuntimeState.allCases.map(\.rawValue).joined(separator: ", ")
+                    return .failure(CLIUsageError(message: "error: --wait takes one or more of: \(valid)"))
+                }
+                guard target != nil else {
+                    return .failure(CLIUsageError(message: "usage: synctray status <name|shortId> --wait <state>[,<state>] [--timeout seconds]"))
+                }
+                wait = StatusWait(states: Set(states), timeout: timeout)
+            }
+            return .success(.status(target: target, json: flags.bools.contains("--json"), wait: wait))
 
         case "sync":
             guard let target = rest.first(where: { !$0.hasPrefix("-") }) else {
@@ -272,11 +334,16 @@ enum SyncTrayCLI {
             return .success(.sync(target))
 
         case "mount", "unmount", "reinstall", "install":
-            guard let target = rest.first(where: { !$0.hasPrefix("-") }) else {
+            let flags = parseFlags(rest, valueFlags: ["--timeout"])
+            guard let target = flags.positionals.first else {
                 return .failure(CLIUsageError(message: "usage: synctray \(command) <name|shortId>"))
             }
             switch command {
-            case "mount": return .success(.mount(target))
+            case "mount":
+                switch parseTimeout(flags.values["--timeout"], default: 600) {
+                case .success(let timeout): return .success(.mount(target, timeout: timeout))
+                case .failure(let error): return .failure(error)
+                }
             case "unmount": return .success(.unmount(target))
             case "reinstall": return .success(.reinstall(target))
             default: return .success(.install(target))
@@ -297,6 +364,39 @@ enum SyncTrayCLI {
     }
 
     /// Parse the `profile <subcommand>` group.
+    /// Split args into positionals, `--flag value` pairs (for `valueFlags`), and
+    /// bare `--flag`s, so a flag's value is never mistaken for a profile name
+    /// (`status --wait mounted KaijuNew`).
+    static func parseFlags(_ args: [String], valueFlags: Set<String>) -> (positionals: [String], values: [String: String], bools: Set<String>) {
+        var positionals: [String] = []
+        var values: [String: String] = [:]
+        var bools: Set<String> = []
+        var index = 0
+        while index < args.count {
+            let arg = args[index]
+            if let eq = arg.firstIndex(of: "="), arg.hasPrefix("--"), valueFlags.contains(String(arg[..<eq])) {
+                values[String(arg[..<eq])] = String(arg[arg.index(after: eq)...])
+            } else if valueFlags.contains(arg), index + 1 < args.count {
+                values[arg] = args[index + 1]
+                index += 1
+            } else if arg.hasPrefix("-") {
+                bools.insert(arg)
+            } else {
+                positionals.append(arg)
+            }
+            index += 1
+        }
+        return (positionals, values, bools)
+    }
+
+    private static func parseTimeout(_ raw: String?, default fallback: TimeInterval) -> Result<TimeInterval, CLIUsageError> {
+        guard let raw else { return .success(fallback) }
+        guard let value = TimeInterval(raw), value >= 0 else {
+            return .failure(CLIUsageError(message: "error: --timeout takes a number of seconds, got \"\(raw)\""))
+        }
+        return .success(value)
+    }
+
     private static func parseProfile(_ rest: [String]) -> Result<CLICommand, CLIUsageError> {
         guard let sub = rest.first else {
             return .failure(CLIUsageError(message: "usage: synctray profile <create|enable|disable|delete|set|list> ..."))
@@ -401,12 +501,15 @@ enum SyncTrayCLI {
             return runListRemotes(env: env)
         case .profiles:
             return runProfiles(env: env)
-        case .status(let target):
-            return runStatus(target, env: env)
+        case .status(let target, let json, let wait):
+            if let wait, let target {
+                return runStatusWait(target, wait: wait, json: json, env: env)
+            }
+            return runStatus(target, json: json, env: env)
         case .sync(let target):
             return runSync(target, env: env)
-        case .mount(let target):
-            return runMount(target, env: env)
+        case .mount(let target, let timeout):
+            return runMount(target, timeout: timeout, env: env)
         case .unmount(let target):
             return runUnmount(target, env: env)
         case .reinstall(let target):
@@ -600,7 +703,7 @@ enum SyncTrayCLI {
 
     // MARK: - status
 
-    private static func runStatus(_ target: String?, env: CLIEnvironment) -> Int32 {
+    private static func runStatus(_ target: String?, json: Bool, env: CLIEnvironment) -> Int32 {
         let all = env.readProfiles()
         let profiles: [SyncProfile]
         if let target {
@@ -614,29 +717,101 @@ enum SyncTrayCLI {
         }
 
         guard !profiles.isEmpty else {
-            env.stdout(target == nil ? "no profiles configured\n" : "")
+            if json {
+                env.stdout("[]\n")
+            } else {
+                env.stdout(target == nil ? "no profiles configured\n" : "")
+            }
             return 0
         }
 
-        for profile in profiles {
-            let agent: String
-            if !profile.isEnabled {
-                agent = "n/a"
-            } else {
-                let (_, out) = env.runLaunchctl(["print", "gui/\(getuid())/\(profile.launchdLabel)"])
-                agent = out.isEmpty ? "unloaded" : "loaded"
+        let reports = profiles.map { statusReport(for: $0, env: env) }
+        if json {
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+            guard let data = try? encoder.encode(reports) else {
+                env.stderr("error: could not encode status\n")
+                return 1
             }
-            let running = env.fileExists(profile.lockFilePath)
-            let last = env.fileExists(profile.logPath)
-                ? lastLogEvent(inFileAt: profile.logPath, read: env.readFile)
-                : "none"
-            env.stdout(
-                "\(profile.name)\t\(profile.shortId)"
-                    + "\tenabled=\(profile.isEnabled)\tagent=\(agent)"
-                    + "\trunning=\(running)\tlast=\(last)\n"
-            )
+            env.stdout(String(decoding: data, as: UTF8.self) + "\n")
+        } else {
+            for report in reports { env.stdout(report.line + "\n") }
         }
         return 0
+    }
+
+    /// One profile's `status` output — the tab-separated line and the `--json`
+    /// object are both rendered from this, so the two formats can't disagree.
+    struct StatusReport: Encodable, Equatable {
+        let name: String
+        let shortId: String
+        let syncMode: String
+        let enabled: Bool
+        let agent: String
+        let running: Bool
+        let last: String
+        let state: String
+        /// Stream only, and only while rclone is running: the `MountMode` token.
+        let mountMode: String?
+        /// Stream only: overlay files waiting to upload.
+        let pendingUploads: Int?
+
+        var line: String {
+            var fields = [
+                name, shortId, "enabled=\(enabled)", "agent=\(agent)",
+                "running=\(running)", "last=\(last)", "state=\(state)",
+            ]
+            if let mountMode { fields.append("mode=\(mountMode)") }
+            if let pendingUploads { fields.append("pending_uploads=\(pendingUploads)") }
+            return fields.joined(separator: "\t")
+        }
+    }
+
+    static func statusReport(for profile: SyncProfile, env: CLIEnvironment) -> StatusReport {
+        let agentLoaded: Bool
+        let agent: String
+        if !profile.isEnabled {
+            agentLoaded = false
+            agent = "n/a"
+        } else {
+            let (_, out) = env.runLaunchctl(["print", "gui/\(getuid())/\(profile.launchdLabel)"])
+            agentLoaded = !out.isEmpty
+            agent = agentLoaded ? "loaded" : "unloaded"
+        }
+        let lockPresent = env.fileExists(profile.lockFilePath)
+        let last = env.fileExists(profile.logPath)
+            ? lastLogEvent(inFileAt: profile.logPath, read: env.readFile)
+            : "none"
+
+        let probe = profile.isMountMode ? env.probeMount(profile) : nil
+        let state = runtimeState(isEnabled: profile.isEnabled, isMountMode: profile.isMountMode,
+                                 lockPresent: lockPresent, probe: probe)
+        // The mode file outlives the mount in /tmp, so it's only meaningful while
+        // rclone is actually running.
+        let mountMode: String? = probe.map { probe in
+            guard probe.processRunning else { return "none" }
+            return env.readFile(profile.mountModePath).flatMap(MountMode.parse)?.rawValue ?? "unknown"
+        }
+        return StatusReport(
+            name: profile.name, shortId: profile.shortId, syncMode: profile.syncMode.rawValue,
+            enabled: profile.isEnabled, agent: agent, running: lockPresent, last: last,
+            state: state.rawValue, mountMode: mountMode, pendingUploads: probe?.pendingUploads
+        )
+    }
+
+    /// Pure state derivation for `status`. For a Stream profile the mount table
+    /// and the rclone process together separate the four live cases; the
+    /// launchd agent alone can't, since a `KeepAlive` agent stays loaded
+    /// through every one of them.
+    static func runtimeState(isEnabled: Bool, isMountMode: Bool, lockPresent: Bool, probe: MountProbe?) -> ProfileRuntimeState {
+        guard isEnabled else { return .disabled }
+        guard isMountMode, let probe else { return lockPresent ? .syncing : .idle }
+        switch (probe.mounted, probe.processRunning) {
+        case (true, true): return .mounted
+        case (true, false): return .stale
+        case (false, true): return .mounting
+        case (false, false): return .unmounted
+        }
     }
 
     /// Derive the last sync outcome from a log file's tail using the shared
@@ -687,7 +862,13 @@ enum SyncTrayCLI {
 
     // MARK: - mount / unmount
 
-    private static func runMount(_ target: String, env: CLIEnvironment) -> Int32 {
+    /// How long `mount` tolerates rclone NOT running before giving up early.
+    /// Covers the script's reachability probe (up to ~20s before rclone starts)
+    /// and a launchd `KeepAlive` restart; past this, waiting longer won't help.
+    static let mountNotRunningGrace: TimeInterval = 60
+    static let waitPollInterval: TimeInterval = 2
+
+    private static func runMount(_ target: String, timeout: TimeInterval, env: CLIEnvironment) -> Int32 {
         guard let profile = resolveProfile(target, in: env.readProfiles()) else {
             env.stderr("error: no profile matches \"\(target)\"\n")
             return 1
@@ -696,13 +877,79 @@ enum SyncTrayCLI {
             env.stderr("error: \"\(profile.name)\" is not a Stream (mount) profile\n")
             return 1
         }
+        if env.probeMount(profile).mounted {
+            env.stdout("already mounted: \(profile.name) (\(profile.shortId)) at \(profile.localSyncPath)\n")
+            return 0
+        }
         env.stdout("mounting \"\(profile.name)\" (\(profile.shortId))…\n")
         if let err = env.mountProfile(profile) {
             env.stderr("error: \(err)\n")
             return 1
         }
-        env.stdout("mounted \(profile.name) (\(profile.shortId)) at \(profile.localSyncPath)\n")
-        return 0
+
+        var waited: TimeInterval = 0
+        var notRunningFor: TimeInterval = 0
+        while true {
+            let probe = env.probeMount(profile)
+            if probe.mounted {
+                env.stdout("mounted \(profile.name) (\(profile.shortId)) at \(profile.localSyncPath)\n")
+                return 0
+            }
+            notRunningFor = probe.processRunning ? 0 : notRunningFor + waitPollInterval
+            if notRunningFor > mountNotRunningGrace {
+                env.stderr("error: rclone is not running for \(profile.name) — the mount failed to start\(logTail(profile, env: env))\n")
+                return 1
+            }
+            if waited >= timeout {
+                if probe.processRunning {
+                    env.stderr("error: still mounting after \(Int(timeout))s — rclone is running (a large VFS cache scan can take minutes); "
+                               + "keep waiting with: synctray status \(profile.shortId) --wait mounted\n")
+                } else {
+                    env.stderr("error: mount did not establish within \(Int(timeout))s\(logTail(profile, env: env))\n")
+                }
+                return 1
+            }
+            env.sleep(waitPollInterval)
+            waited += waitPollInterval
+        }
+    }
+
+    private static func logTail(_ profile: SyncProfile, env: CLIEnvironment, lines: Int = 10) -> String {
+        guard let contents = env.readFile(profile.logPath) else { return "" }
+        let tail = contents.split(separator: "\n", omittingEmptySubsequences: true).suffix(lines).joined(separator: "\n")
+        return tail.isEmpty ? "" : " — recent log:\n\(tail)"
+    }
+
+    /// `status <target> --wait <states>`: poll until the profile reaches one of
+    /// the states. Exit 0 when reached (printing the final status), 1 on timeout.
+    private static func runStatusWait(_ target: String, wait: StatusWait, json: Bool, env: CLIEnvironment) -> Int32 {
+        guard let profile = resolveProfile(target, in: env.readProfiles()) else {
+            env.stderr("error: no profile matches \"\(target)\"\n")
+            return 1
+        }
+        var waited: TimeInterval = 0
+        while true {
+            let report = statusReport(for: profile, env: env)
+            let reached = ProfileRuntimeState(rawValue: report.state).map(wait.states.contains) ?? false
+            if reached || waited >= wait.timeout {
+                if json {
+                    let encoder = JSONEncoder()
+                    encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+                    let data = (try? encoder.encode(report)) ?? Data()
+                    env.stdout(String(decoding: data, as: UTF8.self) + "\n")
+                } else {
+                    env.stdout(report.line + "\n")
+                }
+                if !reached {
+                    let wanted = wait.states.map(\.rawValue).sorted().joined(separator: ",")
+                    env.stderr("error: timed out after \(Int(wait.timeout))s waiting for state=\(wanted) (state=\(report.state))\n")
+                    return 1
+                }
+                return 0
+            }
+            env.sleep(waitPollInterval)
+            waited += waitPollInterval
+        }
     }
 
     private static func runUnmount(_ target: String, env: CLIEnvironment) -> Int32 {
@@ -1186,6 +1433,8 @@ extension CLIEnvironment {
                 return String(data: data, encoding: .utf8)
             },
             readFile: { try? String(contentsOfFile: $0, encoding: .utf8) },
+            probeMount: { profile in CLIEnvironment.probeMountProcess(profile) },
+            sleep: { Thread.sleep(forTimeInterval: $0) },
             stdout: { FileHandle.standardOutput.write(Data($0.utf8)) },
             stderr: { FileHandle.standardError.write(Data($0.utf8)) },
             now: { Date() }
@@ -1200,29 +1449,30 @@ extension CLIEnvironment {
     /// synchronous `diskutil`/`launchctl` calls elsewhere in the setup service. On
     /// timeout it returns the tail of the sync log so an agent sees the real
     /// reason (auth failure, unreachable remote, …) rather than a bare timeout.
-    fileprivate static func mountProfileProcess(_ profile: SyncProfile) -> String? {
-        let service = SyncSetupService.shared
-        if service.isMounted(profile: profile) { return nil }  // already up
-
-        _ = service.loadAgent(for: profile)
-        _ = service.startAgent(for: profile)
-
-        for _ in 0..<60 {
-            if service.isMounted(profile: profile) { return nil }
-            Thread.sleep(forTimeInterval: 1)
+    /// Real implementation of `probeMount`. The process check matches `ps` output
+    /// by substring rather than a `pgrep` regex, because a mount path can contain
+    /// regex metacharacters (parentheses, dots) that would silently mis-match.
+    fileprivate static func probeMountProcess(_ profile: SyncProfile) -> MountProbe {
+        let mounted = SyncSetupService.shared.isMounted(profile: profile)
+        let (_, ps) = runProcess(launchPath: "/bin/ps", args: ["-axww", "-o", "args="])
+        let mountPoint = " \(profile.localSyncPath)"
+        let processRunning = ps.split(separator: "\n").contains { line in
+            let args = String(line)
+            guard args.contains("rclone"), args.contains("mount ") else { return false }
+            return args.contains(mountPoint + " ") || args.hasSuffix(mountPoint)
         }
-
-        let tail = CLIEnvironment.tailOfLog(at: profile.logPath, lines: 10)
-        let reason = tail.isEmpty ? "" : " — recent log:\n\(tail)"
-        return "mount did not establish within 60s\(reason)"
+        let manifest = OverlaySyncService.loadManifest(path: profile.overlayManifestPath)
+        let pending = OverlaySyncService.pendingCount(overlayPath: profile.overlayPath, manifest: manifest)
+        return MountProbe(mounted: mounted, processRunning: processRunning, pendingUploads: pending)
     }
 
-    /// Last `lines` non-empty lines of a log file, for surfacing a mount failure's
-    /// real cause. Best-effort — an unreadable/absent log yields "".
-    fileprivate static func tailOfLog(at path: String, lines: Int) -> String {
-        guard let contents = try? String(contentsOfFile: path, encoding: .utf8) else { return "" }
-        let all = contents.split(separator: "\n", omittingEmptySubsequences: true)
-        return all.suffix(lines).joined(separator: "\n")
+    fileprivate static func mountProfileProcess(_ profile: SyncProfile) -> String? {
+        let service = SyncSetupService.shared
+        _ = service.loadAgent(for: profile)
+        guard service.startAgent(for: profile) else {
+            return "launchctl could not start \(profile.launchdLabel)"
+        }
+        return nil
     }
 
     /// Real implementation of `migrateCache`: refuses an unresolved overlap

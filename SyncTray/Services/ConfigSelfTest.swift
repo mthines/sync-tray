@@ -68,6 +68,7 @@ enum ConfigSelfTest {
             testCLIProfileSetAndShow,
             testDoctorPureChecks,
             testCLIResolveAndList,
+            testCLIStatusStates,
             testShimInstallIdempotentNonClobber,
             testCacheKeyPrimary,
             testCacheMigrationTreeKinds,
@@ -1111,6 +1112,10 @@ enum ConfigSelfTest {
         unmountProfile: @escaping (SyncProfile) -> String? = { _ in nil },
         readStdin: @escaping () -> String? = { nil },
         readFile: @escaping (String) -> String? = { _ in nil },
+        probeMount: @escaping (SyncProfile) -> MountProbe = { _ in
+            MountProbe(mounted: false, processRunning: false, pendingUploads: 0)
+        },
+        sleep: @escaping (TimeInterval) -> Void = { _ in },
         stdout: @escaping (String) -> Void = { _ in },
         stderr: @escaping (String) -> Void = { _ in },
         migrateCache: @escaping (SyncProfile, String, Bool) -> CacheMigrationCLIResult = { _, _, _ in
@@ -1133,10 +1138,148 @@ enum ConfigSelfTest {
             migrateCache: migrateCache,
             readStdin: readStdin,
             readFile: readFile,
+            probeMount: probeMount,
+            sleep: sleep,
             stdout: stdout,
             stderr: stderr,
             now: { Date() }
         )
+    }
+
+    // MARK: - AC-CLI10 — status: runtime state matrix + text/JSON rendering
+
+    /// `status` must let an agent tell "still mounting" (rclone up, volume not
+    /// attached yet) from mounted, stale, and unmounted without reading logs,
+    /// and `--json` must carry the same facts as the text line.
+    private static func testCLIStatusStates() -> Bool {
+        func probe(_ mounted: Bool, _ running: Bool) -> MountProbe {
+            MountProbe(mounted: mounted, processRunning: running, pendingUploads: 0)
+        }
+        let matrix: [(Bool, Bool, Bool, MountProbe?, ProfileRuntimeState)] = [
+            (false, true, false, probe(true, true), .disabled),
+            (true, true, false, probe(true, true), .mounted),
+            (true, true, false, probe(false, true), .mounting),
+            (true, true, false, probe(true, false), .stale),
+            (true, true, false, probe(false, false), .unmounted),
+            (true, false, true, nil, .syncing),
+            (true, false, false, nil, .idle),
+        ]
+        for (enabled, isMount, lock, p, expected) in matrix {
+            let got = SyncTrayCLI.runtimeState(isEnabled: enabled, isMountMode: isMount, lockPresent: lock, probe: p)
+            if got != expected {
+                return report("AC-CLI10", "cli-status-states", false,
+                              "(enabled=\(enabled) mount=\(isMount) lock=\(lock) probe=\(String(describing: p)) → \(got), want \(expected))")
+            }
+        }
+
+        guard SyncTrayCLI.parse(["status", "KaijuNew", "--json"]) == .success(.status(target: "KaijuNew", json: true, wait: nil)),
+              SyncTrayCLI.parse(["status"]) == .success(.status(target: nil, json: false, wait: nil)) else {
+            return report("AC-CLI10", "cli-status-states", false, "(status --json did not parse)")
+        }
+
+        var stream = sampleProfile(id: UUID(), name: "Streamer", isEnabled: true)
+        stream.syncMode = .mount
+        var out = ""
+        let env = fakeCLIEnvironment(
+            readProfiles: { [stream] },
+            runLaunchctl: { _ in (0, "state = running") },
+            readFile: { path in path == stream.mountModePath ? "cache-only-offline\n" : nil },
+            probeMount: { _ in MountProbe(mounted: false, processRunning: true, pendingUploads: 3) },
+            stdout: { out += $0 }
+        )
+        _ = SyncTrayCLI.run(.status(target: nil, json: false, wait: nil), env: env)
+        guard out.contains("state=mounting"), out.contains("mode=cache-only-offline"),
+              out.contains("pending_uploads=3") else {
+            return report("AC-CLI10", "cli-status-states", false, "(text line missing state/mode/pending: \(out))")
+        }
+
+        out = ""
+        _ = SyncTrayCLI.run(.status(target: nil, json: true, wait: nil), env: env)
+        guard let data = out.data(using: .utf8),
+              let rows = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]],
+              let row = rows.first,
+              row["state"] as? String == "mounting",
+              row["mountMode"] as? String == "cache-only-offline",
+              row["pendingUploads"] as? Int == 3,
+              row["syncMode"] as? String == "mount" else {
+            return report("AC-CLI10", "cli-status-states", false, "(json output wrong: \(out))")
+        }
+
+        // The mode file survives in /tmp after rclone exits — it must not be reported then.
+        out = ""
+        let stopped = fakeCLIEnvironment(
+            readProfiles: { [stream] },
+            readFile: { _ in "streaming" },
+            probeMount: { _ in MountProbe(mounted: false, processRunning: false, pendingUploads: 0) },
+            stdout: { out += $0 }
+        )
+        _ = SyncTrayCLI.run(.status(target: nil, json: false, wait: nil), env: stopped)
+        guard out.contains("state=unmounted"), out.contains("mode=none") else {
+            return report("AC-CLI10", "cli-status-states", false, "(stopped mount reported a stale mode: \(out))")
+        }
+        // --wait: flag values are never taken as the target, and bad states are refused.
+        guard SyncTrayCLI.parse(["status", "--wait", "mounted,stale", "KaijuNew", "--timeout", "30"])
+                == .success(.status(target: "KaijuNew", json: false,
+                                    wait: StatusWait(states: [.mounted, .stale], timeout: 30))),
+              case .failure = SyncTrayCLI.parse(["status", "KaijuNew", "--wait", "bogus"]),
+              case .failure = SyncTrayCLI.parse(["status", "--wait", "mounted"]),
+              case .success(.mount("KaijuNew", 45)) = SyncTrayCLI.parse(["mount", "--timeout=45", "KaijuNew"]) else {
+            return report("AC-CLI10", "cli-status-states", false, "(--wait/--timeout did not parse)")
+        }
+
+        // --wait reaches mounted after a few "mounting" polls → exit 0.
+        var polls = 0
+        let waitEnv = fakeCLIEnvironment(
+            readProfiles: { [stream] },
+            probeMount: { _ in
+                polls += 1
+                return MountProbe(mounted: polls >= 4, processRunning: true, pendingUploads: 0)
+            }
+        )
+        guard SyncTrayCLI.run(.status(target: "Streamer", json: false,
+                                      wait: StatusWait(states: [.mounted], timeout: 60)), env: waitEnv) == 0,
+              polls == 4 else {
+            return report("AC-CLI10", "cli-status-states", false, "(--wait did not return on reaching mounted, polls=\(polls))")
+        }
+        // --wait that never gets there → exit 1 after the timeout, not a hang.
+        var timeoutErr = ""
+        let stuckEnv = fakeCLIEnvironment(
+            readProfiles: { [stream] },
+            probeMount: { _ in MountProbe(mounted: false, processRunning: true, pendingUploads: 0) },
+            stderr: { timeoutErr += $0 }
+        )
+        guard SyncTrayCLI.run(.status(target: "Streamer", json: false,
+                                      wait: StatusWait(states: [.mounted], timeout: 10)), env: stuckEnv) == 1,
+              timeoutErr.contains("state=mounting") else {
+            return report("AC-CLI10", "cli-status-states", false, "(--wait timeout wrong: \(timeoutErr))")
+        }
+
+        // mount: a slow cache scan (rclone running, not attached) outlasting the
+        // timeout says "still mounting"; rclone never starting fails early with the log.
+        var slowErr = ""
+        let slowEnv = fakeCLIEnvironment(
+            readProfiles: { [stream] },
+            probeMount: { _ in MountProbe(mounted: false, processRunning: true, pendingUploads: 0) },
+            stderr: { slowErr += $0 }
+        )
+        guard SyncTrayCLI.run(.mount("Streamer", timeout: 120), env: slowEnv) == 1,
+              slowErr.contains("still mounting") else {
+            return report("AC-CLI10", "cli-status-states", false, "(slow mount not reported as still mounting: \(slowErr))")
+        }
+        var deadErr = ""
+        var deadPolls = 0
+        let deadEnv = fakeCLIEnvironment(
+            readProfiles: { [stream] },
+            readFile: { $0 == stream.logPath ? "Error: cache dir not writable\n" : nil },
+            probeMount: { _ in deadPolls += 1; return MountProbe(mounted: false, processRunning: false, pendingUploads: 0) },
+            stderr: { deadErr += $0 }
+        )
+        guard SyncTrayCLI.run(.mount("Streamer", timeout: 600), env: deadEnv) == 1,
+              deadErr.contains("not running"), deadErr.contains("cache dir not writable"),
+              deadPolls < 100 else {
+            return report("AC-CLI10", "cli-status-states", false, "(dead mount not failed early with log: polls=\(deadPolls) \(deadErr))")
+        }
+        return report("AC-CLI10", "cli-status-states", true)
     }
 
     // MARK: - AC-CLI5 — dispatch gate: bare tokens are subcommands, flags/no-args fall to the GUI
@@ -1285,7 +1428,7 @@ enum ConfigSelfTest {
     /// telemetry verbs.
     private static func testCLILifecycleCommands() -> Bool {
         // Parse.
-        guard case .success(.mount("s")) = SyncTrayCLI.parse(["mount", "s"]),
+        guard case .success(.mount("s", 600)) = SyncTrayCLI.parse(["mount", "s"]),
               case .success(.unmount("s")) = SyncTrayCLI.parse(["unmount", "s"]),
               case .success(.reinstall("s")) = SyncTrayCLI.parse(["reinstall", "s"]),
               case .success(.install("s")) = SyncTrayCLI.parse(["install", "s"]) else {
@@ -1300,13 +1443,14 @@ enum ConfigSelfTest {
 
         // mount → mountProfile closure fires for a mount profile.
         var mounted = false
-        let mountEnv = fakeCLIEnvironment(readProfiles: { [stream] }, mountProfile: { _ in mounted = true; return nil })
+        let mountEnv = fakeCLIEnvironment(readProfiles: { [stream] }, mountProfile: { _ in mounted = true; return nil },
+                                           probeMount: { _ in MountProbe(mounted: mounted, processRunning: mounted, pendingUploads: 0) })
         guard SyncTrayCLI.execute(["mount", stream.shortId], env: mountEnv) == 0, mounted else {
             return report("AC-CLI7", "cli-lifecycle-commands", false, "(mount did not fire mountProfile)")
         }
 
         // mount → surfaces the closure's error as a non-zero exit.
-        let mountFailEnv = fakeCLIEnvironment(readProfiles: { [stream] }, mountProfile: { _ in "mount did not establish within 60s" })
+        let mountFailEnv = fakeCLIEnvironment(readProfiles: { [stream] }, mountProfile: { _ in "launchctl could not start" })
         guard SyncTrayCLI.execute(["mount", stream.shortId], env: mountFailEnv) != 0 else {
             return report("AC-CLI7", "cli-lifecycle-commands", false, "(mount did not propagate a mount failure)")
         }
