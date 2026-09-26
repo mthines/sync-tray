@@ -70,6 +70,7 @@ enum ConfigSelfTest {
             testCLIResolveAndList,
             testCLIStatusStates,
             testReachabilityProbeIsPathScoped,
+            testMountReadHealth,
             testShimInstallIdempotentNonClobber,
             testCacheKeyPrimary,
             testCacheMigrationTreeKinds,
@@ -1152,6 +1153,40 @@ enum ConfigSelfTest {
     /// `status` must let an agent tell "still mounting" (rclone up, volume not
     /// attached yet) from mounted, stale, and unmounted without reading logs,
     /// and `--json` must carry the same facts as the text line.
+    /// AC-RH1: mount read-health probe — bounded filesystem buckets, health classification
+    /// (a remote fetch outranks any speed), and the probe schedule gate.
+    private static func testMountReadHealth() -> Bool {
+        let buckets = ["apfs", "APFS", "exfat", "msdos", "smbfs", "zfs", ""].map(VFSCacheService.cacheFilesystemBucket)
+        guard buckets == ["apfs", "apfs", "exfat", "fat", "network", "other", "unknown"] else {
+            return report("AC-RH1", "mount-read-health", false, "(fs buckets=\(buckets))")
+        }
+        func r(_ mb: Double, remote: Int = 0) -> MountReadProbeResult {
+            MountReadProbeResult(bytes: Int(mb * 1_000_000), seconds: 1, firstByteSeconds: 0.01, remoteBytes: remote)
+        }
+        let health = [r(108), r(6.6), r(0.2), r(108, remote: 1)].map(VFSCacheService.readHealth)
+        guard health == ["healthy", "slow", "degraded", "remote_fetch"] else {
+            return report("AC-RH1", "mount-read-health", false, "(health=\(health))")
+        }
+        let now = Date()
+        let long = now.addingTimeInterval(-SyncManager.mountReadProbeInterval - 1)
+        let recent = now.addingTimeInterval(-60)
+        func gate(_ mounted: Bool, _ mode: MountMode?, warm: Bool = false, busy: Bool = false, last: Date?) -> Bool {
+            SyncManager.shouldProbeMountRead(isMounted: mounted, mode: mode, warmActive: warm,
+                                             inFlight: busy, lastProbe: last, now: now)
+        }
+        let gates = [
+            gate(true, .streaming, last: nil),        // first probe
+            gate(true, nil, last: long),              // mode file unknown → treated as streaming, due
+            gate(true, .streaming, last: recent),     // not due yet
+            gate(false, .streaming, last: nil),       // not mounted
+            gate(true, .cacheOnlyOffline, last: nil), // Cache Only serves a different tree
+            gate(true, .streaming, warm: true, last: nil),
+            gate(true, .streaming, busy: true, last: nil),
+        ]
+        return report("AC-RH1", "mount-read-health", gates == [true, true, false, false, false, false, false],
+                      "(gates=\(gates))")
+    }
+
     /// AC-P1: the reachability probe stats the profile's own path (never lists the remote
     /// root, which hangs on a Synology SMB share list) and treats not-found as reachable.
     private static func testReachabilityProbeIsPathScoped() -> Bool {

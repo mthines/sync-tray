@@ -126,6 +126,9 @@ final class TelemetryService {
     private var rcloneDiscoveryCounter: LongCounterSdk?
     private var warmDurationHistogram: DoubleHistogramMeterSdk?
     private var warmThroughputHistogram: DoubleHistogramMeterSdk?
+    private var cachedReadThroughputHistogram: DoubleHistogramMeterSdk?
+    private var cachedReadFirstByteHistogram: DoubleHistogramMeterSdk?
+    private var cachedReadProbeCounter: LongCounterSdk?
     private var warmFilesCounter: LongCounterSdk?
     private var warmBytesCounter: LongCounterSdk?
     private var externalConfigEditCounter: LongCounterSdk?
@@ -445,6 +448,21 @@ final class TelemetryService {
             .histogramBuilder(name: "synctray.offline.warm.throughput")
             .setDescription("Average read throughput of an offline-file warming run (MB/s) — the signal for slow-fallback diagnosis")
             .setUnit("MBy/s")
+            .build()
+        cachedReadThroughputHistogram = meter
+            .histogramBuilder(name: "synctray.mount.cached_read.throughput")
+            .setDescription("Throughput of a timed read of an already fully-cached file through a Stream mount (MB/s) — the signal for slow cache-served reads")
+            .setUnit("MBy/s")
+            .build()
+        cachedReadFirstByteHistogram = meter
+            .histogramBuilder(name: "synctray.mount.cached_read.first_byte")
+            .setDescription("Time from open to the first 64 KB of a fully-cached file through a Stream mount (seconds)")
+            .setUnit("s")
+            .build()
+        cachedReadProbeCounter = meter
+            .counterBuilder(name: "synctray.mount.cached_read.probes")
+            .setDescription("Mount read-health probes by result (healthy/slow/degraded/remote_fetch/no_candidate/failed)")
+            .setUnit("1")
             .build()
         warmFilesCounter = meter
             .counterBuilder(name: "synctray.offline.warm.files")
@@ -1013,6 +1031,9 @@ final class TelemetryService {
         guard SyncTraySettings.telemetryEnabled else { return }
         ensureSetup()
 
+        let cacheVolume = profile.isMountMode
+            ? VFSCacheService.shared.cacheVolumeInfo(path: profile.vfsCachePath) : nil
+
         let intervalBucket = bucketSyncInterval(profile.syncIntervalMinutes)
 
         emitLog(
@@ -1038,8 +1059,60 @@ final class TelemetryService {
                 "config.pinned_directory_count": .int(profile.pinnedDirectories.count),
                 "config.allow_non_empty_mount": .bool(profile.allowNonEmptyMount),
                 "config.download_connections": .int(profile.isMountMode ? profile.downloadConnections : 0),
+                "config.cache_fs_type": .string(cacheVolume?.fsType ?? "n/a"),
+                "config.cache_volume": .string(cacheVolume?.volume ?? "n/a"),
             ]
         )
+    }
+
+    // MARK: - Mount read health
+
+    /// Record one mount read-health probe (`VFSCacheService.probeMountRead`). `result` nil
+    /// means no probe ran: `outcome` is then `no_candidate` (nothing fully cached large
+    /// enough to time) or `failed` (the file couldn't be opened/read through the mount).
+    /// Never carries a path or file name — only the bounded cache-volume buckets.
+    func recordMountReadProbe(
+        profileId: UUID,
+        profileName: String,
+        mountBackend: String,
+        cacheFsType: String,
+        cacheVolume: String,
+        vfsCacheFiles: Int?,
+        result: MountReadProbeResult?,
+        outcome: String? = nil
+    ) {
+        guard SyncTraySettings.telemetryEnabled else { return }
+        ensureSetup()
+
+        let health = result.map(VFSCacheService.readHealth) ?? (outcome ?? "failed")
+        let labels: [String: AttributeValue] = [
+            "synctray.profile.name": .string(profileName),
+            "sync.mode": .string("mount"),
+            "mount.backend": .string(mountBackend),
+            "cache.fs_type": .string(cacheFsType),
+            "cache.volume": .string(cacheVolume),
+            "mount.read_health": .string(health),
+        ]
+        cachedReadProbeCounter?.add(value: 1, attribute: labels)
+
+        var attrs = labels
+        attrs["synctray.profile.id"] = .string(profileId.uuidString)
+        if let vfsCacheFiles { attrs["vfs.cache_files"] = .int(vfsCacheFiles) }
+        guard let result else {
+            emitLog(severity: .warn, body: "Mount read health probe skipped", attributes: attrs)
+            return
+        }
+        var metricLabels = labels
+        metricLabels["mount.read_health"] = nil  // the value is the measurement; don't split it by its own bucket
+        cachedReadThroughputHistogram?.record(value: result.throughputMBps, attributes: metricLabels)
+        cachedReadFirstByteHistogram?.record(value: result.firstByteSeconds, attributes: metricLabels)
+
+        attrs["probe.bytes"] = .int(result.bytes)
+        attrs["probe.duration_seconds"] = .double(result.seconds)
+        attrs["probe.first_byte_seconds"] = .double(result.firstByteSeconds)
+        attrs["probe.throughput_mbps"] = .double(result.throughputMBps)
+        attrs["probe.remote_bytes"] = .int(result.remoteBytes)
+        emitLog(severity: health == "healthy" ? .info : .warn, body: "Mount read health", attributes: attrs)
     }
 
     /// Emit a full snapshot of all profile configurations. Call on app launch.

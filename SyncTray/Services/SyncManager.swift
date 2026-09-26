@@ -69,6 +69,9 @@ final class SyncManager: ObservableObject {
     /// supersedes rather than coalesces). Re-armed when the profile is seen unmounted, so a
     /// later remount warms again and picks up files added on the remote in the meantime.
     private var autoWarmedMounts: Set<UUID> = []
+    // Mount read-health probe bookkeeping (in-memory; see `probeMountReadHealth`).
+    private var lastMountReadProbe: [UUID: Date] = [:]
+    private var mountReadProbesInFlight: Set<UUID> = []
 
     /// Live progress of an in-flight cache-directory move, keyed by the
     /// profile whose Cache Directory is changing. Drives `CacheMoveSheet`'s
@@ -3806,10 +3809,62 @@ final class SyncManager: ObservableObject {
                     pausedProfiles: paused,
                     errorProfiles: errors
                 )
+                self.probeMountReadHealth()
             }
         }
         heartbeatTimer = timer
         timer.resume()
+    }
+
+    /// How often a mounted Stream profile's cached-read speed is sampled.
+    static let mountReadProbeInterval: TimeInterval = 30 * 60
+
+    /// Pure: should this profile get a read-health probe now? Only a mounted profile in
+    /// STREAMING mode (Cache Only serves a different, union tree), never while an offline
+    /// warm is reading through the same mount (it would skew the timing and the remote-byte
+    /// delta), never twice at once, and at most once per `mountReadProbeInterval`.
+    nonisolated static func shouldProbeMountRead(
+        isMounted: Bool, mode: MountMode?, warmActive: Bool, inFlight: Bool,
+        lastProbe: Date?, now: Date
+    ) -> Bool {
+        guard isMounted, (mode ?? .streaming) == .streaming, !warmActive, !inFlight else { return false }
+        guard let lastProbe else { return true }
+        return now.timeIntervalSince(lastProbe) >= mountReadProbeInterval
+    }
+
+    /// Time a cached read through each eligible Stream mount and record it
+    /// (`TelemetryService.recordMountReadProbe`). Gated on the telemetry opt-in: the probe
+    /// exists only to produce the signal, so it does no I/O for a user who opted out.
+    private func probeMountReadHealth() {
+        guard SyncTraySettings.telemetryEnabled else { return }
+        let now = Date()
+        for profile in profileStore.enabledProfiles where profile.isMountMode {
+            guard Self.shouldProbeMountRead(
+                isMounted: profileMountStates[profile.id] == .mounted,
+                mode: profileMountModes[profile.id],
+                warmActive: warmProgress[profile.id]?.isActive == true,
+                inFlight: mountReadProbesInFlight.contains(profile.id),
+                lastProbe: lastMountReadProbe[profile.id], now: now
+            ) else { continue }
+            mountReadProbesInFlight.insert(profile.id)
+            lastMountReadProbe[profile.id] = now
+            let captured = profile
+            Task.detached(priority: .utility) { [weak self] in
+                let service = VFSCacheService.shared
+                let volume = service.cacheVolumeInfo(path: captured.vfsCachePath)
+                let cacheFiles = await service.rcDiskCache(port: captured.rcPort)?.files
+                let pick = service.pickReadProbeFile(for: captured)
+                var result: MountReadProbeResult?
+                if let pick { result = await service.probeMountRead(for: captured, pick: pick) }
+                TelemetryService.shared.recordMountReadProbe(
+                    profileId: captured.id, profileName: captured.name,
+                    mountBackend: captured.mountBackend.rawValue,
+                    cacheFsType: volume.fsType, cacheVolume: volume.volume,
+                    vfsCacheFiles: cacheFiles, result: result,
+                    outcome: pick == nil ? "no_candidate" : "failed")
+                await MainActor.run { _ = self?.mountReadProbesInFlight.remove(captured.id) }
+            }
+        }
     }
 
     /// Find which profile a log watcher belongs to

@@ -754,3 +754,140 @@ final class VFSCacheService {
         }
     }
 }
+
+// MARK: - Mount read-health probe
+
+/// Result of timing a read of an already fully-cached file through a live Stream mount.
+///
+/// Exists because "cached files are slow to open" is invisible in every other signal: the
+/// mount is healthy, the cache is warm, and nothing reaches the remote — rclone's NFS
+/// server is simply slow to serve its own cache (it re-opens the cache file and rewrites
+/// its `vfsMeta` sidecar on every 32 KB READ, which is free on APFS and dominant on an
+/// exFAT/FSKit USB drive). Only a timed read through the mount, tagged with the cache
+/// volume's filesystem, shows it.
+struct MountReadProbeResult: Equatable {
+    /// Bytes read through the mount.
+    let bytes: Int
+    /// Wall-clock seconds for the whole read.
+    let seconds: Double
+    /// Seconds from `open` to the first 64 KB arriving — the "file takes ages to open" symptom.
+    let firstByteSeconds: Double
+    /// Bytes the mount fetched from the remote while the probe ran (rclone `core/stats`
+    /// delta). Non-zero means the "fully cached" file was NOT served from cache — its cache
+    /// entry was invalidated on open, or something else was streaming at the same time.
+    let remoteBytes: Int
+
+    var throughputMBps: Double { seconds > 0 ? Double(bytes) / seconds / 1_000_000 : 0 }
+}
+
+extension VFSCacheService {
+    /// Bytes a probe reads: enough to measure steady-state throughput past the first
+    /// request, small enough to finish in seconds on a healthy cache.
+    static let readProbeBytes = 8 * 1024 * 1024
+    /// Hard wall-clock cap — a degraded mount (~0.2 MB/s) would otherwise take ~40 s.
+    static let readProbeBudgetSeconds: Double = 15
+    /// Only files at least this large are candidates, so a random offset is possible and the
+    /// read isn't dominated by a single open.
+    static let readProbeMinFileSize: Int64 = 16 * 1024 * 1024
+
+    /// Bucket a `statfs` `f_fstypename` into a bounded telemetry value. Unknown names
+    /// collapse to `other`, so this can never become a cardinality leak.
+    static func cacheFilesystemBucket(_ raw: String) -> String {
+        switch raw.lowercased() {
+        case "apfs": return "apfs"
+        case "hfs": return "hfs"
+        case "exfat": return "exfat"
+        case "msdos", "fat", "fat32", "vfat": return "fat"
+        case "ntfs", "tuxera_ntfs", "ufsd_ntfs": return "ntfs"
+        case "smbfs", "nfs", "afpfs", "webdav": return "network"
+        case "": return "unknown"
+        default: return "other"
+        }
+    }
+
+    /// Read-health bucket for a probe result — the attribute a dashboard groups by and a
+    /// check rule watches. `remote_fetch` wins over any speed: a "cached" read that touched
+    /// the remote is a cache-correctness problem, not a speed one.
+    static func readHealth(_ result: MountReadProbeResult) -> String {
+        if result.remoteBytes > 0 { return "remote_fetch" }
+        let mbps = result.throughputMBps
+        if mbps < 1 { return "degraded" }
+        if mbps < 20 { return "slow" }
+        return "healthy"
+    }
+
+    /// Filesystem bucket and internal/external placement of the volume holding `path`.
+    /// `volume` is `internal`, `external`, or `unknown`.
+    func cacheVolumeInfo(path: String) -> (fsType: String, volume: String) {
+        let expanded = (path as NSString).expandingTildeInPath
+        var fsType = "unknown"
+        var st = statfs()
+        if statfs(expanded, &st) == 0 {
+            let name = withUnsafeBytes(of: &st.f_fstypename) { raw in
+                String(decoding: raw.prefix { $0 != 0 }, as: UTF8.self)
+            }
+            fsType = Self.cacheFilesystemBucket(name)
+        }
+        let values = try? URL(fileURLWithPath: expanded).resourceValues(forKeys: [.volumeIsInternalKey])
+        let volume = values?.volumeIsInternal.map { $0 ? "internal" : "external" } ?? "unknown"
+        return (fsType, volume)
+    }
+
+    /// Pick a fully-cached file (mount-relative path + size) to probe, or nil when none
+    /// qualifies. Walks the data tree cheaply (sizes only) and confirms completeness via
+    /// the `vfsMeta` sidecar for a bounded number of candidates, so a 10k-file cache costs
+    /// one directory walk, not 10k JSON reads.
+    func pickReadProbeFile(for profile: SyncProfile, maxSidecarChecks: Int = 25) -> (path: String, size: Int64)? {
+        let roots = cacheSubtreeRoots(for: profile)
+        let rootURL = URL(fileURLWithPath: roots.data)
+        guard let walker = FileManager.default.enumerator(
+            at: rootURL, includingPropertiesForKeys: [.fileSizeKey, .isRegularFileKey],
+            options: [.skipsHiddenFiles]) else { return nil }
+        var candidates: [(String, Int64)] = []
+        for case let url as URL in walker {
+            guard let values = try? url.resourceValues(forKeys: [.fileSizeKey, .isRegularFileKey]),
+                  values.isRegularFile == true,
+                  let size = values.fileSize, Int64(size) >= Self.readProbeMinFileSize else { continue }
+            let rel = String(url.path.dropFirst(rootURL.path.count + 1))
+            candidates.append((rel, Int64(size)))
+            if candidates.count >= 500 { break }
+        }
+        for (rel, size) in candidates.shuffled().prefix(maxSidecarChecks)
+        where isFullyCached(mountRelativePath: rel, size: size, roots: roots) {
+            return (rel, size)
+        }
+        return nil
+    }
+
+    /// Time a read of `readProbeBytes` from a random offset of a fully-cached file THROUGH
+    /// the mount, snapshotting rclone's remote byte counter around it. `pick` comes from
+    /// `pickReadProbeFile`. Blocking — call off the main actor. Nil when the file can't be
+    /// opened or read through the mount.
+    func probeMountRead(for profile: SyncProfile, pick: (path: String, size: Int64)) async -> MountReadProbeResult? {
+        let mountPath = ((profile.localSyncPath as NSString).expandingTildeInPath as NSString)
+            .appendingPathComponent(pick.path)
+        let before = await getCoreStats(port: profile.rcPort)?.bytes ?? 0
+
+        let span = Int64(Self.readProbeBytes)
+        let offset = pick.size > span ? Int64.random(in: 0...(pick.size - span)) : 0
+        let start = Date()
+        guard let handle = FileHandle(forReadingAtPath: mountPath) else { return nil }
+        defer { try? handle.close() }
+        var read = 0
+        var firstByte: Double = 0
+        do {
+            try handle.seek(toOffset: UInt64(offset))
+            while read < Self.readProbeBytes, Date().timeIntervalSince(start) < Self.readProbeBudgetSeconds {
+                guard let chunk = try handle.read(upToCount: 64 * 1024), !chunk.isEmpty else { break }
+                if read == 0 { firstByte = Date().timeIntervalSince(start) }
+                read += chunk.count
+            }
+        } catch {
+            return nil
+        }
+        let seconds = Date().timeIntervalSince(start)
+        let after = await getCoreStats(port: profile.rcPort)?.bytes ?? before
+        return MountReadProbeResult(bytes: read, seconds: seconds, firstByteSeconds: firstByte,
+                                    remoteBytes: max(0, after - before))
+    }
+}
