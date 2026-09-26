@@ -71,6 +71,7 @@ enum ConfigSelfTest {
             testCLIStatusStates,
             testReachabilityProbeIsPathScoped,
             testMountReadHealth,
+            testCacheOnlyAppWrittenList,
             testShimInstallIdempotentNonClobber,
             testCacheKeyPrimary,
             testCacheMigrationTreeKinds,
@@ -2771,6 +2772,113 @@ enum ConfigSelfTest {
         }
 
         return report("AC-CO2", "cache-only-union-behaviour", true)
+    }
+
+    // MARK: - AC-CO3 — app-written partial-file list + the script's fallback to it
+
+    /// The app builds the same list the script does (escaping included), a failed walk
+    /// never leaves a list behind, and when the script can't read the cache itself it uses
+    /// the app's list — or mounts streaming when there is none, never Cache Only unfiltered.
+    private static func testCacheOnlyAppWrittenList() -> Bool {
+        let name = "AC-CO3", slug = "cache-only-app-written-list"
+        // Pure helpers.
+        guard VFSCacheService.cacheOnlyExcludeLine("a/[x]*{y}?.wav") == "/a/\\[x\\]\\*\\{y\\}\\?.wav",
+              VFSCacheService.cacheOnlyExcludeLine("a\\b") == "/a\\\\b",
+              VFSCacheService.cacheOnlyExcludeLines("plain.txt") == ["/plain.txt"],
+              VFSCacheService.cacheOnlyExcludeLines("Caf\u{E9}.wav").count == 2
+        else { return report(name, slug, false, "(line escaping / NFC-NFD forms)") }
+        func meta(_ size: Int, _ ranges: [(Int, Int)], dirty: Bool = false) -> Data {
+            let rs = ranges.map { "{\"Pos\":\($0.0),\"Size\":\($0.1)}" }.joined(separator: ",")
+            return Data("{\"Size\":\(size),\"Rs\":[\(rs)],\"Dirty\":\(dirty)}".utf8)
+        }
+        let partial = [
+            VFSCacheService.isPartialForCacheOnly(metaJSON: meta(5, [(0, 5)]), dataSize: 5),
+            VFSCacheService.isPartialForCacheOnly(metaJSON: meta(5, [(0, 5)], dirty: true), dataSize: 5),
+            VFSCacheService.isPartialForCacheOnly(metaJSON: meta(10, [(0, 4)]), dataSize: 10),
+            VFSCacheService.isPartialForCacheOnly(metaJSON: meta(10, [(0, 4), (6, 4)]), dataSize: 10),
+            VFSCacheService.isPartialForCacheOnly(metaJSON: meta(5, [(0, 5)]), dataSize: 7),
+            VFSCacheService.isPartialForCacheOnly(metaJSON: nil, dataSize: 5),
+            VFSCacheService.isPartialForCacheOnly(metaJSON: Data("junk".utf8), dataSize: 5),
+        ]
+        guard partial == [false, false, true, true, true, true, true] else {
+            return report(name, slug, false, "(isPartialForCacheOnly=\(partial))")
+        }
+
+        let root = "\(selfTestRoot)/co3-\(UUID().uuidString)"
+        let local = "\(root)/mnt", cache = "\(root)/cache"
+        let dataDir = "\(cache)/vfs/synology/Kaiju/KAIJU"
+        let metaDir = "\(cache)/vfsMeta/synology/Kaiju/KAIJU"
+        try? FileManager.default.createDirectory(atPath: local, withIntermediateDirectories: true)
+        writeFile("\(dataDir)/complete.txt", "hello")
+        writeFile("\(metaDir)/complete.txt", "{\"Size\":5,\"Rs\":[{\"Pos\":0,\"Size\":5}],\"Dirty\":false}")
+        writeFile("\(dataDir)/sub/[take 1].wav", "0123456789")
+        writeFile("\(metaDir)/sub/[take 1].wav", "{\"Size\":10,\"Rs\":[{\"Pos\":0,\"Size\":4}],\"Dirty\":false}")
+        writeFile("\(dataDir)/nometa.txt", "no sidecar")
+        let profile = mountFixtureProfile(localPath: local, cachePath: cache, streamCacheOnly: true)
+        defer { try? FileManager.default.removeItem(atPath: profile.cacheOnlyConfigPath) }
+        func readList() -> Set<String>? {
+            (try? String(contentsOfFile: profile.cacheOnlyExcludePath, encoding: .utf8))
+                .map { Set($0.split(separator: "\n").map(String.init)) }
+        }
+
+        // Parity: the app's list equals the one the script generates for the same cache.
+        let written: Int
+        do { written = try VFSCacheService.shared.writeCacheOnlyExcludeList(for: profile) } catch {
+            return report(name, slug, false, "(app list write threw: \(error))")
+        }
+        guard written == 2, let appList = readList() else {
+            return report(name, slug, false, "(app list count=\(written) list=\(String(describing: readList())))")
+        }
+        let expected: Set<String> = ["/sub/\\[take 1\\].wav", "/nometa.txt"]
+        guard appList == expected else { return report(name, slug, false, "(app list=\(appList))") }
+        let direct = dryRunMountScript(profile: profile, rcloneConfig: "")
+        guard direct.mode == MountMode.cacheOnlyManual.rawValue, readList() == expected else {
+            return report(name, slug, false, "(script list=\(String(describing: readList())) log=\(direct.log))")
+        }
+
+        // Make the cache unreadable below the root, as launchd's python3 sees an
+        // external drive it has no privacy grant for.
+        let locked = "\(dataDir)/sub"
+        chmod(locked, 0o000)
+        defer { chmod(locked, 0o755) }
+        // The app's own walk fails too → throws and removes the list rather than keep one
+        // it can't vouch for.
+        guard (try? VFSCacheService.shared.writeCacheOnlyExcludeList(for: profile)) == nil,
+              !FileManager.default.fileExists(atPath: profile.cacheOnlyExcludePath) else {
+            return report(name, slug, false, "(failed app walk left a list behind)")
+        }
+        // No list + script can't read → streaming, not an unfiltered union mount.
+        let noList = dryRunMountScript(profile: profile, rcloneConfig: "")
+        guard noList.mode == MountMode.streaming.rawValue,
+              noList.log.contains("Cache Only unavailable") else {
+            return report(name, slug, false, "(no-list mode=\(noList.mode ?? "nil") log=\(noList.log))")
+        }
+        // An app-written list present → the script uses it as-is.
+        writeFile(profile.cacheOnlyExcludePath, expected.sorted().joined(separator: "\n") + "\n")
+        let fallback = dryRunMountScript(profile: profile, rcloneConfig: "")
+        guard fallback.mode == MountMode.cacheOnlyManual.rawValue,
+              fallback.log.contains("using the app-written partial-file list"),
+              readList() == expected else {
+            return report(name, slug, false, "(fallback mode=\(fallback.mode ?? "nil") log=\(fallback.log))")
+        }
+
+        // Refresh gate: always when missing; otherwise only mounted-streaming and due.
+        let now = Date()
+        let old = now.addingTimeInterval(-SyncManager.cacheOnlyListRefreshInterval - 1)
+        func gate(_ exists: Bool, _ mounted: Bool, _ mode: MountMode?, busy: Bool = false, last: Date?) -> Bool {
+            SyncManager.shouldRefreshCacheOnlyList(listExists: exists, isMounted: mounted, mode: mode,
+                                                   inFlight: busy, lastWrite: last, now: now)
+        }
+        let gates = [
+            gate(false, false, nil, last: now),               // missing → write even unmounted
+            gate(true, true, .streaming, last: nil),          // first refresh this session
+            gate(true, true, nil, last: old),                 // unknown mode = streaming, due
+            gate(true, true, .streaming, last: now),          // not due
+            gate(true, false, .streaming, last: old),         // unmounted: cache is static
+            gate(true, true, .cacheOnlyManual, last: old),    // Cache Only: cache is static
+            gate(false, true, .streaming, busy: true, last: nil),
+        ]
+        return report(name, slug, gates == [true, true, true, false, false, false, false], "(gates=\(gates))")
     }
 
     // MARK: - AC-AO1 — mount mode selection across the six fixture situations

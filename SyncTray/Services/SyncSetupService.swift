@@ -1119,6 +1119,91 @@ final class SyncSetupService {
                         MOUNT_MODE="\(MountMode.cacheOnlyOffline.rawValue)"
                     fi
                 fi
+                # Partial-file list for Cache Only (one exclude line per cached data file
+                # whose bytes aren't provably complete), rebuilt here on every Cache Only
+                # mount start. Under launchd this python3 can be denied read access to a
+                # cache on an external drive (macOS privacy controls grant the app, not the
+                # interpreter), so on failure use the copy the app writes on launch, on
+                # install and periodically (VFSCacheService.writeCacheOnlyExcludeList). With
+                # neither, mount STREAMING: a union mount without the list would serve a
+                # half-downloaded file as complete, with zeros where the missing bytes are.
+                if [[ "$MOUNT_MODE" != "\(MountMode.streaming.rawValue)" ]]; then
+                    if python3 -c "
+            import json, os, sys
+
+            data_root, meta_root, exclude_path = sys.argv[1:4]
+            backslash = chr(92)
+
+            def is_complete(meta, expected_size):
+                if meta.get('Size') != expected_size:
+                    return False
+                if expected_size == 0:
+                    return True
+                ranges = meta.get('Rs') or []
+                if not ranges:
+                    return False
+                covered = 0
+                for r in sorted(ranges, key=lambda x: x.get('Pos', 0)):
+                    pos, size = r.get('Pos', 0), r.get('Size', 0)
+                    if pos < 0 or size < 0 or pos > covered:
+                        return False
+                    covered = max(covered, pos + size)
+                return covered >= expected_size
+
+            def escape(rel):
+                rel = rel.replace(backslash, backslash + backslash)
+                for ch in ('*', '?', '[', ']', '{', '}'):
+                    rel = rel.replace(ch, backslash + ch)
+                return rel
+
+            # Fail LOUDLY on anything unreadable: os.walk skips an unreadable directory
+            # silently and os.path.isdir answers False on a permission error, and either
+            # would produce a short list that looks like success. Only a truly absent data
+            # tree (nothing cached yet) means an empty list.
+            def fail(err):
+                raise err
+
+            try:
+                os.stat(data_root)
+                have_data = bool(data_root)
+            except FileNotFoundError:
+                have_data = False
+
+            lines = []
+            if have_data:
+                for root, dirs, files in os.walk(data_root, onerror=fail):
+                    for name in files:
+                        full = os.path.join(root, name)
+                        rel = os.path.relpath(full, data_root)
+                        try:
+                            size = os.path.getsize(full)
+                        except OSError:
+                            lines.append('/' + escape(rel))
+                            continue
+                        complete = False
+                        try:
+                            with open(os.path.join(meta_root, rel)) as fh:
+                                meta = json.load(fh)
+                            complete = is_complete(meta, size)
+                        except Exception:
+                            complete = False
+                        if not complete:
+                            lines.append('/' + escape(rel))
+
+            os.makedirs(os.path.dirname(exclude_path), exist_ok=True)
+            with open(exclude_path, 'w') as fh:
+                fh.write(chr(10).join(lines))
+                if lines:
+                    fh.write(chr(10))
+            " "$CACHE_DATA_PATH" "$CACHE_META_PATH" "$CACHE_ONLY_EXCLUDE_PATH" 2>/dev/null; then
+                        :
+                    elif [[ -f "$CACHE_ONLY_EXCLUDE_PATH" ]]; then
+                        echo "$(date '+%Y-%m-%d %H:%M:%S') - Cache Only: cache not readable by the script, using the app-written partial-file list" >> "$LOG_FILE"
+                    else
+                        echo "$(date '+%Y-%m-%d %H:%M:%S') - Cache Only unavailable: partial-file list could not be built (cache not readable by the script, no app-written list) - streaming instead" >> "$LOG_FILE"
+                        MOUNT_MODE="\(MountMode.streaming.rawValue)"
+                    fi
+                fi
                 echo "$(date '+%Y-%m-%d %H:%M:%S') - Mount mode: $MOUNT_MODE" >> "$LOG_FILE"
                 if [[ -n "$MOUNT_MODE_PATH" ]]; then
                     echo "$MOUNT_MODE" > "$MOUNT_MODE_PATH"
@@ -1224,71 +1309,6 @@ final class SyncSetupService {
                 fh.write(chr(10).join(lines) + chr(10))
             os.chmod(conf_path, 0o600)
             " "$OVERLAY_PATH" "$CACHE_DATA_PATH" "$CACHE_ONLY_CONFIG_PATH"
-
-                    # Partial-file exclusion (regenerated on every Cache Only mount start —
-                    # what's complete can change between mounts as streaming downloads more).
-                    python3 -c "
-            import json, os, sys
-
-            data_root, meta_root, exclude_path = sys.argv[1:4]
-            backslash = chr(92)
-
-            def is_complete(meta, expected_size):
-                if meta.get('Size') != expected_size:
-                    return False
-                if expected_size == 0:
-                    return True
-                ranges = meta.get('Rs') or []
-                if not ranges:
-                    return False
-                covered = 0
-                for r in sorted(ranges, key=lambda x: x.get('Pos', 0)):
-                    pos, size = r.get('Pos', 0), r.get('Size', 0)
-                    if pos < 0 or size < 0 or pos > covered:
-                        return False
-                    covered = max(covered, pos + size)
-                return covered >= expected_size
-
-            def escape(rel):
-                rel = rel.replace(backslash, backslash + backslash)
-                for ch in ('*', '?', '[', ']', '{', '}'):
-                    rel = rel.replace(ch, backslash + ch)
-                return rel
-
-            lines = []
-            if data_root and os.path.isdir(data_root):
-                for root, dirs, files in os.walk(data_root):
-                    for name in files:
-                        full = os.path.join(root, name)
-                        rel = os.path.relpath(full, data_root)
-                        try:
-                            size = os.path.getsize(full)
-                        except OSError:
-                            continue
-                        complete = False
-                        try:
-                            with open(os.path.join(meta_root, rel)) as fh:
-                                meta = json.load(fh)
-                            complete = is_complete(meta, size)
-                        except Exception:
-                            complete = False
-                        if not complete:
-                            lines.append('/' + escape(rel))
-
-            os.makedirs(os.path.dirname(exclude_path), exist_ok=True)
-            with open(exclude_path, 'w') as fh:
-                fh.write(chr(10).join(lines))
-                if lines:
-                    fh.write(chr(10))
-            " "$CACHE_DATA_PATH" "$CACHE_META_PATH" "$CACHE_ONLY_EXCLUDE_PATH"
-                    # rclone refuses to start at all when --exclude-from names a missing
-                    # file, so a failed generation (e.g. an unreadable cache tree) must not
-                    # take the whole mount down: fall back to an empty list and say so.
-                    if [[ ! -f "$CACHE_ONLY_EXCLUDE_PATH" ]]; then
-                        echo "$(date '+%Y-%m-%d %H:%M:%S') - Cache Only: partial-file list unavailable, partially downloaded files may be visible" >> "$LOG_FILE"
-                        mkdir -p "$(dirname "$CACHE_ONLY_EXCLUDE_PATH")"
-                        : > "$CACHE_ONLY_EXCLUDE_PATH"
-                    fi
 
                     RCLONE_CMD="$RCLONE_BIN $MOUNT_SUBCMD synctray_cacheonly: \\"$LOCAL_PATH\\" --config \\"$CACHE_ONLY_CONFIG_PATH\\" --exclude-from \\"$CACHE_ONLY_EXCLUDE_PATH\\" --vfs-cache-mode writes --cache-dir \\"$CACHE_ONLY_CACHE_PATH\\" --vfs-write-back 2s --dir-cache-time 1m --log-level INFO --use-json-log --volname \\"$MOUNT_VOLNAME\\""
 

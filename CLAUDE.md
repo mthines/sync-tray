@@ -243,10 +243,26 @@ file that shadowed a base file "undeletes" back to the base version); an
 atomic save (temp file + rename over the target, Reaper's own pattern) works
 because both halves land in the overlay.
 
-**Partial files stay hidden.** Regenerated on every Cache-only mount start:
-`cacheOnlyExcludePath` (`{shortId}.exclude.txt`) lists one line per
-partially-downloaded file under the streaming cache's data tree, so a
-truncated read never surfaces through the union mount.
+**Partial files stay hidden.** `cacheOnlyExcludePath` (`{shortId}.exclude.txt`)
+lists one `--exclude-from` line per cached data file whose `vfsMeta` byte ranges
+don't cover it (no sidecar, size mismatch, or a gap; `Dirty` is ignored so an
+unsaved local edit stays visible), so a truncated read never surfaces through
+the union mount. It has two writers producing the same lines:
+
+- **The script**, at every Cache-only mount start. Its walk is fail-loud — an
+  unreadable directory aborts it rather than yield a list missing that
+  directory's partial files.
+- **The app** (`VFSCacheService.writeCacheOnlyExcludeList`), because under
+  launchd the script's `/usr/bin/python3` is denied read access to a cache on an
+  external drive (macOS privacy controls grant the app, not the interpreter).
+  `SyncManager.refreshCacheOnlyExcludeLists` writes it at launch, on the
+  heartbeat every 15 min while the profile is mounted **streaming** (the only
+  time the cache changes), and right before a manual switch to Cache Only. A
+  failed app walk deletes the list rather than leave one it can't vouch for.
+
+When the script can't build the list it uses the app's copy; with no copy at
+all it mounts **streaming** instead (logging "Cache Only unavailable") — never a
+union mount without the filter. Covered by `ConfigSelfTest` AC-CO3.
 
 **Four mount-mode tokens** (`MountMode` in `SyncState.swift`), written to
 `mountModePath` (`/tmp/synctray-mount-{shortId}.mode`) right before rclone
@@ -315,6 +331,14 @@ automatic resume, so a mount is never force-unmounted under an app that might
 be mid-write (`SyncManager.lsofBusyCheckResult`, covered by AC-AO2).
 
 **Known limits** (also documented in the Advanced Options caption in the UI):
+
+- The app-written partial-file list can lag the cache by up to one 15-min refresh:
+  a file first partly downloaded after the last refresh, followed by a launchd
+  offline mount start where the script can't read the cache, isn't on the list.
+- Overlay-pending detection (`cache-only-pending`) is still script-side only, so
+  under the same launchd read denial it can miss files queued in the overlay and
+  mount streaming, which hides them from the mount (they stay queued on disk,
+  not lost) until the next Cache Only session. Known follow-up.
 
 - Deleting or renaming an already-cached (base) file is unsupported while in
   Cache Only — the base upstream is read-only by rclone's own `union`

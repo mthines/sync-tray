@@ -71,6 +71,9 @@ final class SyncManager: ObservableObject {
     private var autoWarmedMounts: Set<UUID> = []
     // Mount read-health probe bookkeeping (in-memory; see `probeMountReadHealth`).
     private var lastMountReadProbe: [UUID: Date] = [:]
+    // Last time this app session wrote each profile's Cache Only partial-file list.
+    private var lastCacheOnlyListWrite: [UUID: Date] = [:]
+    private var cacheOnlyListWritesInFlight: Set<UUID> = []
     private var mountReadProbesInFlight: Set<UUID> = []
 
     /// Live progress of an in-flight cache-directory move, keyed by the
@@ -213,6 +216,7 @@ final class SyncManager: ObservableObject {
         TelemetryService.shared.recordProfileCount(self.profileStore.enabledProfiles.count)
         TelemetryService.shared.recordAllProfileConfigurations(self.profileStore.profiles)
         startSessionHeartbeat()
+        refreshCacheOnlyExcludeLists()
         startMountStateMonitor()
         startMountProgressMonitor()
         startPrimaryRecoveryMonitor()
@@ -3478,7 +3482,13 @@ final class SyncManager: ObservableObject {
             profileStore.update(updated)
             try? setupService.updateConfig(for: updated)
             TelemetryService.shared.recordSettingChanged(name: "stream_cache_only", enabled: true)
-            remountForModeChange(updated)
+            // Freshen the partial-file list from the streaming cache as it is right now,
+            // before the remount: the script falls back to this copy when it can't read the
+            // cache itself (see `refreshCacheOnlyExcludeLists`).
+            Task.detached(priority: .userInitiated) { [weak self] in
+                Self.writeCacheOnlyExcludeList(for: updated)
+                await MainActor.run { self?.remountForModeChange(updated) }
+            }
             return
         }
 
@@ -3810,10 +3820,72 @@ final class SyncManager: ObservableObject {
                     errorProfiles: errors
                 )
                 self.probeMountReadHealth()
+                self.refreshCacheOnlyExcludeLists()
             }
         }
         heartbeatTimer = timer
         timer.resume()
+    }
+
+    /// How often a streaming profile's Cache Only partial-file list is rebuilt.
+    static let cacheOnlyListRefreshInterval: TimeInterval = 15 * 60
+
+    /// Pure: should the app (re)write this profile's Cache Only partial-file list now?
+    /// Always when no list exists. Otherwise only while it is mounted STREAMING — that's
+    /// the only time the streaming cache changes (downloads land); in Cache Only or
+    /// unmounted it is static, so the last list stays exact — and at most once per interval.
+    nonisolated static func shouldRefreshCacheOnlyList(
+        listExists: Bool, isMounted: Bool, mode: MountMode?, inFlight: Bool,
+        lastWrite: Date?, now: Date
+    ) -> Bool {
+        guard !inFlight else { return false }
+        guard listExists else { return true }
+        guard isMounted, (mode ?? .streaming) == .streaming else { return false }
+        guard let lastWrite else { return true }
+        return now.timeIntervalSince(lastWrite) >= cacheOnlyListRefreshInterval
+    }
+
+    /// Keep every Stream profile's Cache Only partial-file list present and recent.
+    ///
+    /// The sync script rebuilds this list itself at each Cache Only mount start, but under
+    /// launchd its `python3` can be denied read access to a cache on an external drive
+    /// (macOS privacy controls grant this app, not the interpreter). The script then uses
+    /// this copy, and with no copy at all mounts streaming instead — a union mount without
+    /// the list would serve partly-downloaded files as complete. Runs off the main actor;
+    /// NOT gated on telemetry, since it's a correctness input, not a signal.
+    ///
+    /// Known window: a file first partly downloaded after the last write, followed by an
+    /// offline mount start before the next one, isn't on the list. At most one refresh
+    /// interval while the app runs.
+    private func refreshCacheOnlyExcludeLists() {
+        let now = Date()
+        for profile in profileStore.enabledProfiles where profile.isMountMode && !profile.mountModePath.isEmpty {
+            guard Self.shouldRefreshCacheOnlyList(
+                listExists: FileManager.default.fileExists(atPath: profile.cacheOnlyExcludePath),
+                isMounted: profileMountStates[profile.id] == .mounted,
+                mode: profileMountModes[profile.id],
+                inFlight: cacheOnlyListWritesInFlight.contains(profile.id),
+                lastWrite: lastCacheOnlyListWrite[profile.id], now: now
+            ) else { continue }
+            cacheOnlyListWritesInFlight.insert(profile.id)
+            lastCacheOnlyListWrite[profile.id] = now
+            let captured = profile
+            Task.detached(priority: .utility) { [weak self] in
+                Self.writeCacheOnlyExcludeList(for: captured)
+                await MainActor.run { _ = self?.cacheOnlyListWritesInFlight.remove(captured.id) }
+            }
+        }
+    }
+
+    /// Write one profile's list, logging (never throwing) on failure — a failed walk has
+    /// already removed any stale copy, so the script falls back to streaming.
+    nonisolated private static func writeCacheOnlyExcludeList(for profile: SyncProfile) {
+        do {
+            let count = try VFSCacheService.shared.writeCacheOnlyExcludeList(for: profile)
+            SyncTraySettings.debugLog("'\(profile.name)': Cache Only partial-file list written (\(count) excluded)")
+        } catch {
+            SyncTraySettings.debugLog("'\(profile.name)': Cache Only partial-file list failed: \(error.localizedDescription)")
+        }
     }
 
     /// How often a mounted Stream profile's cached-read speed is sampled.

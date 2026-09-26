@@ -891,3 +891,96 @@ extension VFSCacheService {
                                     remoteBytes: max(0, after - before))
     }
 }
+
+// MARK: - Cache Only partial-file list (app-side)
+
+extension VFSCacheService {
+    /// One `--exclude-from` line for a data-tree-relative path: `/`-anchored, with rclone
+    /// glob metacharacters (and backslash itself) escaped so a literal `[` or `*` in a file
+    /// name matches only that file. Byte-for-byte the same as the sync script's generator.
+    static func cacheOnlyExcludeLine(_ rel: String) -> String {
+        var escaped = rel.replacingOccurrences(of: "\\", with: "\\\\")
+        for ch in ["*", "?", "[", "]", "{", "}"] {
+            escaped = escaped.replacingOccurrences(of: ch, with: "\\" + ch)
+        }
+        return "/" + escaped
+    }
+
+    /// Exclude lines for `rel` in both Unicode normalization forms when they differ: the
+    /// same visible name can reach rclone composed (NFC) or decomposed (NFD) depending on
+    /// how it was written, and an extra line for a name that doesn't exist is harmless,
+    /// while a missed form would leave a partial file visible.
+    static func cacheOnlyExcludeLines(_ rel: String) -> [String] {
+        let forms = [rel.precomposedStringWithCanonicalMapping, rel.decomposedStringWithCanonicalMapping]
+        var seen = Set<[UInt8]>()
+        return forms.compactMap { form in
+            seen.insert(Array(form.utf8)).inserted ? cacheOnlyExcludeLine(form) : nil
+        }
+    }
+
+    /// Should the Cache Only union mount hide this cached data file? True when its bytes
+    /// don't provably cover the file: no or unreadable sidecar, a size mismatch, or a gap
+    /// in the downloaded ranges. Deliberately ignores `Dirty` — a dirty file holds a local
+    /// edit that hasn't uploaded yet, and hiding it would hide the user's own unsaved work.
+    static func isPartialForCacheOnly(metaJSON: Data?, dataSize: Int64) -> Bool {
+        guard let metaJSON,
+              let meta = try? JSONDecoder().decode(VFSCacheMeta.self, from: metaJSON) else { return true }
+        let clean = VFSCacheMeta(Size: meta.Size, Rs: meta.Rs, Dirty: false)
+        return !isCacheComplete(meta: clean, expectedSize: dataSize)
+    }
+
+    /// Build the Cache Only partial-file list for `profile` from the on-disk streaming cache
+    /// and write it to `profile.cacheOnlyExcludePath` (atomically).
+    ///
+    /// The sync script regenerates this itself on every Cache Only mount start, but under
+    /// launchd its `python3` can be denied access to a cache on an external drive (macOS
+    /// privacy controls grant the app, not the interpreter), so it can't always read the
+    /// cache. The app writes the list on launch and every heartbeat while the profile is
+    /// mounted, and the script falls back to this copy — or to streaming when neither
+    /// exists — rather than mounting Cache Only with partial files exposed. Blocking —
+    /// call off the main actor. Returns the number of excluded files.
+    @discardableResult
+    func writeCacheOnlyExcludeList(for profile: SyncProfile) throws -> Int {
+        let roots = cacheSubtreeRoots(for: profile)
+        let rootURL = URL(fileURLWithPath: roots.data)
+        // The enumerator may hand back a differently-spelled prefix than the root it was
+        // given (Foundation adds or strips `/private` for `/var`, `/tmp`), so relative paths
+        // are cut from the SAME normalization applied to both sides.
+        let rootPrefix = rootURL.resolvingSymlinksInPath().path + "/"
+        var lines: [String] = []
+        var excluded = 0
+        // The enumerator skips an unreadable directory SILENTLY by default, which would
+        // write a list missing that directory's partial files — worse than no list, since
+        // the script trusts it. Abort on the first error instead.
+        var walkError: Error?
+        if FileManager.default.fileExists(atPath: roots.data),
+           let walker = FileManager.default.enumerator(
+               at: rootURL, includingPropertiesForKeys: [.fileSizeKey, .isRegularFileKey],
+               options: [], errorHandler: { _, error in walkError = error; return false }) {
+            for case let url as URL in walker {
+                guard let values = try? url.resourceValues(forKeys: [.fileSizeKey, .isRegularFileKey]),
+                      values.isRegularFile == true, let size = values.fileSize else { continue }
+                let full = url.resolvingSymlinksInPath().path
+                guard full.hasPrefix(rootPrefix) else { continue }
+                let rel = String(full.dropFirst(rootPrefix.count))
+                let meta = FileManager.default.contents(
+                    atPath: (roots.meta as NSString).appendingPathComponent(rel))
+                if Self.isPartialForCacheOnly(metaJSON: meta, dataSize: Int64(size)) {
+                    lines.append(contentsOf: Self.cacheOnlyExcludeLines(rel))
+                    excluded += 1
+                }
+            }
+        }
+        let path = profile.cacheOnlyExcludePath
+        if let walkError {
+            // A list we can't vouch for must not survive for the script to trust.
+            try? FileManager.default.removeItem(atPath: path)
+            throw walkError
+        }
+        try FileManager.default.createDirectory(
+            atPath: (path as NSString).deletingLastPathComponent, withIntermediateDirectories: true)
+        let body = lines.isEmpty ? "" : lines.joined(separator: "\n") + "\n"
+        try body.write(toFile: path, atomically: true, encoding: .utf8)
+        return excluded
+    }
+}
