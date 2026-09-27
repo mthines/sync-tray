@@ -160,20 +160,31 @@ extension SyncManager {
 
     /// In-app "Don't Sync" edit: persist the new patterns, then rewrite the filter file
     /// through the same gate an external edit uses. Applies from the next sync; no reinstall.
-    /// - Returns: the user-facing text of a filter write failure, for the editor to show
-    ///   inline; nil when the file was written, or when no write was needed.
-    @discardableResult
-    func updateSyncExcludePatterns(_ patterns: [String], for profileId: UUID) -> String? {
-        guard let current = profileStore.profile(for: profileId) else { return nil }
+    /// A failed write is recorded in `syncFilterErrors`, which the editor shows.
+    func updateSyncExcludePatterns(_ patterns: [String], for profileId: UUID) {
+        guard let current = profileStore.profile(for: profileId) else { return }
         var updated = current
         updated.syncExcludePatterns = patterns
-        guard updated != current else { return nil }
+        guard updated != current else { return }
         profileStore.update(updated)
-        var writeError: String?
+        applySyncFilterReconcile(from: current, to: updated)
+    }
+
+    /// Rewrite the filter file when an edit needs it (the `applySyncFilterReconcileIfNeeded`
+    /// gate) and record the outcome in `syncFilterErrors`: the error text, or nil once the
+    /// write succeeds. Records only when a write was attempted, so an edit that needs none
+    /// leaves an earlier failure in view. Records after the gate returns, so actor state is
+    /// never touched from inside its nonisolated closure. Shared by the in-app editor and
+    /// the external-edit watcher, so the two record the same way.
+    func applySyncFilterReconcile(from current: SyncProfile, to updated: SyncProfile) {
+        var filterWriteAttempted = false
+        var filterError: String?
         Self.applySyncFilterReconcileIfNeeded(from: current, to: updated) { profile in
-            writeError = Self.writeSyncExcludeFilter(for: profile)
+            filterWriteAttempted = true
+            filterError = Self.writeSyncExcludeFilter(for: profile)
         }
-        return writeError
+        guard filterWriteAttempted else { return }
+        recordSyncFilterWrite(error: filterError, for: updated.id)
     }
 
     /// Rewrite a profile's exclude filter file, logging (not throwing) on failure — the

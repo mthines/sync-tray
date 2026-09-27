@@ -4122,9 +4122,6 @@ struct DontSyncSection: View {
     let syncDirection: SyncDirection
 
     @State private var patterns: [String] = []
-    /// Why the last edit's patterns couldn't be written to the filter file (e.g. the file
-    /// isn't UTF-8), shown under the list; nil when the last edit applied.
-    @State private var writeError: String?
 
     private var liveProfile: SyncProfile {
         profileStore.profile(for: profile.id) ?? profile
@@ -4168,11 +4165,13 @@ struct DontSyncSection: View {
                 patterns: patterns
             ) { updated in
                 patterns = updated
-                writeError = syncManager.updateSyncExcludePatterns(updated, for: profile.id)
+                syncManager.updateSyncExcludePatterns(updated, for: profile.id)
             }
 
-            if let writeError {
-                Label(writeError, systemImage: "exclamationmark.triangle.fill")
+            // Kept by SyncManager, not this view: it survives the view being recreated and
+            // also covers a failed write from an edit made outside the app.
+            if let error = syncManager.syncFilterErrors[profile.id] {
+                Label(error, systemImage: "exclamationmark.triangle.fill")
                     .font(.caption)
                     .foregroundStyle(.red)
                     .fixedSize(horizontal: false, vertical: true)
@@ -4181,7 +4180,6 @@ struct DontSyncSection: View {
         .onAppear { patterns = liveProfile.syncExcludePatterns }
         .onChange(of: profile.id) { _ in
             patterns = liveProfile.syncExcludePatterns
-            writeError = nil
         }
         // Mirror edits made outside this view (CLI, a hand-edited .profile.json).
         .onReceive(profileStore.$profiles) { profiles in
