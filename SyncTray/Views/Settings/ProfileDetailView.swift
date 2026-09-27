@@ -4152,8 +4152,9 @@ struct DontSyncSection: View {
             + "**/BACKUP/** skips every folder named BACKUP, at any depth. Patterns are "
             + "case-sensitive and apply from the next sync."
         if syncMode == .bisync {
-            text += " A new pattern that covers more than half of the files pauses the next "
-                + "sync at its mass-deletion safety check."
+            text += " A new pattern that covers more than half of the files stops two-way sync "
+                + "at its mass-deletion safety check until you remove it, so add broad "
+                + "patterns in steps."
         }
         return text
     }

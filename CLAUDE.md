@@ -494,8 +494,10 @@ of a two-way profile ends in a full `--resync`. Behaviour to know: matching file
 stop syncing but are never deleted on either side (bisync sees them vanish from
 both listings; one-way `sync` leaves excluded files at the destination). A new
 pattern that covers more than half of a two-way profile's files trips bisync's
-`--max-delete` (50%) safety abort on the next run, because the newly-excluded files
-count as deletions against the prior listing. Covered by `ConfigSelfTest` AC-DS1–AC-DS5.
+`--max-delete` (50%) safety abort, because the newly-excluded files count as
+deletions against the prior listing — and since an abort leaves that listing
+unchanged, every later run aborts too until the pattern is removed. Adding broad
+patterns in steps avoids it. Covered by `ConfigSelfTest` AC-DS1–AC-DS5.
 
 **Self-write suppression.** `ConfigSelfWriteRegistry` tracks the content hash
 of every file SyncTray itself writes; `ConfigFileWatcher.shouldReconcile`
