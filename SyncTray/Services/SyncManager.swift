@@ -780,6 +780,14 @@ final class SyncManager: ObservableObject {
             self?.applyWarmReconcile(for: id, trigger: "external_edit")
         }
 
+        // "Don't Sync" patterns, also ORTHOGONAL to `action`: a changed
+        // `syncExcludePatterns` yields `action == .none` (the script re-reads the
+        // filter file every run), so rewrite the file here. Same gate as the in-app
+        // editor (`updateSyncExcludePatterns`).
+        Self.applySyncFilterReconcileIfNeeded(from: currentProfile, to: updatedProfile) { profile in
+            Self.writeSyncExcludeFilter(for: profile)
+        }
+
         // Offline browse point: create / remove / re-point per the edited profile
         // (a toggled `offlineAccessEnabled` yields `action == .none`, and a changed
         // `vfsCachePath` a `.reinstall`; either way the link must follow config).

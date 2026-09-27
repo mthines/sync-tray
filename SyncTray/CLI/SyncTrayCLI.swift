@@ -165,7 +165,8 @@ enum SyncTrayCLI {
       vfsCachePath, allowNonEmptyMount, mountAtStartup, offlineAccessEnabled,
       isMuted, rcPort,
       downloadConnections, pinnedDirectories (comma-separated),
-      warmExcludePatterns (comma-separated). Use enable/disable for isEnabled.
+      warmExcludePatterns (comma-separated), syncExcludePatterns (comma-separated).
+      Use enable/disable for isEnabled.
 
     Profiles author JSON against schema/profile.schema.json under the config
     directory; the same file an agent can drop in or edit directly.
@@ -1061,6 +1062,7 @@ enum SyncTrayCLI {
         // Lists (comma-separated).
         case "pinnedDirectories": profile.pinnedDirectories = list(value)
         case "warmExcludePatterns": profile.warmExcludePatterns = list(value)
+        case "syncExcludePatterns": profile.syncExcludePatterns = list(value)
 
         // Explicitly excluded keys — greppable, with the right command to use.
         case "id":
@@ -1126,6 +1128,13 @@ extension CLIEnvironment {
                 // Keep the read-only "(Offline)" browse point in sync with the written
                 // profile (create/re-point/remove) so a headless CLI edit matches the app.
                 OfflineAccessLink.apply(for: profile)
+                // Keep the exclude filter's "Don't Sync" block in step with the profile,
+                // like the app's watcher does: a pattern edit needs no reinstall, so the
+                // launchd reconcile after this write won't rewrite the file. A disabled
+                // profile's filter isn't in use; `install` writes it on enable.
+                if ok, profile.isEnabled {
+                    SyncManager.writeSyncExcludeFilter(for: profile)
+                }
                 return ok
             },
             installProfile: { profile in

@@ -299,6 +299,18 @@ struct ProfileDetailView: View {
                             profileStore: profileStore,
                             syncManager: syncManager
                         )
+                    } else {
+                        // Don't Sync (two-way and one-way) — the sync-mode counterpart of
+                        // Offline Files' "Don't Download" list.
+                        Divider().padding(.vertical, 4)
+                        sectionHeader("Don't Sync", icon: "nosign")
+                        DontSyncSection(
+                            profile: profile,
+                            profileStore: profileStore,
+                            syncManager: syncManager,
+                            syncMode: syncMode,
+                            syncDirection: syncDirection
+                        )
                     }
 
                     Divider().padding(.vertical, 4)
@@ -2095,6 +2107,14 @@ struct ProfileDetailView: View {
         updatedProfile.mountAtStartup = mountAtStartup
         updatedProfile.offlineAccessEnabled = offlineAccessEnabled
         updatedProfile.downloadConnections = downloadConnections
+        // Lists edited outside the form and saved the moment they change ("Don't Sync",
+        // "Don't Download", pinned folders): take them from the store, so a Save can never
+        // write back an older copy held by this view.
+        if let live = profileStore.profile(for: profile.id) {
+            updatedProfile.syncExcludePatterns = live.syncExcludePatterns
+            updatedProfile.warmExcludePatterns = live.warmExcludePatterns
+            updatedProfile.pinnedDirectories = live.pinnedDirectories
+        }
         return updatedProfile
     }
 
@@ -4082,6 +4102,76 @@ struct ProfileDetailView: View {
             let truncated = lines.suffix(maxLogLines).joined(separator: "\n")
             // Use non-atomic write to preserve inode (prevents LogWatcher from losing track)
             try? truncated.write(toFile: logPath, atomically: false, encoding: .utf8)
+        }
+    }
+}
+
+// MARK: - Don't Sync
+
+/// "Don't Sync" patterns for Two-Way and One-Way profiles: the same pattern list and syntax
+/// as Offline Files' "Don't Download", stored in `syncExcludePatterns` and written as rclone
+/// exclude rules into the profile's filter file. Edits save immediately (like "Don't
+/// Download") and apply from the next sync — no reinstall, so no `--resync`.
+struct DontSyncSection: View {
+    let profile: SyncProfile
+    @ObservedObject var profileStore: ProfileStore
+    @ObservedObject var syncManager: SyncManager
+    /// The form's current mode/direction (may be unsaved), so the caption matches what the
+    /// user is looking at.
+    let syncMode: SyncMode
+    let syncDirection: SyncDirection
+
+    @State private var patterns: [String] = []
+
+    private var liveProfile: SyncProfile {
+        profileStore.profile(for: profile.id) ?? profile
+    }
+
+    private var remoteName: String {
+        let name = profile.rcloneRemote.hasSuffix(":")
+            ? String(profile.rcloneRemote.dropLast()) : profile.rcloneRemote
+        return name.isEmpty ? "the remote" : name
+    }
+
+    private var caption: String {
+        let effect: String
+        if syncMode == .bisync {
+            effect = "Files that match stop syncing in both directions. Nothing is deleted — "
+                + "copies already on this Mac or on \(remoteName) stay where they are."
+        } else if syncDirection == .localToRemote {
+            effect = "Files that match aren't uploaded. Nothing is deleted — "
+                + "copies already on \(remoteName) stay."
+        } else {
+            effect = "Files that match aren't downloaded. Nothing is deleted — "
+                + "copies already on this Mac stay."
+        }
+        var text = effect + " Use wildcards: *.bak matches any file ending in .bak, and "
+            + "**/BACKUP/** skips every folder named BACKUP, at any depth. Patterns are "
+            + "case-sensitive and apply from the next sync."
+        if syncMode == .bisync {
+            text += " A new pattern that covers more than half of the files pauses the next "
+                + "sync at its mass-deletion safety check."
+        }
+        return text
+    }
+
+    var body: some View {
+        ExcludePatternListEditor(
+            title: "Skip these files",
+            caption: caption,
+            emptyText: "Nothing excluded — every file syncs",
+            patterns: patterns
+        ) { updated in
+            patterns = updated
+            syncManager.updateSyncExcludePatterns(updated, for: profile.id)
+        }
+        .onAppear { patterns = liveProfile.syncExcludePatterns }
+        .onChange(of: profile.id) { _ in patterns = liveProfile.syncExcludePatterns }
+        // Mirror edits made outside this view (CLI, a hand-edited .profile.json).
+        .onReceive(profileStore.$profiles) { profiles in
+            guard let updated = profiles.first(where: { $0.id == profile.id }),
+                  updated.syncExcludePatterns != patterns else { return }
+            patterns = updated.syncExcludePatterns
         }
     }
 }

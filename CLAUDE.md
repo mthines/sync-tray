@@ -473,6 +473,29 @@ re-warms via `VFSCacheService`, reusing the exact primitives the in-app
 pin/unpin path uses (`updateAppGroupMountPaths` + `startWarm`) so the two can't
 drift. A warm-only edit NEVER reinstalls the agent or remounts.
 
+**"Don't Sync" patterns (`syncExcludePatterns`) follow the same orthogonal
+pattern — and must never join the reinstall set.** Two-Way and One-Way profiles
+have a "Don't Sync" list in the profile editor (`DontSyncSection`, sharing
+`ExcludePatternListEditor` with "Don't Download"). The patterns use the exact
+syntax and matching rules of `warmExcludePatterns`; `SyncExcludeFilter`
+(`SyncSetupService.swift`) rewrites each one into the rclone rule(s) that exclude
+the same files (rclone's unanchored rules match at any depth, its `**/` needs at
+least one folder, and `[ ] { } \` are syntax to it) and keeps them in a managed
+block at the TOP of `{shortId}-exclude.txt` (first match wins in rclone, so a
+pattern beats any hand-written `+` include below). Lines outside the block are the
+user's and are never touched. The sync script re-reads that file on every run, so
+an edit only needs the file rewritten: the in-app editor
+(`SyncManager.updateSyncExcludePatterns`), the external-edit watcher and the CLI's
+`writeProfile` all go through `applySyncFilterReconcileIfNeeded` /
+`writeSyncExcludeFilter`, and `reconcileAction` returns `.none`. Keep it that way:
+`SyncSetupService.uninstall` deletes the profile's bisync listings, so a reinstall
+of a two-way profile ends in a full `--resync`. Behaviour to know: matching files
+stop syncing but are never deleted on either side (bisync sees them vanish from
+both listings; one-way `sync` leaves excluded files at the destination). A new
+pattern that covers more than half of a two-way profile's files trips bisync's
+`--max-delete` (50%) safety abort on the next run, because the newly-excluded files
+count as deletions against the prior listing. Covered by `ConfigSelfTest` AC-DS1–AC-DS5.
+
 **Self-write suppression.** `ConfigSelfWriteRegistry` tracks the content hash
 of every file SyncTray itself writes; `ConfigFileWatcher.shouldReconcile`
 drops an FSEvent whose file content hash matches a just-noted self-write, so
@@ -968,7 +991,7 @@ Priority: process env vars > `~/.config/synctray/.env` > Info.plist. Key vars: `
 | Path | Purpose |
 |------|---------|
 | `~/.config/synctray/profiles/{shortId}.json` | Profile config |
-| `~/.config/synctray/profiles/{shortId}-exclude.txt` | Exclude filter (user-editable) |
+| `~/.config/synctray/profiles/{shortId}-exclude.txt` | Exclude filter (user-editable; SyncTray owns only the "Don't Sync" block at the top) |
 | `~/.local/bin/synctray-sync.sh` | Shared sync script (all profiles) |
 | `~/Library/LaunchAgents/com.synctray.sync.{shortId}.plist` | launchd schedule |
 | `~/.local/log/synctray-sync-{shortId}.log` | Sync logs |

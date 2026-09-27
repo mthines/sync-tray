@@ -116,6 +116,11 @@
       "items": { "type": "string" },
       "description": "Glob patterns excluded from offline warming (mount mode). Applied app-side by the warmer; not emitted into the derived {shortId}.json script config."
     },
+    "syncExcludePatterns": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "\"Don't Sync\" glob patterns for Two-Way (bisync) and One-Way (sync) profiles — same syntax as warmExcludePatterns: case-sensitive, '*' within one path segment, '?' one character, '**' across segments (e.g. \"*.bak\", \"**/BACKUP/**\"). Matched against each file's name and its path relative to the sync folder. Written as rclone exclude rules into a managed block of the profile's exclude filter file; matching files stop syncing in both directions and nothing is deleted. Ignored in mount mode."
+    },
     "rcPort": {
       "type": "integer",
       "description": "Port for rclone's RC (remote control) API (mount mode)."

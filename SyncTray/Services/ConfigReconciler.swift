@@ -128,6 +128,58 @@ extension SyncManager {
               warmReconcileNeeded(from: current, to: updated) else { return }
         warm(updated.id)
     }
+
+    /// Whether a profile edit needs the exclude filter file rewritten: the "Don't Sync"
+    /// patterns changed on an enabled Two-Way / One-Way profile. A disabled profile has no
+    /// filter file in use; enabling it installs, and `install` writes the file then.
+    ///
+    /// DELIBERATELY not part of `reconcileAction`'s `needsReinstall` set: the sync script
+    /// re-reads the filter file on every run, so rewriting it is all the change needs. A
+    /// reinstall would be actively harmful here — `SyncSetupService.uninstall` clears the
+    /// profile's bisync listings, so the reinstall of a two-way profile ends in a full
+    /// `--resync`. Pure — no I/O.
+    nonisolated static func syncFilterReconcileNeeded(from current: SyncProfile, to updated: SyncProfile) -> Bool {
+        !updated.isMountMode
+            && updated.isEnabled
+            && current.syncExcludePatterns != updated.syncExcludePatterns
+    }
+
+    /// Decide whether an edit should rewrite the exclude filter file and, if so, invoke
+    /// `write`. Pure decision + injected side effect (same idiom as
+    /// `applyWarmReconcileIfNeeded`), so `ConfigSelfTest` covers the trigger with a spy. Both
+    /// the in-app editor (`updateSyncExcludePatterns`) and the external-edit watcher
+    /// (`applyExternalProfileEdit`) go through here, so they fire on the same conditions.
+    nonisolated static func applySyncFilterReconcileIfNeeded(
+        from current: SyncProfile,
+        to updated: SyncProfile,
+        write: (SyncProfile) -> Void
+    ) {
+        guard syncFilterReconcileNeeded(from: current, to: updated) else { return }
+        write(updated)
+    }
+
+    /// In-app "Don't Sync" edit: persist the new patterns, then rewrite the filter file
+    /// through the same gate an external edit uses. Applies from the next sync; no reinstall.
+    func updateSyncExcludePatterns(_ patterns: [String], for profileId: UUID) {
+        guard let current = profileStore.profile(for: profileId) else { return }
+        var updated = current
+        updated.syncExcludePatterns = patterns
+        guard updated != current else { return }
+        profileStore.update(updated)
+        Self.applySyncFilterReconcileIfNeeded(from: current, to: updated) { profile in
+            Self.writeSyncExcludeFilter(for: profile)
+        }
+    }
+
+    /// Rewrite a profile's exclude filter file, logging (not throwing) on failure — the
+    /// patterns are already persisted, and the next install rewrites the file anyway.
+    nonisolated static func writeSyncExcludeFilter(for profile: SyncProfile) {
+        do {
+            try SyncSetupService.shared.writeExcludeFilter(for: profile)
+        } catch {
+            SyncTraySettings.debugLog("Failed to write exclude filter for '\(profile.name)': \(error)")
+        }
+    }
 }
 
 /// What a Save that changed a Stream profile's Cache Directory must ask the
