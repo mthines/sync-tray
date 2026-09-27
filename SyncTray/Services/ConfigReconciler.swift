@@ -160,24 +160,34 @@ extension SyncManager {
 
     /// In-app "Don't Sync" edit: persist the new patterns, then rewrite the filter file
     /// through the same gate an external edit uses. Applies from the next sync; no reinstall.
-    func updateSyncExcludePatterns(_ patterns: [String], for profileId: UUID) {
-        guard let current = profileStore.profile(for: profileId) else { return }
+    /// - Returns: the user-facing text of a filter write failure, for the editor to show
+    ///   inline; nil when the file was written, or when no write was needed.
+    @discardableResult
+    func updateSyncExcludePatterns(_ patterns: [String], for profileId: UUID) -> String? {
+        guard let current = profileStore.profile(for: profileId) else { return nil }
         var updated = current
         updated.syncExcludePatterns = patterns
-        guard updated != current else { return }
+        guard updated != current else { return nil }
         profileStore.update(updated)
+        var writeError: String?
         Self.applySyncFilterReconcileIfNeeded(from: current, to: updated) { profile in
-            Self.writeSyncExcludeFilter(for: profile)
+            writeError = Self.writeSyncExcludeFilter(for: profile)
         }
+        return writeError
     }
 
     /// Rewrite a profile's exclude filter file, logging (not throwing) on failure — the
-    /// patterns are already persisted, and the next install rewrites the file anyway.
-    nonisolated static func writeSyncExcludeFilter(for profile: SyncProfile) {
+    /// patterns are already persisted either way. A failure is not repaired by the next
+    /// install (an unreadable file is left as it is), so the caller must surface it.
+    /// - Returns: the error's user-facing text on failure, nil on success.
+    @discardableResult
+    nonisolated static func writeSyncExcludeFilter(for profile: SyncProfile) -> String? {
         do {
             try SyncSetupService.shared.writeExcludeFilter(for: profile)
+            return nil
         } catch {
             SyncTraySettings.debugLog("Failed to write exclude filter for '\(profile.name)': \(error)")
+            return error.localizedDescription
         }
     }
 }

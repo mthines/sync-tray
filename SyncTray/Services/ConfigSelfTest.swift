@@ -3072,6 +3072,23 @@ enum ConfigSelfTest {
         guard !FileManager.default.fileExists(atPath: mountPath) else {
             return report("AC-DS3", "sync-exclude-write", false, "(mount profile got a filter file)")
         }
+
+        // An existing filter that isn't UTF-8 (a hand edit saved as Latin-1) is reported, never
+        // replaced: the write throws `excludeFilterUnreadable` and leaves the bytes as they were.
+        let unreadablePath = "\(dir)/unreadable.txt"
+        let unreadableBytes = Data([0x2D, 0x20, 0x63, 0x61, 0x66, 0xE9, 0x0A])  // "- café\n", ISO Latin-1
+        try? unreadableBytes.write(to: URL(fileURLWithPath: unreadablePath))
+        do {
+            try SyncSetupService.shared.writeExcludeFilter(for: profile, at: unreadablePath)
+            return report("AC-DS3", "sync-exclude-write", false, "(a non-UTF-8 filter file did not throw)")
+        } catch SyncSetupService.SetupError.excludeFilterUnreadable {
+            // expected
+        } catch {
+            return report("AC-DS3", "sync-exclude-write", false, "(a non-UTF-8 filter file threw \(error))")
+        }
+        guard FileManager.default.contents(atPath: unreadablePath) == unreadableBytes else {
+            return report("AC-DS3", "sync-exclude-write", false, "(a non-UTF-8 filter file was modified)")
+        }
         return report("AC-DS3", "sync-exclude-write", true)
     }
 

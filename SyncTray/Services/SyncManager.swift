@@ -783,9 +783,16 @@ final class SyncManager: ObservableObject {
         // "Don't Sync" patterns, also ORTHOGONAL to `action`: a changed
         // `syncExcludePatterns` yields `action == .none` (the script re-reads the
         // filter file every run), so rewrite the file here. Same gate as the in-app
-        // editor (`updateSyncExcludePatterns`).
+        // editor (`updateSyncExcludePatterns`). A failed write (e.g. a filter file that
+        // isn't UTF-8) is recorded as the profile's error rather than dropped, so the
+        // patterns never look applied while they aren't; set after the call returns so
+        // actor state isn't touched from inside the nonisolated closure.
+        var filterError: String?
         Self.applySyncFilterReconcileIfNeeded(from: currentProfile, to: updatedProfile) { profile in
-            Self.writeSyncExcludeFilter(for: profile)
+            filterError = Self.writeSyncExcludeFilter(for: profile)
+        }
+        if let filterError {
+            profileErrors[updatedProfile.id] = filterError
         }
 
         // Offline browse point: create / remove / re-point per the edited profile

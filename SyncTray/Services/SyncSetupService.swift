@@ -137,7 +137,13 @@ final class SyncSetupService {
         // Generate and write exclude filter (preserves existing user edits)
         // Only needed for sync modes, not mount
         if !profile.isMountMode {
-            try writeExcludeFilter(for: profile)
+            do {
+                try writeExcludeFilter(for: profile)
+            } catch SetupError.excludeFilterUnreadable(let path) {
+                // A hand-edited filter that isn't UTF-8 must not block an install that worked
+                // before Don't Sync existed; the Don't Sync editor reports it on the next change.
+                SyncTraySettings.debugLog("Exclude filter at \(path) isn't UTF-8; left as is")
+            }
         }
 
         // Generate and write plist
@@ -1164,6 +1170,11 @@ final class SyncSetupService {
     /// "Don't Sync" block regenerated from `profile.syncExcludePatterns`. Touches the file only
     /// when its content actually changes, and never for mount profiles (no filter file).
     ///
+    /// An existing file that can't be read as UTF-8 text is left untouched (never replaced
+    /// with the defaults) and reported by throwing `SetupError.excludeFilterUnreadable`, so
+    /// the patterns are never shown as applied while they aren't. `install` tolerates that
+    /// one error; the "Don't Sync" editor, the external-edit path and the CLI surface it.
+    ///
     /// The sync script reads this file on every run (`--filter-from`), so a change applies to
     /// the next sync with no reinstall. That matters: a reinstall of a two-way profile clears
     /// its bisync listings and forces a full `--resync`, which a filter edit must not cause.
@@ -1176,9 +1187,8 @@ final class SyncSetupService {
         if FileManager.default.fileExists(atPath: filterPath) {
             guard let text = try? String(contentsOfFile: filterPath, encoding: .utf8) else {
                 // Unreadable (e.g. not UTF-8): leave the user's file alone rather than
-                // replacing it with the defaults.
-                SyncTraySettings.debugLog("Exclude filter at \(filterPath) is unreadable; not updating it")
-                return
+                // replacing it with the defaults, and say so instead of skipping silently.
+                throw SetupError.excludeFilterUnreadable(filterPath)
             }
             existing = text
         }
@@ -1224,6 +1234,7 @@ final class SyncSetupService {
         case plistGenerationFailed
         case notMountMode
         case unmountFailed(String)
+        case excludeFilterUnreadable(String)
 
         var errorDescription: String? {
             switch self {
@@ -1241,6 +1252,8 @@ final class SyncSetupService {
                 return "Profile is not in mount mode"
             case .unmountFailed(let message):
                 return "Failed to unmount: \(message)"
+            case .excludeFilterUnreadable(let path):
+                return "Can't update the Don't Sync rules: the exclude filter at \(path) isn't readable UTF-8 text. Fix or delete that file, then change the list again."
             }
         }
     }

@@ -1131,9 +1131,11 @@ extension CLIEnvironment {
                 // Keep the exclude filter's "Don't Sync" block in step with the profile,
                 // like the app's watcher does: a pattern edit needs no reinstall, so the
                 // launchd reconcile after this write won't rewrite the file. A disabled
-                // profile's filter isn't in use; `install` writes it on enable.
-                if ok, profile.isEnabled {
-                    SyncManager.writeSyncExcludeFilter(for: profile)
+                // profile's filter isn't in use; `install` writes it on enable. A failed
+                // write (e.g. a filter file that isn't UTF-8) is a warning, not a failure:
+                // the profile itself was saved, so the exit code is unchanged.
+                if ok, profile.isEnabled, let error = SyncManager.writeSyncExcludeFilter(for: profile) {
+                    FileHandle.standardError.write(Data("warning: profile saved, but its Don't Sync rules weren't applied: \(error)\n".utf8))
                 }
                 return ok
             },
