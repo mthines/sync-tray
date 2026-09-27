@@ -2154,7 +2154,7 @@ struct ProfileDetailView: View {
 
         // Only reinstall if sync-related settings changed
         if needsReinstall {
-            reinstallSync()
+            reinstallSync(previous: currentProfile)
         }
     }
 
@@ -2883,11 +2883,16 @@ struct ProfileDetailView: View {
         return base
     }
 
-    /// - Parameter overrideProfile: forwarded to `installSync(using:)` — see
-    ///   its doc comment. The uninstall half already reads the
-    ///   currently-persisted profile from `profileStore`, so only the
-    ///   install half needed a form-bypass.
-    private func reinstallSync(using overrideProfile: SyncProfile? = nil) {
+    /// - Parameters:
+    ///   - overrideProfile: forwarded to `installSync(using:)` — see its doc
+    ///     comment. The uninstall half already reads the currently-persisted
+    ///     profile from `profileStore`, so only the install half needed a
+    ///     form-bypass.
+    ///   - previous: the profile as it was installed before this change, when the
+    ///     caller has it (`saveProfile`). The teardown uses it to detach what is
+    ///     actually installed and to decide whether the bisync listings still apply.
+    ///     Defaults to the persisted profile (the Reinstall button, cache-dir changes).
+    private func reinstallSync(using overrideProfile: SyncProfile? = nil, previous: SyncProfile? = nil) {
         guard let currentProfile = profileStore.profile(for: profile.id) else { return }
 
         TelemetryService.shared.recordProfileLifecycleOperation(
@@ -2896,7 +2901,10 @@ struct ProfileDetailView: View {
         )
 
         do {
-            try setupService.uninstall(profile: currentProfile)
+            // Keeps the exclude filter and, while they still apply, the bisync listings —
+            // so `installSync` finds them and runs no `--resync` after a settings change.
+            try setupService.uninstallForReinstall(
+                from: previous ?? currentProfile, to: overrideProfile ?? currentProfile)
         } catch {
             // Ignore uninstall errors
         }
@@ -3012,8 +3020,10 @@ struct ProfileDetailView: View {
             var arguments: [String]
 
             if capturedSyncMode == .bisync {
-                // Two-way bidirectional sync with --resync to establish baseline
-                arguments = ["bisync", fullRemotePath, capturedLocalSyncPath, "--resync", "--verbose", "--use-json-log", "--stats", "2s"]
+                // Two-way bidirectional sync with --resync to establish a baseline. Newer
+                // wins — never a bare --resync, which lets the remote overwrite every local
+                // file that differs (see `SyncSetupService.resyncArguments`).
+                arguments = SyncSetupService.resyncArguments(remote: fullRemotePath, localPath: capturedLocalSyncPath)
             } else {
                 // One-way sync (sync mode) - direction determines source/destination
                 if capturedSyncDirection == .localToRemote {

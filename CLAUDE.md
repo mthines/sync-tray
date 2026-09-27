@@ -861,6 +861,28 @@ func doBackgroundWork() {
   ```
 - Use `SyncLogPatterns` for all log message categorization to maintain consistency
 
+### 7. Bisync Listings Are User State — Never Discard Them on a Reinstall
+The bisync listings (`<session>.path1.lst` / `.path2.lst` in `~/Library/Caches/rclone/bisync`)
+are rclone's record of the last successful two-way sync. Without them the next run can only
+`--resync`, which copies every file both ways, brings back files deleted since the last sync,
+and overwrites the losing side of every file that differs. So:
+- **Every reinstall goes through `SyncSetupService.uninstallForReinstall(from:to:)`** — the
+  settings-save path (`ProfileDetailView.reinstallSync`), the Reinstall button, an external
+  `.profile.json` edit (`SyncManager.applyExternalProfileEdit`), and the CLI's `reinstall` /
+  `profile set` (`CLIEnvironment.uninstallForReinstall`). It tears down the OLD profile (so a
+  Stream profile detaches the volume that is actually mounted), keeps the exclude filter, and
+  keeps the listings while `reinstallKeepsBisyncListings` holds (two-way before and after,
+  same rclone session), removing only the session's `.lck` lock, which rclone never expires
+  by itself. Otherwise it discards both the old and the new pair's listings.
+  Plain `uninstall(profile:)` (disable, delete, cache migration) still removes everything.
+- **Listing file names must match rclone's `bilib.SessionName`** —
+  `SyncSetupService.bisyncSessionName(for:)` (`CanonicalPath(fullRemotePath) + ".." +
+  CanonicalPath(localSyncPath)`); `hasExistingListings` and `cleanupBisyncCache` both use it.
+  A mismatch (the old naming ignored spaces) makes a reinstall miss its listings and resync.
+- **Every resync SyncTray starts uses `SyncSetupService.resyncArguments`** (`--resync-mode
+  newer`), never a bare `--resync`, which means `--resync-mode path1` — remote wins.
+Covered by `ConfigSelfTest` AC-RI1–AC-RI5.
+
 ## Debugging
 
 ### Enable Debug Logging
@@ -890,10 +912,12 @@ cat ~/.config/synctray/profiles/{shortId}.json
 ### rclone bisync Cache
 rclone bisync maintains state in:
 ```
-~/.cache/rclone/bisync/
+~/Library/Caches/rclone/bisync/
 ```
 
-To force a fresh sync, use "Fix Sync Issues" in the app (runs `--resync`).
+To force a fresh sync, use "Fix Sync Issues" in the app (runs `--resync --resync-mode newer`).
+A reinstall keeps these files (see Critical Rule 7), so deleting a profile's listings by hand
+is the only way to make its next scheduled run bootstrap from scratch.
 
 ### Lock Files
 If sync appears stuck, check for stale lock files:

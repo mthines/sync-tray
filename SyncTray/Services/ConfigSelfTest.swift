@@ -87,6 +87,11 @@ enum ConfigSelfTest {
             testCacheMigrationUIFixes,
             testCacheMigrationTelemetrySpanStatus,
             testCacheMigrationCLI,
+            testBisyncSessionName,
+            testReinstallKeepsBisyncListings,
+            testBisyncListingFilesOnDisk,
+            testResyncNeverBare,
+            testReinstallTeardownRouting,
         ]
 
         for check in checks {
@@ -1152,6 +1157,7 @@ enum ConfigSelfTest {
         writeProfile: @escaping (SyncProfile) -> Bool = { _ in true },
         installProfile: @escaping (SyncProfile) -> String? = { _ in nil },
         uninstallProfile: @escaping (SyncProfile) -> String? = { _ in nil },
+        uninstallForReinstall: ((SyncProfile, SyncProfile) -> String?)? = nil,
         deleteProfileFile: @escaping (SyncProfile) -> Void = { _ in },
         runSyncScript: @escaping (_ configPath: String) -> Int32 = { _ in 0 },
         mountProfile: @escaping (SyncProfile) -> String? = { _ in nil },
@@ -1173,6 +1179,10 @@ enum ConfigSelfTest {
             writeProfile: writeProfile,
             installProfile: installProfile,
             uninstallProfile: uninstallProfile,
+            // Unless a test spies on it directly, the reinstall teardown reports through
+            // the `uninstallProfile` spy, so the existing "reinstall = uninstall + install"
+            // assertions keep observing it.
+            uninstallForReinstall: uninstallForReinstall ?? { current, _ in uninstallProfile(current) },
             deleteProfileFile: deleteProfileFile,
             runSyncScript: runSyncScript,
             mountProfile: mountProfile,
@@ -2939,6 +2949,199 @@ enum ConfigSelfTest {
         }
 
         return report("AC-CM-CLI", "cache-migration-cli", true)
+    }
+
+    // MARK: - AC-RI1 — listing names follow rclone's session naming
+
+    /// `hasExistingListings` and `cleanupBisyncCache` must name files exactly the way rclone's
+    /// `bilib.SessionName` does, or a reinstall can neither find nor keep the listings. The old
+    /// SyncTray naming only replaced `:` and `/`, so any path with a space never matched.
+    private static func testBisyncSessionName() -> Bool {
+        let cases: [(String, String, String)] = [
+            ("synology:Kaiju/KAIJU", "/Users/me/KAIJU", "synology_Kaiju_KAIJU..Users_me_KAIJU"),
+            ("nas:My Files/Work", "/Volumes/Seagate HD/Work", "nas_My_Files_Work..Volumes_Seagate_HD_Work"),
+            ("synology-sftp:/volume1/Kaiju", "/Users/me/K", "synology-sftp__volume1_Kaiju..Users_me_K"),
+            ("remote:path/", "/x/y/", "remote_path..x_y"),
+            ("r:what?*", "/tab\there", "r_what__..tab_here"),
+        ]
+        for (remote, local, expected) in cases {
+            let got = SyncSetupService.bisyncSessionName(remote: remote, localPath: local)
+            guard got == expected else {
+                return report("AC-RI1", "bisync-session-name", false, "(\(remote) + \(local) -> \(got), expected \(expected))")
+            }
+        }
+        // A profile's name comes from the same remote string the sync script passes rclone
+        // (`fullRemotePath`), so a stored "remote:" and "remote" name the same session.
+        var withColon = sampleProfile()
+        withColon.rcloneRemote = "synology:"
+        withColon.remotePath = "Kaiju/KAIJU"
+        withColon.localSyncPath = "/Users/me/KAIJU"
+        var withoutColon = withColon
+        withoutColon.rcloneRemote = "synology"
+        guard SyncSetupService.bisyncSessionName(for: withColon) == "synology_Kaiju_KAIJU..Users_me_KAIJU",
+              SyncSetupService.bisyncSessionName(for: withoutColon) == SyncSetupService.bisyncSessionName(for: withColon) else {
+            return report("AC-RI1", "bisync-session-name", false, "(profile session name wrong: \(SyncSetupService.bisyncSessionName(for: withColon)))")
+        }
+        return report("AC-RI1", "bisync-session-name", true)
+    }
+
+    // MARK: - AC-RI2 — a reinstall keeps the listings exactly while they still apply
+
+    private static func testReinstallKeepsBisyncListings() -> Bool {
+        var base = sampleProfile()
+        base.syncMode = .bisync
+        base.rcloneRemote = "synology"
+        base.remotePath = "Kaiju/KAIJU"
+        base.localSyncPath = "/Users/me/KAIJU"
+
+        func keeps(_ change: (inout SyncProfile) -> Void, from old: SyncProfile? = nil) -> Bool {
+            var new = old ?? base
+            change(&new)
+            return SyncSetupService.reinstallKeepsBisyncListings(from: old ?? base, to: new)
+        }
+        // Settings that don't change what is synced keep them.
+        guard keeps({ $0.syncIntervalMinutes = 42 }),
+              keeps({ $0.additionalRcloneFlags = "--checksum" }),
+              keeps({ $0.fallbackRemote = "synology-sftp" }),
+              keeps({ $0.rcloneRemote = "synology:" }),          // same session, different spelling
+              keeps({ _ in }) else {                              // the Reinstall button
+            return report("AC-RI2", "reinstall-keeps-listings", false, "(a same-pair bisync reinstall would drop the listings)")
+        }
+        // A different pair, or leaving two-way mode, drops them.
+        guard !keeps({ $0.remotePath = "Kaiju/Other" }),
+              !keeps({ $0.localSyncPath = "/Users/me/KAIJU-2" }),
+              !keeps({ $0.rcloneRemote = "other-nas" }),
+              !keeps({ $0.syncMode = .sync }),
+              !keeps({ $0.syncMode = .mount }) else {
+            return report("AC-RI2", "reinstall-keeps-listings", false, "(listings kept for a pair or mode they no longer describe)")
+        }
+        var oneWay = base
+        oneWay.syncMode = .sync
+        guard !keeps({ $0.syncMode = .bisync }, from: oneWay) else {
+            return report("AC-RI2", "reinstall-keeps-listings", false, "(listings kept when switching into two-way mode)")
+        }
+        return report("AC-RI2", "reinstall-keeps-listings", true)
+    }
+
+    // MARK: - AC-RI3 — listing files on disk: found by rclone's name, removed precisely
+
+    private static func testBisyncListingFilesOnDisk() -> Bool {
+        let dir = "\(selfTestRoot)/ri3-bisync"
+        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        var profile = sampleProfile()
+        profile.syncMode = .bisync
+        profile.rcloneRemote = "nas"
+        profile.remotePath = "My Files"
+        profile.localSyncPath = "/Volumes/Seagate HD/Work"
+        let session = SyncSetupService.bisyncSessionName(for: profile)
+        let own = ["\(session).path1.lst", "\(session).path2.lst", "\(session).path1.lst-old", "\(session).lck"]
+        let sibling = "\(session)_old.path1.lst"   // a different profile whose folder name extends this one
+        for name in own + [sibling] {
+            FileManager.default.createFile(atPath: "\(dir)/\(name)", contents: Data("x".utf8))
+        }
+
+        guard SyncSetupService.shared.hasExistingListings(for: profile, in: dir) else {
+            return report("AC-RI3", "bisync-listing-files", false, "(listings for a path with spaces were not found)")
+        }
+        // A kept-listings reinstall removes only the lock.
+        SyncSetupService.shared.removeBisyncLock(for: profile, in: dir)
+        let afterLock = Set((try? FileManager.default.contentsOfDirectory(atPath: dir)) ?? [])
+        guard afterLock == Set(own.filter { !$0.hasSuffix(".lck") } + [sibling]),
+              SyncSetupService.shared.hasExistingListings(for: profile, in: dir) else {
+            return report("AC-RI3", "bisync-listing-files", false, "(removing the lock touched other files: \(afterLock.sorted()))")
+        }
+        SyncSetupService.shared.cleanupBisyncCache(for: profile, in: dir)
+        let remaining = (try? FileManager.default.contentsOfDirectory(atPath: dir)) ?? []
+        guard remaining == [sibling] else {
+            return report("AC-RI3", "bisync-listing-files", false, "(cleanup left \(remaining), expected only \(sibling))")
+        }
+        guard !SyncSetupService.shared.hasExistingListings(for: profile, in: dir) else {
+            return report("AC-RI3", "bisync-listing-files", false, "(listings still reported after cleanup)")
+        }
+        return report("AC-RI3", "bisync-listing-files", true)
+    }
+
+    // MARK: - AC-RI4 — no SyncTray resync is a bare --resync
+
+    /// A bare `--resync` is `--resync-mode path1`: the remote overwrites every local file that
+    /// differs. Every resync SyncTray starts must use the shared newer-wins arguments.
+    private static func testResyncNeverBare() -> Bool {
+        let args = SyncSetupService.resyncArguments(remote: "nas:Work", localPath: "/Users/me/Work")
+        guard args == ["bisync", "nas:Work", "/Users/me/Work", "--resync", "--resync-mode", "newer",
+                       "--verbose", "--use-json-log", "--stats", "2s"] else {
+            return report("AC-RI4", "resync-never-bare", false, "(unexpected resync arguments: \(args))")
+        }
+        guard let detailSource = readSourceFile("Views/Settings/ProfileDetailView.swift"),
+              let runResync = extractFunctionBody(startingAt: "private func runResync(", in: detailSource),
+              let managerSource = readSourceFile("Services/SyncManager.swift"),
+              let performResync = extractFunctionBody(startingAt: "private func performResync(", in: managerSource) else {
+            return report("AC-RI4", "resync-never-bare", false, "(could not read the resync call sites)")
+        }
+        for (name, body) in [("ProfileDetailView.runResync", runResync), ("SyncManager.performResync", performResync)] {
+            guard body.contains("SyncSetupService.resyncArguments("), !body.contains("\"--resync\"") else {
+                return report("AC-RI4", "resync-never-bare", false, "(\(name) builds its own --resync arguments)")
+            }
+        }
+        return report("AC-RI4", "resync-never-bare", true)
+    }
+
+    // MARK: - AC-RI5 — every reinstall path uses the listing-keeping teardown
+
+    private static func testReinstallTeardownRouting() -> Bool {
+        // CLI `reinstall`: teardown from the profile to itself, never the full uninstall.
+        let enabled = sampleProfile(id: UUID(), name: "Enabled", isEnabled: true)
+        var teardowns: [(UUID, UUID)] = []
+        let reinstallEnv = fakeCLIEnvironment(
+            readProfiles: { [enabled] },
+            uninstallProfile: { _ in "should-not-be-called" },
+            uninstallForReinstall: { current, updated in teardowns.append((current.id, updated.id)); return nil }
+        )
+        guard SyncTrayCLI.execute(["reinstall", enabled.shortId], env: reinstallEnv) == 0,
+              teardowns.count == 1 else {
+            return report("AC-RI5", "reinstall-teardown-routing", false, "(CLI reinstall did not use the reinstall teardown)")
+        }
+
+        // CLI `profile set` on a reinstall-triggering field: teardown from OLD to NEW.
+        var seen: (SyncProfile, SyncProfile)?
+        let setEnv = fakeCLIEnvironment(
+            readProfiles: { [enabled] },
+            uninstallProfile: { _ in "should-not-be-called" },
+            uninstallForReinstall: { current, updated in seen = (current, updated); return nil }
+        )
+        guard SyncTrayCLI.execute(["profile", "set", enabled.shortId, "syncIntervalMinutes", "42"], env: setEnv) == 0,
+              let pair = seen, pair.0.syncIntervalMinutes == enabled.syncIntervalMinutes, pair.1.syncIntervalMinutes == 42 else {
+            return report("AC-RI5", "reinstall-teardown-routing", false, "(CLI profile set did not tear down old → new)")
+        }
+
+        // Disabling still does the full uninstall (listings and filter removed, as before).
+        var fullUninstalls = 0
+        let disableEnv = fakeCLIEnvironment(
+            readProfiles: { [enabled] },
+            uninstallProfile: { _ in fullUninstalls += 1; return nil },
+            uninstallForReinstall: { _, _ in "should-not-be-called" }
+        )
+        guard SyncTrayCLI.execute(["profile", "disable", enabled.shortId], env: disableEnv) == 0, fullUninstalls == 1 else {
+            return report("AC-RI5", "reinstall-teardown-routing", false, "(disable no longer runs the full uninstall)")
+        }
+
+        // The app's two reinstall paths: the settings-save / Reinstall button path and the
+        // external-edit path.
+        guard let detailSource = readSourceFile("Views/Settings/ProfileDetailView.swift"),
+              let reinstall = extractFunctionBody(startingAt: "private func reinstallSync(", in: detailSource),
+              let save = extractFunctionBody(startingAt: "private func saveProfile(", in: detailSource),
+              let managerSource = readSourceFile("Services/SyncManager.swift"),
+              let external = extractFunctionBody(startingAt: "func applyExternalProfileEdit(", in: managerSource) else {
+            return report("AC-RI5", "reinstall-teardown-routing", false, "(could not read the app's reinstall paths)")
+        }
+        guard reinstall.contains("setupService.uninstallForReinstall("),
+              !reinstall.contains("setupService.uninstall(profile:"),
+              save.contains("reinstallSync(previous: currentProfile)") else {
+            return report("AC-RI5", "reinstall-teardown-routing", false, "(settings-save reinstall no longer keeps the listings)")
+        }
+        guard external.contains("uninstallForReinstall(from: currentProfile, to: updatedProfile)") else {
+            return report("AC-RI5", "reinstall-teardown-routing", false, "(external-edit reinstall no longer keeps the listings)")
+        }
+        return report("AC-RI5", "reinstall-teardown-routing", true)
     }
 }
 
