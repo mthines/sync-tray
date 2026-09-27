@@ -482,9 +482,10 @@ syntax and matching rules of `warmExcludePatterns`; `SyncExcludeFilter`
 the same files (rclone's unanchored rules match at any depth, its `**/` needs at
 least one folder, and `[ ] { } \` are syntax to it) and keeps them in a managed
 block at the TOP of `{shortId}-exclude.txt` (first match wins in rclone, so a
-pattern beats any hand-written `+` include below). Lines outside the block are the
-user's and are never touched. The sync script re-reads that file on every run, so
-an edit only needs the file rewritten: the in-app editor
+pattern beats any hand-written `+` include below). Changing the patterns never
+touches the lines outside the block (a reinstall still recreates the whole file
+from the defaults, because `uninstall` deletes it). The sync script re-reads that
+file on every run, so an edit only needs the file rewritten: the in-app editor
 (`SyncManager.updateSyncExcludePatterns`), the external-edit watcher and the CLI's
 `writeProfile` all go through `applySyncFilterReconcileIfNeeded` /
 `writeSyncExcludeFilter`, and `reconcileAction` returns `.none`. Keep it that way:

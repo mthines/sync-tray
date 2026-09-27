@@ -164,7 +164,7 @@ For Two-Way and One-Way profiles, skip files you don't want synced with the same
 
 - Matching files stop syncing; nothing is deleted on either side
 - Patterns are case-sensitive and apply from the next sync, with no re-sync
-- Stored as rclone exclude rules at the top of the profile's exclude filter file; your own rules in that file are left alone
+- Stored as rclone exclude rules in a SyncTray-managed block at the top of the profile's exclude filter file; changing the list rewrites only that block
 
 ### One-Click Actions
 
