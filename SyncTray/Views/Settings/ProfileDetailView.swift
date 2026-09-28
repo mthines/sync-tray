@@ -1573,7 +1573,7 @@ struct ProfileDetailView: View {
                 VStack(alignment: .leading, spacing: 2) {
                     Label("Cache only — not syncing", systemImage: "icloud.slash")
                         .font(.caption.weight(.medium))
-                    Text("Serving cached files read-only. Files that aren't cached won't download, and anything recorded here stays queued until you resume syncing — nothing is lost.")
+                    Text("Serving cached files from this Mac. You can edit them and add new files; those changes stay queued until you upload or resume syncing — nothing is lost. Files that aren't cached won't download.")
                         .font(.caption)
                 }
                 .foregroundStyle(.orange)
