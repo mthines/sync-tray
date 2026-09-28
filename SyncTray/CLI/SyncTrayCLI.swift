@@ -376,8 +376,11 @@ enum SyncTrayCLI {
             let arg = args[index]
             if let eq = arg.firstIndex(of: "="), arg.hasPrefix("--"), valueFlags.contains(String(arg[..<eq])) {
                 values[String(arg[..<eq])] = String(arg[arg.index(after: eq)...])
-            } else if valueFlags.contains(arg), index + 1 < args.count {
-                values[arg] = args[index + 1]
+            } else if valueFlags.contains(arg) {
+                // A value flag with nothing after it gets an empty value, which its parser
+                // rejects — never a bare flag, which would silently drop it (`status X --wait`
+                // printing once and exiting 0 instead of blocking).
+                values[arg] = index + 1 < args.count ? args[index + 1] : ""
                 index += 1
             } else if arg.hasPrefix("-") {
                 bools.insert(arg)

@@ -1275,6 +1275,10 @@ enum ConfigSelfTest {
                                     wait: StatusWait(states: [.mounted, .stale], timeout: 30))),
               case .failure = SyncTrayCLI.parse(["status", "KaijuNew", "--wait", "bogus"]),
               case .failure = SyncTrayCLI.parse(["status", "--wait", "mounted"]),
+              // A trailing value flag with no value is an error, not a silently dropped flag.
+              case .failure = SyncTrayCLI.parse(["status", "KaijuNew", "--wait"]),
+              case .failure = SyncTrayCLI.parse(["status", "KaijuNew", "--wait", "mounted", "--timeout"]),
+              case .failure = SyncTrayCLI.parse(["mount", "KaijuNew", "--timeout"]),
               case .success(.mount("KaijuNew", 45)) = SyncTrayCLI.parse(["mount", "--timeout=45", "KaijuNew"]) else {
             return report("AC-CLI10", "cli-status-states", false, "(--wait/--timeout did not parse)")
         }
