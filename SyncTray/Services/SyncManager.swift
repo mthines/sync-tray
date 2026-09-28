@@ -3878,13 +3878,17 @@ final class SyncManager: ObservableObject {
     }
 
     /// Write one profile's list, logging (never throwing) on failure — a failed walk has
-    /// already removed any stale copy, so the script falls back to streaming.
+    /// already removed any stale copy, so the script falls back to streaming. The failure
+    /// also goes to telemetry at warn: the debug log is off by default, and otherwise the
+    /// next offline mount would quietly stream instead of mounting Cache Only.
     nonisolated private static func writeCacheOnlyExcludeList(for profile: SyncProfile) {
         do {
             let count = try VFSCacheService.shared.writeCacheOnlyExcludeList(for: profile)
             SyncTraySettings.debugLog("'\(profile.name)': Cache Only partial-file list written (\(count) excluded)")
         } catch {
             SyncTraySettings.debugLog("'\(profile.name)': Cache Only partial-file list failed: \(error.localizedDescription)")
+            TelemetryService.shared.recordCacheOnlyListFailed(
+                profileId: profile.id, profileName: profile.name, error: error)
         }
     }
 

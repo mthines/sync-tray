@@ -2443,6 +2443,21 @@ final class TelemetryService {
         emitLog(severity: .info, body: "Mount mode changed", attributes: attrs)
     }
 
+    /// Record a failed Cache Only partial-file list write (`SyncManager.writeCacheOnlyExcludeList`).
+    /// The failed walk removed any stale list, so the profile's next offline mount streams
+    /// instead of mounting Cache Only. `error.type` is the bounded `categorizeError` bucket —
+    /// never the error text, which names a cache path.
+    func recordCacheOnlyListFailed(profileId: UUID, profileName: String, error: Error) {
+        guard SyncTraySettings.telemetryEnabled else { return }
+        ensureSetup()
+        let attrs: [String: AttributeValue] = [
+            "synctray.profile.id": .string(profileId.uuidString),
+            "synctray.profile.name": .string(profileName),
+            "error.type": .string(categorizeError(error.localizedDescription)),
+        ]
+        emitLog(severity: .warn, body: "Cache Only list write failed", attributes: attrs)
+    }
+
     /// Record an automatic Cache Only -> Streaming resume decision. `result` is bounded:
     /// `resumed` | `deferred_busy` | `busy_check_failed`.
     func recordAutoResume(profileId: UUID, profileName: String, result: String) {
