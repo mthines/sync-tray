@@ -355,6 +355,20 @@ struct OverlaySyncService {
         }
 
         let cacheRoots = VFSCacheService.shared.cacheSubtreeRoots(for: profile)
+        // Once a drained file's content is on the remote, a CLEAN (non-Dirty) shadowed base
+        // cache entry is stale — delete it so it can't resurface in a later Cache-only
+        // session. A Dirty one is an unsynced streaming recording; leave it, rclone uploads
+        // it when streaming resumes.
+        func removeStaleBaseEntry(_ relativePath: String) {
+            let dataPath = (cacheRoots.data as NSString).appendingPathComponent(relativePath)
+            let metaPath = (cacheRoots.meta as NSString).appendingPathComponent(relativePath)
+            if let metaData = fileManager.contents(atPath: metaPath),
+               let meta = try? JSONDecoder().decode(VFSCacheService.VFSCacheMeta.self, from: metaData),
+               meta.Dirty != true {
+                try? fileManager.removeItem(atPath: dataPath)
+                try? fileManager.removeItem(atPath: metaPath)
+            }
+        }
         let bytesTotal = files.reduce(Int64(0)) { $0 + $1.size }
         var bytesDone: Int64 = 0
         progress?(OverlayUploadProgress(filesDone: 0, filesTotal: files.count, bytesDone: 0, bytesTotal: bytesTotal))
@@ -413,6 +427,9 @@ struct OverlaySyncService {
                 result.alreadyUploaded += 1
                 if mode == .drain {
                     try? fileManager.removeItem(atPath: file.absolutePath)
+                    // Upload Now already put this version on the remote, so the base is
+                    // just as stale as after an upload below.
+                    removeStaleBaseEntry(file.relativePath)
                     manifest.removeValue(forKey: file.relativePath)
                 }
 
@@ -446,18 +463,7 @@ struct OverlaySyncService {
                     bytesDone += file.size
                     if mode == .drain {
                         try? fileManager.removeItem(atPath: file.absolutePath)
-                        // A CLEAN (non-Dirty) shadowed base cache entry is now stale —
-                        // delete it so it can't resurface in a later Cache-only session.
-                        // A Dirty one is an unsynced streaming recording; leave it, rclone
-                        // uploads it when streaming resumes.
-                        let dataPath = (cacheRoots.data as NSString).appendingPathComponent(file.relativePath)
-                        let metaPath = (cacheRoots.meta as NSString).appendingPathComponent(file.relativePath)
-                        if let metaData = fileManager.contents(atPath: metaPath),
-                           let meta = try? JSONDecoder().decode(VFSCacheService.VFSCacheMeta.self, from: metaData),
-                           meta.Dirty != true {
-                            try? fileManager.removeItem(atPath: dataPath)
-                            try? fileManager.removeItem(atPath: metaPath)
-                        }
+                        removeStaleBaseEntry(file.relativePath)
                         manifest.removeValue(forKey: file.relativePath)
                     } else {
                         // Record what the remote ACTUALLY holds now, which a later run

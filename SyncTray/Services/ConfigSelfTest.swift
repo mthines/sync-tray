@@ -3445,11 +3445,22 @@ enum ConfigSelfTest {
 
         // A later DRAIN of the same unchanged (already-uploaded) file deletes it WITHOUT
         // re-uploading — Upload Now's manifest is honoured by the eventual Resume Syncing.
+        // The clean base cache entry it shadowed holds the pre-edit version, so the drain
+        // removes it too, or the next Cache-only session would show the old file.
+        let dataDir = "\(root)/cache/vfs/synology"
+        let metaDir = "\(root)/cache/vfsMeta/synology"
+        writeFile("\(dataDir)/keep.txt", "stale base from before the edit")
+        writeFile("\(metaDir)/keep.txt", "{\"Size\":31,\"Dirty\":false,\"Fingerprint\":\"31,2024-01-01 00:00:00 +0000 UTC\"}")
         let beforeDrainCalls = client.uploadCount
         let drainResult = await_ { await service.run(
             profile: profile, remoteBase: "testremote:", mode: .drain, transport: "primary", client: client) }
         guard !FileManager.default.fileExists(atPath: "\(overlay)/keep.txt"), client.uploadCount == beforeDrainCalls else {
             return report("AC-OU3", "overlay-upload-now", false, "(later drain re-uploaded an Upload-Now-kept file: \(drainResult))")
+        }
+        guard drainResult.alreadyUploaded >= 1,
+              !FileManager.default.fileExists(atPath: "\(dataDir)/keep.txt"),
+              !FileManager.default.fileExists(atPath: "\(metaDir)/keep.txt") else {
+            return report("AC-OU3", "overlay-upload-now", false, "(draining an already-uploaded file kept its stale base cache entry: \(drainResult))")
         }
 
         return report("AC-OU3", "overlay-upload-now", true)
