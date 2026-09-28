@@ -3586,11 +3586,16 @@ final class SyncManager: ObservableObject {
         mountProfile(updated)
     }
 
-    /// "Upload Now" — push overlay files to the remote WITHOUT leaving Cache Only.
+    /// "Upload Now" — push overlay files to the remote WITHOUT leaving Cache Only. One run
+    /// per profile at a time: a click while a run is in flight (including its reachability
+    /// probe, before the button disables) is ignored. Cancelling the old run instead would
+    /// not stop it — the upload engine never checks cancellation — so both would upload the
+    /// same files, the later one as spurious conflict copies.
     func uploadNow(profileId: UUID) {
-        guard let profile = profileStore.profile(for: profileId), profile.isMountMode else { return }
-        overlayUploadTasks[profileId]?.cancel()
+        guard let profile = profileStore.profile(for: profileId), profile.isMountMode,
+              overlayUploadTasks[profileId] == nil else { return }
         overlayUploadTasks[profileId] = Task {
+            defer { self.overlayUploadTasks[profileId] = nil }
             guard let resolved = await resolveUploadTransport(for: profile) else {
                 SyncTraySettings.debugLog("'\(profile.name)': Upload Now found no reachable remote")
                 TelemetryService.shared.recordOverlayUploadUnreachable(

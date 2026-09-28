@@ -3507,6 +3507,17 @@ enum ConfigSelfTest {
             return report("AC-OU3", "overlay-upload-now", false, "(draining an already-uploaded file kept its stale base cache entry: \(drainResult))")
         }
 
+        // One Upload Now per profile at a time: a second click is ignored while a run is in
+        // flight, never a cancel-and-restart (the engine doesn't check cancellation, so both
+        // runs would upload and the later one would write spurious conflict copies).
+        guard let managerSource = readSourceFile("Services/SyncManager.swift"),
+              let uploadNow = extractFunctionBody(startingAt: "func uploadNow(profileId: UUID)", in: managerSource),
+              uploadNow.contains("overlayUploadTasks[profileId] == nil"),
+              uploadNow.contains("defer { self.overlayUploadTasks[profileId] = nil }"),
+              !uploadNow.contains(".cancel()") else {
+            return report("AC-OU3", "overlay-upload-now", false, "(Upload Now can start a second run while one is in flight)")
+        }
+
         return report("AC-OU3", "overlay-upload-now", true)
     }
 
