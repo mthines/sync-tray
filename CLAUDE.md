@@ -867,7 +867,8 @@ are rclone's record of the last successful two-way sync. Without them the next r
 `--resync`, which copies every file both ways, brings back files deleted since the last sync,
 and overwrites the losing side of every file that differs. So:
 - **Every reinstall goes through `SyncSetupService.uninstallForReinstall(from:to:)`** — the
-  settings-save path (`ProfileDetailView.reinstallSync`), the Reinstall button, an external
+  settings-save path (`ProfileDetailView.reinstallSync`), the Reinstall button, Mount Anyway
+  (`enableNonEmptyMountAndReinstall`), an external
   `.profile.json` edit (`SyncManager.applyExternalProfileEdit`), and the CLI's `reinstall` /
   `profile set` (`CLIEnvironment.uninstallForReinstall`). It tears down the OLD profile (so a
   Stream profile detaches the volume that is actually mounted), keeps the exclude filter, and

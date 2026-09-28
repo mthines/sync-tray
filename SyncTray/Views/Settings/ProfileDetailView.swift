@@ -3556,9 +3556,11 @@ struct ProfileDetailView: View {
         // Clear any cached error
         syncManager.clearError(for: profile.id)
 
-        // Build updated profile and save
+        // Build updated profile and save. Capture what is installed right now first, so the
+        // teardown detaches the volume that is actually mounted.
         var updatedProfile = buildProfileFromForm()
         updatedProfile.allowNonEmptyMount = true
+        let installedProfile = profileStore.profile(for: profile.id) ?? updatedProfile
         profileStore.update(updatedProfile)
 
         // Reinstall with the new setting
@@ -3567,9 +3569,10 @@ struct ProfileDetailView: View {
 
         DispatchQueue.global(qos: .userInitiated).async {
             do {
-                // Uninstall first if already installed
+                // Tear down first if already installed — through the reinstall teardown, like
+                // every other reinstall, so the exclude filter (and any bisync state) survives.
                 if self.setupService.isInstalled(profile: updatedProfile) {
-                    try self.setupService.uninstall(profile: updatedProfile)
+                    try self.setupService.uninstallForReinstall(from: installedProfile, to: updatedProfile)
                 }
 
                 // Reinstall with new config

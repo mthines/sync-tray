@@ -3149,6 +3149,12 @@ enum ConfigSelfTest {
         guard external.contains("uninstallForReinstall(from: currentProfile, to: updatedProfile)") else {
             return report("AC-RI5", "reinstall-teardown-routing", false, "(external-edit reinstall no longer keeps the listings)")
         }
+        // Mount Anyway (the non-empty-folder recovery action) reinstalls too.
+        guard let mountAnyway = extractFunctionBody(startingAt: "private func enableNonEmptyMountAndReinstall(", in: detailSource),
+              mountAnyway.contains("setupService.uninstallForReinstall(from: installedProfile, to: updatedProfile)"),
+              !mountAnyway.contains("setupService.uninstall(profile:") else {
+            return report("AC-RI5", "reinstall-teardown-routing", false, "(Mount Anyway reinstall no longer uses the reinstall teardown)")
+        }
         return report("AC-RI5", "reinstall-teardown-routing", true)
     }
 
