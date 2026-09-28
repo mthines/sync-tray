@@ -3430,6 +3430,18 @@ final class SyncManager: ObservableObject {
         return OverlaySyncService.pendingCount(overlayPath: profile.overlayPath, manifest: manifest)
     }
 
+    /// Why a Stream profile's cache directory can't change right now, or nil when it can.
+    /// The Cache Only overlay lives under `vfsCachePath`, and neither a move nor a re-point
+    /// carries it along, so files still waiting to upload would be stranded at the old
+    /// location. The app's Save refuses with this; the CLI refuses the same change with its
+    /// own wording. Pure.
+    nonisolated static func cacheDirectoryChangeBlockedReason(pendingUploads: Int) -> String? {
+        guard pendingUploads > 0 else { return nil }
+        let files = pendingUploads == 1 ? "1 file is" : "\(pendingUploads) files are"
+        return "\(files) waiting to upload from Cache Only. Upload them (Upload Now or Resume Syncing) "
+            + "before changing the cache directory."
+    }
+
     /// Bridge `isRemoteReachable`'s blocking, MainActor-isolated probe into something a
     /// `Task` can `await` without holding up the main actor for the probe's up-to-12s
     /// wall-clock cap — the same off-actor hop `checkPrimaryRecovery` uses, just wrapped as

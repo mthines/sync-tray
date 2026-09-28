@@ -3554,6 +3554,20 @@ enum ConfigSelfTest {
                           "(profile set vfsCachePath was not refused while overlay files are pending: exit=\(setExit))")
         }
 
+        // The app refuses too: Save with a changed Cache Directory, and Offline Files'
+        // "Move Cache…", both while files are pending.
+        guard SyncManager.cacheDirectoryChangeBlockedReason(pendingUploads: 0) == nil,
+              SyncManager.cacheDirectoryChangeBlockedReason(pendingUploads: 1)?.hasPrefix("1 file is waiting") == true,
+              SyncManager.cacheDirectoryChangeBlockedReason(pendingUploads: 3)?.hasPrefix("3 files are waiting") == true,
+              let detailSource = readSourceFile("Views/Settings/ProfileDetailView.swift"),
+              let save = extractFunctionBody(startingAt: "private func saveProfile(", in: detailSource),
+              save.contains("SyncManager.cacheDirectoryChangeBlockedReason("),
+              let offlineSource = readSourceFile("Views/Settings/OfflineFilesSection.swift"),
+              offlineSource.contains(".disabled(syncManager.pendingUploadCount(for: profile.id) > 0)") else {
+            return report("AC-OU4", "cache-move-blocked-pending", false,
+                          "(the app can change the cache directory while overlay files are pending)")
+        }
+
         // Negative check: once the overlay is empty, both commands proceed normally.
         try? FileManager.default.removeItem(atPath: "\(profile.overlayPath)/pending.txt")
         var migrateCalledAfter = false

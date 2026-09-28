@@ -2201,6 +2201,15 @@ struct ProfileDetailView: View {
         let updatedProfile = buildProfileFromForm()
         let currentProfile = profile
 
+        // Refuse a Cache Directory change while Cache Only files wait to upload: the overlay
+        // lives under the cache directory, so they would be stranded at the old location.
+        if updatedProfile.isMountMode, updatedProfile.vfsCachePath != currentProfile.vfsCachePath,
+           let reason = SyncManager.cacheDirectoryChangeBlockedReason(
+               pendingUploads: syncManager.pendingUploadCount(for: profile.id)) {
+            installError = reason
+            return
+        }
+
         // A Stream profile whose Cache Directory changed needs a decision about
         // the files already cached at the old location before anything reinstalls —
         // hand off to the move sheet instead of saving vfsCachePath immediately.
