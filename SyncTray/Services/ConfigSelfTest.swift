@@ -3584,6 +3584,64 @@ enum ConfigSelfTest {
             return report("AC-OU4", "cache-move-blocked-pending", false, "(cache move stayed blocked with an empty overlay)")
         }
 
+        // A co-migrated sibling is repointed too, and its overlay stays under its own
+        // vfsCachePath: its pending files block the move exactly like the mover's.
+        var sibling = mountFixtureProfile(
+            localPath: "\(root)/mnt-reaper", cachePath: "\(root)/cache", remotePath: "Kaiju/KAIJU/Reaper")
+        sibling.name = "Reaper"
+        writeFile("\(sibling.overlayPath)/take.wav", "recorded in Cache Only")
+        let counts: [UUID: Int] = [sibling.id: 2]
+        guard SyncManager.cacheMoveBlockedReason(moving: profile, coMigrate: [], pendingUploads: { counts[$0.id] ?? 0 }) == nil,
+              let siblingReason = SyncManager.cacheMoveBlockedReason(
+                  moving: profile, coMigrate: [sibling], pendingUploads: { counts[$0.id] ?? 0 }),
+              siblingReason.contains("\"Reaper\" (2 files)"),
+              SyncManager.cacheMoveBlockedReason(
+                  moving: profile, coMigrate: [sibling], pendingUploads: { _ in 1 })?.contains("1 file is") == true,
+              SyncManager.pendingUploadCount(of: sibling) == 1 else {
+            return report("AC-OU4", "cache-move-blocked-pending", false, "(a co-migrated sibling's pending uploads did not block the move)")
+        }
+
+        // CLI: `--include-overlapping` would repoint the sibling → refused before migrating.
+        var overlapMigrated = false
+        var overlapStderr = ""
+        let overlapEnv = fakeCLIEnvironment(
+            readProfiles: { [profile, sibling] },
+            stderr: { overlapStderr += $0 },
+            migrateCache: { _, _, _ in overlapMigrated = true; return .completed(files: 0, bytes: 0, sameVolume: true) })
+        let overlapExit = SyncTrayCLI.execute(
+            ["cache", "move", profile.shortId, "--to", "\(root)/newcache3", "--include-overlapping"], env: overlapEnv)
+        guard overlapExit != 0, !overlapMigrated, overlapStderr.contains("Reaper") else {
+            return report("AC-OU4", "cache-move-blocked-pending", false,
+                          "(cache move --include-overlapping moved a sibling with pending uploads: exit=\(overlapExit) stderr=\(overlapStderr))")
+        }
+        try? FileManager.default.removeItem(atPath: "\(sibling.overlayPath)/take.wav")
+        var overlapMigratedAfter = false
+        let overlapEnv2 = fakeCLIEnvironment(
+            readProfiles: { [profile, sibling] },
+            migrateCache: { _, _, _ in overlapMigratedAfter = true; return .completed(files: 0, bytes: 0, sameVolume: true) })
+        _ = SyncTrayCLI.execute(
+            ["cache", "move", profile.shortId, "--to", "\(root)/newcache4", "--include-overlapping"], env: overlapEnv2)
+        guard overlapMigratedAfter else {
+            return report("AC-OU4", "cache-move-blocked-pending", false, "(cache move --include-overlapping stayed blocked once the sibling's overlay was empty)")
+        }
+
+        // App: every move runs through migrateCacheDirectory, which checks every profile it
+        // repoints before detaching anything; the sheet can't tick a blocked same-root
+        // sibling and disables the move while an overlapping one is blocked.
+        guard let managerSource = readSourceFile("Services/SyncManager.swift"),
+              let migrate = extractFunctionBody(startingAt: "private func migrateCacheDirectory(", in: managerSource),
+              let guardAt = migrate.range(of: "Self.cacheMoveBlockedReason("),
+              let detachAt = migrate.range(of: "detachForCacheMigration("),
+              guardAt.lowerBound < detachAt.lowerBound,
+              migrate.contains("coMigrate: coMigrate.compactMap { profileStore.profile(for: $0) }"),
+              let sheetSource = readSourceFile("Views/Settings/CacheMoveSheet.swift"),
+              let toggle = extractFunctionBody(startingAt: "private func sameRootToggle(", in: sheetSource),
+              toggle.contains(".disabled(pending > 0)"),
+              sheetSource.contains(".disabled(moveBlockedReason != nil)"),
+              sheetSource.contains("case .preflightRejected(.pendingUploads(let reason)):") else {
+            return report("AC-OU4", "cache-move-blocked-pending", false, "(the app's cache move does not check co-migrated siblings for pending uploads)")
+        }
+
         return report("AC-OU4", "cache-move-blocked-pending", true)
     }
 

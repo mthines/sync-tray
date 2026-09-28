@@ -2741,6 +2741,19 @@ final class SyncManager: ObservableObject {
         let allProfiles = profileStore.profiles
         let startedAt = Date()
 
+        // Refuse before anything is cancelled or detached when a profile this run repoints
+        // still has Cache Only files waiting to upload: its overlay stays under the old
+        // `vfsCachePath`. Every app entry point (the Save-time prompt, Offline Files' Move
+        // Cache…, and each ticked same-root sibling's own run) comes through here.
+        if let reason = Self.cacheMoveBlockedReason(
+            moving: movingProfile,
+            coMigrate: coMigrate.compactMap { profileStore.profile(for: $0) },
+            pendingUploads: Self.pendingUploadCount(of:)
+        ) {
+            return CacheMigrationOutcome(
+                result: .preflightRejected(.pendingUploads(reason)), filesMoved: 0, bytesMoved: 0, sameVolume: false)
+        }
+
         // R5 — cancel any warm reading through the mount BEFORE any file is touched.
         let affectedIds = [profileId] + coMigrate
         for id in affectedIds { cancelWarm(for: id) }
@@ -3426,8 +3439,41 @@ final class SyncManager: ObservableObject {
     /// show as "N files waiting to upload".
     func pendingUploadCount(for profileId: UUID) -> Int {
         guard let profile = profileStore.profile(for: profileId) else { return 0 }
+        return Self.pendingUploadCount(of: profile)
+    }
+
+    /// `pendingUploadCount(for:)` for a profile value — reads only that profile's overlay
+    /// and manifest on disk, so the CLI can use it too.
+    nonisolated static func pendingUploadCount(of profile: SyncProfile) -> Int {
         let manifest = OverlaySyncService.loadManifest(path: profile.overlayManifestPath)
         return OverlaySyncService.pendingCount(overlayPath: profile.overlayPath, manifest: manifest)
+    }
+
+    /// Why a cache move can't run right now, or nil when it can. A move repoints EVERY
+    /// profile it carries — the one being moved plus each co-migrated sibling (an
+    /// overlapping one that shares the same cached bytes, or a same-root one the user
+    /// ticked) — and each of those keeps its own Cache Only overlay under its own
+    /// `vfsCachePath`, which the move does not carry along. So any of them with files still
+    /// waiting to upload would have them stranded at the old location. The app's
+    /// `migrateCacheDirectory` and the CLI's `cache move --include-overlapping` both refuse
+    /// with this. Pure over `pendingUploads`.
+    nonisolated static func cacheMoveBlockedReason(
+        moving: SyncProfile, coMigrate: [SyncProfile], pendingUploads: (SyncProfile) -> Int
+    ) -> String? {
+        if let reason = cacheDirectoryChangeBlockedReason(pendingUploads: pendingUploads(moving)) {
+            return reason
+        }
+        let blocked = coMigrate.filter { $0.id != moving.id }.compactMap { sibling -> String? in
+            let pending = pendingUploads(sibling)
+            guard pending > 0 else { return nil }
+            return "\"\(sibling.name)\" (\(pending) \(pending == 1 ? "file" : "files"))"
+        }
+        guard !blocked.isEmpty else { return nil }
+        let one = blocked.count == 1
+        return "\(blocked.joined(separator: ", ")) \(one ? "moves" : "move") with this cache and "
+            + "\(one ? "has" : "have") files waiting to upload from Cache Only. Upload them in "
+            + "\(one ? "that profile" : "those profiles") (Upload Now or Resume Syncing) before moving "
+            + "the cache directory."
     }
 
     /// Why a Stream profile's cache directory can't change right now, or nil when it can.

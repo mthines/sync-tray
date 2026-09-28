@@ -1343,7 +1343,8 @@ enum SyncTrayCLI {
     // MARK: - cache move
 
     private static func runCacheMove(_ target: String, destination: String, includeOverlapping: Bool, env: CLIEnvironment) -> Int32 {
-        guard let profile = resolveProfile(target, in: env.readProfiles()) else {
+        let profiles = env.readProfiles()
+        guard let profile = resolveProfile(target, in: profiles) else {
             env.stderr("error: no profile matches \"\(target)\"\n")
             return 1
         }
@@ -1362,6 +1363,19 @@ enum SyncTrayCLI {
                 "error: \(pending) file(s) waiting to upload from Cache Only — "
                     + "resolve them (Upload Now / Resume Syncing) before moving the cache directory\n")
             return 1
+        }
+
+        // `--include-overlapping` repoints every overlapping sibling too, and each keeps its
+        // own overlay under its own `vfsCachePath` — refuse the same way for those.
+        if includeOverlapping {
+            let (overlapping, _) = CacheMigrationPlanner.classifySiblings(
+                of: profile, sourceRoot: CacheMigrationPlanner.normalizeRoot(profile.vfsCachePath),
+                allProfiles: profiles)
+            if let reason = SyncManager.cacheMoveBlockedReason(
+                moving: profile, coMigrate: overlapping, pendingUploads: SyncManager.pendingUploadCount(of:)) {
+                env.stderr("error: \(reason)\n")
+                return 1
+            }
         }
 
         switch env.migrateCache(profile, destination, includeOverlapping) {

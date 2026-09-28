@@ -362,7 +362,13 @@ the saved profile and reinstalling with exactly that profile, so unsaved edits
 elsewhere in the form are neither applied nor discarded. A **cache-directory
 move is refused** while the overlay has pending (undrained) files — both the
 CLI (`cache move`) and the save-time prompt check `OverlaySyncService.pendingCount`
-and error out rather than relocating an overlay that still owes an upload.
+and error out rather than relocating an overlay that still owes an upload. The
+check covers **every profile the move repoints**, not only the one being moved:
+an overlapping sibling (always co-migrated) or a ticked same-root sibling keeps
+its own overlay under its own `vfsCachePath`, so `SyncManager.migrateCacheDirectory`
+(every app entry point) and `cache move --include-overlapping` refuse via
+`SyncManager.cacheMoveBlockedReason`, and `CacheMoveSheet` won't tick a blocked
+same-root sibling.
 
 #### Mount preflight — never mount with the cache silently disabled
 
