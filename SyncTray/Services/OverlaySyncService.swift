@@ -546,23 +546,38 @@ struct OverlaySyncService {
             let (exit, stdout, _) = CLIEnvironment.runRcloneProcess(args: args, timeout: timeout)
             if exit == 3 { return .success([]) }  // directory not found == empty
             guard exit == 0 else { return .failure(.rcloneFailed(exitCode: exit)) }
-            guard let data = stdout.data(using: .utf8),
-                  let raw = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]]
-            else { return .success([]) }
-
-            let entries: [RemoteEntry] = raw.compactMap { item in
-                guard let name = item["Name"] as? String,
-                      let size = (item["Size"] as? NSNumber)?.int64Value,
-                      let modTime = Self.parseModTime(item["ModTime"])
-                else { return nil }
-                return RemoteEntry(name: name, size: size, modTime: modTime)
-            }
+            guard let entries = Self.parseListing(stdout) else { return .failure(.rcloneFailed(exitCode: exit)) }
             return .success(entries)
         }
 
-        /// rclone `lsjson` `ModTime` (RFC 3339, with or without fractional seconds).
-        private static func parseModTime(_ value: Any?) -> Date? {
-            guard let string = value as? String else { return nil }
+        /// Parse `lsjson` output; nil when it isn't a JSON array, which says nothing about
+        /// what the remote holds (a failure, like a failed listing — never "empty"). An
+        /// entry is never dropped for an unreadable field, since a missing entry makes its
+        /// file look absent and the planner would upload over the remote copy with no
+        /// conflict check. An unparseable `ModTime` becomes `.distantPast` and a missing
+        /// `Size` becomes -1: neither can match the expected state, so the file uploads as
+        /// a conflict copy instead. Pure.
+        static func parseListing(_ stdout: String) -> [RemoteEntry]? {
+            guard let data = stdout.data(using: .utf8),
+                  let raw = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]]
+            else { return nil }
+            return raw.compactMap { item in
+                guard let name = item["Name"] as? String else { return nil }
+                let size = (item["Size"] as? NSNumber)?.int64Value ?? -1
+                return RemoteEntry(name: name, size: size, modTime: Self.parseModTime(item["ModTime"]) ?? .distantPast)
+            }
+        }
+
+        /// rclone `lsjson` `ModTime` (RFC 3339, with or without fractional seconds; rclone
+        /// prints up to nine digits and drops trailing zeros). The fraction is first cut or
+        /// padded to exactly three digits, so parsing never depends on how many digits
+        /// `ISO8601DateFormatter` accepts. Pure.
+        static func parseModTime(_ value: Any?) -> Date? {
+            guard var string = value as? String else { return nil }
+            if let range = string.range(of: #"\.[0-9]+"#, options: .regularExpression) {
+                let padded = String(string[range].dropFirst()) + "00"
+                string.replaceSubrange(range, with: "." + String(padded.prefix(3)))
+            }
             let formatter = ISO8601DateFormatter()
             formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
             if let date = formatter.date(from: string) { return date }

@@ -108,6 +108,7 @@ enum ConfigSelfTest {
             testOverlayUploadNow,
             testOverlayListingFailure,
             testUploadNowManifestRemoteState,
+            testOverlayListingParse,
             testCacheMoveBlockedPending,
             testCLIProfileSetRemovedKeys,
         ]
@@ -3392,6 +3393,49 @@ enum ConfigSelfTest {
                           "(an edit after Upload Now was planned as a conflict: \(second), copies=\(conflictCopies))")
         }
         return report("AC-OU6", "upload-now-manifest-remote-state", true)
+    }
+
+    // MARK: - AC-OU7 — a remote listing never hides a file the planner must not overwrite
+
+    private static func testOverlayListingParse() -> Bool {
+        typealias Client = OverlaySyncService.ProductionOverlayRemoteClient
+        let whole = Date(timeIntervalSince1970: 1_790_456_054)  // 2026-09-26T20:54:14Z
+        // rclone prints up to nine fractional digits and drops trailing zeros.
+        let cases: [(String, Date)] = [
+            ("2026-09-26T20:54:14Z", whole),
+            ("2026-09-26T22:54:14+02:00", whole),
+            ("2026-09-26T22:54:14.123456789+02:00", whole.addingTimeInterval(0.123)),
+            ("2026-09-26T20:54:14.5Z", whole.addingTimeInterval(0.5)),
+        ]
+        for (raw, expected) in cases {
+            guard let got = Client.parseModTime(raw), abs(got.timeIntervalSince(expected)) < 0.002 else {
+                return report("AC-OU7", "overlay-listing-parse", false,
+                              "(ModTime \(raw) parsed as \(String(describing: Client.parseModTime(raw))))")
+            }
+        }
+
+        // An entry whose ModTime can't be read stays in the listing, and plans as a conflict
+        // copy rather than a plain upload over the remote file.
+        let listing = #"[{"Path":"a.txt","Name":"a.txt","Size":5,"ModTime":"not a time","IsDir":false}]"#
+        guard let entries = Client.parseListing(listing), entries.count == 1,
+              let entry = entries.first, entry.name == "a.txt", entry.modTime == .distantPast else {
+            return report("AC-OU7", "overlay-listing-parse", false, "(an entry with an unreadable ModTime was dropped)")
+        }
+        let file = OverlaySyncService.OverlayFile(
+            relativePath: "a.txt", absolutePath: "/tmp/a.txt", size: 7, modificationDate: whole)
+        let expected = OverlaySyncService.RemoteState(size: 5, modTime: whole)
+        let remote = OverlaySyncService.RemoteState(size: entry.size, modTime: entry.modTime)
+        guard case .uploadConflict = OverlaySyncService.plan(
+            file: file, manifestEntry: nil, expected: expected, remote: remote, now: whole) else {
+            return report("AC-OU7", "overlay-listing-parse", false, "(an unreadable remote ModTime did not plan as a conflict)")
+        }
+
+        // Output that isn't a JSON array says nothing about the remote: a failure, not "empty".
+        guard Client.parseListing("rclone: something went wrong") == nil,
+              Client.parseListing("[]")?.isEmpty == true else {
+            return report("AC-OU7", "overlay-listing-parse", false, "(unparseable lsjson output read as an empty directory)")
+        }
+        return report("AC-OU7", "overlay-listing-parse", true)
     }
 
     // MARK: - AC-OU3 — Upload Now (keep mode)
