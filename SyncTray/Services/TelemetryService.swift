@@ -2443,12 +2443,23 @@ final class TelemetryService {
         emitLog(severity: .info, body: "Mount mode changed", attributes: attrs)
     }
 
-    /// Record a failed Cache Only partial-file list write (`SyncManager.writeCacheOnlyExcludeList`).
-    /// The failed walk removed any stale list, so the profile's next offline mount streams
-    /// instead of mounting Cache Only. `error.type` is the bounded `categorizeError` bucket —
-    /// never the error text, which names a cache path.
+    /// Profiles whose Cache Only list write has failed since its last success. A failed
+    /// write leaves no list, so the heartbeat retries it every few minutes; this keeps a
+    /// persistent failure to one log line until a write succeeds again. Guarded by
+    /// `cacheOnlyListLock` — the writes run off the main actor.
+    private var cacheOnlyListFailing: Set<UUID> = []
+    private let cacheOnlyListLock = NSLock()
+
+    /// Record a failed Cache Only partial-file list write (`SyncManager.writeCacheOnlyExcludeList`),
+    /// once per failure run (see `cacheOnlyListFailing`). The failed walk removed any stale
+    /// list, so the profile's next offline mount streams instead of mounting Cache Only.
+    /// `error.type` is the bounded `categorizeError` bucket — never the error text, which
+    /// names a cache path.
     func recordCacheOnlyListFailed(profileId: UUID, profileName: String, error: Error) {
-        guard SyncTraySettings.telemetryEnabled else { return }
+        cacheOnlyListLock.lock()
+        let isNewFailure = cacheOnlyListFailing.insert(profileId).inserted
+        cacheOnlyListLock.unlock()
+        guard isNewFailure, SyncTraySettings.telemetryEnabled else { return }
         ensureSetup()
         let attrs: [String: AttributeValue] = [
             "synctray.profile.id": .string(profileId.uuidString),
@@ -2456,6 +2467,13 @@ final class TelemetryService {
             "error.type": .string(categorizeError(error.localizedDescription)),
         ]
         emitLog(severity: .warn, body: "Cache Only list write failed", attributes: attrs)
+    }
+
+    /// Note a successful Cache Only list write, so the next failure is reported again.
+    func recordCacheOnlyListWritten(profileId: UUID) {
+        cacheOnlyListLock.lock()
+        cacheOnlyListFailing.remove(profileId)
+        cacheOnlyListLock.unlock()
     }
 
     /// Record an automatic Cache Only -> Streaming resume decision. `result` is bounded:
