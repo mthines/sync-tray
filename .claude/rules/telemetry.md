@@ -237,6 +237,12 @@ rollout. No event is emitted on a fresh install.
 | `synctray.cache.migration.throughput` | Histogram | Average copy throughput of a CROSS-volume cache-directory migration, MB/s (0 for a same-volume rename — a byte-for-byte throughput figure would be meaningless for a rename) |
 | `synctray.cache.migration.files` | Counter | Files relocated during a cache-directory migration |
 | `synctray.cache.migration.bytes` | Counter | Bytes relocated during a cache-directory migration |
+| `synctray.overlay.upload.count` | Counter | Cache Only overlay upload runs by `upload.trigger` (resume/auto_resume/upload_now), `upload.outcome` and `upload.transport` |
+| `synctray.overlay.upload.files` | Counter | Overlay files processed by an upload run, by `upload.file_result` (uploaded/conflict/already_uploaded/failed) |
+| `synctray.overlay.upload.bytes` | Counter | Bytes uploaded from the Cache Only overlay to the remote |
+| `synctray.overlay.upload.duration` | Histogram | Duration of a Cache Only overlay upload run, seconds |
+| `synctray.mount.mode_changes` | Counter | Mount mode transitions for a Stream profile (`mount.mode`: streaming/cache_only_manual/cache_only_offline/cache_only_pending) |
+| `synctray.mount.auto_resume` | Counter | Automatic Cache Only → Streaming resume decisions (`auto_resume.result`: resumed/deferred_busy/busy_check_failed) |
 
 ### Spans
 | Span | Kind | Description |
