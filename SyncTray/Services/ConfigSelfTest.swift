@@ -3039,9 +3039,12 @@ enum ConfigSelfTest {
         profile.remotePath = "My Files"
         profile.localSyncPath = "/Volumes/Seagate HD/Work"
         let session = SyncSetupService.bisyncSessionName(for: profile)
-        let own = ["\(session).path1.lst", "\(session).path2.lst", "\(session).path1.lst-old", "\(session).lck"]
-        let sibling = "\(session)_old.path1.lst"   // a different profile whose folder name extends this one
-        for name in own + [sibling] {
+        let own = ["\(session).path1.lst", "\(session).path2.lst", "\(session).path1.lst-old",
+                   "\(session).path2.lst-new", "\(session).lck"]
+        // Different profiles whose folder name extends this one: rclone keeps the `.`, so a
+        // `…/Work.old` sibling's files start with "<session>." too.
+        let siblings = ["\(session)_old.path1.lst", "\(session).old.path1.lst", "\(session).old.lck"]
+        for name in own + siblings {
             FileManager.default.createFile(atPath: "\(dir)/\(name)", contents: Data("x".utf8))
         }
 
@@ -3051,14 +3054,14 @@ enum ConfigSelfTest {
         // A kept-listings reinstall removes only the lock.
         SyncSetupService.shared.removeBisyncLock(for: profile, in: dir)
         let afterLock = Set((try? FileManager.default.contentsOfDirectory(atPath: dir)) ?? [])
-        guard afterLock == Set(own.filter { !$0.hasSuffix(".lck") } + [sibling]),
+        guard afterLock == Set(own.filter { !$0.hasSuffix(".lck") } + siblings),
               SyncSetupService.shared.hasExistingListings(for: profile, in: dir) else {
             return report("AC-RI3", "bisync-listing-files", false, "(removing the lock touched other files: \(afterLock.sorted()))")
         }
         SyncSetupService.shared.cleanupBisyncCache(for: profile, in: dir)
-        let remaining = (try? FileManager.default.contentsOfDirectory(atPath: dir)) ?? []
-        guard remaining == [sibling] else {
-            return report("AC-RI3", "bisync-listing-files", false, "(cleanup left \(remaining), expected only \(sibling))")
+        let remaining = Set((try? FileManager.default.contentsOfDirectory(atPath: dir)) ?? [])
+        guard remaining == Set(siblings) else {
+            return report("AC-RI3", "bisync-listing-files", false, "(cleanup left \(remaining.sorted()), expected only \(siblings))")
         }
         guard !SyncSetupService.shared.hasExistingListings(for: profile, in: dir) else {
             return report("AC-RI3", "bisync-listing-files", false, "(listings still reported after cleanup)")

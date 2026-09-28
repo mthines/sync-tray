@@ -371,17 +371,30 @@ final class SyncSetupService {
         return String(result)
     }
 
-    /// Remove rclone bisync cache files for a profile (listing files, lock files). Only files
-    /// named `<session>.<suffix>` — a bare prefix match would also catch a different profile
-    /// whose local folder merely starts with this one's name (`…/KAIJU` vs `…/KAIJU_old`).
+    /// Whether `fileName` is one of the files rclone bisync writes for `session` in its working
+    /// directory: the listings (`<session>.path1.lst`, `<session>.path2.lst` and their
+    /// `-new` / `-old` / `-err` / `-dry` variants) and the lock (`<session>.lck`). Matching
+    /// rclone's own suffixes rather than a bare `<session>.` prefix keeps a sibling profile
+    /// whose folder name extends this one's safe — with a `_` (`…/KAIJU_old`) or a `.`
+    /// (`…/KAIJU.old`, whose files are `<session>.old.path1.lst`, since canonicalization keeps
+    /// dots). Pure.
+    static func isBisyncSessionFile(_ fileName: String, session: String) -> Bool {
+        fileName == session + ".lck"
+            || fileName.hasPrefix(session + ".path1.lst")
+            || fileName.hasPrefix(session + ".path2.lst")
+    }
+
+    /// Remove rclone bisync cache files for a profile (listing files, lock file) — only the
+    /// names `isBisyncSessionFile` recognizes, so a different profile whose local folder merely
+    /// starts with this one's name (`…/KAIJU_old`, `…/KAIJU.old`) keeps its listings.
     /// - Parameter workDir: defaults to `bisyncWorkDir`; `ConfigSelfTest` passes a temp dir.
     func cleanupBisyncCache(for profile: SyncProfile, in workDir: String = SyncSetupService.bisyncWorkDir) {
         let fm = FileManager.default
         guard fm.fileExists(atPath: workDir) else { return }
 
-        let prefix = Self.bisyncSessionName(for: profile) + "."
+        let session = Self.bisyncSessionName(for: profile)
         if let files = try? fm.contentsOfDirectory(atPath: workDir) {
-            for file in files where file.hasPrefix(prefix) {
+            for file in files where Self.isBisyncSessionFile(file, session: session) {
                 let fullPath = (workDir as NSString).appendingPathComponent(file)
                 try? fm.removeItem(atPath: fullPath)
             }
