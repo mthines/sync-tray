@@ -877,11 +877,14 @@ and overwrites the losing side of every file that differs. So:
   Plain `uninstall(profile:)` (disable, delete, cache migration) still removes everything.
 - **Listing file names must match rclone's `bilib.SessionName`** —
   `SyncSetupService.bisyncSessionName(for:)` (`CanonicalPath(fullRemotePath) + ".." +
-  CanonicalPath(localSyncPath)`); `hasExistingListings` and `cleanupBisyncCache` both use it.
-  A mismatch (the old naming ignored spaces) makes a reinstall miss its listings and resync.
+  CanonicalPath(localSyncPath)`); `hasExistingListings` and `cleanupBisyncCache` both use it,
+  and the sync script's python `canon` (which names the session itself, since its REMOTE can
+  be the fallback) must replace exactly the same characters — Go's ASCII-only `\s`, never
+  `str.isspace()`. A mismatch (the old naming ignored spaces) makes a reinstall miss its
+  listings and resync.
 - **Every resync SyncTray starts uses `SyncSetupService.resyncArguments`** (`--resync-mode
   newer`), never a bare `--resync`, which means `--resync-mode path1` — remote wins.
-Covered by `ConfigSelfTest` AC-RI1–AC-RI5.
+Covered by `ConfigSelfTest` AC-RI1–AC-RI6.
 
 ## Debugging
 

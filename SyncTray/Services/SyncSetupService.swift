@@ -354,13 +354,21 @@ final class SyncSetupService {
     }
 
     /// rclone's `bilib.CanonicalPath`: trim `\` and `/` from both ends, then replace every
-    /// whitespace character (Go's `\s`: space, tab, newline, form feed, carriage return) and
-    /// every `\ / : ? *` with `_`. The old SyncTray version only replaced `:` and `/`, so a
-    /// path with a space never matched rclone's listing names.
+    /// whitespace character (Go's `\s`: space, tab, newline, form feed, carriage return — not
+    /// other Unicode spaces such as U+00A0) and every `\ / : ? *` with `_`. The old SyncTray
+    /// version only replaced `:` and `/`, so a path with a space never matched rclone's
+    /// listing names. Works on Unicode scalars, as Go's regexp works on runes: a Swift
+    /// `Character` can fuse `\r\n`, or a space with a following combining mark, into one
+    /// grapheme that would slip past the set. The sync script's python `canon` must stay
+    /// identical (AC-RI6 runs it against this). Pure.
     static func canonicalBisyncPath(_ path: String) -> String {
         let trimmed = path.trimmingCharacters(in: CharacterSet(charactersIn: "\\/"))
-        let replaced: Set<Character> = [" ", "\t", "\n", "\u{0C}", "\r", "\\", "/", ":", "?", "*"]
-        return String(trimmed.map { replaced.contains($0) ? "_" : $0 })
+        let replaced: Set<Unicode.Scalar> = [" ", "\t", "\n", "\u{0C}", "\r", "\\", "/", ":", "?", "*"]
+        var result = String.UnicodeScalarView()
+        for scalar in trimmed.unicodeScalars {
+            result.append(replaced.contains(scalar) ? "_" : scalar)
+        }
+        return String(result)
     }
 
     /// Remove rclone bisync cache files for a profile (listing files, lock files). Only files
@@ -622,8 +630,9 @@ final class SyncSetupService {
     // MARK: - Script Generation
 
     /// Generate the shared sync script that reads config from JSON
-    /// Supports bisync (two-way), sync (one-way), and mount (streaming) modes
-    private func generateSyncScript() -> String {
+    /// Supports bisync (two-way), sync (one-way), and mount (streaming) modes.
+    /// Internal (not private) so `ConfigSelfTest` can run the script's own snippets.
+    func generateSyncScript() -> String {
         return """
             #!/bin/bash
             # SyncTray Sync Script
@@ -966,18 +975,24 @@ final class SyncSetupService {
                 # newer-wins so failover works unattended (no app required) and a
                 # stale remote copy can never overwrite newer local edits.
                 #
-                # Session name mirrors rclone's bilib.SessionName/CanonicalPath:
-                # trim leading/trailing slashes, replace whitespace and /:?* with
-                # "_", join path1..path2. (Backslashes, which rclone also replaces,
-                # cannot occur in macOS paths or these remote names.)
+                # Session name mirrors rclone's bilib.SessionName/CanonicalPath and
+                # SyncSetupService.canonicalBisyncPath character for character:
+                # trim leading/trailing slashes and backslashes, replace Go's
+                # regexp whitespace class (space, tab, LF, FF, CR - never the other
+                # Unicode spaces str.isspace() matches, such as a no-break space)
+                # plus backslash and /:?* with "_", join path1..path2. The
+                # characters are built with chr() so no escape sequence has to
+                # survive the Swift literal, bash and python.
                 # A pair counts as having state when a .lst OR .lst-new listing
                 # exists for BOTH sides — bisync --recover resumes from .lst-new.
                 BISYNC_WORKDIR="$HOME/Library/Caches/rclone/bisync"
                 SESSION_NAME=$(python3 -c "
             import sys
+            BS = chr(92)
+            REPLACED = ' ' + chr(9) + chr(10) + chr(12) + chr(13) + BS + '/:?*'
             def canon(p):
-                p = p.strip('/')
-                return ''.join('_' if (ch.isspace() or ch in '/:?*') else ch for ch in p)
+                p = p.strip('/' + BS)
+                return ''.join('_' if ch in REPLACED else ch for ch in p)
             print(canon(sys.argv[1]) + '..' + canon(sys.argv[2]))
             " "$REMOTE" "$LOCAL_PATH")
                 BOOTSTRAP_FLAGS=""

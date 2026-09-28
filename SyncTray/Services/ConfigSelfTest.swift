@@ -92,6 +92,7 @@ enum ConfigSelfTest {
             testBisyncListingFilesOnDisk,
             testResyncNeverBare,
             testReinstallTeardownRouting,
+            testSyncScriptSessionNameParity,
         ]
 
         for check in checks {
@@ -2963,6 +2964,10 @@ enum ConfigSelfTest {
             ("synology-sftp:/volume1/Kaiju", "/Users/me/K", "synology-sftp__volume1_Kaiju..Users_me_K"),
             ("remote:path/", "/x/y/", "remote_path..x_y"),
             ("r:what?*", "/tab\there", "r_what__..tab_here"),
+            // Go's `\s` is ASCII-only: a no-break space and a vertical tab stay as they are.
+            ("r:no\u{00A0}break", "/x\u{0B}y", "r_no\u{00A0}break..x\u{0B}y"),
+            // Backslashes are replaced and trimmed; CRLF is two runes to rclone, not one.
+            ("r:back\\slash/", "/a\r\nb\\", "r_back_slash..a__b"),
         ]
         for (remote, local, expected) in cases {
             let got = SyncSetupService.bisyncSessionName(remote: remote, localPath: local)
@@ -3142,6 +3147,54 @@ enum ConfigSelfTest {
             return report("AC-RI5", "reinstall-teardown-routing", false, "(external-edit reinstall no longer keeps the listings)")
         }
         return report("AC-RI5", "reinstall-teardown-routing", true)
+    }
+
+    // MARK: - AC-RI6 — the sync script names a session exactly like the app
+
+    /// The sync script computes the session name itself (its REMOTE can be the fallback), so its
+    /// python `canon` must match `canonicalBisyncPath` character for character — otherwise the
+    /// script misses the listings a reinstall kept and bootstraps `--resync` on every run.
+    /// Extracts the snippet from the generated script and runs it the way the script does
+    /// (`python3 -c <snippet> "$REMOTE" "$LOCAL_PATH"`).
+    private static func testSyncScriptSessionNameParity() -> Bool {
+        let script = SyncSetupService.shared.generateSyncScript()
+        let startMarker = "SESSION_NAME=$(python3 -c \""
+        let endMarker = "\" \"$REMOTE\" \"$LOCAL_PATH\")"
+        guard let start = script.range(of: startMarker),
+              let end = script.range(of: endMarker, range: start.upperBound..<script.endIndex) else {
+            return report("AC-RI6", "script-session-name-parity", false, "(session-name snippet not found in the sync script)")
+        }
+        let snippet = String(script[start.upperBound..<end.lowerBound])
+        let cases: [(String, String)] = [
+            ("nas:My Files/Work", "/Volumes/Seagate HD/Work"),
+            ("r:no\u{00A0}break", "/Users/me/thin\u{2009}space"),  // Unicode spaces: Go's \s keeps them
+            ("r:v\u{0B}tab", "/Users/me/tab\there"),               // vertical tab kept, tab replaced
+            ("r:back\\slash/", "/Users/me/a\\b\\"),              // backslash replaced and trimmed
+            ("r:what?*", "/Users/me/KAIJU.old"),
+        ]
+        for (remote, local) in cases {
+            let expected = SyncSetupService.bisyncSessionName(remote: remote, localPath: local)
+            let proc = Process()
+            proc.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+            proc.arguments = ["python3", "-c", snippet, remote, local]
+            let stdout = Pipe()
+            proc.standardOutput = stdout
+            proc.standardError = FileHandle.nullDevice
+            do {
+                try proc.run()
+            } catch {
+                return report("AC-RI6", "script-session-name-parity", false, "(could not run python3: \(error))")
+            }
+            let data = stdout.fileHandleForReading.readDataToEndOfFile()
+            proc.waitUntilExit()
+            var got = String(decoding: data, as: UTF8.self)
+            if got.hasSuffix("\n") { got.removeLast() }
+            guard proc.terminationStatus == 0, got == expected else {
+                return report("AC-RI6", "script-session-name-parity", false,
+                              "(script named \(remote.debugDescription) + \(local.debugDescription) \(got.debugDescription), app \(expected.debugDescription), exit \(proc.terminationStatus))")
+            }
+        }
+        return report("AC-RI6", "script-session-name-parity", true)
     }
 }
 
