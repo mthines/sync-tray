@@ -2456,10 +2456,13 @@ final class TelemetryService {
     /// `error.type` is the bounded `categorizeError` bucket — never the error text, which
     /// names a cache path.
     func recordCacheOnlyListFailed(profileId: UUID, profileName: String, error: Error) {
+        // Checked before marking the failure reported, so one that began while telemetry
+        // was off is still logged after the user opts in.
+        guard SyncTraySettings.telemetryEnabled else { return }
         cacheOnlyListLock.lock()
         let isNewFailure = cacheOnlyListFailing.insert(profileId).inserted
         cacheOnlyListLock.unlock()
-        guard isNewFailure, SyncTraySettings.telemetryEnabled else { return }
+        guard isNewFailure else { return }
         ensureSetup()
         let attrs: [String: AttributeValue] = [
             "synctray.profile.id": .string(profileId.uuidString),
