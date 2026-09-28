@@ -3563,6 +3563,10 @@ final class SyncManager: ObservableObject {
 
     /// Unmount, drain the overlay to the primary, persist the flag off, reinstall + remount.
     private func drainAndResume(profile: SyncProfile, trigger: String = "resume") async {
+        // An Upload Now still in flight would race this drain over the same overlay files
+        // (the later run plans spurious conflict copies), so let it finish first — its
+        // manifest then makes those files `alreadyUploaded` here.
+        if let upload = overlayUploadTasks[profile.id] { await upload.value }
         try? setupService.unmount(profile: profile)
         try? await Task.sleep(nanoseconds: 1_000_000_000)
 

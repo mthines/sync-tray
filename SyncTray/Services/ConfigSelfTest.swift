@@ -3517,6 +3517,11 @@ enum ConfigSelfTest {
               !uploadNow.contains(".cancel()") else {
             return report("AC-OU3", "overlay-upload-now", false, "(Upload Now can start a second run while one is in flight)")
         }
+        // Resume Syncing's drain waits out an in-flight Upload Now instead of racing it.
+        guard let drain = extractFunctionBody(startingAt: "private func drainAndResume(", in: managerSource),
+              drain.contains("if let upload = overlayUploadTasks[profile.id] { await upload.value }") else {
+            return report("AC-OU3", "overlay-upload-now", false, "(Resume Syncing can drain during an in-flight Upload Now)")
+        }
 
         return report("AC-OU3", "overlay-upload-now", true)
     }
