@@ -68,9 +68,6 @@ struct DoctorCheck: Equatable {
     var line: String { "[\(status.rawValue)] \(name): \(detail)" }
 }
 
-/// Every impure operation the CLI touches, injected so `execute`/`doctorChecks`
-/// are pure over `env` and fully exercisable by `ConfigSelfTest` with fakes —
-/// no real `Process`, `FileManager`, or stdio needed to test dispatch logic.
 /// Raw runtime facts about one Stream profile, sampled by `CLIEnvironment.probeMount`
 /// and turned into a `ProfileRuntimeState` by the pure `SyncTrayCLI.runtimeState`.
 struct MountProbe: Equatable {
@@ -99,6 +96,9 @@ enum ProfileRuntimeState: String, CaseIterable {
     case idle
 }
 
+/// Every impure operation the CLI touches, injected so `execute`/`doctorChecks`
+/// are pure over `env` and fully exercisable by `ConfigSelfTest` with fakes —
+/// no real `Process`, `FileManager`, or stdio needed to test dispatch logic.
 struct CLIEnvironment {
     /// Run rclone with `args`, hard-killed after `timeout` seconds if still
     /// running. Returns `(exitCode, stdout, stderr)`.
@@ -363,7 +363,6 @@ enum SyncTrayCLI {
         }
     }
 
-    /// Parse the `profile <subcommand>` group.
     /// Split args into positionals, `--flag value` pairs (for `valueFlags`), and
     /// bare `--flag`s, so a flag's value is never mistaken for a profile name
     /// (`status --wait mounted KaijuNew`).
@@ -400,6 +399,7 @@ enum SyncTrayCLI {
         return .success(value)
     }
 
+    /// Parse the `profile <subcommand>` group.
     private static func parseProfile(_ rest: [String]) -> Result<CLICommand, CLIUsageError> {
         guard let sub = rest.first else {
             return .failure(CLIUsageError(message: "usage: synctray profile <create|enable|disable|delete|set|list> ..."))
@@ -1444,14 +1444,6 @@ extension CLIEnvironment {
         )
     }
 
-    /// Real implementation of `mountProfile`: load + kickstart the launchd agent
-    /// (the same `loadAgent` + `startAgent` pair `SyncManager.mountProfile` uses —
-    /// `kickstart -k` is what actually starts an opt-out `RunAtLoad=false` mount
-    /// and reaps a zombie rclone), then poll `isMounted` for up to ~60s. Blocks
-    /// synchronously on the calling thread via `Thread.sleep`, matching the
-    /// synchronous `diskutil`/`launchctl` calls elsewhere in the setup service. On
-    /// timeout it returns the tail of the sync log so an agent sees the real
-    /// reason (auth failure, unreachable remote, …) rather than a bare timeout.
     /// Real implementation of `probeMount`. The process check matches `ps` output
     /// by substring rather than a `pgrep` regex, because a mount path can contain
     /// regex metacharacters (parentheses, dots) that would silently mis-match.
@@ -1469,6 +1461,12 @@ extension CLIEnvironment {
         return MountProbe(mounted: mounted, processRunning: processRunning, pendingUploads: pending)
     }
 
+    /// Real implementation of `mountProfile`: load + kickstart the launchd agent
+    /// (the same `loadAgent` + `startAgent` pair `SyncManager.mountProfile` uses —
+    /// `kickstart -k` is what actually starts an opt-out `RunAtLoad=false` mount
+    /// and reaps a zombie rclone) and return once launchd has started the job.
+    /// It does not wait for the volume: `runMount` polls `probeMount` up to
+    /// `--timeout` and reports the sync log tail if the mount never establishes.
     fileprivate static func mountProfileProcess(_ profile: SyncProfile) -> String? {
         let service = SyncSetupService.shared
         _ = service.loadAgent(for: profile)
