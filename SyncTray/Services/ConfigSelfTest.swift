@@ -3101,6 +3101,12 @@ enum ConfigSelfTest {
                 return report("AC-RI4", "resync-never-bare", false, "(\(name) builds its own --resync arguments)")
             }
         }
+        // The sync script's first-run bootstrap is a resync SyncTray starts too.
+        let script = SyncSetupService.shared.generateSyncScript()
+        guard script.contains("BOOTSTRAP_FLAGS=\"--resync --resync-mode newer\""),
+              !script.contains("BOOTSTRAP_FLAGS=\"--resync\"") else {
+            return report("AC-RI4", "resync-never-bare", false, "(the sync script's bootstrap is not newer-wins)")
+        }
         return report("AC-RI4", "resync-never-bare", true)
     }
 
