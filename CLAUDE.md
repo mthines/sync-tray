@@ -330,7 +330,7 @@ silent exit 1 that means "nothing open") — the decision is `.notify`, never an
 automatic resume, so a mount is never force-unmounted under an app that might
 be mid-write (`SyncManager.lsofBusyCheckResult`, covered by AC-AO2).
 
-**Known limits** (also documented in the Advanced Options caption in the UI):
+**Known limits** (also documented in the Stream status card's Cache Only caption, `cacheOnlyStatusCard`):
 
 - The app-written partial-file list can lag the cache by up to one 15-min refresh:
   a file first partly downloaded after the last refresh, followed by a launchd
