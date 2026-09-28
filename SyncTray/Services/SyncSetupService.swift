@@ -315,12 +315,16 @@ final class SyncSetupService {
     }
 
     /// Whether a reinstall from `old` to `new` can keep the bisync listings: both are two-way
-    /// profiles and they are the same rclone bisync session (same remote path, same local
-    /// folder). Pure.
+    /// profiles and they sync the same folders (same `fullRemotePath`, so `synology` and
+    /// `synology:` still match, and the same local folder). Comparing session names is not
+    /// enough: canonicalization gives `…/My Work` and `…/My_Work` one name, and keeping the old
+    /// folder's listings for a different folder makes bisync read every file missing from the
+    /// new one as a deletion. Pure.
     static func reinstallKeepsBisyncListings(from old: SyncProfile, to new: SyncProfile) -> Bool {
         old.syncMode == .bisync
             && new.syncMode == .bisync
-            && bisyncSessionName(for: old) == bisyncSessionName(for: new)
+            && old.fullRemotePath == new.fullRemotePath
+            && old.localSyncPath == new.localSyncPath
     }
 
     /// The rclone arguments for every `--resync` SyncTray runs itself: the initial sync after

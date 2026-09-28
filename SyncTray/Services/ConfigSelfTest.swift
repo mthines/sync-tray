@@ -3025,6 +3025,17 @@ enum ConfigSelfTest {
         guard !keeps({ $0.syncMode = .bisync }, from: oneWay) else {
             return report("AC-RI2", "reinstall-keeps-listings", false, "(listings kept when switching into two-way mode)")
         }
+        // Folders that only share a session name (a space and `_` canonicalize alike) are
+        // different folders: the old listings would turn the new folder's missing files into
+        // deletions on the other side.
+        var spaced = base
+        spaced.remotePath = "Kaiju/My Files"
+        spaced.localSyncPath = "/Users/me/My Work"
+        guard !keeps({ $0.localSyncPath = "/Users/me/My_Work" }, from: spaced),
+              !keeps({ $0.remotePath = "Kaiju/My_Files" }, from: spaced),
+              keeps({ $0.syncIntervalMinutes = 42 }, from: spaced) else {
+            return report("AC-RI2", "reinstall-keeps-listings", false, "(listings kept for a different folder with the same session name)")
+        }
         return report("AC-RI2", "reinstall-keeps-listings", true)
     }
 

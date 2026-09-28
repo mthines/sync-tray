@@ -873,8 +873,9 @@ and overwrites the losing side of every file that differs. So:
   `profile set` (`CLIEnvironment.uninstallForReinstall`). It tears down the OLD profile (so a
   Stream profile detaches the volume that is actually mounted), keeps the exclude filter, and
   keeps the listings while `reinstallKeepsBisyncListings` holds (two-way before and after,
-  same rclone session), removing only the session's `.lck` lock, which rclone never expires
-  by itself. Otherwise it discards both the old and the new pair's listings.
+  same `fullRemotePath` and local folder — not merely the same session name, which
+  `…/My Work` and `…/My_Work` share), removing only the session's `.lck` lock, which rclone
+  never expires by itself. Otherwise it discards both the old and the new pair's listings.
   Plain `uninstall(profile:)` (disable, delete, cache migration) still removes everything.
 - **Listing file names must match rclone's `bilib.SessionName`** —
   `SyncSetupService.bisyncSessionName(for:)` (`CanonicalPath(fullRemotePath) + ".." +
