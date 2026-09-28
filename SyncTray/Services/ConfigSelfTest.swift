@@ -3513,6 +3513,8 @@ enum ConfigSelfTest {
         guard let managerSource = readSourceFile("Services/SyncManager.swift"),
               let uploadNow = extractFunctionBody(startingAt: "func uploadNow(profileId: UUID)", in: managerSource),
               uploadNow.contains("overlayUploadTasks[profileId] == nil"),
+              // …nor while Resume Syncing / auto-resume is draining the same overlay.
+              uploadNow.contains("!resumingFromCacheOnly.contains(profileId)"),
               uploadNow.contains("defer { self.overlayUploadTasks[profileId] = nil }"),
               !uploadNow.contains(".cancel()") else {
             return report("AC-OU3", "overlay-upload-now", false, "(Upload Now can start a second run while one is in flight)")

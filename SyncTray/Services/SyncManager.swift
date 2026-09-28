@@ -3652,10 +3652,14 @@ final class SyncManager: ObservableObject {
     /// per profile at a time: a click while a run is in flight (including its reachability
     /// probe, before the button disables) is ignored. Cancelling the old run instead would
     /// not stop it — the upload engine never checks cancellation — so both would upload the
-    /// same files, the later one as spurious conflict copies.
+    /// same files, the later one as spurious conflict copies. The same goes for a click
+    /// while Resume Syncing (or auto-resume) is leaving Cache Only: both callers of
+    /// `drainAndResume` hold `resumingFromCacheOnly` from the reachability probe through
+    /// the drain, and before the drain's first progress update nothing disables the button.
     func uploadNow(profileId: UUID) {
         guard let profile = profileStore.profile(for: profileId), profile.isMountMode,
-              overlayUploadTasks[profileId] == nil else { return }
+              overlayUploadTasks[profileId] == nil,
+              !resumingFromCacheOnly.contains(profileId) else { return }
         overlayUploadTasks[profileId] = Task {
             defer { self.overlayUploadTasks[profileId] = nil }
             guard let resolved = await resolveUploadTransport(for: profile) else {
