@@ -110,6 +110,7 @@ enum ConfigSelfTest {
             testOverlayListingFailure,
             testUploadNowManifestRemoteState,
             testOverlayListingParse,
+            testOverlayPendingManifestParity,
             testCacheMoveBlockedPending,
             testCLIProfileSetRemovedKeys,
         ]
@@ -3667,6 +3668,80 @@ enum ConfigSelfTest {
         }
 
         return report("AC-OU3", "overlay-upload-now", true)
+    }
+
+    // MARK: - AC-OU8 — Upload-Now-and-kept files aren't counted pending (Swift + script parity)
+
+    /// The bug: a presence-only pending check (any overlay file ⇒ pending) counted an
+    /// Upload-Now file kept in the overlay as pending forever, so a remount came up
+    /// `cache-only-pending` with nothing to upload; and Swift's `pendingCount` had the same
+    /// flaw, so a cache move wouldn't count a file edited AFTER Upload Now as pending. Both
+    /// the app (`pendingCount`/`plan`/`isUploaded`) and the generated script's python check
+    /// now apply the shared size+mtime(±1s) rule against the manifest.
+    private static func testOverlayPendingManifestParity() -> Bool {
+        let name = "AC-OU8", slug = "overlay-pending-manifest-parity"
+        let fm = FileManager.default
+
+        func fileState(_ path: String) -> (Int64, Date) {
+            let attrs = (try? fm.attributesOfItem(atPath: path)) ?? [:]
+            return ((attrs[.size] as? NSNumber)?.int64Value ?? 0,
+                    (attrs[.modificationDate] as? Date) ?? Date())
+        }
+        func entry(_ size: Int64, _ mod: Date, as name: String) -> OverlaySyncService.ManifestEntry {
+            .init(localSize: size, localModTime: mod, remoteSize: size, remoteModTime: mod,
+                  uploadedAs: name, uploadedAt: mod)
+        }
+
+        // --- Swift side: pendingCount + plan agree via the shared isUploaded rule. ---
+        let sroot = "\(selfTestRoot)/ou7-\(UUID().uuidString)/overlay"
+        try? fm.createDirectory(atPath: sroot, withIntermediateDirectories: true)
+        writeFile("\(sroot)/kept.wav", "aaaa")       // uploaded, unchanged since
+        writeFile("\(sroot)/edited.wav", "bbbb")     // uploaded, then edited (size drifts)
+        writeFile("\(sroot)/new.wav", "cccc")        // never uploaded
+        let (keptSize, keptMod) = fileState("\(sroot)/kept.wav")
+        let (_, editedMod) = fileState("\(sroot)/edited.wav")
+        let manifest: [String: OverlaySyncService.ManifestEntry] = [
+            "kept.wav": entry(keptSize, keptMod, as: "kept.wav"),
+            // Recorded with a size that no longer matches the file → must read as pending.
+            "edited.wav": entry(99_999, editedMod, as: "edited.wav"),
+        ]
+        let pending = OverlaySyncService.pendingCount(overlayPath: sroot, manifest: manifest)
+        guard pending == 2 else {
+            return report(name, slug, false, "(pendingCount expected 2 [edited+new], got \(pending))")
+        }
+        guard let keptFile = OverlaySyncService.scan(overlayPath: sroot).first(where: { $0.relativePath == "kept.wav" }) else {
+            return report(name, slug, false, "(kept.wav not scanned)")
+        }
+        guard OverlaySyncService.isUploaded(file: keptFile, manifestEntry: manifest["kept.wav"]),
+              OverlaySyncService.plan(file: keptFile, manifestEntry: manifest["kept.wav"], expected: nil, remote: nil) == .alreadyUploaded else {
+            return report(name, slug, false, "(kept file not treated as already-uploaded by isUploaded/plan)")
+        }
+
+        // --- Script side: a reachable primary + ONLY an uploaded-and-kept file + its
+        // matching manifest must mount STREAMING, not cache-only-pending. ---
+        let root = "\(selfTestRoot)/ou7s-\(UUID().uuidString)"
+        try? fm.createDirectory(atPath: "\(root)/mnt", withIntermediateDirectories: true)
+        try? fm.createDirectory(atPath: "\(root)/reachable-target", withIntermediateDirectories: true)
+        let profile = mountFixtureProfile(localPath: "\(root)/mnt", cachePath: "\(root)/cache")
+        defer { try? fm.removeItem(atPath: profile.cacheOnlyConfigPath) }
+        let conf = aliasRcloneConfig(name: "synology", path: "\(root)/reachable-target")
+
+        writeFile("\(profile.overlayPath)/kept.wav", "aaaa")
+        let (ks, km) = fileState("\(profile.overlayPath)/kept.wav")
+        OverlaySyncService.saveManifest(["kept.wav": entry(ks, km, as: "kept.wav")], path: profile.overlayManifestPath)
+        let keptResult = dryRunMountScript(profile: profile, rcloneConfig: conf)
+        guard keptResult.mode == MountMode.streaming.rawValue else {
+            return report(name, slug, false, "(uploaded-and-kept overlay file still forced pending: mode=\(keptResult.mode ?? "nil") log=\(keptResult.log))")
+        }
+
+        // Now EDIT that file so it no longer matches the manifest → the script must see it
+        // as pending again (cache-only-pending), proving the check isn't presence-blind.
+        writeFile("\(profile.overlayPath)/kept.wav", "aaaa-EDITED-LONGER")
+        let editedResult = dryRunMountScript(profile: profile, rcloneConfig: conf)
+        guard editedResult.mode == MountMode.cacheOnlyPending.rawValue else {
+            return report(name, slug, false, "(edited-after-upload overlay file not counted pending: mode=\(editedResult.mode ?? "nil") log=\(editedResult.log))")
+        }
+        return report(name, slug, true)
     }
 
     // MARK: - AC-OU4 — cache move / vfsCachePath refused while overlay files are pending

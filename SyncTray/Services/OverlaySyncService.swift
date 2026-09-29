@@ -127,14 +127,31 @@ struct OverlaySyncService {
         return results
     }
 
-    /// Overlay files (ignore list applied) not yet recorded as uploaded in the
-    /// manifest — the guard that refuses a cache-directory move (or a `vfsCachePath`
-    /// re-point) while uploads are still pending.
+    /// True iff an overlay file is already on the remote and unchanged since — its
+    /// manifest entry exists AND records the same size and mtime (±1s) as the file has
+    /// now. The SINGLE definition of "not pending", shared by `plan` (→ `.alreadyUploaded`),
+    /// `pendingCount`, and the sync script's python pending-check, so the three can't
+    /// disagree. A presence-only check (any overlay file ⇒ pending) was the bug: an
+    /// Upload-Now file kept in the overlay read as pending forever, so a remount came up
+    /// `cache-only-pending` with nothing to upload — and, conversely, a file EDITED after
+    /// Upload Now (size/mtime now differ) must read as pending again, or a cache move could
+    /// strand that edit.
+    nonisolated static func isUploaded(file: OverlayFile, manifestEntry: ManifestEntry?) -> Bool {
+        guard let manifestEntry else { return false }
+        return manifestEntry.localSize == file.size
+            && abs(manifestEntry.localModTime.timeIntervalSince(file.modificationDate)) <= 1
+    }
+
+    /// Overlay files (ignore list applied) still pending upload — no manifest entry, or a
+    /// manifest entry whose recorded size/mtime no longer matches (edited since Upload Now).
+    /// The guard that refuses a cache-directory move (or a `vfsCachePath` re-point) while
+    /// uploads are still pending. Uses the shared `isUploaded` rule, so it agrees with
+    /// `plan` and the sync script.
     nonisolated static func pendingCount(
         overlayPath: String, manifest: [String: ManifestEntry], fileManager: FileManager = .default
     ) -> Int {
         scan(overlayPath: overlayPath, fileManager: fileManager)
-            .filter { manifest[$0.relativePath] == nil }
+            .filter { !isUploaded(file: $0, manifestEntry: manifest[$0.relativePath]) }
             .count
     }
 
@@ -262,9 +279,7 @@ struct OverlaySyncService {
         remote: RemoteState?,
         now: Date = Date()
     ) -> OverlayAction {
-        if let manifestEntry,
-           manifestEntry.localSize == file.size,
-           abs(manifestEntry.localModTime.timeIntervalSince(file.modificationDate)) <= 1 {
+        if isUploaded(file: file, manifestEntry: manifestEntry) {
             return .alreadyUploaded
         }
         guard let remote else {

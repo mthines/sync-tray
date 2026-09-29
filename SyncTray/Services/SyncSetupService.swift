@@ -642,6 +642,7 @@ final class SyncSetupService {
             # streaming-only, with a warning, instead of failing outright.
             MOUNT_MODE_PATH=$(parse_json "mountModePath" "")
             OVERLAY_PATH=$(parse_json "overlayPath" "")
+            OVERLAY_MANIFEST_PATH=$(parse_json "overlayManifestPath" "")
             CACHE_ONLY_CONFIG_PATH=$(parse_json "cacheOnlyConfigPath" "")
             CACHE_ONLY_EXCLUDE_PATH=$(parse_json "cacheOnlyExcludePath" "")
             CACHE_ONLY_CACHE_PATH=$(parse_json "cacheOnlyCachePath" "")
@@ -1055,19 +1056,50 @@ final class SyncSetupService {
                     OVERLAY_PENDING=$(python3 -c "
             import fnmatch, json, os, sys
 
-            overlay_path, cache_path = sys.argv[1], sys.argv[2]
+            overlay_path, cache_path, manifest_path = sys.argv[1], sys.argv[2], sys.argv[3]
             ignore_patterns = \(overlayIgnorePatternsPythonLiteral)
 
             def is_ignored(name):
                 return any(fnmatch.fnmatchcase(name, p) for p in ignore_patterns)
+
+            # Upload-Now manifest (Swift-written): {relpath: {localSize, localModTime, ...}}.
+            # Applies the SAME rule as OverlaySyncService.pendingCount / plan so the script
+            # and the app agree on 'pending'. A file kept in the overlay after Upload Now,
+            # whose size+mtime still match its entry, is NOT pending; a file absent from the
+            # manifest, or edited since (size differs, or mtime drifts >1s), IS pending.
+            manifest = {}
+            if manifest_path and os.path.isfile(manifest_path):
+                try:
+                    with open(manifest_path) as fh:
+                        manifest = json.load(fh)
+                except Exception:
+                    manifest = {}
+
+            def is_file_pending(abs_path, rel):
+                e = manifest.get(rel)
+                if not isinstance(e, dict):
+                    return True  # never uploaded
+                try:
+                    st = os.stat(abs_path)
+                except OSError:
+                    return True  # can't stat -> be safe, treat as pending
+                if e.get('localSize') != st.st_size:
+                    return True
+                return abs(e.get('localModTime', 0) - st.st_mtime) > 1
 
             pending = False
 
             if overlay_path and os.path.isdir(overlay_path):
                 for root, dirs, files in os.walk(overlay_path):
                     dirs[:] = [d for d in dirs if not is_ignored(d)]
-                    if any(not is_ignored(f) for f in files):
-                        pending = True
+                    for f in files:
+                        if is_ignored(f):
+                            continue
+                        abs_path = os.path.join(root, f)
+                        if is_file_pending(abs_path, os.path.relpath(abs_path, overlay_path)):
+                            pending = True
+                            break
+                    if pending:
                         break
 
             if not pending and cache_path:
@@ -1087,7 +1119,7 @@ final class SyncSetupService {
                             break
 
             print('true' if pending else 'false')
-            " "$OVERLAY_PATH" "$CACHE_ONLY_CACHE_PATH")
+            " "$OVERLAY_PATH" "$CACHE_ONLY_CACHE_PATH" "$OVERLAY_MANIFEST_PATH")
 
                     # Primary reachability for mode selection, with a short bounded retry.
                     # At login launchd starts this agent (RunAtLoad) before Wi-Fi/DNS is
@@ -1492,6 +1524,7 @@ final class SyncSetupService {
         return [
             "mountModePath": profile.mountModePath,
             "overlayPath": profile.overlayPath,
+            "overlayManifestPath": profile.overlayManifestPath,
             "cacheOnlyConfigPath": profile.cacheOnlyConfigPath,
             "cacheOnlyExcludePath": profile.cacheOnlyExcludePath,
             "cacheOnlyCachePath": profile.cacheOnlyCachePath,

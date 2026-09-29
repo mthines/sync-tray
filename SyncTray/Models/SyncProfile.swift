@@ -151,7 +151,11 @@ struct SyncProfile: Identifiable, Codable, Equatable {
     /// Upload-tracking manifest (path + size + mtime AT UPLOAD TIME) for overlay files
     /// already pushed to the remote by "Upload Now" without leaving Cache-only, so a
     /// later drain/keep run can tell an unchanged uploaded file from one needing
-    /// re-upload. Swift-only — the script never reads or writes it.
+    /// re-upload. **Swift WRITES it (`OverlaySyncService.saveManifest`); the sync script
+    /// READS it (never writes) at mount time** to apply the same "is this file pending?"
+    /// rule as `OverlaySyncService.pendingCount`, so an Upload-Now-and-kept file no longer
+    /// forces a spurious `cache-only-pending` mode on remount. Emitted into the derived
+    /// `{shortId}.json` as `overlayManifestPath`.
     var overlayManifestPath: String {
         "\(overlayRootPath)/\(shortId).manifest.json"
     }

@@ -326,6 +326,19 @@ Upload Now target even though mount mode never streams through it (see
 (`{shortId}.manifest.json`, path + size + mtime at upload time) so a later
 drain can tell an already-uploaded, unchanged file from one needing re-upload.
 
+**Pending detection is manifest-aware, in Swift AND the script.** "Pending" means
+*not yet uploaded* — an overlay file with no manifest entry, or one whose size/mtime
+no longer matches its entry (edited since Upload Now). A file uploaded by Upload Now
+and kept in the overlay, unchanged, is **not** pending. This one rule lives in
+`OverlaySyncService.isUploaded` (shared by `plan` → `.alreadyUploaded` and
+`pendingCount`) and is applied identically by the generated sync script's python
+mount-mode check, which now **reads** `overlayManifestPath` (never writes it) and
+emits `overlayManifestPath` into the derived `{shortId}.json`. Without this, a
+presence-only check counted every kept-but-uploaded file as pending, so a remount
+came up `cache-only-pending` with nothing to upload, and a cache move wouldn't
+count a file edited *after* Upload Now as pending (could strand the edit). Covered
+by `ConfigSelfTest` AC-OU8 (Swift + script parity).
+
 **Automatic offline entry and exit.** The mount enters Cache Only on its own
 (`cache-only-offline`) when the primary is still unreachable after the
 mount-time probe and its 2 retries (see the table above; the retries ride out
