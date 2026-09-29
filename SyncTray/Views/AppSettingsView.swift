@@ -249,17 +249,25 @@ struct AppSettingsView: View {
             .accessibilityLabel("Beta release")
     }
 
+    /// The version shown in About. CI release builds carry the exact version they
+    /// were tagged as in `SyncTrayReleaseVersion` (e.g. `0.81.0-beta.75.1`), baked
+    /// in by `scripts/release-ci.sh`. A beta needs it: it never bumps
+    /// `CFBundleShortVersionString`, which still reads the stable version its PR
+    /// branched from. Dev and local builds leave the key empty and fall back to
+    /// `CFBundleShortVersionString`.
     private var appVersion: String {
-        let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?"
-        let build = Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "?"
+        let info = Bundle.main.infoDictionary
+        let releaseVersion = (info?["SyncTrayReleaseVersion"] as? String) ?? ""
+        let bundleVersion = (info?["CFBundleShortVersionString"] as? String) ?? "?"
+        let version = releaseVersion.isEmpty ? bundleVersion : releaseVersion
+        let build = (info?["CFBundleVersion"] as? String) ?? "?"
         return "\(version) (\(build))"
     }
 
     /// True for a `/beta` release. `scripts/release-ci.sh` passes
     /// `SYNCTRAY_RELEASE_CHANNEL=beta` to xcodebuild for betas, which Info.plist
     /// expands into `SyncTrayReleaseChannel`; stable releases carry "stable" and
-    /// dev builds "". The version string can't tell: a beta never bumps
-    /// `CFBundleShortVersionString`, so it reads the last stable version.
+    /// dev builds "".
     private var isBetaBuild: Bool {
         (Bundle.main.infoDictionary?["SyncTrayReleaseChannel"] as? String) == "beta"
     }
