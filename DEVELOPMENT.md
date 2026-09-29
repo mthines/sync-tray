@@ -138,10 +138,12 @@ Config resolution priority (first non-empty wins):
 
 A `/beta` build shows a **Beta** tag after the version in **App Settings → About**. The version string can't signal this on its own: a beta only tags the PR head and never bumps `CFBundleShortVersionString`, so it still reads the last stable version the PR branched from.
 
-The channel is baked in at build time the same way as the token above. The `SYNCTRAY_RELEASE_CHANNEL` build setting is empty by default. `scripts/release-ci.sh` passes `beta` or `stable` to xcodebuild, and Info.plist expands the value into `SyncTrayReleaseChannel`. The script then reads the key back from the built bundle and fails the release if it doesn't match. Local builds leave it empty, so they never show the tag. To preview the tag locally:
+The channel is baked in at build time the same way as the token above. The `SYNCTRAY_RELEASE_CHANNEL` build setting is empty by default. `scripts/release-ci.sh` passes `beta` or `stable` to xcodebuild, and Info.plist expands the value into `SyncTrayReleaseChannel`. The script then reads the key back from the built bundle and fails the release if it doesn't match. The local `scripts/release.sh` passes `stable`. Dev builds leave it empty, so they never show the tag. To preview the tag locally:
 
 ```bash
-xcodebuild -scheme SyncTray -destination 'platform=macOS' SYNCTRAY_RELEASE_CHANNEL=beta build
+xcodebuild -scheme SyncTray -configuration Debug -derivedDataPath build \
+    -destination 'platform=macOS' CODE_SIGNING_ALLOWED=NO SYNCTRAY_RELEASE_CHANNEL=beta build
+open build/Build/Products/Debug/SyncTray.app
 ```
 
 ### Disabling Telemetry

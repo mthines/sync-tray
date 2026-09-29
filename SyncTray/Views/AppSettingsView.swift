@@ -258,7 +258,7 @@ struct AppSettingsView: View {
     /// True for a `/beta` release. `scripts/release-ci.sh` passes
     /// `SYNCTRAY_RELEASE_CHANNEL=beta` to xcodebuild for betas, which Info.plist
     /// expands into `SyncTrayReleaseChannel`; stable releases carry "stable" and
-    /// local builds "". The version string can't tell: a beta never bumps
+    /// dev builds "". The version string can't tell: a beta never bumps
     /// `CFBundleShortVersionString`, so it reads the last stable version.
     private var isBetaBuild: Bool {
         (Bundle.main.infoDictionary?["SyncTrayReleaseChannel"] as? String) == "beta"
