@@ -50,6 +50,7 @@ enum ConfigSelfTest {
             testIsolatedLaunchAtLogin,
             testDeleteDurable,
             testWarmExcludePatternsRoundTrip,
+            testBandwidthLimit,
             testWarmSkipsCachedFiles,
             testMountMonitorAutoWarm,
             testMountPollDecision,
@@ -590,6 +591,88 @@ enum ConfigSelfTest {
             return report("AC-20", "warm-exclude-roundtrip", false, "(missing key did not default to [])")
         }
         return report("AC-20", "warm-exclude-roundtrip", true)
+    }
+
+    // MARK: - AC-BW1 — bandwidth limit: validation, round-trip, reconcile, script emission
+
+    /// `bandwidthLimit` maps to rclone `--bwlimit` on every command. It must validate to a
+    /// shell-safe single-rate token (so it can't break the generated script), survive the
+    /// file round-trip, trigger a reinstall on change, and actually appear in the rendered
+    /// mount command when set (and be absent when empty).
+    private static func testBandwidthLimit() -> Bool {
+        let name = "AC-BW1", slug = "bandwidth-limit"
+
+        // Validation: accepted vs rejected forms.
+        let valid = ["", "off", "10M", "512k", "1.5M", "1M:512k", "0", "100"]
+        for v in valid where !SyncProfile.isValidBandwidthLimit(v) {
+            return report(name, slug, false, "(rejected a valid rate: '\(v)')")
+        }
+        let invalid = ["10 M", "abc", "10M ; rm -rf /", "10M:", ":512k", "10::5", "$(whoami)", "10M 20M"]
+        for v in invalid where SyncProfile.isValidBandwidthLimit(v) {
+            return report(name, slug, false, "(accepted an invalid rate: '\(v)')")
+        }
+        // normalize trims and rejects bad values to "".
+        guard SyncProfile.normalizedBandwidthLimit("  10M  ") == "10M",
+              SyncProfile.normalizedBandwidthLimit("bad value") == "",
+              SyncProfile.normalizedBandwidthLimit("") == "" else {
+            return report(name, slug, false, "(normalizedBandwidthLimit wrong)")
+        }
+
+        // Round-trip through JSON.
+        var profile = sampleProfile()
+        profile.bandwidthLimit = "1M:512k"
+        guard let data = try? JSONEncoder().encode(profile),
+              let decoded = try? JSONDecoder().decode(SyncProfile.self, from: data),
+              decoded.bandwidthLimit == "1M:512k" else {
+            return report(name, slug, false, "(bandwidthLimit not preserved through round-trip)")
+        }
+        // A hand-edited bad value in a file decodes to "" (never reaches the script).
+        let bad: [String: Any] = [
+            "id": UUID().uuidString, "name": "BadBW", "rcloneRemote": "r:",
+            "remotePath": "P", "localSyncPath": "/tmp/x", "bandwidthLimit": "10M; rm -rf /",
+        ]
+        guard let badData = try? JSONSerialization.data(withJSONObject: bad),
+              let badDecoded = try? JSONDecoder().decode(SyncProfile.self, from: badData),
+              badDecoded.bandwidthLimit == "" else {
+            return report(name, slug, false, "(malformed bandwidthLimit did not decode to empty)")
+        }
+
+        // Reconcile: a change reinstalls (regenerates the script).
+        let base = sampleProfile()
+        var bwChanged = base
+        bwChanged.bandwidthLimit = "10M"
+        guard SyncManager.reconcileAction(from: base, to: bwChanged) == .reinstall else {
+            return report(name, slug, false, "(bandwidthLimit change expected .reinstall)")
+        }
+
+        // Script: the rendered mount command carries --bwlimit when set...
+        let fm = FileManager.default
+        let root = "\(selfTestRoot)/bw1-\(UUID().uuidString)"
+        try? fm.createDirectory(atPath: "\(root)/mnt", withIntermediateDirectories: true)
+        var capped = mountFixtureProfile(localPath: "\(root)/mnt", cachePath: "\(root)/cache")
+        capped.bandwidthLimit = "5M"
+        let cappedResult = dryRunMountScript(profile: capped, rcloneConfig: "")
+        guard let cappedCmd = cappedResult.cmd, cappedCmd.contains("--bwlimit \"5M\"") else {
+            return report(name, slug, false, "(mount command missing --bwlimit: \(cappedResult.cmd ?? "nil"))")
+        }
+        // ...and is absent when empty.
+        let uncapped = mountFixtureProfile(localPath: "\(root)/mnt", cachePath: "\(root)/cache")
+        let uncappedResult = dryRunMountScript(profile: uncapped, rcloneConfig: "")
+        guard let uncappedCmd = uncappedResult.cmd, !uncappedCmd.contains("--bwlimit") else {
+            return report(name, slug, false, "(mount command has --bwlimit with no limit set: \(uncappedResult.cmd ?? "nil"))")
+        }
+
+        // CLI profile set: valid accepted, invalid rejected with no mutation.
+        var p = sampleProfile()
+        guard SyncTrayCLI.applyProfileAssignment(&p, key: "bandwidthLimit", value: "2M") == nil,
+              p.bandwidthLimit == "2M" else {
+            return report(name, slug, false, "(CLI set of a valid bandwidthLimit failed)")
+        }
+        guard SyncTrayCLI.applyProfileAssignment(&p, key: "bandwidthLimit", value: "no good") != nil,
+              p.bandwidthLimit == "2M" else {
+            return report(name, slug, false, "(CLI set of an invalid bandwidthLimit was not rejected)")
+        }
+        return report(name, slug, true)
     }
 
     // MARK: - AC-23 — warm skips files already fully in the VFS cache

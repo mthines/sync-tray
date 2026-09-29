@@ -61,6 +61,7 @@ struct ProfileDetailView: View {
     @State private var mountAtStartup: Bool = true
     @State private var streamCacheOnly: Bool = false
     @State private var downloadConnections: Int = 2
+    @State private var bandwidthLimit: String = ""
 
     // UI State
     @State private var showAdvanced: Bool = false
@@ -185,7 +186,8 @@ struct ProfileDetailView: View {
         allowNonEmptyMount != profile.allowNonEmptyMount ||
         mountAtStartup != profile.mountAtStartup ||
         streamCacheOnly != profile.streamCacheOnly ||
-        downloadConnections != profile.downloadConnections
+        downloadConnections != profile.downloadConnections ||
+        SyncProfile.normalizedBandwidthLimit(bandwidthLimit) != profile.bandwidthLimit
     }
 
     /// Display name for the mount folder, used in the offline-access caption
@@ -1995,6 +1997,34 @@ struct ProfileDetailView: View {
 
             Divider()
 
+            // Bandwidth Limit — applies to every mode (mount, sync, bisync).
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Bandwidth Limit")
+                    .font(.subheadline.weight(.medium))
+                Text("Cap the network speed rclone uses (passed as --bwlimit). Leave empty for "
+                    + "no limit. Use a single rate like 10M (10 MByte/s), separate up:down like "
+                    + "1M:512k, or off. A cap keeps a busy sync or a live mount from saturating "
+                    + "your uplink (which can stall the mount and freeze Finder). Changing this "
+                    + "reinstalls the agent (a Stream mount remounts).")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                HStack(spacing: 6) {
+                    TextField("unlimited", text: $bandwidthLimit)
+                        .textFieldStyle(.roundedBorder)
+                        .frame(width: 160)
+                    if !bandwidthLimit.trimmingCharacters(in: .whitespaces).isEmpty
+                        && !SyncProfile.isValidBandwidthLimit(bandwidthLimit.trimmingCharacters(in: .whitespaces)) {
+                        Label("Invalid rate", systemImage: "exclamationmark.triangle.fill")
+                            .labelStyle(.titleAndIcon)
+                            .font(.caption)
+                            .foregroundStyle(.orange)
+                    }
+                }
+            }
+
+            Divider()
+
             // Reconfigure Remote
             VStack(alignment: .leading, spacing: 4) {
                 Text("Reconfigure Profile")
@@ -2073,6 +2103,7 @@ struct ProfileDetailView: View {
         mountAtStartup = profile.mountAtStartup
         streamCacheOnly = profile.streamCacheOnly
         downloadConnections = profile.downloadConnections
+        bandwidthLimit = profile.bandwidthLimit
 
         // Show text input if the path contains "/" (nested path) or is a custom path
         // that won't be in the folder picker dropdown
@@ -2107,6 +2138,7 @@ struct ProfileDetailView: View {
         updatedProfile.mountAtStartup = mountAtStartup
         updatedProfile.streamCacheOnly = streamCacheOnly
         updatedProfile.downloadConnections = downloadConnections
+        updatedProfile.bandwidthLimit = SyncProfile.normalizedBandwidthLimit(bandwidthLimit)
         return updatedProfile
     }
 
