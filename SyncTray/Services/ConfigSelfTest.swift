@@ -69,6 +69,7 @@ enum ConfigSelfTest {
             testDoctorPureChecks,
             testCLIResolveAndList,
             testCLIStatusStates,
+            testCLIOfflineStatus,
             testReachabilityProbeIsPathScoped,
             testMountReadHealth,
             testCacheOnlyAppWrittenList,
@@ -1119,6 +1120,9 @@ enum ConfigSelfTest {
         probeMount: @escaping (SyncProfile) -> MountProbe = { _ in
             MountProbe(mounted: false, processRunning: false, pendingUploads: 0)
         },
+        warmEstimate: @escaping (String, SyncProfile) -> VFSCacheService.WarmEstimate = { _, _ in
+            VFSCacheService.WarmEstimate(files: 0, bytes: 0, cachedFiles: 0, cachedBytes: 0)
+        },
         sleep: @escaping (TimeInterval) -> Void = { _ in },
         stdout: @escaping (String) -> Void = { _ in },
         stderr: @escaping (String) -> Void = { _ in },
@@ -1143,6 +1147,7 @@ enum ConfigSelfTest {
             readStdin: readStdin,
             readFile: readFile,
             probeMount: probeMount,
+            warmEstimate: warmEstimate,
             sleep: sleep,
             stdout: stdout,
             stderr: stderr,
@@ -1258,6 +1263,37 @@ enum ConfigSelfTest {
             return report("AC-CLI10", "cli-status-states", false, "(json output wrong: \(out))")
         }
 
+        // Cache Only requested (streamCacheOnly) but the live mount resolved to streaming =
+        // the silent script fallback. status must surface it; and it must NOT fire when the
+        // mode is a genuine cache-only state, nor when Cache Only was never requested.
+        var cacheOnly = sampleProfile(id: UUID(), name: "CacheOnly", isEnabled: true)
+        cacheOnly.syncMode = .mount
+        cacheOnly.streamCacheOnly = true
+        out = ""
+        let fellBack = fakeCLIEnvironment(
+            readProfiles: { [cacheOnly] },
+            runLaunchctl: { _ in (0, "state = running") },
+            readFile: { path in path == cacheOnly.mountModePath ? "streaming\n" : nil },
+            probeMount: { _ in MountProbe(mounted: true, processRunning: true, pendingUploads: 0) },
+            stdout: { out += $0 }
+        )
+        _ = SyncTrayCLI.run(.status(target: nil, json: false, wait: nil), env: fellBack)
+        guard out.contains("cache_only_fallback=true") else {
+            return report("AC-CLI10", "cli-status-states", false, "(cache-only fallback not surfaced: \(out))")
+        }
+        out = ""
+        let honoured = fakeCLIEnvironment(
+            readProfiles: { [cacheOnly] },
+            runLaunchctl: { _ in (0, "state = running") },
+            readFile: { path in path == cacheOnly.mountModePath ? "cache-only-manual\n" : nil },
+            probeMount: { _ in MountProbe(mounted: true, processRunning: true, pendingUploads: 0) },
+            stdout: { out += $0 }
+        )
+        _ = SyncTrayCLI.run(.status(target: nil, json: false, wait: nil), env: honoured)
+        guard !out.contains("cache_only_fallback") else {
+            return report("AC-CLI10", "cli-status-states", false, "(cache-only fallback false-positive on honoured mode: \(out))")
+        }
+
         // The mode file survives in /tmp after rclone exits — it must not be reported then.
         out = ""
         let stopped = fakeCLIEnvironment(
@@ -1337,6 +1373,105 @@ enum ConfigSelfTest {
             return report("AC-CLI10", "cli-status-states", false, "(dead mount not failed early with log: polls=\(deadPolls) \(deadErr))")
         }
         return report("AC-CLI10", "cli-status-states", true)
+    }
+
+    // MARK: - AC-CLI11 — offline status: readiness reporting + Stream-only guard
+
+    /// `offline status` must let an agent tell, before flipping Cache Only, whether a
+    /// Stream profile's pinned set (or whole mount) is fully offline — missing/cached
+    /// counts summed from the pure warm estimate, `ready=<bool>`, mount-down → unknown,
+    /// and a non-mount target refused.
+    private static func testCLIOfflineStatus() -> Bool {
+        let name = "AC-CLI11", slug = "cli-offline-status"
+
+        // Parse: `offline status`, with/without a target and `--json`; a bad subcommand fails.
+        guard SyncTrayCLI.parse(["offline", "status"]) == .success(.offlineStatus(target: nil, json: false)),
+              SyncTrayCLI.parse(["offline", "status", "Kaiju", "--json"]) == .success(.offlineStatus(target: "Kaiju", json: true)),
+              case .failure = SyncTrayCLI.parse(["offline", "bogus"]) else {
+            return report(name, slug, false, "(offline status did not parse)")
+        }
+        // Telemetry verb stays bounded.
+        guard SyncTrayCLI.telemetryVerb(for: ["offline", "status", "Kaiju"]) == "offline-status",
+              SyncTrayCLI.telemetryVerb(for: ["offline", "bogus"]) == "(other)" else {
+            return report(name, slug, false, "(offline verb mapping wrong)")
+        }
+
+        var mount = sampleProfile(id: UUID(), name: "Streamer", isEnabled: true)
+        mount.syncMode = .mount
+        mount.pinnedDirectories = ["Kaiju", "Reaper"]
+
+        // Mounted, some files still to download → ready=false, sums across pinned dirs.
+        var out = ""
+        let partial = fakeCLIEnvironment(
+            readProfiles: { [mount] },
+            probeMount: { _ in MountProbe(mounted: true, processRunning: true, pendingUploads: 0) },
+            warmEstimate: { _, _ in VFSCacheService.WarmEstimate(files: 3, bytes: 300, cachedFiles: 7, cachedBytes: 700) },
+            stdout: { out += $0 }
+        )
+        _ = SyncTrayCLI.run(.offlineStatus(target: nil, json: false), env: partial)
+        // Two pinned dirs → the per-dir estimate is summed: 6 missing files, 14 cached.
+        guard out.contains("mounted=true"), out.contains("missing_files=6"),
+              out.contains("cached_files=14"), out.contains("ready=false") else {
+            return report(name, slug, false, "(partial readiness wrong: \(out))")
+        }
+
+        // Mounted, nothing missing → ready=true.
+        out = ""
+        let full = fakeCLIEnvironment(
+            readProfiles: { [mount] },
+            probeMount: { _ in MountProbe(mounted: true, processRunning: true, pendingUploads: 0) },
+            warmEstimate: { _, _ in VFSCacheService.WarmEstimate(files: 0, bytes: 0, cachedFiles: 5, cachedBytes: 500) },
+            stdout: { out += $0 }
+        )
+        _ = SyncTrayCLI.run(.offlineStatus(target: nil, json: false), env: full)
+        guard out.contains("ready=true"), out.contains("missing_files=0") else {
+            return report(name, slug, false, "(full readiness not ready=true: \(out))")
+        }
+
+        // Mount down → readiness unknowable; warm estimate is never consulted.
+        out = ""
+        var estimateCalled = false
+        let down = fakeCLIEnvironment(
+            readProfiles: { [mount] },
+            probeMount: { _ in MountProbe(mounted: false, processRunning: false, pendingUploads: 0) },
+            warmEstimate: { _, _ in estimateCalled = true; return VFSCacheService.WarmEstimate(files: 9, bytes: 9, cachedFiles: 0, cachedBytes: 0) },
+            stdout: { out += $0 }
+        )
+        _ = SyncTrayCLI.run(.offlineStatus(target: nil, json: false), env: down)
+        guard out.contains("mounted=false"), out.contains("ready=unknown"), !estimateCalled else {
+            return report(name, slug, false, "(down mount not reported unknown, or estimate consulted: \(out))")
+        }
+
+        // JSON parity: same facts as the text line.
+        out = ""
+        _ = SyncTrayCLI.run(.offlineStatus(target: nil, json: true), env: partial)
+        guard let data = out.data(using: .utf8),
+              let rows = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]],
+              let row = rows.first,
+              row["mounted"] as? Bool == true,
+              row["missingFiles"] as? Int == 6,
+              row["ready"] as? Bool == false else {
+            return report(name, slug, false, "(json output wrong: \(out))")
+        }
+
+        // A non-mount target is refused (Stream-only command), exit 1.
+        var syncProfile = sampleProfile(id: UUID(), name: "Bisyncer", isEnabled: true)
+        syncProfile.syncMode = .bisync
+        var syncErr = ""
+        let refused = fakeCLIEnvironment(readProfiles: { [syncProfile] }, stderr: { syncErr += $0 })
+        guard SyncTrayCLI.run(.offlineStatus(target: "Bisyncer", json: false), env: refused) == 1,
+              syncErr.contains("Stream") else {
+            return report(name, slug, false, "(non-mount target not refused: \(syncErr))")
+        }
+
+        // An unknown target is refused too.
+        var missErr = ""
+        let missing = fakeCLIEnvironment(readProfiles: { [mount] }, stderr: { missErr += $0 })
+        guard SyncTrayCLI.run(.offlineStatus(target: "nope", json: false), env: missing) == 1,
+              missErr.contains("no profile matches") else {
+            return report(name, slug, false, "(unknown target not refused: \(missErr))")
+        }
+        return report(name, slug, true)
     }
 
     // MARK: - AC-CLI5 — dispatch gate: bare tokens are subcommands, flags/no-args fall to the GUI
@@ -2655,6 +2790,12 @@ enum ConfigSelfTest {
         }
         guard !cmd.contains("--cache-dir \"\(cache)\"") else {
             return report("AC-CO1", "cache-only-union-config", false, "(cache-only mount reused the streaming --cache-dir)")
+        }
+        // Cache Only must use the same long dir-cache-time as streaming (1000h): its union
+        // upstreams are local and static, so a short window only re-lists the tree and
+        // surfaces as Finder "loading" — the opposite of "open files as if local".
+        guard cmd.contains("--dir-cache-time 1000h"), !cmd.contains("--dir-cache-time 1m") else {
+            return report("AC-CO1", "cache-only-union-config", false, "(cache-only should use --dir-cache-time 1000h, not a short window: \(cmd))")
         }
 
         let confPath = profile.cacheOnlyConfigPath

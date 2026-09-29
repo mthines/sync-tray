@@ -144,6 +144,7 @@ final class TelemetryService {
     private var overlayUploadDurationHistogram: DoubleHistogramMeterSdk?
     private var mountModeChangesCounter: LongCounterSdk?
     private var mountAutoResumeCounter: LongCounterSdk?
+    private var mountCacheOnlyFallbackCounter: LongCounterSdk?
     private var activeOverlayUploadSpans: [UUID: any Span] = [:]
 
     // MARK: - Providers (kept alive for shutdown)
@@ -541,6 +542,11 @@ final class TelemetryService {
         mountAutoResumeCounter = meter
             .counterBuilder(name: "synctray.mount.auto_resume")
             .setDescription("Automatic Cache Only -> Streaming resume decisions (resumed, deferred_busy, busy_check_failed)")
+            .setUnit("1")
+            .build()
+        mountCacheOnlyFallbackCounter = meter
+            .counterBuilder(name: "synctray.mount.cache_only_fallback")
+            .setDescription("Cache Only was requested (streamCacheOnly=true) but the mount settled on streaming instead — e.g. the partial-file list could not be built")
             .setUnit("1")
             .build()
     }
@@ -2495,6 +2501,21 @@ final class TelemetryService {
         if result != "resumed" {
             emitLog(severity: .warn, body: "Auto-resume deferred", attributes: attrs)
         }
+    }
+
+    /// Record that Cache Only was requested (`streamCacheOnly == true`) but the mount settled
+    /// on streaming instead — the silent fallback in the sync script when the partial-file
+    /// exclude list can't be built. This is the "I enabled Cache Only but it's still streaming
+    /// / still downloading" case; without this signal it is invisible.
+    func recordCacheOnlyFallback(profileId: UUID, profileName: String) {
+        guard SyncTraySettings.telemetryEnabled else { return }
+        ensureSetup()
+        let attrs: [String: AttributeValue] = [
+            "synctray.profile.id": .string(profileId.uuidString),
+            "synctray.profile.name": .string(profileName),
+        ]
+        mountCacheOnlyFallbackCounter?.add(value: 1, attribute: attrs)
+        emitLog(severity: .warn, body: "Cache Only fell back to streaming", attributes: attrs)
     }
 
     private func emitLog(

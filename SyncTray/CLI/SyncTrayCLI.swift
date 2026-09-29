@@ -28,6 +28,7 @@ enum CLICommand: Equatable {
     case listRemotes
     case profiles
     case status(target: String?, json: Bool, wait: StatusWait?)
+    case offlineStatus(target: String?, json: Bool)
     case sync(String)
     case mount(String, timeout: TimeInterval)
     case unmount(String)
@@ -145,6 +146,12 @@ struct CLIEnvironment {
     /// Sample a Stream profile's runtime facts (mount table, rclone process,
     /// pending overlay uploads) for `status`. Never called for sync profiles.
     var probeMount: (SyncProfile) -> MountProbe
+    /// Estimate offline-readiness of a mount-relative directory: how many files
+    /// (and bytes) are NOT yet fully in the local VFS cache vs already cached.
+    /// Pure filesystem — walks the mount tree and reads `vfsMeta` sidecars, no
+    /// network. Backs `offline status`; injected so the self-test drives it with
+    /// fixtures. Defaults to `VFSCacheService.shared.estimateWarmWork`.
+    var warmEstimate: (_ dir: String, _ profile: SyncProfile) -> VFSCacheService.WarmEstimate
     /// Pause between polls in `status --wait` / `mount`. Injected so the
     /// self-test's wait loops run instantly.
     var sleep: (TimeInterval) -> Void
@@ -175,6 +182,9 @@ enum SyncTrayCLI {
       status [name|id] [--json]    Show live state for one or all profiles
       status <name|id> --wait <state>[,<state>] [--timeout s]
                                    Block until the profile reaches a state (default timeout 600s)
+      offline status [name|id] [--json]
+                                   Offline-readiness of a Stream profile: files/bytes not yet
+                                   cached vs already offline, and ready=<bool> before Cache Only
       profiles                     List configured SyncTray profiles
       profile show <name|id>       Print one profile's full config as JSON
       logs <name|id> [--follow]    Print or tail a profile's sync log
@@ -270,6 +280,10 @@ enum SyncTrayCLI {
             let sub = argv.dropFirst().first(where: { !$0.hasPrefix("-") }) ?? ""
             return sub == "move" ? "cache-move" : "(other)"
         }
+        if first == "offline" {
+            let sub = argv.dropFirst().first(where: { !$0.hasPrefix("-") }) ?? ""
+            return sub == "status" ? "offline-status" : "(other)"
+        }
         return known.contains(first) ? first : "(other)"
     }
 
@@ -348,6 +362,9 @@ enum SyncTrayCLI {
             case "reinstall": return .success(.reinstall(target))
             default: return .success(.install(target))
             }
+
+        case "offline":
+            return parseOffline(rest)
 
         case "profile":
             return parseProfile(rest)
@@ -461,6 +478,16 @@ enum SyncTrayCLI {
         }
     }
 
+    /// Parse the `offline status` group.
+    private static func parseOffline(_ rest: [String]) -> Result<CLICommand, CLIUsageError> {
+        let usageError = CLIUsageError(message: "usage: synctray offline status [name|shortId] [--json]")
+        guard rest.first == "status" else {
+            return .failure(usageError)
+        }
+        let flags = parseFlags(Array(rest.dropFirst()), valueFlags: [])
+        return .success(.offlineStatus(target: flags.positionals.first, json: flags.bools.contains("--json")))
+    }
+
     /// Parse the `cache move` group.
     private static func parseCache(_ rest: [String]) -> Result<CLICommand, CLIUsageError> {
         let usageError = CLIUsageError(message: "usage: synctray cache move <name|shortId> --to <path> [--include-overlapping]")
@@ -509,6 +536,8 @@ enum SyncTrayCLI {
                 return runStatusWait(target, wait: wait, json: json, env: env)
             }
             return runStatus(target, json: json, env: env)
+        case .offlineStatus(let target, let json):
+            return runOfflineStatus(target, json: json, env: env)
         case .sync(let target):
             return runSync(target, env: env)
         case .mount(let target, let timeout):
@@ -743,6 +772,106 @@ enum SyncTrayCLI {
         return 0
     }
 
+    // MARK: - offline status
+
+    /// One profile's `offline status` output. The tab-separated line and the `--json`
+    /// object render from the same struct, so the two formats can't disagree. Counts come
+    /// from the pure `VFSCacheService.estimateWarmWork` summed over the readiness scope.
+    struct OfflineReport: Encodable, Equatable {
+        let name: String
+        let shortId: String
+        /// Whether the mount is up so the file tree could be enumerated. Readiness is only
+        /// meaningful when true — a down mount can't be inspected.
+        let mounted: Bool
+        /// Files not yet fully in the local VFS cache (what a warm would still download).
+        let missingFiles: Int
+        let missingBytes: Int64
+        /// Files already fully offline.
+        let cachedFiles: Int
+        let cachedBytes: Int64
+        /// Every non-excluded file is fully offline (`missingFiles == 0`). `nil` when the
+        /// mount is down and readiness is unknowable.
+        let ready: Bool?
+
+        var line: String {
+            var fields = [name, shortId, "mounted=\(mounted)"]
+            if mounted {
+                fields.append("missing_files=\(missingFiles)")
+                fields.append("missing_bytes=\(missingBytes)")
+                fields.append("cached_files=\(cachedFiles)")
+                fields.append("cached_bytes=\(cachedBytes)")
+                fields.append("ready=\(ready == true)")
+            } else {
+                fields.append("ready=unknown")
+            }
+            return fields.joined(separator: "\t")
+        }
+    }
+
+    static func offlineReport(for profile: SyncProfile, env: CLIEnvironment) -> OfflineReport {
+        let probe = env.probeMount(profile)
+        // A down mount can't be walked (its tree lives behind the NFS server), so readiness
+        // is unknowable — reported as mounted=false / ready=unknown rather than a false "ready".
+        guard probe.mounted, probe.processRunning else {
+            return OfflineReport(name: profile.name, shortId: profile.shortId, mounted: false,
+                                 missingFiles: 0, missingBytes: 0, cachedFiles: 0, cachedBytes: 0, ready: nil)
+        }
+        // Readiness scope: the pinned directories a user marked "keep offline", or the whole
+        // mount ("") when none are pinned — the whole-project readiness question.
+        let dirs = profile.pinnedDirectories.isEmpty ? [""] : profile.pinnedDirectories
+        var missingFiles = 0, cachedFiles = 0
+        var missingBytes: Int64 = 0, cachedBytes: Int64 = 0
+        for dir in dirs {
+            let est = env.warmEstimate(dir, profile)
+            missingFiles += est.files
+            missingBytes += est.bytes
+            cachedFiles += est.cachedFiles
+            cachedBytes += est.cachedBytes
+        }
+        return OfflineReport(name: profile.name, shortId: profile.shortId, mounted: true,
+                             missingFiles: missingFiles, missingBytes: missingBytes,
+                             cachedFiles: cachedFiles, cachedBytes: cachedBytes,
+                             ready: missingFiles == 0)
+    }
+
+    private static func runOfflineStatus(_ target: String?, json: Bool, env: CLIEnvironment) -> Int32 {
+        let all = env.readProfiles()
+        let mountProfiles: [SyncProfile]
+        if let target {
+            guard let match = resolveProfile(target, in: all) else {
+                env.stderr("error: no profile matches \"\(target)\"\n")
+                return 1
+            }
+            guard match.isMountMode else {
+                env.stderr("error: offline status is a Stream (mount) command; \"\(match.name)\" is \(match.syncMode.rawValue)\n")
+                return 1
+            }
+            mountProfiles = [match]
+        } else {
+            mountProfiles = all.filter { $0.isMountMode }
+        }
+
+        guard !mountProfiles.isEmpty else {
+            if json { env.stdout("[]\n") }
+            else { env.stdout(target == nil ? "no Stream profiles configured\n" : "") }
+            return 0
+        }
+
+        let reports = mountProfiles.map { offlineReport(for: $0, env: env) }
+        if json {
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+            guard let data = try? encoder.encode(reports) else {
+                env.stderr("error: could not encode offline status\n")
+                return 1
+            }
+            env.stdout(String(decoding: data, as: UTF8.self) + "\n")
+        } else {
+            for report in reports { env.stdout(report.line + "\n") }
+        }
+        return 0
+    }
+
     /// One profile's `status` output — the tab-separated line and the `--json`
     /// object are both rendered from this, so the two formats can't disagree.
     struct StatusReport: Encodable, Equatable {
@@ -758,6 +887,10 @@ enum SyncTrayCLI {
         let mountMode: String?
         /// Stream only: overlay files waiting to upload.
         let pendingUploads: Int?
+        /// Stream only: Cache Only was requested (`streamCacheOnly`) but the live mount is
+        /// streaming — the silent script fallback. `true` only when the mismatch is observable
+        /// (rclone running, mode == streaming); `nil` when not applicable.
+        let cacheOnlyFallback: Bool?
 
         var line: String {
             var fields = [
@@ -766,6 +899,7 @@ enum SyncTrayCLI {
             ]
             if let mountMode { fields.append("mode=\(mountMode)") }
             if let pendingUploads { fields.append("pending_uploads=\(pendingUploads)") }
+            if cacheOnlyFallback == true { fields.append("cache_only_fallback=true") }
             return fields.joined(separator: "\t")
         }
     }
@@ -795,10 +929,16 @@ enum SyncTrayCLI {
             guard probe.processRunning else { return "none" }
             return env.readFile(profile.mountModePath).flatMap(MountMode.parse)?.rawValue ?? "unknown"
         }
+        // Cache Only requested but the live mount is streaming = the silent script fallback.
+        // Only meaningful while rclone is running and the mode resolved to streaming.
+        let cacheOnlyFallback: Bool? = profile.streamCacheOnly
+            ? (mountMode == MountMode.streaming.rawValue)
+            : nil
         return StatusReport(
             name: profile.name, shortId: profile.shortId, syncMode: profile.syncMode.rawValue,
             enabled: profile.isEnabled, agent: agent, running: lockPresent, last: last,
-            state: state.rawValue, mountMode: mountMode, pendingUploads: probe?.pendingUploads
+            state: state.rawValue, mountMode: mountMode, pendingUploads: probe?.pendingUploads,
+            cacheOnlyFallback: cacheOnlyFallback
         )
     }
 
@@ -1451,6 +1591,7 @@ extension CLIEnvironment {
             },
             readFile: { try? String(contentsOfFile: $0, encoding: .utf8) },
             probeMount: { profile in CLIEnvironment.probeMountProcess(profile) },
+            warmEstimate: { dir, profile in VFSCacheService.shared.estimateWarmWork(dir, for: profile) },
             sleep: { Thread.sleep(forTimeInterval: $0) },
             stdout: { FileHandle.standardOutput.write(Data($0.utf8)) },
             stderr: { FileHandle.standardError.write(Data($0.utf8)) },

@@ -3401,6 +3401,16 @@ final class SyncManager: ObservableObject {
                         if let newMode {
                             TelemetryService.shared.recordMountModeChanged(
                                 profileId: profile.id, profileName: profile.name, mode: newMode)
+                            // Cache Only was requested but the mount settled on streaming: the
+                            // sync script's silent fallback when it couldn't build the partial-file
+                            // exclude list. This is the invisible "I turned Cache Only on but it's
+                            // still streaming/downloading" case — surface it. The resume guard
+                            // excludes the legitimate flip back to streaming during a drain.
+                            if newMode == .streaming, profile.streamCacheOnly,
+                               !self.resumingFromCacheOnly.contains(profile.id) {
+                                TelemetryService.shared.recordCacheOnlyFallback(
+                                    profileId: profile.id, profileName: profile.name)
+                            }
                         }
                     }
                     self.profileMountModes[profile.id] = newMode

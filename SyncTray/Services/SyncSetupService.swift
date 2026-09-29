@@ -1316,7 +1316,16 @@ final class SyncSetupService {
             os.chmod(conf_path, 0o600)
             " "$OVERLAY_PATH" "$CACHE_DATA_PATH" "$CACHE_ONLY_CONFIG_PATH"
 
-                    RCLONE_CMD="$RCLONE_BIN $MOUNT_SUBCMD synctray_cacheonly: \\"$LOCAL_PATH\\" --config \\"$CACHE_ONLY_CONFIG_PATH\\" --exclude-from \\"$CACHE_ONLY_EXCLUDE_PATH\\" --vfs-cache-mode writes --cache-dir \\"$CACHE_ONLY_CACHE_PATH\\" --vfs-write-back 2s --dir-cache-time 1m --log-level INFO --use-json-log --volname \\"$MOUNT_VOLNAME\\""
+                    # --dir-cache-time 1000h (matches streaming): the union's upstreams are
+                    # both LOCAL (the writable overlay + the read-only cache DATA tree), and
+                    # the cache tree is static while Cache Only is active (warming is disabled
+                    # in this mode). New recordings are created THROUGH the mount, so rclone
+                    # updates its own directory cache for them regardless of this window. A
+                    # short window (the old 1m) bought nothing but a directory re-list every
+                    # minute — which surfaced as recurring Finder "loading" that defeats the
+                    # whole point of Cache Only (open files as if local). So use the same long
+                    # window streaming uses; there is no unreachable remote here to re-list from.
+                    RCLONE_CMD="$RCLONE_BIN $MOUNT_SUBCMD synctray_cacheonly: \\"$LOCAL_PATH\\" --config \\"$CACHE_ONLY_CONFIG_PATH\\" --exclude-from \\"$CACHE_ONLY_EXCLUDE_PATH\\" --vfs-cache-mode writes --cache-dir \\"$CACHE_ONLY_CACHE_PATH\\" --vfs-write-back 2s --dir-cache-time 1000h --log-level INFO --use-json-log --volname \\"$MOUNT_VOLNAME\\""
 
                     echo "$(date '+%Y-%m-%d %H:%M:%S') - Cache Only: union(overlay=$OVERLAY_PATH, cache=$CACHE_DATA_PATH:ro), no --rc" >> "$LOG_FILE"
                 fi

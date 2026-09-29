@@ -264,6 +264,23 @@ When the script can't build the list it uses the app's copy; with no copy at
 all it mounts **streaming** instead (logging "Cache Only unavailable") — never a
 union mount without the filter. Covered by `ConfigSelfTest` AC-CO3.
 
+**The silent fallback is measurable.** A Cache-Only-requested profile
+(`streamCacheOnly == true`) that settles on `streaming` is the invisible "I turned
+Cache Only on but it's still streaming/downloading" case. The mount-state reconcile
+loop (`reconcileMountStatesOffMain`) detects the mismatch at the mode-change edge and
+emits `TelemetryService.recordCacheOnlyFallback` — a WARN log "Cache Only fell back to
+streaming" plus the `synctray.mount.cache_only_fallback` counter — guarded by
+`resumingFromCacheOnly` so the legitimate flip back to streaming during a drain isn't
+counted. The CLI surfaces the same fact synchronously: `synctray status` appends
+`cache_only_fallback=true` when a profile requests Cache Only but its live mount mode is
+`streaming` (and `offline status` reports how much of the set is actually cached).
+
+**Cache Only uses the same long `--dir-cache-time 1000h` as streaming.** Its union
+upstreams are local and static (app-side warming is disabled in Cache Only), and new
+recordings are created *through* the mount so rclone keeps its own dir-cache current — a
+short window would only re-list the tree and surface in Finder as "loading", the opposite
+of "open files as if local". Asserted by `ConfigSelfTest` AC-CO1.
+
 **Four mount-mode tokens** (`MountMode` in `SyncState.swift`), written to
 `mountModePath` (`/tmp/synctray-mount-{shortId}.mode`) right before rclone
 starts, all mounting the SAME union remote — the token only changes what the
@@ -790,7 +807,8 @@ isn't SyncTray's own.
 | Command | Purpose |
 |---------|---------|
 | `synctray doctor` | Health report: rclone found + version, config schemas installed, per-profile derived-config presence, launchd agent loaded (enabled profiles), stale lock files, remote reachability. Exits non-zero iff any check is `[fail]`; `[warn]` never fails the run. |
-| `synctray status [name\|shortId] [--json]` | One tab-separated line per profile (or a single one): `enabled=`, `agent=loaded\|unloaded\|n/a`, `running=` (lock present), `last=started\|completed\|failed\|none` (from the log tail via the shared `SyncLogPatterns`), and `state=` — the field an agent should branch on. Stream profiles: `mounting` (rclone running, volume not attached yet — the startup cache scan takes minutes on a large cache), `mounted`, `stale` (volume in the mount table but no rclone serving it), `unmounted`, `disabled`; they also carry `mode=` (the `MountMode` token, `none` when rclone isn't running, `unknown` when the derived config predates Cache Only) and `pending_uploads=`. Sync profiles: `syncing` (lock held), `idle`, `disabled`. `--json` prints the same facts as a sorted-key array (`state`, `mountMode`, `pendingUploads`, `syncMode`, …). `status <name|shortId> --wait <state>[,<state>] [--timeout s]` (default 600s) blocks until the profile reaches one of those states — exit 0 when reached, 1 on timeout, printing the last observed state either way. State derivation is the pure `SyncTrayCLI.runtimeState` (AC-CLI10); the mount table and the rclone process are sampled together because a `KeepAlive` agent stays loaded through every mount state. |
+| `synctray status [name\|shortId] [--json]` | One tab-separated line per profile (or a single one): `enabled=`, `agent=loaded\|unloaded\|n/a`, `running=` (lock present), `last=started\|completed\|failed\|none` (from the log tail via the shared `SyncLogPatterns`), and `state=` — the field an agent should branch on. Stream profiles: `mounting` (rclone running, volume not attached yet — the startup cache scan takes minutes on a large cache), `mounted`, `stale` (volume in the mount table but no rclone serving it), `unmounted`, `disabled`; they also carry `mode=` (the `MountMode` token, `none` when rclone isn't running, `unknown` when the derived config predates Cache Only) and `pending_uploads=`. Sync profiles: `syncing` (lock held), `idle`, `disabled`. A Stream profile that requested Cache Only (`streamCacheOnly`) but whose live mode is `streaming` also carries `cache_only_fallback=true` — the silent script fallback surfaced synchronously (see "The silent fallback is measurable"). `--json` prints the same facts as a sorted-key array (`state`, `mountMode`, `pendingUploads`, `cacheOnlyFallback`, `syncMode`, …). `status <name|shortId> --wait <state>[,<state>] [--timeout s]` (default 600s) blocks until the profile reaches one of those states — exit 0 when reached, 1 on timeout, printing the last observed state either way. State derivation is the pure `SyncTrayCLI.runtimeState` (AC-CLI10); the mount table and the rclone process are sampled together because a `KeepAlive` agent stays loaded through every mount state. |
+| `synctray offline status [name\|shortId] [--json]` | Offline-readiness of a Stream profile before flipping Cache Only: per profile, `mounted=`, and (when mounted) `missing_files=`/`missing_bytes=` (not yet fully cached), `cached_files=`/`cached_bytes=` (already offline), and `ready=<bool>` (every non-excluded file cached). Scope is the profile's `pinnedDirectories`, or the whole mount when none are pinned. A down mount reports `mounted=false ready=unknown` (the tree can't be walked). Counts come from the pure, mount-free `VFSCacheService.estimateWarmWork` (reads `vfsMeta` sidecars, no network). Stream-only — a non-mount target exits 1. Covered by `ConfigSelfTest` AC-CLI11. |
 | `synctray profiles` | List every profile: name, shortId, mode, `enabled=`, `remote=` — no secrets. (`profile list` is an alias.) |
 | `synctray profile show <name\|shortId>` | Print one profile's FULL config as pretty, sorted-key JSON — the same shape as its `.profile.json`, so an agent can `show` → edit → `profile create`/`profile set` round-trip. No secrets (credentials live in `rclone.conf`). |
 | `synctray logs <name\|shortId> [--follow]` | Print (or `tail -f`) that profile's sync log. |
