@@ -328,7 +328,11 @@ struct CacheMoveSheet: View {
             let doneSummary = outcome.result == .completed
                 ? summary(for: outcome)
                 : "Nothing was cached yet — the new location is saved."
-            let extraTargets = sameRootIds.filter { coMigrateSameRoot.contains($0) }
+            // A sibling ticked before it gained Cache Only uploads shows unticked now; skip
+            // it here too rather than start a move `migrateCacheDirectory` will refuse.
+            let extraTargets = sameRootIds.filter {
+                coMigrateSameRoot.contains($0) && syncManager.pendingUploadCount(for: $0) == 0
+            }
             guard !extraTargets.isEmpty else {
                 step = .done(doneSummary)
                 return
