@@ -61,6 +61,17 @@ struct SyncProfile: Identifiable, Codable, Equatable {
     /// 1...16. Defaults to 2 — a safe value for the common case (a NAS reached over Wi-Fi
     /// or a mesh, and/or a spinning-disk cache); users on a fast wired link raise it.
     var downloadConnections: Int
+    /// Optional bandwidth cap passed to rclone's `--bwlimit` on every command this
+    /// profile runs (mount, sync, bisync) — so the streaming/warm mount, a one-way
+    /// sync, and a bisync all stay under it. rclone's own format: a single rate
+    /// (`10M` = 10 MByte/s) or `up:down` (`1M:512k`), a bare number in KiByte/s, or
+    /// `off`. Empty = unlimited (rclone's default). Capping the shared uplink is the
+    /// knob for "SyncTray is saturating my network / freezing Finder": a live mount
+    /// that maxes the link can stall the local NFS server and drop the volume, and a
+    /// cap keeps headroom. Validated app/CLI-side (`SyncProfile.isValidBandwidthLimit`)
+    /// to a shell-safe single-rate spec — no spaces, so it can't break the generated
+    /// script — and trimmed; an invalid value is rejected at the boundary, never written.
+    var bandwidthLimit: String
 
     /// Short ID for file naming (first 8 chars of UUID)
     var shortId: String {
@@ -273,7 +284,8 @@ struct SyncProfile: Identifiable, Codable, Equatable {
         pinnedDirectories: [String] = [],
         warmExcludePatterns: [String] = [],
         rcPort: Int = 0,
-        downloadConnections: Int = 2
+        downloadConnections: Int = 2,
+        bandwidthLimit: String = ""
     ) {
         self.id = id
         self.name = name
@@ -302,6 +314,27 @@ struct SyncProfile: Identifiable, Codable, Equatable {
         self.warmExcludePatterns = warmExcludePatterns
         self.rcPort = rcPort > 0 ? rcPort : SyncProfile.defaultRCPort(for: id)
         self.downloadConnections = min(16, max(1, downloadConnections))
+        self.bandwidthLimit = SyncProfile.normalizedBandwidthLimit(bandwidthLimit)
+    }
+
+    /// A `--bwlimit` value SyncTray will pass to rclone, trimmed. Returns "" (unlimited)
+    /// for empty/whitespace or anything not matching the shell-safe single-rate grammar
+    /// `isValidBandwidthLimit` accepts — so a bad value never reaches the generated script.
+    static func normalizedBandwidthLimit(_ raw: String) -> String {
+        let trimmed = raw.trimmingCharacters(in: .whitespaces)
+        return isValidBandwidthLimit(trimmed) ? trimmed : ""
+    }
+
+    /// True for a bandwidth spec SyncTray supports: empty (unlimited), `off`, or a single
+    /// rate `<number><unit?>` optionally as `up:down`, where unit is one of rclone's
+    /// b/K/M/G/T/P (with optional `i`, case-insensitive). Deliberately NOT the full rclone
+    /// grammar (no space-separated timetables) so the value is a single shell-safe token
+    /// the script can pass as one argument.
+    static func isValidBandwidthLimit(_ value: String) -> Bool {
+        if value.isEmpty { return true }
+        let rate = "(?:off|[0-9]+(?:\\.[0-9]+)?[bBkKmMgGtTpP]?i?)"
+        let pattern = "^\(rate)(?::\(rate))?$"
+        return value.range(of: pattern, options: .regularExpression) != nil
     }
 
     /// Generate a deterministic RC port from the profile UUID (range: 5800-5899)
@@ -335,6 +368,7 @@ extension SyncProfile {
         case streamCacheOnly
         case pinnedDirectories, warmExcludePatterns, rcPort
         case downloadConnections
+        case bandwidthLimit
     }
 
     init(from decoder: Decoder) throws {
@@ -400,6 +434,11 @@ extension SyncProfile {
         // --transfers.
         let decodedConnections = try container.decodeIfPresent(Int.self, forKey: .downloadConnections) ?? 2
         downloadConnections = min(16, max(1, decodedConnections))
+        // Backwards compatibility: no cap by default. Normalized (trimmed + validated to a
+        // shell-safe single-rate spec) so a hand-edited profile file can never inject a
+        // malformed or space-carrying value into the generated script's rclone command.
+        let decodedBandwidth = try container.decodeIfPresent(String.self, forKey: .bandwidthLimit) ?? ""
+        bandwidthLimit = SyncProfile.normalizedBandwidthLimit(decodedBandwidth)
     }
 }
 

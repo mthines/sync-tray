@@ -1065,6 +1065,7 @@ final class TelemetryService {
                 "config.pinned_directory_count": .int(profile.pinnedDirectories.count),
                 "config.allow_non_empty_mount": .bool(profile.allowNonEmptyMount),
                 "config.download_connections": .int(profile.isMountMode ? profile.downloadConnections : 0),
+                "config.has_bandwidth_limit": .bool(!profile.bandwidthLimit.isEmpty),
                 "config.cache_fs_type": .string(cacheVolume?.fsType ?? "n/a"),
                 "config.cache_volume": .string(cacheVolume?.volume ?? "n/a"),
             ]

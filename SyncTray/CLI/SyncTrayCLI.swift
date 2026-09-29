@@ -216,7 +216,8 @@ enum SyncTrayCLI {
       vfsCacheMode (off|minimal|writes|full), vfsCacheMaxSize, vfsCacheMaxAge,
       vfsCachePath, allowNonEmptyMount, mountAtStartup,
       streamCacheOnly, isMuted, rcPort,
-      downloadConnections, pinnedDirectories (comma-separated),
+      downloadConnections, bandwidthLimit (rclone --bwlimit: '', 'off',
+      '10M', or '1M:512k'), pinnedDirectories (comma-separated),
       warmExcludePatterns (comma-separated). Use enable/disable for isEnabled.
 
     Profiles author JSON against schema/profile.schema.json under the config
@@ -1422,6 +1423,12 @@ enum SyncTrayCLI {
         case "downloadConnections":
             guard let n = int(value), (1...16).contains(n) else { return "downloadConnections must be an integer in 1...16" }
             profile.downloadConnections = n
+        case "bandwidthLimit":
+            let trimmed = value.trimmingCharacters(in: .whitespaces)
+            guard SyncProfile.isValidBandwidthLimit(trimmed) else {
+                return "bandwidthLimit must be empty, 'off', a rate like '10M', or 'up:down' like '1M:512k'"
+            }
+            profile.bandwidthLimit = trimmed
         case "rcPort":
             guard let n = int(value), (1...65535).contains(n) else { return "rcPort must be an integer in 1...65535" }
             profile.rcPort = n

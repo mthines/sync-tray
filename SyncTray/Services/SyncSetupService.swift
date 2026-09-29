@@ -654,6 +654,10 @@ final class SyncSetupService {
             DOWNLOAD_CONNECTIONS=$(parse_json "downloadConnections" "2")
             ALLOW_NON_EMPTY=$(parse_json "allowNonEmptyMount" "false")
             RC_PORT=$(parse_json "rcPort" "0")
+            # Optional rclone --bwlimit for every command this profile runs (mount, sync,
+            # bisync). Empty = unlimited. The app validates it to a shell-safe single-rate
+            # token before writing the config, so it's a single argument here.
+            BANDWIDTH_LIMIT=$(parse_json "bandwidthLimit" "")
 
             if [[ -z "$REMOTE" || -z "$LOCAL_PATH" ]]; then
                 echo "Error: Invalid config - missing remote or localPath"
@@ -1369,6 +1373,16 @@ final class SyncSetupService {
                     RCLONE_CMD="$RCLONE_CMD --allow-non-empty"
                 fi
 
+                # Bandwidth cap: rclone --bwlimit on BOTH mount commands (streaming +
+                # Cache Only) so a live mount can't saturate the uplink and stall the
+                # local NFS server (which drops the volume — "Server connections
+                # interrupted"). Empty = unlimited. Applied before the dry-run seam so the
+                # rendered mount command carries it; the sync/bisync path applies the same
+                # cap at the shared append point below (guarded so mount never doubles it).
+                if [[ -n "$BANDWIDTH_LIMIT" ]]; then
+                    RCLONE_CMD="$RCLONE_CMD --bwlimit \\"$BANDWIDTH_LIMIT\\""
+                fi
+
                 # DRY-RUN TEST SEAM
                 #
                 # Reading through a real NFS/FUSE mount requires an actual rclone mount and
@@ -1461,6 +1475,12 @@ final class SyncSetupService {
 
             if [[ -n "$ADDITIONAL_FLAGS" ]]; then
                 RCLONE_CMD="$RCLONE_CMD $ADDITIONAL_FLAGS"
+            fi
+
+            # Bandwidth cap for sync/bisync. The mount path adds --bwlimit before its
+            # dry-run seam above, so exclude mount here to avoid a duplicate flag.
+            if [[ -n "$BANDWIDTH_LIMIT" && "$SYNC_MODE" != "mount" ]]; then
+                RCLONE_CMD="$RCLONE_CMD --bwlimit \\"$BANDWIDTH_LIMIT\\""
             fi
 
             # Run sync command
@@ -1565,6 +1585,7 @@ final class SyncSetupService {
             "pinnedDirectories": profile.pinnedDirectories,
             "rcPort": profile.rcPort,
             "downloadConnections": profile.downloadConnections,
+            "bandwidthLimit": profile.bandwidthLimit,
         ].merging(mountCacheOnlyConfigKeys(for: profile)) { _, new in new }
 
         if let data = try? JSONSerialization.data(

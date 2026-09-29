@@ -127,6 +127,11 @@
       "maximum": 16,
       "default": 2,
       "description": "How many files rclone downloads in parallel — sets the mount's --transfers and the app-side offline-warm concurrency. Higher saturates a fast wired link; 1–2 is faster on Wi-Fi/mesh or a slow remote, where parallel transfers contend and collapse throughput. Clamped to 1–16; omitted defaults to 2."
+    },
+    "bandwidthLimit": {
+      "type": "string",
+      "default": "",
+      "description": "Optional rclone --bwlimit applied to every command this profile runs (mount, sync, bisync). A single rate ('10M' = 10 MByte/s), 'up:down' ('1M:512k'), a bare number in KiByte/s, or 'off'. Empty = unlimited. Caps the shared uplink so a live mount can't saturate the link and stall the local NFS server. Validated to a shell-safe single-rate spec (no spaces); an invalid value is treated as empty."
     }
   },
   "required": [

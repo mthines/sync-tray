@@ -118,6 +118,25 @@ this field existed) decodes to 2, and users on a fast wired link raise it. Chang
 is in `reconcileAction`'s reinstall set, so it remounts the stream to apply the new
 `--transfers`; a hand-edited value is clamped to 1–16 by the decoder.
 
+**Bandwidth limit (`bandwidthLimit`, default empty = unlimited):** a per-profile
+"Bandwidth Limit" control (Advanced Options, **all** sync modes) that maps to rclone's
+`--bwlimit`, applied to EVERY command the profile runs — the streaming/warm mount, a
+one-way sync, and a bisync. rclone's own format: a single rate (`10M` = 10 MByte/s),
+`up:down` (`1M:512k`), a bare number in KiByte/s, or `off`. This is the knob for
+"SyncTray is saturating my network / freezing Finder": a live mount that maxes the
+uplink can stall the local NFS server and make macOS drop the volume ("Server
+connections interrupted"), and a cap keeps headroom. It's validated app/CLI-side
+(`SyncProfile.isValidBandwidthLimit`) to a **shell-safe single-rate token — no spaces,
+no metacharacters** — so it can never break the generated script's rclone command
+(`SyncProfile.normalizedBandwidthLimit` trims + rejects to empty at every boundary:
+memberwise init, the `Codable` decoder, the CLI's `profile set`, and the profile
+editor). Emitted into the derived `{shortId}.json` as `bandwidthLimit`; the script
+appends `--bwlimit "$BANDWIDTH_LIMIT"` to the mount command (before the dry-run seam)
+and to sync/bisync at the shared flag-append point (guarded to non-mount so the mount
+command never gets a duplicate flag). Changing it is in `reconcileAction`'s reinstall
+set. Because the app-side warm reads through the capped mount, capping the mount caps
+the warm too — no separate knob. Covered by `ConfigSelfTest` AC-BW1.
+
 **NFS backend caveats:** writes require `--vfs-cache-mode` ≥ `writes` (default is
 `full`, so this is satisfied). The NFS client couples access/modification times,
 which can occasionally cause an extra re-upload after a file is merely viewed in
