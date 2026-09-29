@@ -51,6 +51,7 @@ enum ConfigSelfTest {
             testDeleteDurable,
             testWarmExcludePatternsRoundTrip,
             testBandwidthLimit,
+            testMountResilient,
             testWarmSkipsCachedFiles,
             testMountMonitorAutoWarm,
             testMountPollDecision,
@@ -671,6 +672,94 @@ enum ConfigSelfTest {
         guard SyncTrayCLI.applyProfileAssignment(&p, key: "bandwidthLimit", value: "no good") != nil,
               p.bandwidthLimit == "2M" else {
             return report(name, slug, false, "(CLI set of an invalid bandwidthLimit was not rejected)")
+        }
+        return report(name, slug, true)
+    }
+
+    // MARK: - AC-FR1 — mount resilience: default, round-trip, reconcile, script emission
+
+    /// `mountResilient` (default true) hardens a Stream mount against a stalled backend
+    /// freezing Finder. It must default to true (including for a config that predates the
+    /// field), survive the round-trip, reinstall on change, and render the right flags:
+    /// `--timeout`/`--contimeout` on every backend, and the NFS `-o soft…` options on the
+    /// nfsmount backend ONLY (they are not FUSE options — passing them to macFUSE would
+    /// break the mount). When off, none of these appear.
+    private static func testMountResilient() -> Bool {
+        let name = "AC-FR1", slug = "mount-resilient"
+
+        // Default true from the memberwise init.
+        guard sampleProfile().mountResilient else {
+            return report(name, slug, false, "(mountResilient did not default to true)")
+        }
+        // A config that predates the field decodes to true, not false.
+        let legacy: [String: Any] = [
+            "id": UUID().uuidString, "name": "Legacy", "rcloneRemote": "r:",
+            "remotePath": "P", "localSyncPath": "/tmp/x",
+        ]
+        guard let legacyData = try? JSONSerialization.data(withJSONObject: legacy),
+              let legacyDecoded = try? JSONDecoder().decode(SyncProfile.self, from: legacyData),
+              legacyDecoded.mountResilient else {
+            return report(name, slug, false, "(missing mountResilient did not decode to true)")
+        }
+        // Round-trip an explicit false.
+        var profile = sampleProfile()
+        profile.mountResilient = false
+        guard let data = try? JSONEncoder().encode(profile),
+              let decoded = try? JSONDecoder().decode(SyncProfile.self, from: data),
+              decoded.mountResilient == false else {
+            return report(name, slug, false, "(mountResilient not preserved through round-trip)")
+        }
+
+        // Reconcile: a change reinstalls (regenerates the script + remounts).
+        let base = sampleProfile()
+        var toggled = base
+        toggled.mountResilient = !base.mountResilient
+        guard SyncManager.reconcileAction(from: base, to: toggled) == .reinstall else {
+            return report(name, slug, false, "(mountResilient change expected .reinstall)")
+        }
+
+        let fm = FileManager.default
+        let root = "\(selfTestRoot)/fr1-\(UUID().uuidString)"
+        try? fm.createDirectory(atPath: "\(root)/mnt", withIntermediateDirectories: true)
+
+        // NFS backend, resilient on → --timeout/--contimeout AND the -o soft options.
+        var nfsOn = mountFixtureProfile(localPath: "\(root)/mnt", cachePath: "\(root)/cache")
+        nfsOn.mountBackend = .nfs
+        nfsOn.mountResilient = true
+        let nfsOnCmd = dryRunMountScript(profile: nfsOn, rcloneConfig: "").cmd ?? ""
+        guard nfsOnCmd.contains("--timeout 30s"), nfsOnCmd.contains("--contimeout 10s"),
+              nfsOnCmd.contains("-o soft,timeo=100,retrans=3") else {
+            return report(name, slug, false, "(nfs resilient mount missing flags: \(nfsOnCmd))")
+        }
+
+        // macFUSE backend, resilient on → rclone timeouts but NOT the NFS -o soft options.
+        var fuseOn = mountFixtureProfile(localPath: "\(root)/mnt", cachePath: "\(root)/cache")
+        fuseOn.mountBackend = .macfuse
+        fuseOn.mountResilient = true
+        let fuseOnCmd = dryRunMountScript(profile: fuseOn, rcloneConfig: "").cmd ?? ""
+        guard fuseOnCmd.contains("--timeout 30s"), fuseOnCmd.contains("--contimeout 10s"),
+              !fuseOnCmd.contains("-o soft") else {
+            return report(name, slug, false, "(macfuse resilient mount wrong flags: \(fuseOnCmd))")
+        }
+
+        // Resilient off → none of the resilience flags.
+        var off = mountFixtureProfile(localPath: "\(root)/mnt", cachePath: "\(root)/cache")
+        off.mountResilient = false
+        let offCmd = dryRunMountScript(profile: off, rcloneConfig: "").cmd ?? ""
+        guard !offCmd.contains("--timeout 30s"), !offCmd.contains("--contimeout"),
+              !offCmd.contains("-o soft") else {
+            return report(name, slug, false, "(resilient-off mount still carries flags: \(offCmd))")
+        }
+
+        // CLI profile set: bool parsed, bad value rejected with no mutation.
+        var p = sampleProfile()
+        guard SyncTrayCLI.applyProfileAssignment(&p, key: "mountResilient", value: "false") == nil,
+              p.mountResilient == false else {
+            return report(name, slug, false, "(CLI set of mountResilient=false failed)")
+        }
+        guard SyncTrayCLI.applyProfileAssignment(&p, key: "mountResilient", value: "maybe") != nil,
+              p.mountResilient == false else {
+            return report(name, slug, false, "(CLI set of an invalid mountResilient was not rejected)")
         }
         return report(name, slug, true)
     }

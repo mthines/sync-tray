@@ -132,6 +132,11 @@
       "type": "string",
       "default": "",
       "description": "Optional rclone --bwlimit applied to every command this profile runs (mount, sync, bisync). A single rate ('10M' = 10 MByte/s), 'up:down' ('1M:512k'), a bare number in KiByte/s, or 'off'. Empty = unlimited. Caps the shared uplink so a live mount can't saturate the link and stall the local NFS server. Validated to a shell-safe single-rate spec (no spaces); an invalid value is treated as empty."
+    },
+    "mountResilient": {
+      "type": "boolean",
+      "default": true,
+      "description": "Mount mode only. When true (default), the mount is hardened against a stalled backend freezing Finder: rclone gets '--timeout 30s --contimeout 10s' (vs 5m/1m defaults) so it releases a held NFS RPC fast, and the NFS backend is mounted '-o soft,timeo=100,retrans=3' so a wedged rclone NFS server returns a bounded I/O error instead of the default 'hard' mount's uninterruptible hang. The soft options are NFS-only (not FUSE), so a macFUSE profile gets only the rclone timeouts. Set false to revert to the classic hard mount."
     }
   },
   "required": [

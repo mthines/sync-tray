@@ -62,6 +62,7 @@ struct ProfileDetailView: View {
     @State private var streamCacheOnly: Bool = false
     @State private var downloadConnections: Int = 2
     @State private var bandwidthLimit: String = ""
+    @State private var mountResilient: Bool = true
 
     // UI State
     @State private var showAdvanced: Bool = false
@@ -187,7 +188,8 @@ struct ProfileDetailView: View {
         mountAtStartup != profile.mountAtStartup ||
         streamCacheOnly != profile.streamCacheOnly ||
         downloadConnections != profile.downloadConnections ||
-        SyncProfile.normalizedBandwidthLimit(bandwidthLimit) != profile.bandwidthLimit
+        SyncProfile.normalizedBandwidthLimit(bandwidthLimit) != profile.bandwidthLimit ||
+        mountResilient != profile.mountResilient
     }
 
     /// Display name for the mount folder, used in the offline-access caption
@@ -1993,6 +1995,25 @@ struct ProfileDetailView: View {
                     }
                     .frame(width: 220, alignment: .leading)
                 }
+
+                Divider()
+
+                // Mount resilience — bound a stalled backend so it can't freeze Finder.
+                VStack(alignment: .leading, spacing: 4) {
+                    Toggle(isOn: $mountResilient) {
+                        Text("Resilient Mount")
+                            .font(.subheadline.weight(.medium))
+                    }
+                    Text("Stops a stalled server from freezing Finder and the whole computer. "
+                        + "Bounds rclone's timeouts and mounts the NFS volume \"soft\", so when "
+                        + "the remote drops you get a quick error on an uncached file instead of "
+                        + "an app that hangs until the server comes back. Recommended on; turn it "
+                        + "off only if you see occasional read errors on a slow-but-working remote. "
+                        + "Changing this remounts the stream.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
             }
 
             Divider()
@@ -2104,6 +2125,7 @@ struct ProfileDetailView: View {
         streamCacheOnly = profile.streamCacheOnly
         downloadConnections = profile.downloadConnections
         bandwidthLimit = profile.bandwidthLimit
+        mountResilient = profile.mountResilient
 
         // Show text input if the path contains "/" (nested path) or is a custom path
         // that won't be in the folder picker dropdown
@@ -2139,6 +2161,7 @@ struct ProfileDetailView: View {
         updatedProfile.streamCacheOnly = streamCacheOnly
         updatedProfile.downloadConnections = downloadConnections
         updatedProfile.bandwidthLimit = SyncProfile.normalizedBandwidthLimit(bandwidthLimit)
+        updatedProfile.mountResilient = mountResilient
         return updatedProfile
     }
 

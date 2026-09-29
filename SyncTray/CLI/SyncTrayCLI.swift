@@ -217,8 +217,10 @@ enum SyncTrayCLI {
       vfsCachePath, allowNonEmptyMount, mountAtStartup,
       streamCacheOnly, isMuted, rcPort,
       downloadConnections, bandwidthLimit (rclone --bwlimit: '', 'off',
-      '10M', or '1M:512k'), pinnedDirectories (comma-separated),
-      warmExcludePatterns (comma-separated). Use enable/disable for isEnabled.
+      '10M', or '1M:512k'), mountResilient (true|false — soft/bounded mount
+      so a stalled backend can't freeze Finder), pinnedDirectories
+      (comma-separated), warmExcludePatterns (comma-separated).
+      Use enable/disable for isEnabled.
 
     Profiles author JSON against schema/profile.schema.json under the config
     directory; the same file an agent can drop in or edit directly.
@@ -1446,6 +1448,9 @@ enum SyncTrayCLI {
         case "allowNonEmptyMount":
             guard let b = bool(value) else { return "allowNonEmptyMount must be true or false" }
             profile.allowNonEmptyMount = b
+        case "mountResilient":
+            guard let b = bool(value) else { return "mountResilient must be true or false" }
+            profile.mountResilient = b
 
         // Enums.
         case "syncMode":
