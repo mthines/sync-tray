@@ -240,7 +240,7 @@ struct AppSettingsView: View {
     private var betaTag: some View {
         Text("Beta")
             .font(.caption2.weight(.semibold))
-            .foregroundStyle(.orange)
+            .foregroundStyle(.primary)
             .padding(.horizontal, 6)
             .padding(.vertical, 2)
             .background(Color.orange.opacity(0.15))
