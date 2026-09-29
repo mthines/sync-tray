@@ -47,6 +47,16 @@ cd "$PROJECT_DIR"
 
 log_info "CI release ${TAG} (beta=${IS_BETA})"
 
+# Release channel, baked into Info.plist as SyncTrayReleaseChannel so the app can
+# tell a /beta build from a stable one (App Settings shows a "Beta" tag after the
+# version). The version string can't carry this: a beta only tags the PR head and
+# never bumps CFBundleShortVersionString, so it still reads the last stable version.
+if [ "$IS_BETA" = "true" ]; then
+  RELEASE_CHANNEL="beta"
+else
+  RELEASE_CHANNEL="stable"
+fi
+
 if [ -z "${DASH0_AUTH_TOKEN:-}" ]; then
   log_warning "DASH0_AUTH_TOKEN not set — telemetry token will not be embedded"
 fi
@@ -65,6 +75,7 @@ xcodebuild -project "$XCODEPROJ" \
   ONLY_ACTIVE_ARCH=NO \
   CODE_SIGNING_ALLOWED=NO \
   DASH0_AUTH_TOKEN="${DASH0_AUTH_TOKEN:-}" \
+  SYNCTRAY_RELEASE_CHANNEL="$RELEASE_CHANNEL" \
   | tail -20
 
 APP_PATH="$BUILD_DIR/DerivedData/Build/Products/Release/${PROJECT_NAME}.app"
@@ -73,6 +84,15 @@ BINARY="$APP_PATH/Contents/MacOS/${PROJECT_NAME}"
 if [ ! -f "$BINARY" ]; then
   log_error "Binary not found at $BINARY — build produced an empty app bundle"
 fi
+
+# Fail closed if the channel didn't reach the bundle: a beta that can't identify
+# itself, or a stable build labelled beta, is exactly what the Settings tag exists
+# to prevent.
+BUILT_CHANNEL=$(/usr/libexec/PlistBuddy -c "Print :SyncTrayReleaseChannel" "$APP_PATH/Contents/Info.plist" 2>/dev/null || echo "")
+if [ "$BUILT_CHANNEL" != "$RELEASE_CHANNEL" ]; then
+  log_error "Built Info.plist has SyncTrayReleaseChannel='${BUILT_CHANNEL}', expected '${RELEASE_CHANNEL}'"
+fi
+log_success "Release channel: ${RELEASE_CHANNEL}"
 
 ARCH_INFO=$(lipo -info "$BINARY" 2>/dev/null | sed 's/.*: //' || echo "unknown")
 log_success "Build OK ($ARCH_INFO)"

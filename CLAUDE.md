@@ -504,7 +504,7 @@ is the separate, fail-closed schema-drift gate.
 |------|---------|
 | `MenuBarView.swift` | Menu bar dropdown with profile status, recent changes, quick actions |
 | `SettingsView.swift` | Settings window with profile list and detail editor |
-| `AppSettingsView.swift` | Global app settings — launch at login, telemetry toggle, debug logging |
+| `AppSettingsView.swift` | Global app settings — launch at login, telemetry toggle, debug logging; About shows the version with a **Beta** tag on `/beta` builds, read from the build-time `SyncTrayReleaseChannel` Info.plist key (a beta never bumps `CFBundleShortVersionString`; see DEVELOPMENT.md "Release Channel") |
 | `ProfileListView.swift` | Sidebar list of profiles with add/delete controls |
 | `StatusHeaderView.swift` | Header showing current sync state and progress |
 | `SyncProgressDetailView.swift` | Detailed per-file transfer progress during sync |

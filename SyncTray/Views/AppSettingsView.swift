@@ -205,7 +205,7 @@ struct AppSettingsView: View {
     private var aboutSection: some View {
         GroupBox("About") {
             VStack(alignment: .leading, spacing: 8) {
-                infoRow("Version", value: appVersion)
+                versionRow
                 infoRow("rclone", value: rcloneVersion ?? "Detecting...")
                 infoRow("Config", value: "~/.config/synctray/")
                 infoRow("Logs", value: "~/.local/log/")
@@ -227,10 +227,41 @@ struct AppSettingsView: View {
         .font(.caption)
     }
 
+    /// The Version row, followed by a "Beta" tag when this is a beta release.
+    private var versionRow: some View {
+        HStack(spacing: 6) {
+            infoRow("Version", value: appVersion)
+            if isBetaBuild {
+                betaTag
+            }
+        }
+    }
+
+    private var betaTag: some View {
+        Text("Beta")
+            .font(.caption2.weight(.semibold))
+            .foregroundStyle(.orange)
+            .padding(.horizontal, 6)
+            .padding(.vertical, 2)
+            .background(Color.orange.opacity(0.15))
+            .clipShape(Capsule())
+            .help("You're running a beta release of SyncTray")
+            .accessibilityLabel("Beta release")
+    }
+
     private var appVersion: String {
         let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?"
         let build = Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "?"
         return "\(version) (\(build))"
+    }
+
+    /// True for a `/beta` release. `scripts/release-ci.sh` passes
+    /// `SYNCTRAY_RELEASE_CHANNEL=beta` to xcodebuild for betas, which Info.plist
+    /// expands into `SyncTrayReleaseChannel`; stable releases carry "stable" and
+    /// local builds "". The version string can't tell: a beta never bumps
+    /// `CFBundleShortVersionString`, so it reads the last stable version.
+    private var isBetaBuild: Bool {
+        (Bundle.main.infoDictionary?["SyncTrayReleaseChannel"] as? String) == "beta"
     }
 
     private func detectRcloneVersion() async -> String {
