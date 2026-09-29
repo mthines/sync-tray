@@ -1066,6 +1066,7 @@ final class TelemetryService {
                 "config.allow_non_empty_mount": .bool(profile.allowNonEmptyMount),
                 "config.download_connections": .int(profile.isMountMode ? profile.downloadConnections : 0),
                 "config.has_bandwidth_limit": .bool(!profile.bandwidthLimit.isEmpty),
+                "config.mount_resilient": .string(profile.isMountMode ? String(profile.mountResilient) : "n/a"),
                 "config.cache_fs_type": .string(cacheVolume?.fsType ?? "n/a"),
                 "config.cache_volume": .string(cacheVolume?.volume ?? "n/a"),
             ]

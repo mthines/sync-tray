@@ -658,6 +658,9 @@ final class SyncSetupService {
             # bisync). Empty = unlimited. The app validates it to a shell-safe single-rate
             # token before writing the config, so it's a single argument here.
             BANDWIDTH_LIMIT=$(parse_json "bandwidthLimit" "")
+            # Mount resilience (mount mode). Default true, matching the Swift model default
+            # so a config that predates the field hardens on its next mount.
+            MOUNT_RESILIENT=$(parse_json "mountResilient" "true")
 
             if [[ -z "$REMOTE" || -z "$LOCAL_PATH" ]]; then
                 echo "Error: Invalid config - missing remote or localPath"
@@ -1373,6 +1376,26 @@ final class SyncSetupService {
                     RCLONE_CMD="$RCLONE_CMD --allow-non-empty"
                 fi
 
+                # Mount resilience: stop a stalled backend from freezing Finder (and every
+                # process touching the volume). Applied to BOTH mount commands (streaming +
+                # Cache Only), before the dry-run seam so the rendered command carries it.
+                #   --timeout 30s / --contimeout 10s : rclone's IO-idle and connect timeouts,
+                #     down from its 5m/1m defaults, so rclone gives up on a wedged backend
+                #     fast and releases the NFS RPC it is holding open (that held RPC is what
+                #     the reading process blocks on). Valid for both nfsmount and macFUSE.
+                #   -o soft,timeo=100,retrans=3 : NFS CLIENT options (nfsmount only). The
+                #     default macOS mount is `hard`, which retries forever regardless of
+                #     timeo/retrans — so a wedged rclone NFS server hangs Finder
+                #     uninterruptibly. `soft` returns a bounded I/O error instead
+                #     (timeo is in 0.1s units => 10s per RPC, 3 retrans => ~30s to error).
+                #     Not FUSE options, so never passed to the `mount` (macFUSE) subcommand.
+                if [[ "$MOUNT_RESILIENT" == "true" || "$MOUNT_RESILIENT" == "True" || "$MOUNT_RESILIENT" == "1" ]]; then
+                    RCLONE_CMD="$RCLONE_CMD --timeout 30s --contimeout 10s"
+                    if [[ "$MOUNT_SUBCMD" == "nfsmount" ]]; then
+                        RCLONE_CMD="$RCLONE_CMD -o soft,timeo=100,retrans=3"
+                    fi
+                fi
+
                 # Bandwidth cap: rclone --bwlimit on BOTH mount commands (streaming +
                 # Cache Only) so a live mount can't saturate the uplink and stall the
                 # local NFS server (which drops the volume — "Server connections
@@ -1586,6 +1609,7 @@ final class SyncSetupService {
             "rcPort": profile.rcPort,
             "downloadConnections": profile.downloadConnections,
             "bandwidthLimit": profile.bandwidthLimit,
+            "mountResilient": profile.mountResilient,
         ].merging(mountCacheOnlyConfigKeys(for: profile)) { _, new in new }
 
         if let data = try? JSONSerialization.data(

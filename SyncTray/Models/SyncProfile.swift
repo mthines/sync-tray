@@ -72,6 +72,22 @@ struct SyncProfile: Identifiable, Codable, Equatable {
     /// to a shell-safe single-rate spec — no spaces, so it can't break the generated
     /// script — and trimmed; an invalid value is rejected at the boundary, never written.
     var bandwidthLimit: String
+    /// Mount resilience (Stream mode only, default true). When on, the generated mount
+    /// command bounds how long a stalled backend can hang the mount: rclone's
+    /// `--timeout 30s --contimeout 10s` (down from rclone's 5m/1m defaults) so rclone
+    /// gives up on a wedged backend fast and releases the held NFS RPC, and — for the
+    /// NFS backend only — the macOS NFS client is mounted `-o soft,timeo=100,retrans=3`
+    /// so a stalled rclone NFS server surfaces as a bounded I/O error instead of the
+    /// default `hard` mount's uninterruptible hang that freezes Finder (and any process
+    /// touching the volume) until the server responds. This is the knob for "the whole
+    /// computer freezes when the NAS drops": the `soft` options are what actually break
+    /// the infinite hang, since a macOS `hard` mount retries forever regardless of
+    /// `timeo`/`retrans`. Default ON because the freeze is the common pain; the toggle
+    /// exists so a user who hits a soft-mount edge case (a transient read EIO under a
+    /// very slow but recovering backend) can revert to the classic hard mount. The
+    /// `-o soft…` options are NFS-only — they are not FUSE options, so a macFUSE-backed
+    /// profile gets only the rclone `--timeout`/`--contimeout` bounds.
+    var mountResilient: Bool
 
     /// Short ID for file naming (first 8 chars of UUID)
     var shortId: String {
@@ -285,7 +301,8 @@ struct SyncProfile: Identifiable, Codable, Equatable {
         warmExcludePatterns: [String] = [],
         rcPort: Int = 0,
         downloadConnections: Int = 2,
-        bandwidthLimit: String = ""
+        bandwidthLimit: String = "",
+        mountResilient: Bool = true
     ) {
         self.id = id
         self.name = name
@@ -315,6 +332,7 @@ struct SyncProfile: Identifiable, Codable, Equatable {
         self.rcPort = rcPort > 0 ? rcPort : SyncProfile.defaultRCPort(for: id)
         self.downloadConnections = min(16, max(1, downloadConnections))
         self.bandwidthLimit = SyncProfile.normalizedBandwidthLimit(bandwidthLimit)
+        self.mountResilient = mountResilient
     }
 
     /// A `--bwlimit` value SyncTray will pass to rclone, trimmed. Returns "" (unlimited)
@@ -369,6 +387,7 @@ extension SyncProfile {
         case pinnedDirectories, warmExcludePatterns, rcPort
         case downloadConnections
         case bandwidthLimit
+        case mountResilient
     }
 
     init(from decoder: Decoder) throws {
@@ -439,6 +458,9 @@ extension SyncProfile {
         // malformed or space-carrying value into the generated script's rclone command.
         let decodedBandwidth = try container.decodeIfPresent(String.self, forKey: .bandwidthLimit) ?? ""
         bandwidthLimit = SyncProfile.normalizedBandwidthLimit(decodedBandwidth)
+        // Default true: a profile persisted before this field existed is upgraded to the
+        // resilient mount on its next mount, which is the safer default for the freeze.
+        mountResilient = try container.decodeIfPresent(Bool.self, forKey: .mountResilient) ?? true
     }
 }
 
