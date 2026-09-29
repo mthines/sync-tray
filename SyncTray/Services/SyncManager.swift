@@ -2750,8 +2750,20 @@ final class SyncManager: ObservableObject {
             coMigrate: coMigrate.compactMap { profileStore.profile(for: $0) },
             pendingUploads: Self.pendingUploadCount(of:)
         ) {
-            return CacheMigrationOutcome(
+            let outcome = CacheMigrationOutcome(
                 result: .preflightRejected(.pendingUploads(reason)), filesMoved: 0, bytesMoved: 0, sameVolume: false)
+            // Recorded like every other `preflight_rejected` outcome — a begin/end pair, so
+            // the refusal is visible in telemetry — while still refusing before any warm is
+            // cancelled or anything is detached.
+            TelemetryService.shared.endCacheMigration(
+                TelemetryService.shared.beginCacheMigration(profileId: profileId, profileName: movingProfile.name),
+                filesMoved: 0,
+                bytesMoved: 0,
+                durationSeconds: Date().timeIntervalSince(startedAt),
+                sameVolume: false,
+                outcome: Self.cacheMigrationOutcomeLabel(outcome.result)
+            )
+            return outcome
         }
 
         // R5 — cancel any warm reading through the mount BEFORE any file is touched.
