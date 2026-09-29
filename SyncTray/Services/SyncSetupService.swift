@@ -1251,10 +1251,12 @@ final class SyncSetupService {
                     # offline-warm) instead of within a shorter auto-expiry. Offline WRITES
                     # need no flag here: under --vfs-cache-mode full a write while the remote
                     # is down lands in the VFS cache as dirty and rclone retries the
-                    # write-back until it returns. If the remote stays down long enough for
-                    # the mode selection above to notice on the NEXT mount start, that queued
-                    # write becomes the overlay's job instead (Cache Only Pending) — see the
-                    # automatic-entry note in CLAUDE.md.
+                    # write-back until it returns. That queued write stays in this streaming
+                    # cache even if the remote is still down on the NEXT mount start and the
+                    # mode selection above brings the mount up Cache Only: it never moves into
+                    # the overlay (the pending check reads only the overlay and the Cache Only
+                    # mount's own cache, and the overlay drain leaves Dirty streaming entries
+                    # alone), and rclone uploads it once Streaming resumes.
                     RCLONE_CMD="$RCLONE_CMD --buffer-size 128M --vfs-read-ahead 256M --transfers $DOWNLOAD_CONNECTIONS --vfs-read-chunk-size 128M --vfs-read-chunk-size-limit off --attr-timeout 5s --dir-cache-time 1000h --vfs-cache-max-age $VFS_CACHE_MAX_AGE"
                     RCLONE_CMD="$RCLONE_CMD --volname \\"$MOUNT_VOLNAME\\""
 
