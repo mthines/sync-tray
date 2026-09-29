@@ -134,6 +134,21 @@ Config resolution priority (first non-empty wins):
 2. `~/.config/synctray/.env` file
 3. Info.plist values embedded at build time
 
+### Release Channel and Version (Beta Tag)
+
+A `/beta` build shows its exact version (e.g. `0.81.0-beta.75.1 (1)`) followed by a **Beta** tag in **App Settings → About**. `CFBundleShortVersionString` can't carry either: a beta only tags the PR head and never bumps it, so it still reads the last stable version the PR branched from.
+
+Both are baked in at build time the same way as the token above. The build settings `SYNCTRAY_RELEASE_CHANNEL` and `SYNCTRAY_RELEASE_VERSION` are empty by default. For every release, `scripts/release-ci.sh` passes the channel (`beta` or `stable`) and the tagged version without its `v`. Info.plist expands them into `SyncTrayReleaseChannel` and `SyncTrayReleaseVersion`. The script then reads both keys back from the built bundle and fails the release if either doesn't match.
+
+The app shows `SyncTrayReleaseVersion` when it is set and falls back to `CFBundleShortVersionString` otherwise. For a CI stable release the two are identical. The local `scripts/release.sh` passes only `stable` and leaves the version to its Info.plist bump. Dev builds leave both empty, so they show the plist version and no tag. To preview a beta locally:
+
+```bash
+xcodebuild -scheme SyncTray -configuration Debug -derivedDataPath build \
+    -destination 'platform=macOS' CODE_SIGNING_ALLOWED=NO \
+    SYNCTRAY_RELEASE_CHANNEL=beta SYNCTRAY_RELEASE_VERSION=0.81.0-beta.75.1 build
+open build/Build/Products/Debug/SyncTray.app
+```
+
 ### Disabling Telemetry
 
 - **In the app:** Toggle "Anonymous Usage Data" OFF in Settings. All telemetry methods become no-ops.

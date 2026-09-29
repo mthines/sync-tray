@@ -12,6 +12,10 @@
 	<string>0.80.0</string>
 	<key>CFBundleVersion</key>
 	<string>1</string>
+	<key>SyncTrayReleaseChannel</key>
+	<string>$(SYNCTRAY_RELEASE_CHANNEL)</string>
+	<key>SyncTrayReleaseVersion</key>
+	<string>$(SYNCTRAY_RELEASE_VERSION)</string>
 	<key>Dash0AuthToken</key>
 	<string>$(DASH0_AUTH_TOKEN)</string>
 	<key>GitCommitSHA</key>
