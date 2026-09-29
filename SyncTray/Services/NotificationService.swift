@@ -174,6 +174,31 @@ final class NotificationService {
         )
     }
 
+    /// Notify the user their Cache Only mount is back on the network but can't auto-resume
+    /// yet because something has a file open on it. Called at most once per busy episode —
+    /// the caller (`SyncManager`) tracks that, this just sends the notification.
+    func notifyBackOnNetwork(profileName: String) {
+        sendNotification(
+            title: "SyncTray: \(profileName)",
+            body: "Back on your network. Close open files to resume syncing automatically.",
+            sound: nil,
+            profileId: nil
+        )
+    }
+
+    /// Notify the user that leaving Cache Only left files that couldn't upload — they stay
+    /// in the overlay (never lost) and the mount stays in a Cache Only flavour so they're
+    /// still visible, but syncing hasn't fully resumed.
+    func notifyOverlayUploadIssue(profileName: String, remaining: Int) {
+        let filesWord = remaining == 1 ? "file" : "files"
+        sendNotification(
+            title: "SyncTray: \(profileName)",
+            body: "\(remaining) \(filesWord) couldn't upload — still in Cache Only; will retry.",
+            sound: nil,
+            profileId: nil
+        )
+    }
+
     /// Reset the "drive not mounted" notification state for a specific profile or all profiles
     func resetDriveNotMountedState(for profileId: UUID? = nil) {
         if let profileId = profileId {

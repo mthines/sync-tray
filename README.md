@@ -502,11 +502,35 @@ diskutil unmount force /path/to/mount/point
 
 ### Mount mode: Slow file access
 
-Try adjusting cache settings:
+First check whether the slow files come from the network or the cache. A file read
+from the network means it isn't cached yet: pin its folder as **Available Offline**,
+and check it doesn't match one of the profile's warm-exclude patterns.
 
-- Increase cache size (e.g., from 10G to 20G)
-- Use "Full" cache mode for better read performance
-- Check network speed to remote (mount streams over network)
+**Cached files that are still slow usually point at the cache disk.** The NFS
+backend reads in 32 KB requests, and rclone treats each request as a fresh file
+open, rewriting that file's small cache record (`vfsMeta/`) every time. On a fast
+local filesystem that costs nothing. On a slow one, such as an **exFAT or FAT
+external drive** (FSKit on recent macOS) or any spinning USB disk, it dominates. For
+one ~100 GB cache on an exFAT USB hard drive we measured:
+
+| Cache location | Cached read speed through the mount |
+|---|---|
+| Internal APFS SSD | ~108 MB/s |
+| exFAT USB hard drive | ~6.6 MB/s (as low as ~0.2 MB/s with a large, busy cache) |
+
+The same files read straight off the exFAT drive ran at ~105 MB/s, so the drive
+itself wasn't the bottleneck. Options, most effective first:
+
+- **Put the cache on APFS.** Use the internal SSD if the cache fits, or reformat
+  the external drive as APFS (you lose Linux/Windows compatibility).
+- **Use Two-Way Sync instead of Stream for that folder.** Files become ordinary
+  files on disk and apps read them at disk speed, with no rclone in the read path.
+- **Switch the profile to the macFUSE backend.** FUSE keeps each file open across
+  reads, so the per-read rewrite goes away. It needs macFUSE (see above).
+
+Also note that the mount reads ahead of what an app asks for, so briefly touching
+an **uncached** file (a Finder preview, Spotlight) can download far more than was
+actually read.
 
 ## Development
 

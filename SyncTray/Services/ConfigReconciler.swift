@@ -86,7 +86,11 @@ extension SyncManager {
             current.vfsCacheMaxAge != updated.vfsCacheMaxAge ||
             current.vfsCachePath != updated.vfsCachePath ||
             current.downloadConnections != updated.downloadConnections ||
-            current.mountAtStartup != updated.mountAtStartup
+            current.mountAtStartup != updated.mountAtStartup ||
+            // Emitted into the script's {shortId}.json and flips the mount between
+            // streaming and a manual Cache-only union mount, so the agent has to be
+            // reinstalled and the stream remounted for it to take effect.
+            current.streamCacheOnly != updated.streamCacheOnly
 
         return needsReinstall ? .reinstall : .none
     }

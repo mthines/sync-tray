@@ -102,9 +102,10 @@
       "type": "boolean",
       "description": "Whether this mount profile auto-mounts at login/app launch."
     },
-    "offlineAccessEnabled": {
+    "streamCacheOnly": {
       "type": "boolean",
-      "description": "Mount mode only. When true (default), SyncTray maintains a read-only \"<mount-name> (Offline)\" folder next to the mount point that links to the VFS cache, so already-cached files stay browsable in Finder while the network is down. App-side only — not consumed by the sync script."
+      "default": false,
+      "description": "Mount mode only. Manual Cache Only: mount this profile as a writable union overlay over the VFS cache's data tree instead of streaming from the remote — new files and edits land in the overlay (never touching the cache), already-cached files open at local-disk speed, and partially-downloaded files stay hidden. Files created or changed while in this mode upload the next time the profile switches back to Streaming, or via Upload Now without leaving Cache Only. The mount also enters Cache Only AUTOMATICALLY when the primary remote is unreachable at mount time; this flag only tracks the user's manual choice — the running mount's mode file is the source of truth for which mode (including the automatic ones) is actually active."
     },
     "pinnedDirectories": {
       "type": "array",

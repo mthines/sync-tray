@@ -45,6 +45,7 @@ enum MigrationRunner {
         MigrationV1LegacyToMultiProfile(),
         MigrationV2FixVFSCachePath(),
         MigrationV3BlobToPerProfileFiles(),
+        MigrationV4Retired(),
     ]
 
     /// Run all pending migrations. Call this once at app startup,
@@ -348,4 +349,26 @@ struct MigrationV3BlobToPerProfileFiles: ProfileMigration {
         }
         return result
     }
+}
+
+
+// MARK: - Migration V4: retired
+
+/// Retired. Previously pinned each mount profile's cache identity to its primary remote
+/// name so the VFS cache survived a remote change — a feature this build removes because
+/// mounting an env-var-defined remote makes rclone suffix the cache name
+/// (`vfs/{remote}{hash}/…`), and one shared streaming cache between SMB and SFTP is
+/// evicted by their differing modtime fingerprints. The cache is keyed by the primary
+/// remote name directly again (see `VFSCacheService.cacheRelativePath`), and a leftover
+/// suffixed tree is consolidated by the sync script on the next mount start rather than
+/// by this migration.
+///
+/// Kept as a no-op, not deleted, so the schema-version numbering stays monotonic for a
+/// machine that already ran v4 — deleting the slot would make its `schemaVersion == 4`
+/// skip whatever migration NEXT claims v4.
+struct MigrationV4Retired: ProfileMigration {
+    let version = 4
+    let description = "Retired cache-pinning migration — intentionally a no-op"
+
+    func migrateUserDefaults(_ defaults: UserDefaults) throws {}
 }

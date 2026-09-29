@@ -37,14 +37,31 @@ final class VFSCacheService {
 
     // MARK: - Cache Directory Scanning
 
-    /// Single home for the on-disk VFS cache subtree key: the remote name with
-    /// its trailing colon stripped, joined with the profile's remote path.
-    /// `cacheDirectory(for:)` below and `CacheMigrationPlanner` BOTH call this,
-    /// so they cannot disagree about which subtree a profile owns (a drift
-    /// there would relocate the wrong subtree during a cache move).
+    /// Single home for the on-disk VFS cache subtree key: the PRIMARY remote's name
+    /// (colon stripped), joined with the profile's remote path — exactly the layout rclone
+    /// uses when it mounts `rcloneRemote:remotePath` directly, and exactly what an older
+    /// build (before, and after, the retired "Share the cache across remotes" feature)
+    /// expects. `cacheDirectory(for:)` below and `CacheMigrationPlanner` ALL call this, so
+    /// they cannot disagree about which subtree a profile owns (a drift there would
+    /// relocate the wrong subtree during a cache move). See "Cache identity" in CLAUDE.md
+    /// for why a suffixed variant (`{primary}{hash}`) can also appear on disk and how the
+    /// sync script consolidates it into this unsuffixed key on every mount start.
     nonisolated static func cacheRelativePath(for profile: SyncProfile) -> String {
-        let remoteName = profile.rcloneRemote.replacingOccurrences(of: ":", with: "")
-        return profile.remotePath.isEmpty ? remoteName : "\(remoteName)/\(profile.remotePath)"
+        key(remoteName: profile.primaryRemoteName, remotePath: profile.remotePath)
+    }
+
+    /// The subtree key for an ARBITRARY remote name (e.g. a fallback's), used when
+    /// classifying a stray tree that isn't necessarily the profile's primary remote.
+    nonisolated static func cacheRelativePath(
+        remoteName: String, remotePath: String
+    ) -> String {
+        key(remoteName: remoteName.replacingOccurrences(of: ":", with: ""), remotePath: remotePath)
+    }
+
+    /// Shared join so every caller can only differ in the remote-name component.
+    private nonisolated static func key(remoteName: String, remotePath: String) -> String {
+        let name = remoteName.replacingOccurrences(of: ":", with: "")
+        return remotePath.isEmpty ? name : "\(name)/\(remotePath)"
     }
 
     /// Get the VFS cache directory path for a profile's remote
@@ -53,13 +70,12 @@ final class VFSCacheService {
         let fm = FileManager.default
         guard fm.fileExists(atPath: baseCachePath) else { return nil }
 
-        // rclone stores VFS cache in: {cache-dir}/vfs/{remote-name}/
-        // The remote name has the colon stripped
+        // rclone stores VFS cache in: {cache-dir}/vfs/{fs-name}/{fs-root}
+        // The fs name is the profile's primary remote name (colon stripped).
         let vfsDir = (baseCachePath as NSString).appendingPathComponent(CacheTreeKind.content.rawValue)
         guard fm.fileExists(atPath: vfsDir) else { return nil }
 
-        // Try to find the remote's cache directory
-        let remoteName = profile.rcloneRemote.replacingOccurrences(of: ":", with: "")
+        let remoteName = profile.primaryRemoteName.replacingOccurrences(of: ":", with: "")
         let remoteDir = (vfsDir as NSString).appendingPathComponent(remoteName)
 
         if fm.fileExists(atPath: remoteDir) {
@@ -462,6 +478,19 @@ final class VFSCacheService {
         let Size: Int64
         let Rs: [Range]?
         let Dirty: Bool?
+        /// `"<size>,<remote modtime>[,<hash>]"` — rclone's record of the remote state
+        /// this cache entry was fetched against. `OverlaySyncService.parseFingerprint`
+        /// is the parser; see its doc comment for the exact modtime shape. Defaulted so
+        /// existing call sites that construct a `VFSCacheMeta` directly (pre-dating this
+        /// field) don't all need updating.
+        let Fingerprint: String?
+
+        init(Size: Int64, Rs: [Range]?, Dirty: Bool?, Fingerprint: String? = nil) {
+            self.Size = Size
+            self.Rs = Rs
+            self.Dirty = Dirty
+            self.Fingerprint = Fingerprint
+        }
     }
 
     /// Pure completeness check: does this `vfsMeta` sidecar prove the file is FULLY
@@ -723,5 +752,235 @@ final class VFSCacheService {
                 return "VFS cache directory not found"
             }
         }
+    }
+}
+
+// MARK: - Mount read-health probe
+
+/// Result of timing a read of an already fully-cached file through a live Stream mount.
+///
+/// Exists because "cached files are slow to open" is invisible in every other signal: the
+/// mount is healthy, the cache is warm, and nothing reaches the remote — rclone's NFS
+/// server is simply slow to serve its own cache (it re-opens the cache file and rewrites
+/// its `vfsMeta` sidecar on every 32 KB READ, which is free on APFS and dominant on an
+/// exFAT/FSKit USB drive). Only a timed read through the mount, tagged with the cache
+/// volume's filesystem, shows it.
+struct MountReadProbeResult: Equatable {
+    /// Bytes read through the mount.
+    let bytes: Int
+    /// Wall-clock seconds for the whole read.
+    let seconds: Double
+    /// Seconds from `open` to the first 64 KB arriving — the "file takes ages to open" symptom.
+    let firstByteSeconds: Double
+    /// Bytes the mount fetched from the remote while the probe ran (rclone `core/stats`
+    /// delta). Non-zero means the "fully cached" file was NOT served from cache — its cache
+    /// entry was invalidated on open, or something else was streaming at the same time.
+    let remoteBytes: Int
+
+    var throughputMBps: Double { seconds > 0 ? Double(bytes) / seconds / 1_000_000 : 0 }
+}
+
+extension VFSCacheService {
+    /// Bytes a probe reads: enough to measure steady-state throughput past the first
+    /// request, small enough to finish in seconds on a healthy cache.
+    static let readProbeBytes = 8 * 1024 * 1024
+    /// Hard wall-clock cap — a degraded mount (~0.2 MB/s) would otherwise take ~40 s.
+    static let readProbeBudgetSeconds: Double = 15
+    /// Only files at least this large are candidates, so a random offset is possible and the
+    /// read isn't dominated by a single open.
+    static let readProbeMinFileSize: Int64 = 16 * 1024 * 1024
+
+    /// Bucket a `statfs` `f_fstypename` into a bounded telemetry value. Unknown names
+    /// collapse to `other`, so this can never become a cardinality leak.
+    static func cacheFilesystemBucket(_ raw: String) -> String {
+        switch raw.lowercased() {
+        case "apfs": return "apfs"
+        case "hfs": return "hfs"
+        case "exfat": return "exfat"
+        case "msdos", "fat", "fat32", "vfat": return "fat"
+        case "ntfs", "tuxera_ntfs", "ufsd_ntfs": return "ntfs"
+        case "smbfs", "nfs", "afpfs", "webdav": return "network"
+        case "": return "unknown"
+        default: return "other"
+        }
+    }
+
+    /// Read-health bucket for a probe result — the attribute a dashboard groups by and a
+    /// check rule watches. `remote_fetch` wins over any speed: a "cached" read that touched
+    /// the remote is a cache-correctness problem, not a speed one.
+    static func readHealth(_ result: MountReadProbeResult) -> String {
+        if result.remoteBytes > 0 { return "remote_fetch" }
+        let mbps = result.throughputMBps
+        if mbps < 1 { return "degraded" }
+        if mbps < 20 { return "slow" }
+        return "healthy"
+    }
+
+    /// Filesystem bucket and internal/external placement of the volume holding `path`.
+    /// `volume` is `internal`, `external`, or `unknown`.
+    func cacheVolumeInfo(path: String) -> (fsType: String, volume: String) {
+        let expanded = (path as NSString).expandingTildeInPath
+        var fsType = "unknown"
+        var st = statfs()
+        if statfs(expanded, &st) == 0 {
+            let name = withUnsafeBytes(of: &st.f_fstypename) { raw in
+                String(decoding: raw.prefix { $0 != 0 }, as: UTF8.self)
+            }
+            fsType = Self.cacheFilesystemBucket(name)
+        }
+        let values = try? URL(fileURLWithPath: expanded).resourceValues(forKeys: [.volumeIsInternalKey])
+        let volume = values?.volumeIsInternal.map { $0 ? "internal" : "external" } ?? "unknown"
+        return (fsType, volume)
+    }
+
+    /// Pick a fully-cached file (mount-relative path + size) to probe, or nil when none
+    /// qualifies. Walks the data tree cheaply (sizes only) and confirms completeness via
+    /// the `vfsMeta` sidecar for a bounded number of candidates, so a 10k-file cache costs
+    /// one directory walk, not 10k JSON reads.
+    func pickReadProbeFile(for profile: SyncProfile, maxSidecarChecks: Int = 25) -> (path: String, size: Int64)? {
+        let roots = cacheSubtreeRoots(for: profile)
+        let rootURL = URL(fileURLWithPath: roots.data)
+        guard let walker = FileManager.default.enumerator(
+            at: rootURL, includingPropertiesForKeys: [.fileSizeKey, .isRegularFileKey],
+            options: [.skipsHiddenFiles]) else { return nil }
+        var candidates: [(String, Int64)] = []
+        for case let url as URL in walker {
+            guard let values = try? url.resourceValues(forKeys: [.fileSizeKey, .isRegularFileKey]),
+                  values.isRegularFile == true,
+                  let size = values.fileSize, Int64(size) >= Self.readProbeMinFileSize else { continue }
+            let rel = String(url.path.dropFirst(rootURL.path.count + 1))
+            candidates.append((rel, Int64(size)))
+            if candidates.count >= 500 { break }
+        }
+        for (rel, size) in candidates.shuffled().prefix(maxSidecarChecks)
+        where isFullyCached(mountRelativePath: rel, size: size, roots: roots) {
+            return (rel, size)
+        }
+        return nil
+    }
+
+    /// Time a read of `readProbeBytes` from a random offset of a fully-cached file THROUGH
+    /// the mount, snapshotting rclone's remote byte counter around it. `pick` comes from
+    /// `pickReadProbeFile`. Blocking — call off the main actor. Nil when the file can't be
+    /// opened or read through the mount.
+    func probeMountRead(for profile: SyncProfile, pick: (path: String, size: Int64)) async -> MountReadProbeResult? {
+        let mountPath = ((profile.localSyncPath as NSString).expandingTildeInPath as NSString)
+            .appendingPathComponent(pick.path)
+        let before = await getCoreStats(port: profile.rcPort)?.bytes ?? 0
+
+        let span = Int64(Self.readProbeBytes)
+        let offset = pick.size > span ? Int64.random(in: 0...(pick.size - span)) : 0
+        let start = Date()
+        guard let handle = FileHandle(forReadingAtPath: mountPath) else { return nil }
+        defer { try? handle.close() }
+        var read = 0
+        var firstByte: Double = 0
+        do {
+            try handle.seek(toOffset: UInt64(offset))
+            while read < Self.readProbeBytes, Date().timeIntervalSince(start) < Self.readProbeBudgetSeconds {
+                guard let chunk = try handle.read(upToCount: 64 * 1024), !chunk.isEmpty else { break }
+                if read == 0 { firstByte = Date().timeIntervalSince(start) }
+                read += chunk.count
+            }
+        } catch {
+            return nil
+        }
+        let seconds = Date().timeIntervalSince(start)
+        let after = await getCoreStats(port: profile.rcPort)?.bytes ?? before
+        return MountReadProbeResult(bytes: read, seconds: seconds, firstByteSeconds: firstByte,
+                                    remoteBytes: max(0, after - before))
+    }
+}
+
+// MARK: - Cache Only partial-file list (app-side)
+
+extension VFSCacheService {
+    /// One `--exclude-from` line for a data-tree-relative path: `/`-anchored, with rclone
+    /// glob metacharacters (and backslash itself) escaped so a literal `[` or `*` in a file
+    /// name matches only that file. Byte-for-byte the same as the sync script's generator.
+    static func cacheOnlyExcludeLine(_ rel: String) -> String {
+        var escaped = rel.replacingOccurrences(of: "\\", with: "\\\\")
+        for ch in ["*", "?", "[", "]", "{", "}"] {
+            escaped = escaped.replacingOccurrences(of: ch, with: "\\" + ch)
+        }
+        return "/" + escaped
+    }
+
+    /// Exclude lines for `rel` in both Unicode normalization forms when they differ: the
+    /// same visible name can reach rclone composed (NFC) or decomposed (NFD) depending on
+    /// how it was written, and an extra line for a name that doesn't exist is harmless,
+    /// while a missed form would leave a partial file visible.
+    static func cacheOnlyExcludeLines(_ rel: String) -> [String] {
+        let forms = [rel.precomposedStringWithCanonicalMapping, rel.decomposedStringWithCanonicalMapping]
+        var seen = Set<[UInt8]>()
+        return forms.compactMap { form in
+            seen.insert(Array(form.utf8)).inserted ? cacheOnlyExcludeLine(form) : nil
+        }
+    }
+
+    /// Should the Cache Only union mount hide this cached data file? True when its bytes
+    /// don't provably cover the file: no or unreadable sidecar, a size mismatch, or a gap
+    /// in the downloaded ranges. Deliberately ignores `Dirty` — a dirty file holds a local
+    /// edit that hasn't uploaded yet, and hiding it would hide the user's own unsaved work.
+    static func isPartialForCacheOnly(metaJSON: Data?, dataSize: Int64) -> Bool {
+        guard let metaJSON,
+              let meta = try? JSONDecoder().decode(VFSCacheMeta.self, from: metaJSON) else { return true }
+        let clean = VFSCacheMeta(Size: meta.Size, Rs: meta.Rs, Dirty: false)
+        return !isCacheComplete(meta: clean, expectedSize: dataSize)
+    }
+
+    /// Build the Cache Only partial-file list for `profile` from the on-disk streaming cache
+    /// and write it to `profile.cacheOnlyExcludePath` (atomically).
+    ///
+    /// The sync script regenerates this itself on every Cache Only mount start, but under
+    /// launchd its `python3` can be denied access to a cache on an external drive (macOS
+    /// privacy controls grant the app, not the interpreter), so it can't always read the
+    /// cache. The app writes the list on launch and every heartbeat while the profile is
+    /// mounted, and the script falls back to this copy — or to streaming when neither
+    /// exists — rather than mounting Cache Only with partial files exposed. Blocking —
+    /// call off the main actor. Returns the number of excluded files.
+    @discardableResult
+    func writeCacheOnlyExcludeList(for profile: SyncProfile) throws -> Int {
+        let roots = cacheSubtreeRoots(for: profile)
+        let rootURL = URL(fileURLWithPath: roots.data)
+        // The enumerator may hand back a differently-spelled prefix than the root it was
+        // given (Foundation adds or strips `/private` for `/var`, `/tmp`), so relative paths
+        // are cut from the SAME normalization applied to both sides.
+        let rootPrefix = rootURL.resolvingSymlinksInPath().path + "/"
+        var lines: [String] = []
+        var excluded = 0
+        // The enumerator skips an unreadable directory SILENTLY by default, which would
+        // write a list missing that directory's partial files — worse than no list, since
+        // the script trusts it. Abort on the first error instead.
+        var walkError: Error?
+        if FileManager.default.fileExists(atPath: roots.data),
+           let walker = FileManager.default.enumerator(
+               at: rootURL, includingPropertiesForKeys: [.fileSizeKey, .isRegularFileKey],
+               options: [], errorHandler: { _, error in walkError = error; return false }) {
+            for case let url as URL in walker {
+                guard let values = try? url.resourceValues(forKeys: [.fileSizeKey, .isRegularFileKey]),
+                      values.isRegularFile == true, let size = values.fileSize else { continue }
+                let full = url.resolvingSymlinksInPath().path
+                guard full.hasPrefix(rootPrefix) else { continue }
+                let rel = String(full.dropFirst(rootPrefix.count))
+                let meta = FileManager.default.contents(
+                    atPath: (roots.meta as NSString).appendingPathComponent(rel))
+                if Self.isPartialForCacheOnly(metaJSON: meta, dataSize: Int64(size)) {
+                    lines.append(contentsOf: Self.cacheOnlyExcludeLines(rel))
+                    excluded += 1
+                }
+            }
+        }
+        let path = profile.cacheOnlyExcludePath
+        if let walkError {
+            // A list we can't vouch for must not survive for the script to trust.
+            try? FileManager.default.removeItem(atPath: path)
+            throw walkError
+        }
+        try FileManager.default.createDirectory(
+            atPath: (path as NSString).deletingLastPathComponent, withIntermediateDirectories: true)
+        let body = lines.isEmpty ? "" : lines.joined(separator: "\n") + "\n"
+        try body.write(toFile: path, atomically: true, encoding: .utf8)
+        return excluded
     }
 }
