@@ -902,7 +902,11 @@ final class SyncSetupService {
                 # Deferred (not run at all) while another rclone mount process is using the
                 # SAME --cache-dir: two nested profiles can share one suffixed tree, and
                 # racing a live mount's cache with a rename mid-flight is not safe.
-                if pgrep -f "cache-dir ${VFS_CACHE_PATH} " >/dev/null 2>&1; then
+                # Matched as a fixed string: pgrep -f reads the path as a regex, so a cache
+                # path such as "Drive (2)" never matched and the rename ran under a live
+                # mount. The pattern reaches grep on a file descriptor, so grep never matches
+                # its own command line.
+                if ps -axww -o args= 2>/dev/null | grep -F -f <(printf '%s\\n' "cache-dir ${VFS_CACHE_PATH} ") >/dev/null 2>&1; then
                     echo "$(date '+%Y-%m-%d %H:%M:%S') - Cache key consolidation deferred (another rclone mount is using this cache dir)" >> "$LOG_FILE"
                 else
                     python3 -c "
