@@ -673,6 +673,33 @@ The app-driven mount path (`mountProfile`) sets the same flag so the two can't d
 This also covers a slow fallback mount that established after `mountProfile`'s poll gave
 up. Covered by `ConfigSelfTest` AC-24.
 
+**Whole-tree listing warm on mount — the "Loading…" spinner fix, separate from the data
+warm above.** rclone keeps TWO caches: the file-**data** cache (`--vfs-cache-mode full`,
+populated by the pinned-dir warm above) and a separate directory-**listing** cache
+(`--dir-cache-time 1000h`). They are independent — a folder can have its data warm and its
+listing cold. The data warm only touches **pinned** folders (it downloads bytes, which is
+expensive), so the first Finder browse of any *unpinned* folder is a live SMB `readdir`:
+8–12 s on a slow Synology, sometimes intermittently failing with `directory not found`,
+which is the endless "Loading…" spinner even on a plain streaming (non-Cache-Only) mount.
+`SyncManager.startListingWarm` closes this: the same 5 s mount monitor, on first seeing a
+profile mounted **streaming**, fires ONE whole-tree recursive `/vfs/refresh`
+(`VFSCacheService.refreshAllListings`, `dir:""`, `recursive:"true"`) that enumerates every
+directory once, up front — so subsequent browsing is served from the 1000 h listing cache
+(~0.1 s) everywhere, not just under pinned folders. It is **metadata only — no file bytes
+are downloaded**, so it is cheap enough to run tree-wide and needs no pinned-dir gating.
+Three things make it robust: it inspects the JSON body (rclone answers a cold-root SMB
+readdir failure with HTTP 200 and `{"result":{"":"directory not found"}}`, so a status-only
+check would misread the transient failure as success — success requires every per-dir
+result to be `OK`); it **retries** up to 3 times with a short backoff, because those SMB
+listing failures are intermittent (observed: the same refresh fails once, then succeeds
+seconds later); and a `failed` outcome is **non-fatal** — the mount stays fully usable and
+folders just warm lazily on first browse. Gated on `streaming` (a Cache Only union mount
+reads local upstreams — nothing remote to enumerate, and no RC API) and once per mount
+session via the pure `SyncManager.shouldWarmListingsOnMount` + a `listingWarmedMounts` set
+(re-arms on unmount, mirroring the data warm), so a fresh whole-tree refresh never fires
+every tick. Measurable via `synctray.mount.listing_warm` + the `Mount listing warm` log.
+Covered by `ConfigSelfTest` AC-LW1.
+
 **The check deliberately ignores modtime — and that is the whole point.** Under
 `--vfs-cache-mode full` rclone re-validates a `size,modtime` fingerprint on every open;
 on a **fingerprint-unstable backend (SMB especially)** the modtime drifts, the fingerprint

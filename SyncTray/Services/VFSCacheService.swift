@@ -325,6 +325,87 @@ final class VFSCacheService {
         }
     }
 
+    /// Outcome of a whole-tree LISTING warm (`refreshAllListings`) — metadata only, no data.
+    struct ListingWarmResult: Equatable {
+        /// `completed` when rclone reported the recursive root refresh `OK`; `failed` when
+        /// every attempt returned a transient error (e.g. an SMB `directory not found` on
+        /// the cold root readdir); `skipped` when there was no RC port to talk to.
+        let outcome: String
+        /// How many attempts ran (1...maxAttempts). 0 only for `skipped`.
+        let attempts: Int
+        /// Wall-clock seconds for the whole warm, retries included.
+        let durationSeconds: Double
+    }
+
+    /// Warm the **listing** cache for a streaming mount's ENTIRE tree in one recursive
+    /// `/vfs/refresh` — the directory-enumeration cache Finder browsing needs, which is
+    /// SEPARATE from `--vfs-cache-mode full`'s file-DATA cache. This downloads no bytes: it
+    /// only makes rclone fetch every directory listing once, up front, so the first Finder
+    /// open of any folder is instant (0.1s from `--dir-cache-time`'s cache) instead of a
+    /// live 8–12s SMB round-trip per cold folder — the "Loading…" spinner.
+    ///
+    /// Unlike `refreshDirectory`, this inspects the JSON body: rclone answers a cold-root
+    /// SMB readdir failure with HTTP 200 and `{"result": {"": "directory not found"}}`, so a
+    /// status-only check would read that transient failure as success. Those failures are
+    /// intermittent on a flaky SMB backend (observed: the same root refresh fails once, then
+    /// succeeds seconds later), so this retries a few times with a short backoff before
+    /// giving up. A `failed` result is non-fatal — the mount still works, browsing is just
+    /// cold — so callers record it and move on rather than surfacing an error.
+    func refreshAllListings(
+        port: Int,
+        maxAttempts: Int = 3,
+        retryDelay: TimeInterval = 3
+    ) async -> ListingWarmResult {
+        let start = Date()
+        guard port > 0 else {
+            return ListingWarmResult(outcome: "skipped", attempts: 0, durationSeconds: 0)
+        }
+        var attempt = 0
+        while attempt < maxAttempts {
+            attempt += 1
+            if (try? await refreshRootRecursive(port: port)) == true {
+                return ListingWarmResult(
+                    outcome: "completed", attempts: attempt,
+                    durationSeconds: Date().timeIntervalSince(start))
+            }
+            if attempt < maxAttempts {
+                try? await Task.sleep(nanoseconds: UInt64(retryDelay * 1_000_000_000))
+            }
+        }
+        return ListingWarmResult(
+            outcome: "failed", attempts: attempt,
+            durationSeconds: Date().timeIntervalSince(start))
+    }
+
+    /// One recursive `/vfs/refresh` of the mount root, returning whether rclone actually
+    /// enumerated it. `true` iff the response is HTTP 200 AND every per-directory result in
+    /// the body is `OK` (rclone reports a partial/failed walk as a non-`OK` value like
+    /// `directory not found` while still returning 200). Throws on transport failure.
+    private func refreshRootRecursive(port: Int) async throws -> Bool {
+        let url = URL(string: "http://localhost:\(port)/vfs/refresh")!
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        // Same string-typed params as refreshDirectory (rclone rejects a JSON boolean here).
+        // dir "" = the mount root; recursive walks the whole tree in one call.
+        let body: [String: Any] = ["dir": "", "recursive": "true"]
+        request.httpBody = try JSONSerialization.data(withJSONObject: body)
+
+        let (data, response) = try await URLSession.shared.data(for: request)
+        guard let httpResponse = response as? HTTPURLResponse,
+              httpResponse.statusCode == 200 else {
+            throw VFSCacheError.rcRequestFailed
+        }
+        // { "result": { "<dir>": "OK" | "directory not found" | ... } } — success only when
+        // every reported directory is OK. An empty/absent result map is treated as failure.
+        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let result = json["result"] as? [String: String],
+              !result.isEmpty else {
+            return false
+        }
+        return result.values.allSatisfy { $0 == "OK" }
+    }
+
     /// Forget (evict) a directory from VFS cache via rclone RC API
     func forgetDirectory(_ dir: String, port: Int) async throws {
         let url = URL(string: "http://localhost:\(port)/vfs/forget")!

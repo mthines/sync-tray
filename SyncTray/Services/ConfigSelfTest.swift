@@ -54,6 +54,7 @@ enum ConfigSelfTest {
             testMountResilient,
             testWarmSkipsCachedFiles,
             testMountMonitorAutoWarm,
+            testListingWarmOnMount,
             testMountPollDecision,
             testLegacyOfflineLinkCleanup,
             testWarmReconcileTrigger,
@@ -992,6 +993,51 @@ enum ConfigSelfTest {
         // an unmounted tick (no crash, idempotent remove).
         _ = SyncManager.shouldAutoWarmOnMount(isMounted: false, hasPinnedDirs: true, profileId: UUID(), alreadyWarmed: &warmed)
         return report("AC-24", "mount-monitor-auto-warm", true)
+    }
+
+    // MARK: - AC-LW1 — whole-tree listing warm fires once per streaming mount session
+
+    /// A cold directory-listing cache makes first-browse of every folder a live SMB round
+    /// trip (the endless Finder "Loading…"). The mount monitor warms ALL listings once when
+    /// it first sees a streaming mount — unlike the pinned-dir DATA warm (AC-24), this is
+    /// metadata-only and gated on `streaming` (a Cache Only union mount reads local upstreams,
+    /// so there is nothing to warm from the remote). This drives the pure decision
+    /// (`SyncManager.shouldWarmListingsOnMount`) through a streaming mount → steady-state →
+    /// cache-only flip → unmount → remount lifecycle without a real mount.
+    private static func testListingWarmOnMount() -> Bool {
+        let id = UUID()
+        var warmed: Set<UUID> = []
+        func decide(mounted: Bool, streaming: Bool) -> Bool {
+            SyncManager.shouldWarmListingsOnMount(isMounted: mounted, isStreaming: streaming, profileId: id, alreadyWarmed: &warmed)
+        }
+
+        // First tick seen mounted + streaming → warm once.
+        guard decide(mounted: true, streaming: true) else {
+            return report("AC-LW1", "listing-warm-on-mount", false, "(first streaming tick did not warm)")
+        }
+        // Subsequent streaming ticks → no repeat (a fresh whole-tree refresh each tick would thrash).
+        guard !decide(mounted: true, streaming: true), !decide(mounted: true, streaming: true) else {
+            return report("AC-LW1", "listing-warm-on-mount", false, "(re-warmed while still streaming)")
+        }
+        // Mounted but NOT streaming (Cache Only union) → never warms, and stays armed so a later
+        // flip back to streaming warms once.
+        var w2: Set<UUID> = []
+        let cacheOnlyId = UUID()
+        guard !SyncManager.shouldWarmListingsOnMount(isMounted: true, isStreaming: false, profileId: cacheOnlyId, alreadyWarmed: &w2), w2.isEmpty else {
+            return report("AC-LW1", "listing-warm-on-mount", false, "(cache-only mount warmed or was tracked)")
+        }
+        guard SyncManager.shouldWarmListingsOnMount(isMounted: true, isStreaming: true, profileId: cacheOnlyId, alreadyWarmed: &w2) else {
+            return report("AC-LW1", "listing-warm-on-mount", false, "(flip to streaming did not warm)")
+        }
+        // Seen unmounted → re-arm.
+        guard !decide(mounted: false, streaming: true) else {
+            return report("AC-LW1", "listing-warm-on-mount", false, "(unmounted tick returned true)")
+        }
+        // Remount streaming → warms again.
+        guard decide(mounted: true, streaming: true) else {
+            return report("AC-LW1", "listing-warm-on-mount", false, "(remount did not re-warm after re-arm)")
+        }
+        return report("AC-LW1", "listing-warm-on-mount", true)
     }
 
     // MARK: - AC-21 — external warm-field edit triggers the app-side warm path
