@@ -2504,10 +2504,12 @@ final class SyncManager: ObservableObject {
     }
 
     /// Warm the whole-tree directory-LISTING cache for a streaming mount via the RC API
-    /// (`VFSCacheService.refreshAllListings`) so Finder browsing is instant across the tree,
-    /// not just under pinned folders. Metadata only — no bytes are downloaded. Fire-and-record:
-    /// a `failed` outcome (every retry hit a transient SMB listing error) is non-fatal, the
-    /// mount still works, so it's recorded for telemetry and dropped. Runs at .utility off the
+    /// (`VFSCacheService.refreshAllListings`, a per-subtree descent — see there for why one
+    /// recursive `/vfs/refresh` is unreliable on large SMB trees) so Finder browsing is instant
+    /// across the tree, not just under pinned folders. Metadata only — no bytes are downloaded.
+    /// Fire-and-record: a `failed`/partial outcome is non-fatal, the mount still works, so it's
+    /// recorded for telemetry and dropped. Passes `profile.fullRemotePath` as the rclone Fs so
+    /// the descent can enumerate subdirectories via `operations/list`. Runs at .utility off the
     /// main actor; gated once-per-mount by `shouldWarmListingsOnMount`, so no supersede/cancel
     /// bookkeeping is needed (unlike the data warm).
     func startListingWarm(for profileId: UUID) {
@@ -2515,12 +2517,15 @@ final class SyncManager: ObservableObject {
               profile.isMountMode, profile.rcPort > 0 else { return }
         let port = profile.rcPort
         let name = profile.name
+        let fs = profile.fullRemotePath
         Task.detached(priority: .utility) {
-            let result = await VFSCacheService.shared.refreshAllListings(port: port)
+            let result = await VFSCacheService.shared.refreshAllListings(fs: fs, port: port)
             await MainActor.run {
                 TelemetryService.shared.recordListingWarm(
                     profileId: profileId, profileName: name,
-                    outcome: result.outcome, attempts: result.attempts,
+                    outcome: result.outcome,
+                    directoriesWarmed: result.directoriesWarmed,
+                    directoriesFailed: result.directoriesFailed,
                     durationSeconds: result.durationSeconds)
             }
         }
