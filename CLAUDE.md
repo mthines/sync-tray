@@ -700,6 +700,36 @@ session via the pure `SyncManager.shouldWarmListingsOnMount` + a `listingWarmedM
 every tick. Measurable via `synctray.mount.listing_warm` + the `Mount listing warm` log.
 Covered by `ConfigSelfTest` AC-LW1.
 
+**Spotlight exclusion on mount — the OTHER "Loading…" cause, and why a warm listing cache
+isn't enough on its own.** Even with every folder listing warm (above), Finder can still
+spin, because a warm *listing* cache doesn't stop macOS from *reading file data*. On a
+freshly-mounted network volume, the Spotlight importer (`mds`/`mdworker`) — and QuickLook
+thumbnailing — walk the tree and read every file THROUGH the mount to index it (observed on
+a real 73 GB Kaiju mount: 10+ GB pulled at 75 MB/s right after mount, sequentially reading
+media files in whatever folder the user opened). That bulk read monopolises the mount's
+`--transfers` download slots, so Finder's own `readdir`/`getattr` for the folder you're
+looking at queues *behind* the indexer — the spinner returns despite a warm listing cache.
+The fix is the Apple-documented whole-volume opt-out: `SyncManager.writeSpotlightExclusionMarker`
+drops an empty **`.metadata_never_index`** file at the mount root (`VFSCacheService.writeSpotlightExclusionMarker`,
+pure/idempotent — `written`/`exists`/`failed`/`skipped`), fired on the SAME first-streaming-mount
+edge as the listing warm. `mds` keys on the marker's mere presence and skips the entire
+volume. Two deliberate design points:
+- **App-side write, not the launchd script** — the mount root is on an external drive, where
+  the script's `/usr/bin/python3` is TCC-denied (the same reason the Cache-Only exclude list
+  is app-written); the app holds the grant.
+- **The marker lands on the REMOTE** (mount root = remote root; there's no local shadow for a
+  streaming mount), so it persists and is present at every FUTURE mount BEFORE Spotlight
+  evaluates the volume — the one hidden dotfile synced to the NAS is the accepted, standard
+  cost (rclone-mount setups do exactly this). The first-ever mount may still get partially
+  indexed before the write lands; every mount after is clean. The marker can't be scoped
+  per-client, so a side effect is that it also disables Spotlight indexing of that share for
+  ANY other Mac that mounts the same NAS path directly (not just SyncTray's stream mount) —
+  accepted, since a Spotlight-indexed streamed share is the very cost this removes, and a NAS
+  share is rarely something users Spotlight-search as a local volume anyway.
+
+Measurable via `synctray.mount.spotlight_marker` + the `Mount Spotlight marker` log. Covered
+by `ConfigSelfTest` AC-SM1.
+
 **The check deliberately ignores modtime — and that is the whole point.** Under
 `--vfs-cache-mode full` rclone re-validates a `size,modtime` fingerprint on every open;
 on a **fingerprint-unstable backend (SMB especially)** the modtime drifts, the fingerprint

@@ -55,6 +55,7 @@ enum ConfigSelfTest {
             testWarmSkipsCachedFiles,
             testMountMonitorAutoWarm,
             testListingWarmOnMount,
+            testSpotlightMarkerWrite,
             testMountPollDecision,
             testLegacyOfflineLinkCleanup,
             testWarmReconcileTrigger,
@@ -1049,6 +1050,54 @@ enum ConfigSelfTest {
             return report("AC-LW1", "listing-warm-on-mount", false, "(remount did not re-warm after re-arm)")
         }
         return report("AC-LW1", "listing-warm-on-mount", true)
+    }
+
+    // MARK: - AC-SM1 — Spotlight-exclusion marker write on mount
+
+    /// The `.metadata_never_index` marker stops macOS bulk-indexing a freshly-mounted network
+    /// volume (the read storm that starves Finder even once listings are warm). This drives the
+    /// pure path derivation and the idempotent write engine against a temp "mount root" — no
+    /// real mount — asserting: correct marker path, a fresh write reports `written` and creates
+    /// an EMPTY file, a second write reports `exists` and doesn't rewrite, and an empty root is
+    /// `skipped`. Mirrors AC-OA3's real-FS-in-a-temp-dir style.
+    private static func testSpotlightMarkerWrite() -> Bool {
+        let fm = FileManager.default
+        let root = (NSTemporaryDirectory() as NSString)
+            .appendingPathComponent("synctray-sm-\(UUID().uuidString)")
+        try? fm.createDirectory(atPath: root, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(atPath: root) }
+
+        // Path derivation is pure and at the mount root.
+        let expected = (root as NSString).appendingPathComponent(".metadata_never_index")
+        guard VFSCacheService.spotlightMarkerPath(forMountRoot: root) == expected else {
+            return report("AC-SM1", "spotlight-marker-write", false,
+                          "(bad marker path: \(VFSCacheService.spotlightMarkerPath(forMountRoot: root)))")
+        }
+
+        // Empty mount root → skipped, nothing created.
+        guard VFSCacheService.writeSpotlightExclusionMarker(atMountRoot: "") == "skipped" else {
+            return report("AC-SM1", "spotlight-marker-write", false, "(empty root not skipped)")
+        }
+
+        // First write → written, and the marker is an EMPTY file (mds keys on presence).
+        guard VFSCacheService.writeSpotlightExclusionMarker(atMountRoot: root) == "written",
+              fm.fileExists(atPath: expected),
+              (try? Data(contentsOf: URL(fileURLWithPath: expected)))?.isEmpty == true else {
+            return report("AC-SM1", "spotlight-marker-write", false, "(first write did not create an empty marker)")
+        }
+
+        // Second write → exists (idempotent), file untouched.
+        guard VFSCacheService.writeSpotlightExclusionMarker(atMountRoot: root) == "exists" else {
+            return report("AC-SM1", "spotlight-marker-write", false, "(second write not idempotent)")
+        }
+
+        // A `~`-prefixed root expands (no literal `~` directory created under cwd).
+        let tilded = VFSCacheService.spotlightMarkerPath(forMountRoot: "~/SomeMount")
+        guard !tilded.hasPrefix("~"), tilded.hasSuffix("/SomeMount/.metadata_never_index") else {
+            return report("AC-SM1", "spotlight-marker-write", false, "(tilde not expanded: \(tilded))")
+        }
+
+        return report("AC-SM1", "spotlight-marker-write", true)
     }
 
     // MARK: - AC-21 — external warm-field edit triggers the app-side warm path

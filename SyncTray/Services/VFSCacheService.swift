@@ -622,6 +622,33 @@ final class VFSCacheService {
         return covered >= expectedSize
     }
 
+    /// Absolute path of the Spotlight-exclusion marker for a mount rooted at `mountRoot`.
+    /// Pure (no I/O), so the self-test can assert the derivation without a real mount.
+    static func spotlightMarkerPath(forMountRoot mountRoot: String) -> String {
+        let root = (mountRoot as NSString).expandingTildeInPath
+        return (root as NSString).appendingPathComponent(".metadata_never_index")
+    }
+
+    /// Write `.metadata_never_index` at a mount root so macOS Spotlight skips the volume.
+    /// Idempotent and self-reporting: returns `"exists"` when the marker is already there
+    /// (the common steady-state case — the file persists on the remote), `"written"` on a
+    /// fresh create, `"skipped"` when `mountRoot` is empty, and `"failed"` when the write
+    /// throws (e.g. the mount is not actually attached, so the path is a root-owned
+    /// placeholder). A failure is non-fatal — the mount still works, Spotlight just keeps
+    /// indexing — so callers record the outcome and move on. The marker is intentionally
+    /// EMPTY: `mds` keys on its mere presence, not its contents.
+    static func writeSpotlightExclusionMarker(atMountRoot mountRoot: String) -> String {
+        guard !mountRoot.isEmpty else { return "skipped" }
+        let markerPath = spotlightMarkerPath(forMountRoot: mountRoot)
+        if FileManager.default.fileExists(atPath: markerPath) { return "exists" }
+        do {
+            try Data().write(to: URL(fileURLWithPath: markerPath), options: .atomic)
+            return "written"
+        } catch {
+            return "failed"
+        }
+    }
+
     /// The `{data, meta}` cache-subtree roots for a profile, derived purely from the
     /// profile (no disk probing). A file at mount-relative path `p` has its cached data at
     /// `data/p` and its sidecar at `meta/p`. Shares `cacheRelativePath(for:)` with
