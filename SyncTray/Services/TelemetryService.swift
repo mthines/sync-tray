@@ -147,6 +147,7 @@ final class TelemetryService {
     private var mountCacheOnlyFallbackCounter: LongCounterSdk?
     private var mountListingWarmCounter: LongCounterSdk?
     private var mountListingWarmDurationHistogram: DoubleHistogramMeterSdk?
+    private var mountSpotlightMarkerCounter: LongCounterSdk?
     private var activeOverlayUploadSpans: [UUID: any Span] = [:]
 
     // MARK: - Providers (kept alive for shutdown)
@@ -560,6 +561,11 @@ final class TelemetryService {
             .histogramBuilder(name: "synctray.mount.listing_warm.duration")
             .setDescription("Duration of a whole-tree directory-listing warm run on mount (seconds)")
             .setUnit("s")
+            .build()
+        mountSpotlightMarkerCounter = meter
+            .counterBuilder(name: "synctray.mount.spotlight_marker")
+            .setDescription("Spotlight-exclusion marker writes at a streaming Stream mount root (written, exists, failed, skipped)")
+            .setUnit("1")
             .build()
     }
 
@@ -2485,6 +2491,25 @@ final class TelemetryService {
         mountListingWarmCounter?.add(value: 1, attribute: attrs)
         mountListingWarmDurationHistogram?.record(value: durationSeconds, attributes: attrs)
         emitLog(severity: outcome == "completed" ? .info : .warn, body: "Mount listing warm", attributes: attrs)
+    }
+
+    /// Record the Spotlight-exclusion marker write at a streaming mount root
+    /// (`SyncManager.writeSpotlightExclusionMarker`), fired once per mount session. `outcome`
+    /// is `written` (fresh create), `exists` (already present — the steady state), `failed`
+    /// (write threw, e.g. the mount isn't attached), or `skipped` (empty mount path). A
+    /// `failed`/`skipped` is non-fatal — Spotlight just keeps indexing — so it logs at warn,
+    /// the success cases at info. No paths: the profile id/name only, same as every mount log.
+    func recordSpotlightMarker(profileId: UUID, profileName: String, outcome: String) {
+        guard SyncTraySettings.telemetryEnabled else { return }
+        ensureSetup()
+        let attrs: [String: AttributeValue] = [
+            "synctray.profile.id": .string(profileId.uuidString),
+            "synctray.profile.name": .string(profileName),
+            "spotlight_marker.outcome": .string(outcome),
+        ]
+        mountSpotlightMarkerCounter?.add(value: 1, attribute: attrs)
+        emitLog(severity: (outcome == "written" || outcome == "exists") ? .info : .warn,
+                body: "Mount Spotlight marker", attributes: attrs)
     }
 
     /// Profiles whose Cache Only list write has failed since its last success. A failed

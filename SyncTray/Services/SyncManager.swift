@@ -2526,6 +2526,34 @@ final class SyncManager: ObservableObject {
         }
     }
 
+    /// Drop macOS's `.metadata_never_index` marker at a streaming mount's root so Spotlight
+    /// (`mds`) skips the whole tree. On a freshly-mounted network volume, the Spotlight
+    /// importer otherwise walks every file THROUGH the mount to index it — observed pulling
+    /// 10+ GB at mount time — which monopolises the `--transfers` download slots and leaves
+    /// Finder's own directory listing queued behind it (the "Loading…" spinner that persists
+    /// even after the listing cache is warm). The marker is the Apple-documented, whole-volume
+    /// opt-out and is what rclone-mount setups use.
+    ///
+    /// Written APP-side (not by the launchd sync script) for the same reason the Cache-Only
+    /// exclude list is: under launchd the script's `/usr/bin/python3` is denied read/write to
+    /// a mount on an external drive, while the app holds the TCC grant. The write lands at the
+    /// mount root = the remote root, so it persists to the remote and is present at every
+    /// FUTURE mount BEFORE Spotlight evaluates the volume — the one hidden dotfile is the
+    /// deliberate, standard cost. Idempotent: skips the write when the marker already exists.
+    func writeSpotlightExclusionMarker(for profileId: UUID) {
+        guard let profile = profileStore.profiles.first(where: { $0.id == profileId }),
+              profile.isMountMode, !profile.localSyncPath.isEmpty else { return }
+        let mountRoot = profile.localSyncPath
+        let name = profile.name
+        Task.detached(priority: .utility) {
+            let outcome = VFSCacheService.writeSpotlightExclusionMarker(atMountRoot: mountRoot)
+            await MainActor.run {
+                TelemetryService.shared.recordSpotlightMarker(
+                    profileId: profileId, profileName: name, outcome: outcome)
+            }
+        }
+    }
+
     // MARK: - Cache Directory Migration
 
     /// Cancel an in-flight cache-directory migration for a profile. The
@@ -3516,6 +3544,14 @@ final class SyncManager: ObservableObject {
                         alreadyWarmed: &self.listingWarmedMounts
                     ) {
                         self.startListingWarm(for: profile.id)
+                        // Same first-streaming-mount edge: drop the Spotlight-exclusion
+                        // marker at the mount root so macOS never bulk-indexes the tree.
+                        // Without it, mds/QuickLook read every file through the mount to
+                        // index it — gigabytes pulled at mount time — which saturates the
+                        // download slots and starves Finder's own listing (the SECOND
+                        // "Loading…" cause, distinct from the cold-listing one the warm
+                        // above fixes). Fire-and-record; the write is idempotent.
+                        self.writeSpotlightExclusionMarker(for: profile.id)
                     }
                 }
                 // Republish to the FinderSync extension whenever the set of mounted
