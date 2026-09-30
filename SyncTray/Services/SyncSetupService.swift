@@ -210,8 +210,14 @@ final class SyncSetupService {
         return result.exitCode == 0
     }
 
-    /// Uninstall the sync configuration for a profile
-    func uninstall(profile: SyncProfile) throws {
+    /// Uninstall the sync configuration for a profile.
+    ///
+    /// - Parameter keepingSyncState: `true` keeps the two files that describe the user's
+    ///   data rather than the install: the exclude filter (the user's own rules) and the
+    ///   bisync listings (rclone's record of the last successful two-way sync). Reinstalls
+    ///   go through `uninstallForReinstall(from:to:)`, which sets it. `false` — disable,
+    ///   delete, cache migration — removes them too, as before.
+    func uninstall(profile: SyncProfile, keepingSyncState: Bool = false) throws {
         // For mount-mode profiles, detach the volume gracefully BEFORE unloading the
         // launchd agent. `rclone nfsmount`/`rclone mount` does not exit when its
         // volume is torn down by killing the process out from under it (see
@@ -260,7 +266,7 @@ final class SyncSetupService {
             try fm.removeItem(atPath: profile.configPath)
         }
 
-        if fm.fileExists(atPath: profile.filterFilePath) {
+        if !keepingSyncState, fm.fileExists(atPath: profile.filterFilePath) {
             try fm.removeItem(atPath: profile.filterFilePath)
         }
 
@@ -270,37 +276,135 @@ final class SyncSetupService {
         }
 
         // Clean up rclone bisync cache files (listings, locks)
-        cleanupBisyncCache(for: profile)
+        if !keepingSyncState {
+            cleanupBisyncCache(for: profile)
+        }
 
         // Note: We don't remove the shared script as other profiles may use it
         // Note: We don't remove log files to preserve history
     }
 
-    /// Remove rclone bisync cache files for a profile (listing files, lock files)
-    private func cleanupBisyncCache(for profile: SyncProfile) {
-        let cacheDir = (("~/Library/Caches/rclone/bisync" as NSString).expandingTildeInPath)
-        let fm = FileManager.default
-
-        guard fm.fileExists(atPath: cacheDir) else { return }
-
-        // Build the base name that rclone uses for cache files
-        // Format: {remote}_{remotePath}..{localPath}
-        let remote = "\(profile.rcloneRemote)_\(profile.remotePath)"
-            .replacingOccurrences(of: ":", with: "_")
-            .replacingOccurrences(of: "/", with: "_")
-
-        var localPath = profile.localSyncPath
-        if localPath.hasPrefix("/") {
-            localPath = String(localPath.dropFirst())
+    /// Tear a profile down so it can be installed again with changed settings — the
+    /// settings-save reinstall, the Reinstall button, an external `.profile.json` edit, and
+    /// the CLI's `reinstall` / `profile set`.
+    ///
+    /// Tears down `old` (what is installed right now, so a Stream profile whose folder
+    /// changed detaches the volume that is actually mounted) and keeps the profile's sync
+    /// state. The bisync listings are kept whenever they still describe what the profile
+    /// syncs (`reinstallKeepsBisyncListings`). Deleting them is what used to turn every
+    /// settings save into a full `--resync`: rclone copies every file both ways, brings back
+    /// files deleted since the last sync, and overwrites the losing side of every file that
+    /// differs. When the listings no longer apply (the profile left two-way mode, or now pairs
+    /// a different remote path or local folder), both pairs' listings are discarded: the old
+    /// pair's are stale, and any already under the new pair's name come from an earlier
+    /// configuration, not from a sync this profile ran.
+    func uninstallForReinstall(from old: SyncProfile, to new: SyncProfile) throws {
+        try uninstall(profile: old, keepingSyncState: true)
+        if Self.reinstallKeepsBisyncListings(from: old, to: new) {
+            // The agent was just unloaded, so a bisync lock left behind belongs to a run that
+            // was stopped part-way. rclone never expires a lock on its own (no `--max-lock`),
+            // so keeping it would block every later run with "prior lock file found" — the old
+            // full cleanup removed it too.
+            removeBisyncLock(for: old)
+        } else {
+            cleanupBisyncCache(for: old)
+            cleanupBisyncCache(for: new)
         }
-        let local = localPath.replacingOccurrences(of: "/", with: "_")
+    }
 
-        let baseName = "\(remote)..\(local)"
+    /// Remove only a profile's bisync lock file (`<session>.lck`), keeping its listings.
+    /// - Parameter workDir: defaults to `bisyncWorkDir`; `ConfigSelfTest` passes a temp dir.
+    func removeBisyncLock(for profile: SyncProfile, in workDir: String = SyncSetupService.bisyncWorkDir) {
+        let lockPath = (workDir as NSString).appendingPathComponent(Self.bisyncSessionName(for: profile) + ".lck")
+        try? FileManager.default.removeItem(atPath: lockPath)
+    }
 
-        // Find and remove all files matching this profile's base name
-        if let files = try? fm.contentsOfDirectory(atPath: cacheDir) {
-            for file in files where file.hasPrefix(baseName) {
-                let fullPath = (cacheDir as NSString).appendingPathComponent(file)
+    /// Whether a reinstall from `old` to `new` can keep the bisync listings: both are two-way
+    /// profiles and they sync the same folders (same `fullRemotePath`, so `synology` and
+    /// `synology:` still match, and the same local folder). Comparing session names is not
+    /// enough: canonicalization gives `…/My Work` and `…/My_Work` one name, and keeping the old
+    /// folder's listings for a different folder makes bisync read every file missing from the
+    /// new one as a deletion. Pure.
+    static func reinstallKeepsBisyncListings(from old: SyncProfile, to new: SyncProfile) -> Bool {
+        old.syncMode == .bisync
+            && new.syncMode == .bisync
+            && old.fullRemotePath == new.fullRemotePath
+            && old.localSyncPath == new.localSyncPath
+    }
+
+    /// The rclone arguments for every `--resync` SyncTray runs itself: the initial sync after
+    /// an install that has no listings, Fix Sync Issues, Restore from Remote, and auto-fix.
+    /// Always `--resync-mode newer`, never a bare `--resync`: bare means `--resync-mode path1`,
+    /// where the remote copy overwrites every local file that differs, however much newer the
+    /// local one is. Files that exist on only one side are copied across in every mode, so
+    /// restoring deleted files still works. (A remote without modification times, such as
+    /// generic WebDAV, makes rclone fall back to path1 on its own.) Callers append the filter,
+    /// certificate, and extra-flag arguments. Pure.
+    static func resyncArguments(remote: String, localPath: String) -> [String] {
+        ["bisync", remote, localPath,
+         "--resync", "--resync-mode", "newer",
+         "--verbose", "--use-json-log", "--stats", "2s"]
+    }
+
+    /// rclone bisync's working directory on macOS (`os.UserCacheDir()/rclone/bisync`).
+    static var bisyncWorkDir: String {
+        ("~/Library/Caches/rclone/bisync" as NSString).expandingTildeInPath
+    }
+
+    /// The session name rclone gives a profile's primary bisync pair — the prefix of its
+    /// listing files (`<session>.path1.lst`, …) in `bisyncWorkDir`. Mirrors rclone's
+    /// `bilib.SessionName`: `CanonicalPath(path1) + ".." + CanonicalPath(path2)`. Pure.
+    static func bisyncSessionName(for profile: SyncProfile) -> String {
+        bisyncSessionName(remote: profile.fullRemotePath, localPath: profile.localSyncPath)
+    }
+
+    static func bisyncSessionName(remote: String, localPath: String) -> String {
+        canonicalBisyncPath(remote) + ".." + canonicalBisyncPath(localPath)
+    }
+
+    /// rclone's `bilib.CanonicalPath`: trim `\` and `/` from both ends, then replace every
+    /// whitespace character (Go's `\s`: space, tab, newline, form feed, carriage return — not
+    /// other Unicode spaces such as U+00A0) and every `\ / : ? *` with `_`. The old SyncTray
+    /// version only replaced `:` and `/`, so a path with a space never matched rclone's
+    /// listing names. Works on Unicode scalars, as Go's regexp works on runes: a Swift
+    /// `Character` can fuse `\r\n`, or a space with a following combining mark, into one
+    /// grapheme that would slip past the set. The sync script's python `canon` must stay
+    /// identical (AC-RI6 runs it against this). Pure.
+    static func canonicalBisyncPath(_ path: String) -> String {
+        let trimmed = path.trimmingCharacters(in: CharacterSet(charactersIn: "\\/"))
+        let replaced: Set<Unicode.Scalar> = [" ", "\t", "\n", "\u{0C}", "\r", "\\", "/", ":", "?", "*"]
+        var result = String.UnicodeScalarView()
+        for scalar in trimmed.unicodeScalars {
+            result.append(replaced.contains(scalar) ? "_" : scalar)
+        }
+        return String(result)
+    }
+
+    /// Whether `fileName` is one of the files rclone bisync writes for `session` in its working
+    /// directory: the listings (`<session>.path1.lst`, `<session>.path2.lst` and their
+    /// `-new` / `-old` / `-err` / `-dry` variants) and the lock (`<session>.lck`). Matching
+    /// rclone's own suffixes rather than a bare `<session>.` prefix keeps a sibling profile
+    /// whose folder name extends this one's safe — with a `_` (`…/KAIJU_old`) or a `.`
+    /// (`…/KAIJU.old`, whose files are `<session>.old.path1.lst`, since canonicalization keeps
+    /// dots). Pure.
+    static func isBisyncSessionFile(_ fileName: String, session: String) -> Bool {
+        fileName == session + ".lck"
+            || fileName.hasPrefix(session + ".path1.lst")
+            || fileName.hasPrefix(session + ".path2.lst")
+    }
+
+    /// Remove rclone bisync cache files for a profile (listing files, lock file) — only the
+    /// names `isBisyncSessionFile` recognizes, so a different profile whose local folder merely
+    /// starts with this one's name (`…/KAIJU_old`, `…/KAIJU.old`) keeps its listings.
+    /// - Parameter workDir: defaults to `bisyncWorkDir`; `ConfigSelfTest` passes a temp dir.
+    func cleanupBisyncCache(for profile: SyncProfile, in workDir: String = SyncSetupService.bisyncWorkDir) {
+        let fm = FileManager.default
+        guard fm.fileExists(atPath: workDir) else { return }
+
+        let session = Self.bisyncSessionName(for: profile)
+        if let files = try? fm.contentsOfDirectory(atPath: workDir) {
+            for file in files where Self.isBisyncSessionFile(file, session: session) {
+                let fullPath = (workDir as NSString).appendingPathComponent(file)
                 try? fm.removeItem(atPath: fullPath)
             }
         }
@@ -499,29 +603,15 @@ final class SyncSetupService {
         }
     }
 
-    /// Checks if listing files exist for this profile's path combination
-    func hasExistingListings(for profile: SyncProfile) -> Bool {
-        let cacheDir = (("~/Library/Caches/rclone/bisync" as NSString).expandingTildeInPath)
-
-        // Build the path hash that rclone uses for listing filenames
-        // rclone format: {remote}_{remotePath}..{localPath} with / replaced by _ and leading _ removed
-        let remote = "\(profile.rcloneRemote)_\(profile.remotePath)"
-            .replacingOccurrences(of: ":", with: "_")
-            .replacingOccurrences(of: "/", with: "_")
-
-        // Remove leading slash before replacing to match rclone's format
-        var localPath = profile.localSyncPath
-        if localPath.hasPrefix("/") {
-            localPath = String(localPath.dropFirst())
-        }
-        let local = localPath.replacingOccurrences(of: "/", with: "_")
-
-        let baseName = "\(remote)..\(local)"
+    /// Checks if listing files exist for this profile's path combination.
+    /// - Parameter workDir: defaults to `bisyncWorkDir`; `ConfigSelfTest` passes a temp dir.
+    func hasExistingListings(for profile: SyncProfile, in workDir: String = SyncSetupService.bisyncWorkDir) -> Bool {
+        let baseName = Self.bisyncSessionName(for: profile)
 
         // Only check for .lst files (not .lst-new which are incomplete/partial)
         // The .lst files are only created after a successful bisync completes
-        let listingPath1 = (cacheDir as NSString).appendingPathComponent("\(baseName).path1.lst")
-        let listingPath2 = (cacheDir as NSString).appendingPathComponent("\(baseName).path2.lst")
+        let listingPath1 = (workDir as NSString).appendingPathComponent("\(baseName).path1.lst")
+        let listingPath2 = (workDir as NSString).appendingPathComponent("\(baseName).path2.lst")
 
         let fm = FileManager.default
         // Both listing files must exist for sync to work without --resync
@@ -1453,18 +1543,24 @@ final class SyncSetupService {
                 # newer-wins so failover works unattended (no app required) and a
                 # stale remote copy can never overwrite newer local edits.
                 #
-                # Session name mirrors rclone's bilib.SessionName/CanonicalPath:
-                # trim leading/trailing slashes, replace whitespace and /:?* with
-                # "_", join path1..path2. (Backslashes, which rclone also replaces,
-                # cannot occur in macOS paths or these remote names.)
+                # Session name mirrors rclone's bilib.SessionName/CanonicalPath and
+                # SyncSetupService.canonicalBisyncPath character for character:
+                # trim leading/trailing slashes and backslashes, replace Go's
+                # regexp whitespace class (space, tab, LF, FF, CR - never the other
+                # Unicode spaces str.isspace() matches, such as a no-break space)
+                # plus backslash and /:?* with "_", join path1..path2. The
+                # characters are built with chr() so no escape sequence has to
+                # survive the Swift literal, bash and python.
                 # A pair counts as having state when a .lst OR .lst-new listing
                 # exists for BOTH sides — bisync --recover resumes from .lst-new.
                 BISYNC_WORKDIR="$HOME/Library/Caches/rclone/bisync"
                 SESSION_NAME=$(python3 -c "
             import sys
+            BS = chr(92)
+            REPLACED = ' ' + chr(9) + chr(10) + chr(12) + chr(13) + BS + '/:?*'
             def canon(p):
-                p = p.strip('/')
-                return ''.join('_' if (ch.isspace() or ch in '/:?*') else ch for ch in p)
+                p = p.strip('/' + BS)
+                return ''.join('_' if ch in REPLACED else ch for ch in p)
             print(canon(sys.argv[1]) + '..' + canon(sys.argv[2]))
             " "$REMOTE" "$LOCAL_PATH")
                 BOOTSTRAP_FLAGS=""

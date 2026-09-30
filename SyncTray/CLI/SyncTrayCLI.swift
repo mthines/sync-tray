@@ -120,6 +120,12 @@ struct CLIEnvironment {
     /// Uninstall (detach a mounted volume, unload the agent, remove the
     /// derived files). Returns an error message on failure, or `nil`.
     var uninstallProfile: (SyncProfile) -> String?
+    /// The teardown half of a reinstall from the installed profile to its new
+    /// settings (`SyncSetupService.uninstallForReinstall`): like `uninstallProfile`,
+    /// but it keeps the exclude filter and, while they still apply, the bisync
+    /// listings, so the reinstall never forces a full `--resync`. Returns an error
+    /// message on failure, or `nil`.
+    var uninstallForReinstall: (_ current: SyncProfile, _ updated: SyncProfile) -> String?
     /// Delete the authoritative `{shortId}.profile.json`.
     var deleteProfileFile: (SyncProfile) -> Void
     /// Run the shared sync script against a profile's derived config path,
@@ -1159,8 +1165,9 @@ enum SyncTrayCLI {
             return 1
         }
         // Uninstall is cleanup — a failure here is non-fatal (mirrors delete),
-        // since the following install regenerates every file anyway.
-        if let err = env.uninstallProfile(profile) {
+        // since the following install regenerates every file anyway. The
+        // reinstall teardown keeps the bisync listings (same profile in and out).
+        if let err = env.uninstallForReinstall(profile, profile) {
             env.stderr("warning: uninstall reported: \(err)\n")
         }
         if let err = env.installProfile(profile) {
@@ -1291,9 +1298,10 @@ enum SyncTrayCLI {
     /// injected `env` closures — the SINGLE place the CLI turns a reconcile delta
     /// into install/uninstall calls, shared by `profile enable/disable` and
     /// `profile set` so they can never route a delta differently. A `.reinstall`
-    /// is an uninstall of the OLD profile (which detaches a mounted volume) then
-    /// an install of the NEW one — the same order the app's settings-save path
-    /// uses. Returns an error message or `nil`.
+    /// is a reinstall teardown of the OLD profile (which detaches a mounted volume
+    /// and keeps the bisync listings while they still apply) then an install of
+    /// the NEW one — the same order the app's settings-save path uses. Returns an
+    /// error message or `nil`.
     private static func applyLaunchdReconcile(
         _ action: ProfileReconcileAction,
         current: SyncProfile,
@@ -1308,7 +1316,7 @@ enum SyncTrayCLI {
         case .uninstall:
             return env.uninstallProfile(current)
         case .reinstall:
-            if let err = env.uninstallProfile(current) { return err }
+            if let err = env.uninstallForReinstall(current, updated) { return err }
             return env.installProfile(updated)
         }
     }
@@ -1572,6 +1580,10 @@ extension CLIEnvironment {
             },
             uninstallProfile: { profile in
                 do { try SyncSetupService.shared.uninstall(profile: profile); return nil }
+                catch { return "\(error)" }
+            },
+            uninstallForReinstall: { current, updated in
+                do { try SyncSetupService.shared.uninstallForReinstall(from: current, to: updated); return nil }
                 catch { return "\(error)" }
             },
             deleteProfileFile: { profile in
