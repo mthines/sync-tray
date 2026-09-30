@@ -354,7 +354,8 @@ final class VFSCacheService {
     func refreshAllListings(
         port: Int,
         maxAttempts: Int = 3,
-        retryDelay: TimeInterval = 3
+        retryDelay: TimeInterval = 3,
+        requestTimeout: TimeInterval = 300
     ) async -> ListingWarmResult {
         let start = Date()
         guard port > 0 else {
@@ -363,7 +364,7 @@ final class VFSCacheService {
         var attempt = 0
         while attempt < maxAttempts {
             attempt += 1
-            if (try? await refreshRootRecursive(port: port)) == true {
+            if (try? await refreshRootRecursive(port: port, timeout: requestTimeout)) == true {
                 return ListingWarmResult(
                     outcome: "completed", attempts: attempt,
                     durationSeconds: Date().timeIntervalSince(start))
@@ -381,10 +382,21 @@ final class VFSCacheService {
     /// enumerated it. `true` iff the response is HTTP 200 AND every per-directory result in
     /// the body is `OK` (rclone reports a partial/failed walk as a non-`OK` value like
     /// `directory not found` while still returning 200). Throws on transport failure.
-    private func refreshRootRecursive(port: Int) async throws -> Bool {
+    ///
+    /// `timeout` is set EXPLICITLY and long (default 300s) because this is the one RC call
+    /// that must outlast a whole-tree server-side walk: rclone enumerates every directory
+    /// before responding, and on exactly the large/slow SMB trees this warm targets (the
+    /// per-cold-folder readdir this feature replaces is already 8–12s) that recursive walk
+    /// can far exceed URLSession's ~60s default. Inheriting the default would time the
+    /// request out mid-walk — and, with the retry loop above, likely time out all attempts —
+    /// reporting `failed` and degrading to the very lazy first-browse behaviour the feature
+    /// exists to eliminate. The sibling single-dir RC calls use a 2s timeout precisely
+    /// because they are NOT recursive; this one is.
+    private func refreshRootRecursive(port: Int, timeout: TimeInterval = 300) async throws -> Bool {
         let url = URL(string: "http://localhost:\(port)/vfs/refresh")!
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
+        request.timeoutInterval = timeout
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         // Same string-typed params as refreshDirectory (rclone rejects a JSON boolean here).
         // dir "" = the mount root; recursive walks the whole tree in one call.
