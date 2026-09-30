@@ -4114,6 +4114,13 @@ enum ConfigSelfTest {
         return report("AC-CLI9", "cli-profile-set-removed-keys", true)
     }
 
+    private static func usageMentionsNoRemovedKeys() -> Bool {
+        for key in ["cacheIdentity", "stableCacheIdentity", "offlineAccessEnabled"] where SyncTrayCLI.usage.contains(key) {
+            return false
+        }
+        return true
+    }
+
     // MARK: - AC-DS1 — "Don't Sync" patterns translate to equivalent rclone rules
 
     /// Each SyncTray glob must become the rclone rule(s) that exclude exactly the files
@@ -4340,13 +4347,6 @@ enum ConfigSelfTest {
             return report("AC-DS5", "sync-exclude-roundtrip-cli", false, "(CLI assignment failed: \(p.syncExcludePatterns))")
         }
         return report("AC-DS5", "sync-exclude-roundtrip-cli", true)
-    }
-
-    private static func usageMentionsNoRemovedKeys() -> Bool {
-        for key in ["cacheIdentity", "stableCacheIdentity", "offlineAccessEnabled"] where SyncTrayCLI.usage.contains(key) {
-            return false
-        }
-        return true
     }
 
     /// `OverlaySyncService.run` is `async`; these self-tests are synchronous, so bridge with
