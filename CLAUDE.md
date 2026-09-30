@@ -818,8 +818,8 @@ the same files (rclone's unanchored rules match at any depth, its `**/` needs at
 least one folder, and `[ ] { } \` are syntax to it) and keeps them in a managed
 block at the TOP of `{shortId}-exclude.txt` (first match wins in rclone, so a
 pattern beats any hand-written `+` include below). Changing the patterns never
-touches the lines outside the block (a plain `uninstall` — disable, delete — removes
-the whole file, and the next install recreates it from the defaults). The sync script re-reads that
+touches the lines outside the block (when `uninstall` deletes the file, as disable
+and delete always do, the next install recreates it from the defaults). The sync script re-reads that
 file on every run, so an edit only needs the file rewritten: the in-app editor
 (`SyncManager.updateSyncExcludePatterns`), the external-edit watcher and the CLI's
 `writeProfile` all go through `applySyncFilterReconcileIfNeeded` /
