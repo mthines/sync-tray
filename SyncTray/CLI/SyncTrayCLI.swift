@@ -225,7 +225,8 @@ enum SyncTrayCLI {
       downloadConnections, bandwidthLimit (rclone --bwlimit: '', 'off',
       '10M', or '1M:512k'), mountResilient (true|false — soft/bounded mount
       so a stalled backend can't freeze Finder), pinnedDirectories
-      (comma-separated), warmExcludePatterns (comma-separated).
+      (comma-separated), warmExcludePatterns (comma-separated),
+      syncExcludePatterns (comma-separated).
       Use enable/disable for isEnabled.
 
     Profiles author JSON against schema/profile.schema.json under the config
@@ -1485,6 +1486,7 @@ enum SyncTrayCLI {
         // Lists (comma-separated).
         case "pinnedDirectories": profile.pinnedDirectories = list(value)
         case "warmExcludePatterns": profile.warmExcludePatterns = list(value)
+        case "syncExcludePatterns": profile.syncExcludePatterns = list(value)
 
         // Explicitly excluded keys — greppable, with the right command to use.
         case "id":
@@ -1572,7 +1574,17 @@ extension CLIEnvironment {
                 }
             },
             writeProfile: { profile in
-                ProfileStore.writeProfileFile(profile, in: SyncProfile.configDirectory) != nil
+                let ok = ProfileStore.writeProfileFile(profile, in: SyncProfile.configDirectory) != nil
+                // Keep the exclude filter's "Don't Sync" block in step with the profile,
+                // like the app's watcher does: a pattern edit needs no reinstall, so the
+                // launchd reconcile after this write won't rewrite the file. A disabled
+                // profile's filter isn't in use; `install` writes it on enable. A failed
+                // write (e.g. a filter file that isn't UTF-8) is a warning, not a failure:
+                // the profile itself was saved, so the exit code is unchanged.
+                if ok, profile.isEnabled, let error = SyncManager.writeSyncExcludeFilter(for: profile) {
+                    FileHandle.standardError.write(Data("warning: profile saved, but its Don't Sync rules weren't applied: \(error)\n".utf8))
+                }
+                return ok
             },
             installProfile: { profile in
                 do { try SyncSetupService.shared.install(profile: profile); return nil }

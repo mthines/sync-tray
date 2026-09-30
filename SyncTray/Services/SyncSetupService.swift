@@ -142,7 +142,13 @@ final class SyncSetupService {
         // Generate and write exclude filter (preserves existing user edits)
         // Only needed for sync modes, not mount
         if !profile.isMountMode {
-            try writeExcludeFilter(for: profile)
+            do {
+                try writeExcludeFilter(for: profile)
+            } catch SetupError.excludeFilterUnreadable(let path) {
+                // A hand-edited filter that isn't UTF-8 must not block an install that worked
+                // before Don't Sync existed; the Don't Sync editor reports it on the next change.
+                SyncTraySettings.debugLog("Exclude filter at \(path) isn't UTF-8; left as is")
+            }
         }
 
         // Generate and write plist
@@ -1835,14 +1841,38 @@ final class SyncSetupService {
         }
     }
 
-    /// Write the exclude filter file for a profile (only if it doesn't exist)
-    private func writeExcludeFilter(for profile: SyncProfile) throws {
-        let filterPath = profile.filterFilePath
-        // Only create if it doesn't exist (preserve user edits)
-        if !FileManager.default.fileExists(atPath: filterPath) {
-            try Self.defaultExcludeFilter.write(
-                toFile: filterPath, atomically: true, encoding: .utf8)
+    /// Write the exclude filter file for a profile: the default rules when the file doesn't
+    /// exist yet (a user's own edits are never overwritten afterwards), plus the managed
+    /// "Don't Sync" block regenerated from `profile.syncExcludePatterns`. Touches the file only
+    /// when its content actually changes, and never for mount profiles (no filter file).
+    ///
+    /// An existing file that can't be read as UTF-8 text is left untouched (never replaced
+    /// with the defaults) and reported by throwing `SetupError.excludeFilterUnreadable`, so
+    /// the patterns are never shown as applied while they aren't. `install` tolerates that
+    /// one error; the "Don't Sync" editor, the external-edit path and the CLI surface it.
+    ///
+    /// The sync script reads this file on every run (`--filter-from`), so a change applies to
+    /// the next sync with no reinstall, and without stopping a sync in progress.
+    /// - Parameter path: where to write; defaults to `profile.filterFilePath` (a different
+    ///   path lets `ConfigSelfTest` exercise the real write without touching `~/.config`).
+    func writeExcludeFilter(for profile: SyncProfile, at path: String? = nil) throws {
+        guard !profile.isMountMode else { return }
+        let filterPath = path ?? profile.filterFilePath
+        var existing: String?
+        if FileManager.default.fileExists(atPath: filterPath) {
+            guard let text = try? String(contentsOfFile: filterPath, encoding: .utf8) else {
+                // Unreadable (e.g. not UTF-8): leave the user's file alone rather than
+                // replacing it with the defaults, and say so instead of skipping silently.
+                throw SetupError.excludeFilterUnreadable(filterPath)
+            }
+            existing = text
         }
+        let updated = SyncExcludeFilter.merged(
+            existing: existing ?? Self.defaultExcludeFilter,
+            patterns: profile.syncExcludePatterns
+        )
+        guard updated != existing else { return }
+        try updated.write(toFile: filterPath, atomically: true, encoding: .utf8)
     }
 
     private func runCommand(_ command: String, arguments: [String]) -> (
@@ -1879,6 +1909,7 @@ final class SyncSetupService {
         case plistGenerationFailed
         case notMountMode
         case unmountFailed(String)
+        case excludeFilterUnreadable(String)
 
         var errorDescription: String? {
             switch self {
@@ -1896,7 +1927,159 @@ final class SyncSetupService {
                 return "Profile is not in mount mode"
             case .unmountFailed(let message):
                 return "Failed to unmount: \(message)"
+            case .excludeFilterUnreadable(let path):
+                return "Can't update the Don't Sync rules: the exclude filter at \(path) isn't readable UTF-8 text. Fix or delete that file, then change the list again."
             }
         }
+    }
+}
+
+// MARK: - "Don't Sync" patterns → rclone filter rules
+
+/// Turns a profile's `syncExcludePatterns` into rclone exclude rules and keeps them in a
+/// SyncTray-managed block at the top of the profile's exclude filter file
+/// (`{shortId}-exclude.txt`), leaving every line the user wrote themselves untouched.
+///
+/// The patterns use the SAME syntax and matching rules as the mount-mode "Don't Download"
+/// list (`VFSCacheService.ExcludeMatcher`): case-sensitive, `*` within one path segment, `?`
+/// one non-`/` character, `**/` zero or more leading folders, `**` across segments, every
+/// other character literal — and each pattern is tested against a file's NAME and against
+/// its path RELATIVE to the sync folder. rclone's glob dialect differs (an unanchored rule
+/// matches at any depth, its `**/` needs at least one folder, and `[ ] { } \` are syntax),
+/// so `rcloneRules(for:)` rewrites each pattern into the rule(s) that exclude exactly the
+/// same files. Two conveniences on top: a leading `/` anchors a pattern to the sync
+/// folder's root, and a trailing `/` means "this folder and everything in it".
+///
+/// Pure — no I/O — so `ConfigSelfTest` drives it directly.
+enum SyncExcludeFilter {
+    static let beginMarker = "# >>> SyncTray \"Don't Sync\" patterns (managed: edit them in SyncTray's profile settings)"
+    static let endMarker = "# <<< SyncTray \"Don't Sync\" patterns"
+
+    /// The rclone globs (without the `- ` prefix) that exclude exactly the files `pattern`
+    /// matches under SyncTray's matcher. Empty for a blank pattern, or one containing a line
+    /// break (which would corrupt the filter file).
+    static func rcloneRules(for pattern: String) -> [String] {
+        var glob = pattern.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !glob.isEmpty, !glob.contains(where: { $0.isNewline }) else { return [] }
+
+        let rootOnly = glob.hasPrefix("/")
+        while glob.hasPrefix("/") { glob.removeFirst() }
+        if glob.hasSuffix("/") {
+            while glob.hasSuffix("/") { glob.removeLast() }
+            glob += "/**"
+        }
+        glob = collapsingStarRuns(glob)
+        guard !glob.isEmpty else { return [] }
+
+        if rootOnly { return ["/" + rcloneGlob(glob)] }
+
+        var rules: [String] = []
+        // Name rule: the pattern tested against a bare file name. A name has no "/", so every
+        // `**/` can only match empty and `**` behaves like `*`. An unanchored rclone rule
+        // matches the last path segment, i.e. the name at any depth.
+        let nameGlob = glob
+            .replacingOccurrences(of: "**/", with: "")
+            .replacingOccurrences(of: "**", with: "*")
+        if !nameGlob.isEmpty, !nameGlob.contains("/") {
+            rules.append(rcloneGlob(nameGlob))
+        }
+
+        // Relative-path rule: the pattern tested against the whole path from the sync root.
+        // A leading `**/` means "at any depth", which is what an unanchored rclone rule does;
+        // otherwise the rule is anchored to the root with a leading "/".
+        let relativeRule: String
+        if glob.hasPrefix("**/") {
+            var rest = Substring(glob)
+            while rest.hasPrefix("**/") { rest = rest.dropFirst(3) }
+            relativeRule = rcloneGlob(String(rest))
+        } else {
+            relativeRule = "/" + rcloneGlob(glob)
+        }
+        // With no "/" and no "**", the path rule only matches top-level files, which the name
+        // rule already covers.
+        let coveredByNameRule = !glob.contains("/") && !glob.contains("**")
+        if !coveredByNameRule, !relativeRule.isEmpty, relativeRule != "/", !rules.contains(relativeRule) {
+            rules.append(relativeRule)
+        }
+        return rules
+    }
+
+    /// Every rule for `patterns`, de-duplicated, in the order the patterns were added.
+    static func rules(for patterns: [String]) -> [String] {
+        var seen = Set<String>()
+        return patterns.flatMap { rcloneRules(for: $0) }.filter { seen.insert($0).inserted }
+    }
+
+    /// `existing` filter-file text with the managed block regenerated from `patterns`, or
+    /// removed when they yield no rules. The block goes first because rclone applies the first
+    /// rule that matches, so a "Don't Sync" pattern wins even over a hand-written `+` include
+    /// further down. Everything outside the block is kept as written. Idempotent.
+    static func merged(existing: String, patterns: [String]) -> String {
+        let userContent = droppingLeadingBlankLines(strippingManagedBlock(from: existing))
+        let excludeRules = Self.rules(for: patterns)
+        guard !excludeRules.isEmpty else { return userContent }
+        let block = ([beginMarker] + excludeRules.map { "- \($0)" } + [endMarker]).joined(separator: "\n")
+        return userContent.isEmpty ? block + "\n" : block + "\n\n" + userContent
+    }
+
+    /// `text` without SyncTray's managed block. A block whose end marker was deleted by hand
+    /// ends at the first blank line, so the user's own rules below it survive.
+    static func strippingManagedBlock(from text: String) -> String {
+        var lines = text.components(separatedBy: "\n")
+        func isLine(_ line: String, _ marker: String) -> Bool {
+            line.trimmingCharacters(in: .whitespacesAndNewlines) == marker
+        }
+        guard let start = lines.firstIndex(where: { isLine($0, beginMarker) }) else { return text }
+        let end = lines[start...].firstIndex(where: { isLine($0, endMarker) })
+            ?? lines[start...].firstIndex(where: { $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }).map { $0 - 1 }
+            ?? lines.count - 1
+        lines.removeSubrange(start...end)
+        return lines.joined(separator: "\n")
+    }
+
+    private static func droppingLeadingBlankLines(_ text: String) -> String {
+        var lines = text.components(separatedBy: "\n")
+        while let first = lines.first, lines.count > 1,
+              first.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            lines.removeFirst()
+        }
+        if lines.count == 1, lines[0].trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return "" }
+        return lines.joined(separator: "\n")
+    }
+
+    /// Three or more stars mean the same as two in SyncTray's matcher, while rclone rejects
+    /// them ("too many stars") and would refuse the whole filter file.
+    private static func collapsingStarRuns(_ glob: String) -> String {
+        var out = ""
+        var run = 0
+        for char in glob {
+            run = char == "*" ? run + 1 : 0
+            if run <= 2 { out.append(char) }
+        }
+        return out
+    }
+
+    /// Rewrite a SyncTray glob in rclone's dialect: `**/` becomes `{,**/}` (rclone's plain
+    /// `**/` would require at least one folder), and `[ ] { } \`, which are literal characters
+    /// to SyncTray but syntax to rclone, are escaped. `*`, `**` and `?` mean the same in both.
+    private static func rcloneGlob(_ glob: String) -> String {
+        let chars = Array(glob)
+        var out = ""
+        var i = 0
+        while i < chars.count {
+            let isDoubleStar = chars[i] == "*" && i + 1 < chars.count && chars[i + 1] == "*"
+            if isDoubleStar && i + 2 < chars.count && chars[i + 2] == "/" {
+                out += "{,**/}"
+                i += 3
+            } else if isDoubleStar {
+                out += "**"
+                i += 2
+            } else {
+                if "[]{}\\".contains(chars[i]) { out.append("\\") }
+                out.append(chars[i])
+                i += 1
+            }
+        }
+        return out
     }
 }

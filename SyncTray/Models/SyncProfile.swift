@@ -52,6 +52,13 @@ struct SyncProfile: Identifiable, Codable, Equatable {
     /// every folder named BACKUP at any depth (e.g. "*.bak", "*.tmp", "**/BACKUP/**").
     /// Excluded files are skipped by the warmer so they never download into the offline cache.
     var warmExcludePatterns: [String]
+    /// "Don't Sync" globs for Two-Way and One-Way profiles — the same syntax and matching
+    /// rules as `warmExcludePatterns` (case-sensitive; `*` within a segment, `?`, `**` across
+    /// segments; matched against each file's name and its path relative to the sync folder).
+    /// Translated into rclone filter rules by `SyncExcludeFilter` and written into a managed
+    /// block at the top of the profile's exclude filter file, so matching files stop syncing in
+    /// both directions. Nothing is deleted on either side. Ignored in mount mode.
+    var syncExcludePatterns: [String]
     var rcPort: Int                     // Port for rclone RC (remote control) API (mount mode)
     /// Number of files rclone downloads in parallel — drives the mount's `--transfers`
     /// AND the app-side offline-warm concurrency (`VFSCacheService`), kept in lockstep.
@@ -299,6 +306,7 @@ struct SyncProfile: Identifiable, Codable, Equatable {
         streamCacheOnly: Bool = false,
         pinnedDirectories: [String] = [],
         warmExcludePatterns: [String] = [],
+        syncExcludePatterns: [String] = [],
         rcPort: Int = 0,
         downloadConnections: Int = 2,
         bandwidthLimit: String = "",
@@ -329,6 +337,7 @@ struct SyncProfile: Identifiable, Codable, Equatable {
         self.streamCacheOnly = streamCacheOnly
         self.pinnedDirectories = pinnedDirectories
         self.warmExcludePatterns = warmExcludePatterns
+        self.syncExcludePatterns = syncExcludePatterns
         self.rcPort = rcPort > 0 ? rcPort : SyncProfile.defaultRCPort(for: id)
         self.downloadConnections = min(16, max(1, downloadConnections))
         self.bandwidthLimit = SyncProfile.normalizedBandwidthLimit(bandwidthLimit)
@@ -384,7 +393,7 @@ extension SyncProfile {
         case vfsCacheMode, vfsCacheMaxSize, vfsCacheMaxAge, vfsCachePath, allowNonEmptyMount
         case mountAtStartup
         case streamCacheOnly
-        case pinnedDirectories, warmExcludePatterns, rcPort
+        case pinnedDirectories, warmExcludePatterns, syncExcludePatterns, rcPort
         case downloadConnections
         case bandwidthLimit
         case mountResilient
@@ -444,6 +453,8 @@ extension SyncProfile {
         pinnedDirectories = try container.decodeIfPresent([String].self, forKey: .pinnedDirectories) ?? []
         // Backwards compatibility: default to empty array if not present
         warmExcludePatterns = try container.decodeIfPresent([String].self, forKey: .warmExcludePatterns) ?? []
+        // Backwards compatibility: default to empty array if not present
+        syncExcludePatterns = try container.decodeIfPresent([String].self, forKey: .syncExcludePatterns) ?? []
         // Backwards compatibility: generate default RC port if not present
         let decodedRCPort = try container.decodeIfPresent(Int.self, forKey: .rcPort) ?? 0
         rcPort = decodedRCPort > 0 ? decodedRCPort : SyncProfile.defaultRCPort(for: id)

@@ -37,6 +37,11 @@ final class SyncManager: ObservableObject {
     /// Last error message per profile (for display in UI)
     @Published private(set) var profileErrors: [UUID: String] = [:]
 
+    /// Why a profile's "Don't Sync" patterns couldn't be written to its exclude filter
+    /// file. Kept apart from `profileErrors`, which every sync run clears, so a failed
+    /// write stays visible until a later write succeeds.
+    @Published private(set) var syncFilterErrors: [UUID: String] = [:]
+
     /// Mount state per profile (for mount mode profiles only)
     @Published private(set) var profileMountStates: [UUID: MountState] = [:]
 
@@ -812,6 +817,14 @@ final class SyncManager: ObservableObject {
             self?.applyWarmReconcile(for: id, trigger: "external_edit")
         }
 
+        // "Don't Sync" patterns, also ORTHOGONAL to `action`: a changed
+        // `syncExcludePatterns` yields `action == .none` (the script re-reads the
+        // filter file every run), so rewrite the file here, with the same gate and the
+        // same outcome recording as the in-app editor (`updateSyncExcludePatterns`). A
+        // failed write goes to `syncFilterErrors`, not `profileErrors`: every sync run
+        // clears `profileErrors`, which would make the patterns look applied again.
+        applySyncFilterReconcile(from: currentProfile, to: updatedProfile)
+
         updateAggregateState()
         TelemetryService.shared.recordExternalConfigEdit(kind: "profile")
     }
@@ -934,6 +947,13 @@ final class SyncManager: ObservableObject {
             profileStates[profileId] = .idle
         }
         updateAggregateState()
+    }
+
+    /// Record the outcome of a "Don't Sync" filter write: its error text, or nil once a
+    /// write succeeds. The only writer of `syncFilterErrors`, whose setter is private to
+    /// this file; `applySyncFilterReconcile` (ConfigReconciler.swift) calls it.
+    func recordSyncFilterWrite(error: String?, for profileId: UUID) {
+        syncFilterErrors[profileId] = error
     }
 
     /// Set the syncing state for a profile (used by views running direct resyncs)

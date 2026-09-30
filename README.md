@@ -158,6 +158,14 @@ For Stream (Mount) profiles, keep chosen folders downloaded so they open instant
 - **Cache management**: clear the VFS cache with an option to keep pinned (offline) folders
 - The Finder right-click menu needs a one-time approval under System Settings → General → Login Items & Extensions → Extensions; the app's Offline Files section links you there
 
+### Don't Sync
+
+For Two-Way and One-Way profiles, skip files you don't want synced with the same wildcard patterns as Offline Files' **Don't Download** list — for example `*.rpp-bak` for every Reaper backup, or `**/BACKUP/**` for every folder named `BACKUP` at any depth.
+
+- Matching files stop syncing; nothing is deleted on either side
+- Patterns are case-sensitive and apply from the next sync, with no re-sync
+- Stored as rclone exclude rules in a SyncTray-managed block at the top of the profile's exclude filter file; changing the list rewrites only that block
+
 ### One-Click Actions
 
 - **Sync Now**: Trigger immediate sync for all enabled profiles

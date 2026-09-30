@@ -29,7 +29,6 @@ struct OfflineFilesSection: View {
     @State private var pinnedDirs: [String] = []
 
     // Offline exclude globs (e.g. *.rpp-bak) — files matching these never download.
-    @State private var newExcludePattern: String = ""
     @State private var excludePatterns: [String] = []
 
     private let cacheService = VFSCacheService.shared
@@ -563,74 +562,18 @@ struct OfflineFilesSection: View {
     // MARK: - Exclude Patterns
 
     private var excludePatternsSection: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text("Don't Download")
-                .font(.caption.weight(.medium))
-
-            Text("Skip files you don't need offline so they never download. Use wildcards: "
+        ExcludePatternListEditor(
+            title: "Don't Download",
+            caption: "Skip files you don't need offline so they never download. Use wildcards: "
                 + "*.bak matches any file ending in .bak, and **/BACKUP/** skips every "
                 + "folder named BACKUP, at any depth. Patterns are case-sensitive and apply "
-                + "right away — files already downloaded stay until you free up space.")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-
-            if excludePatterns.isEmpty {
-                Text("Nothing excluded — every file downloads")
-                    .font(.caption)
-                    .foregroundStyle(.tertiary)
-                    .frame(maxWidth: .infinity, alignment: .center)
-                    .padding(.vertical, 6)
-            } else {
-                ForEach(excludePatterns, id: \.self) { pattern in
-                    HStack(spacing: 8) {
-                        Image(systemName: "nosign")
-                            .foregroundStyle(.secondary)
-                            .font(.caption2)
-                        Text(pattern)
-                            .font(.caption.monospaced())
-                            .lineLimit(1)
-                            .truncationMode(.middle)
-                        Spacer()
-                        Button(action: { removeExcludePattern(pattern) }) {
-                            Image(systemName: "xmark.circle.fill")
-                                .foregroundStyle(.secondary)
-                                .font(.caption)
-                        }
-                        .buttonStyle(.plain)
-                    }
-                    .padding(.vertical, 3)
-                    .padding(.horizontal, 6)
-                    .background(Color.secondary.opacity(0.08))
-                    .clipShape(.rect(cornerRadius: 4))
-                }
-            }
-
-            HStack(spacing: 4) {
-                TextField("Pattern (e.g., *.bak or **/BACKUP/**)", text: $newExcludePattern)
-                    .textFieldStyle(.roundedBorder)
-                    .font(.caption)
-                    .onSubmit { addExcludePattern() }
-                Button(action: { addExcludePattern() }) {
-                    Image(systemName: "plus.circle.fill")
-                        .foregroundStyle(.blue)
-                }
-                .buttonStyle(.plain)
-                .disabled(newExcludePattern.trimmingCharacters(in: .whitespaces).isEmpty)
-            }
+                + "right away — files already downloaded stay until you free up space.",
+            emptyText: "Nothing excluded — every file downloads",
+            patterns: excludePatterns
+        ) { updated in
+            excludePatterns = updated
+            saveExcludePatterns()
         }
-    }
-
-    private func addExcludePattern() {
-        let pattern = newExcludePattern.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !pattern.isEmpty, !excludePatterns.contains(pattern) else { return }
-        excludePatterns.append(pattern)
-        newExcludePattern = ""
-        saveExcludePatterns()
-    }
-
-    private func removeExcludePattern(_ pattern: String) {
-        excludePatterns.removeAll { $0 == pattern }
-        saveExcludePatterns()
     }
 
     private func saveExcludePatterns() {
@@ -969,5 +912,99 @@ struct OfflineFilesSection: View {
         case "swift", "py", "js", "ts", "html", "css": return "chevron.left.forwardslash.chevron.right"
         default: return "doc"
         }
+    }
+}
+
+// MARK: - Exclude pattern list (shared)
+
+/// The glob-pattern list behind both "Don't Download" (Stream profiles, `warmExcludePatterns`)
+/// and "Don't Sync" (Two-Way / One-Way profiles, `syncExcludePatterns`): a caption, the
+/// current patterns with a remove button each, and a field to add one. Owns no persistence —
+/// it hands the new list to `onChange`, and the owner saves it and applies it.
+struct ExcludePatternListEditor: View {
+    let title: String
+    let caption: String
+    let emptyText: String
+    var placeholder: String = "Pattern (e.g., *.bak or **/BACKUP/**)"
+    let patterns: [String]
+    let onChange: ([String]) -> Void
+
+    @State private var newPattern: String = ""
+
+    private var trimmedNewPattern: String {
+        newPattern.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text(title)
+                .font(.caption.weight(.medium))
+
+            Text(caption)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            if patterns.isEmpty {
+                Text(emptyText)
+                    .font(.caption)
+                    .foregroundStyle(.tertiary)
+                    .frame(maxWidth: .infinity, alignment: .center)
+                    .padding(.vertical, 6)
+            } else {
+                ForEach(patterns, id: \.self) { pattern in
+                    HStack(spacing: 8) {
+                        Image(systemName: "nosign")
+                            .foregroundStyle(.secondary)
+                            .font(.caption2)
+                            .accessibilityHidden(true)
+                        Text(pattern)
+                            .font(.caption.monospaced())
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                        Spacer()
+                        Button(action: { remove(pattern) }) {
+                            Image(systemName: "xmark.circle.fill")
+                                .foregroundStyle(.secondary)
+                                .font(.caption)
+                        }
+                        .buttonStyle(.plain)
+                        .help("Remove \(pattern)")
+                        .accessibilityLabel("Remove \(pattern)")
+                    }
+                    .padding(.vertical, 3)
+                    .padding(.horizontal, 6)
+                    .background(Color.secondary.opacity(0.08))
+                    .clipShape(.rect(cornerRadius: 4))
+                }
+            }
+
+            HStack(spacing: 4) {
+                TextField(placeholder, text: $newPattern)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.caption)
+                    .onSubmit { add() }
+                Button(action: { add() }) {
+                    Image(systemName: "plus.circle.fill")
+                        .foregroundStyle(.blue)
+                }
+                .buttonStyle(.plain)
+                .disabled(trimmedNewPattern.isEmpty)
+                .help("Add pattern")
+                .accessibilityLabel("Add pattern")
+            }
+        }
+    }
+
+    private func add() {
+        let pattern = trimmedNewPattern
+        guard !pattern.isEmpty else { return }
+        newPattern = ""
+        guard !patterns.contains(pattern) else { return }
+        onChange(patterns + [pattern])
+    }
+
+    private func remove(_ pattern: String) {
+        onChange(patterns.filter { $0 != pattern })
     }
 }

@@ -1075,6 +1075,9 @@ final class TelemetryService {
                 "config.vfs_cache_mode": .string(profile.isMountMode ? profile.vfsCacheMode.rawValue : "n/a"),
                 "config.has_pinned_directories": .bool(!profile.pinnedDirectories.isEmpty),
                 "config.pinned_directory_count": .int(profile.pinnedDirectories.count),
+                // "Don't Sync" adoption (two-way / one-way). Count only: the patterns
+                // themselves can name folders, so they never leave the machine.
+                "config.sync_exclude_pattern_count": .int(profile.isMountMode ? 0 : profile.syncExcludePatterns.count),
                 "config.allow_non_empty_mount": .bool(profile.allowNonEmptyMount),
                 "config.download_connections": .int(profile.isMountMode ? profile.downloadConnections : 0),
                 "config.has_bandwidth_limit": .bool(!profile.bandwidthLimit.isEmpty),

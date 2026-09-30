@@ -122,6 +122,11 @@ enum ConfigSelfTest {
             testOverlayPendingManifestParity,
             testCacheMoveBlockedPending,
             testCLIProfileSetRemovedKeys,
+            testSyncExcludeRules,
+            testSyncExcludeFilterMerge,
+            testSyncExcludeFilterWrite,
+            testSyncFilterReconcileTrigger,
+            testSyncExcludePatternsRoundTripAndCLI,
         ]
 
         for check in checks {
@@ -4125,6 +4130,234 @@ enum ConfigSelfTest {
             return false
         }
         return true
+    }
+
+    // MARK: - AC-DS1 — "Don't Sync" patterns translate to equivalent rclone rules
+
+    /// Each SyncTray glob must become the rclone rule(s) that exclude exactly the files
+    /// SyncTray's own matcher (`VFSCacheService.ExcludeMatcher`) matches. The expected rules
+    /// here were verified against ports of both matchers (rclone `fs/filter/glob.go` and
+    /// `VFSCacheService.globToRegex`) over 27 patterns x 61 paths with zero differences.
+    private static func testSyncExcludeRules() -> Bool {
+        let cases: [(String, [String])] = [
+            ("*.bak", ["*.bak"]),                                   // name, any depth
+            ("*.rpp-bak", ["*.rpp-bak"]),
+            ("**/BACKUP/**", ["BACKUP/**"]),                        // folder at any depth, incl. top level
+            ("**/*.bak", ["*.bak"]),
+            ("BACKUP/**", ["/BACKUP/**"]),                          // a "/" anchors to the sync root
+            ("Reaper/Config/**", ["/Reaper/Config/**"]),
+            ("a/**/b", ["/a/{,**/}b"]),                             // interior **/ = zero or more folders
+            ("foo**", ["foo*", "/foo**"]),                          // name rule + root-anchored path rule
+            ("***.tmp", ["*.tmp", "/**.tmp"]),                      // 3+ stars collapse (rclone rejects them)
+            ("file[1].txt", ["file\\[1\\].txt"]),                   // [ ] { } \ are literal to SyncTray
+            ("{x}.txt", ["\\{x\\}.txt"]),
+            ("back\\slash", ["back\\\\slash"]),
+            ("  *.tmp  ", ["*.tmp"]),                               // trimmed
+            ("/BACKUP/", ["/BACKUP/**"]),                           // leading "/" = root, trailing "/" = folder
+            ("BACKUP/", ["/BACKUP/**"]),
+            ("**/BACKUP/", ["BACKUP/**"]),
+            ("/notes.txt", ["/notes.txt"]),
+            ("", []),
+            ("   ", []),
+            ("/", []),
+            ("a\nb", []),                                           // a line break would corrupt the file
+        ]
+        for (pattern, expected) in cases {
+            let got = SyncExcludeFilter.rcloneRules(for: pattern)
+            guard got == expected else {
+                return report("AC-DS1", "sync-exclude-rules", false, "(\(pattern.debugDescription) -> \(got), expected \(expected))")
+            }
+        }
+        // De-duplicated across patterns, in order.
+        let combined = SyncExcludeFilter.rules(for: ["*.bak", "**/*.bak", "**/BACKUP/**", "*.bak"])
+        guard combined == ["*.bak", "BACKUP/**"] else {
+            return report("AC-DS1", "sync-exclude-rules", false, "(rules(for:) not de-duplicated: \(combined))")
+        }
+        return report("AC-DS1", "sync-exclude-rules", true)
+    }
+
+    // MARK: - AC-DS2 — managed block merges into the filter file without touching user rules
+
+    private static func testSyncExcludeFilterMerge() -> Bool {
+        let begin = SyncExcludeFilter.beginMarker
+        let end = SyncExcludeFilter.endMarker
+        let userRules = "# macOS metadata\n- ._*\n- .DS_Store\n\n# mine\n- *.partial"
+        let patterns = ["*.rpp-bak", "**/BACKUP/**"]
+
+        let merged = SyncExcludeFilter.merged(existing: userRules, patterns: patterns)
+        let expected = "\(begin)\n- *.rpp-bak\n- BACKUP/**\n\(end)\n\n\(userRules)"
+        guard merged == expected else {
+            return report("AC-DS2", "sync-exclude-merge", false, "(unexpected merge:\n\(merged))")
+        }
+        guard SyncExcludeFilter.merged(existing: merged, patterns: patterns) == merged else {
+            return report("AC-DS2", "sync-exclude-merge", false, "(merge is not idempotent)")
+        }
+        guard SyncExcludeFilter.merged(existing: merged, patterns: []) == userRules else {
+            return report("AC-DS2", "sync-exclude-merge", false, "(clearing the patterns did not restore the user's file)")
+        }
+        // A rule the user adds below the block survives a pattern change.
+        let edited = merged + "\n- my-own-rule"
+        let changed = SyncExcludeFilter.merged(existing: edited, patterns: ["*.tmp"])
+        guard changed.hasPrefix("\(begin)\n- *.tmp\n\(end)\n\n"),
+              changed.hasSuffix("- my-own-rule"),
+              !changed.contains("rpp-bak") else {
+            return report("AC-DS2", "sync-exclude-merge", false, "(pattern change lost a user rule or kept a stale one:\n\(changed))")
+        }
+        // A block whose end marker was deleted by hand ends at the first blank line.
+        let unterminated = "\(begin)\n- *.old\n\n\(userRules)"
+        guard SyncExcludeFilter.merged(existing: unterminated, patterns: []) == userRules else {
+            return report("AC-DS2", "sync-exclude-merge", false, "(unterminated block not removed cleanly)")
+        }
+        // Empty file: block only; clearing returns to empty.
+        let fromEmpty = SyncExcludeFilter.merged(existing: "", patterns: patterns)
+        guard fromEmpty.hasSuffix("\(end)\n"),
+              SyncExcludeFilter.merged(existing: fromEmpty, patterns: []) == "" else {
+            return report("AC-DS2", "sync-exclude-merge", false, "(empty-file merge wrong: \(fromEmpty.debugDescription))")
+        }
+        return report("AC-DS2", "sync-exclude-merge", true)
+    }
+
+    // MARK: - AC-DS3 — the real writer creates, updates, and leaves the file alone when unchanged
+
+    private static func testSyncExcludeFilterWrite() -> Bool {
+        let dir = "\(selfTestRoot)/ds3"
+        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        let path = "\(dir)/exclude.txt"
+        var profile = sampleProfile()
+        profile.syncMode = .bisync
+        profile.syncExcludePatterns = ["*.rpp-bak"]
+
+        do {
+            try SyncSetupService.shared.writeExcludeFilter(for: profile, at: path)
+        } catch {
+            return report("AC-DS3", "sync-exclude-write", false, "(first write threw: \(error))")
+        }
+        guard let first = try? String(contentsOfFile: path, encoding: .utf8),
+              first.hasPrefix(SyncExcludeFilter.beginMarker),
+              first.contains("- *.rpp-bak"),
+              first.contains("- .DS_Store") else {  // defaults written on first create
+            return report("AC-DS3", "sync-exclude-write", false, "(first write missing block or defaults)")
+        }
+
+        // The user's own edit survives a pattern change.
+        try? (first + "\n- my-own-rule").write(toFile: path, atomically: true, encoding: .utf8)
+        profile.syncExcludePatterns = ["**/BACKUP/**"]
+        try? SyncSetupService.shared.writeExcludeFilter(for: profile, at: path)
+        guard let second = try? String(contentsOfFile: path, encoding: .utf8),
+              second.contains("- BACKUP/**"),
+              !second.contains("rpp-bak"),
+              second.hasSuffix("- my-own-rule") else {
+            return report("AC-DS3", "sync-exclude-write", false, "(update lost the user's rule or kept a stale one)")
+        }
+
+        // Mount profiles never get a filter file.
+        let mountPath = "\(dir)/mount-exclude.txt"
+        var mount = profile
+        mount.syncMode = .mount
+        try? SyncSetupService.shared.writeExcludeFilter(for: mount, at: mountPath)
+        guard !FileManager.default.fileExists(atPath: mountPath) else {
+            return report("AC-DS3", "sync-exclude-write", false, "(mount profile got a filter file)")
+        }
+
+        // An existing filter that isn't UTF-8 (a hand edit saved as Latin-1) is reported, never
+        // replaced: the write throws `excludeFilterUnreadable` and leaves the bytes as they were.
+        let unreadablePath = "\(dir)/unreadable.txt"
+        let unreadableBytes = Data([0x2D, 0x20, 0x63, 0x61, 0x66, 0xE9, 0x0A])  // "- café\n", ISO Latin-1
+        try? unreadableBytes.write(to: URL(fileURLWithPath: unreadablePath))
+        do {
+            try SyncSetupService.shared.writeExcludeFilter(for: profile, at: unreadablePath)
+            return report("AC-DS3", "sync-exclude-write", false, "(a non-UTF-8 filter file did not throw)")
+        } catch SyncSetupService.SetupError.excludeFilterUnreadable {
+            // expected
+        } catch {
+            return report("AC-DS3", "sync-exclude-write", false, "(a non-UTF-8 filter file threw \(error))")
+        }
+        guard FileManager.default.contents(atPath: unreadablePath) == unreadableBytes else {
+            return report("AC-DS3", "sync-exclude-write", false, "(a non-UTF-8 filter file was modified)")
+        }
+        return report("AC-DS3", "sync-exclude-write", true)
+    }
+
+    // MARK: - AC-DS4 — a pattern edit rewrites the filter and NEVER reinstalls
+
+    /// The sync script re-reads the filter file on every run, so a "Don't Sync" edit must
+    /// stay out of `reconcileAction`'s reinstall set (a reinstall unloads the agent and stops
+    /// any sync in progress) and go through the orthogonal filter reconcile instead.
+    private static func testSyncFilterReconcileTrigger() -> Bool {
+        func fired(from current: SyncProfile, to updated: SyncProfile) -> [UUID] {
+            var calls: [UUID] = []
+            SyncManager.applySyncFilterReconcileIfNeeded(from: current, to: updated) { calls.append($0.id) }
+            return calls
+        }
+        var bisync = sampleProfile(isEnabled: true)
+        bisync.syncMode = .bisync
+        var changed = bisync
+        changed.syncExcludePatterns = ["*.bak"]
+
+        guard SyncManager.reconcileAction(from: bisync, to: changed) == .none else {
+            return report("AC-DS4", "sync-filter-reconcile", false, "(pattern edit would reinstall the agent)")
+        }
+        guard fired(from: bisync, to: changed) == [bisync.id] else {
+            return report("AC-DS4", "sync-filter-reconcile", false, "(pattern edit on an enabled bisync profile did not rewrite the filter)")
+        }
+        var oneWay = bisync
+        oneWay.syncMode = .sync
+        var oneWayChanged = oneWay
+        oneWayChanged.syncExcludePatterns = ["*.bak"]
+        guard fired(from: oneWay, to: oneWayChanged) == [oneWay.id] else {
+            return report("AC-DS4", "sync-filter-reconcile", false, "(pattern edit on a one-way profile did not rewrite the filter)")
+        }
+        var mount = bisync
+        mount.syncMode = .mount
+        var mountChanged = mount
+        mountChanged.syncExcludePatterns = ["*.bak"]
+        guard fired(from: mount, to: mountChanged).isEmpty else {
+            return report("AC-DS4", "sync-filter-reconcile", false, "(mount profile wrongly rewrote a filter)")
+        }
+        var disabled = sampleProfile(isEnabled: false)
+        disabled.syncMode = .bisync
+        var disabledChanged = disabled
+        disabledChanged.syncExcludePatterns = ["*.bak"]
+        guard fired(from: disabled, to: disabledChanged).isEmpty else {
+            return report("AC-DS4", "sync-filter-reconcile", false, "(disabled profile wrongly rewrote a filter)")
+        }
+        var renamed = bisync
+        renamed.name = "Renamed"
+        guard fired(from: bisync, to: renamed).isEmpty else {
+            return report("AC-DS4", "sync-filter-reconcile", false, "(name-only change wrongly rewrote the filter)")
+        }
+        return report("AC-DS4", "sync-filter-reconcile", true)
+    }
+
+    // MARK: - AC-DS5 — syncExcludePatterns persists, stays out of the derived config, and is CLI-settable
+
+    private static func testSyncExcludePatternsRoundTripAndCLI() -> Bool {
+        var profile = sampleProfile()
+        profile.syncExcludePatterns = ["*.bak", "**/BACKUP/**"]
+        guard let data = try? JSONEncoder().encode(profile),
+              let decoded = try? JSONDecoder().decode(SyncProfile.self, from: data),
+              decoded.syncExcludePatterns == profile.syncExcludePatterns else {
+            return report("AC-DS5", "sync-exclude-roundtrip-cli", false, "(syncExcludePatterns not preserved by encode/decode)")
+        }
+        let noKey: [String: Any] = [
+            "id": UUID().uuidString, "name": "NoSyncExcludeKey", "rcloneRemote": "r:",
+            "remotePath": "P", "localSyncPath": "/tmp/x",
+        ]
+        guard let noKeyData = try? JSONSerialization.data(withJSONObject: noKey),
+              let noKeyDecoded = try? JSONDecoder().decode(SyncProfile.self, from: noKeyData),
+              noKeyDecoded.syncExcludePatterns == [] else {
+            return report("AC-DS5", "sync-exclude-roundtrip-cli", false, "(missing key did not default to [])")
+        }
+        // The rules live in the filter file, not the script's derived config.
+        guard !SyncSetupService.shared.generateProfileConfig(for: profile).contains("syncExcludePatterns") else {
+            return report("AC-DS5", "sync-exclude-roundtrip-cli", false, "(syncExcludePatterns leaked into the derived config)")
+        }
+        var p = sampleProfile()
+        guard SyncTrayCLI.applyProfileAssignment(&p, key: "syncExcludePatterns", value: "*.bak, **/BACKUP/** ,") == nil,
+              p.syncExcludePatterns == ["*.bak", "**/BACKUP/**"] else {
+            return report("AC-DS5", "sync-exclude-roundtrip-cli", false, "(CLI assignment failed: \(p.syncExcludePatterns))")
+        }
+        return report("AC-DS5", "sync-exclude-roundtrip-cli", true)
     }
 
     /// `OverlaySyncService.run` is `async`; these self-tests are synchronous, so bridge with
