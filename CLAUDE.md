@@ -682,23 +682,40 @@ expensive), so the first Finder browse of any *unpinned* folder is a live SMB `r
 8–12 s on a slow Synology, sometimes intermittently failing with `directory not found`,
 which is the endless "Loading…" spinner even on a plain streaming (non-Cache-Only) mount.
 `SyncManager.startListingWarm` closes this: the same 5 s mount monitor, on first seeing a
-profile mounted **streaming**, fires ONE whole-tree recursive `/vfs/refresh`
-(`VFSCacheService.refreshAllListings`, `dir:""`, `recursive:"true"`) that enumerates every
-directory once, up front — so subsequent browsing is served from the 1000 h listing cache
-(~0.1 s) everywhere, not just under pinned folders. It is **metadata only — no file bytes
-are downloaded**, so it is cheap enough to run tree-wide and needs no pinned-dir gating.
-Three things make it robust: it inspects the JSON body (rclone answers a cold-root SMB
-readdir failure with HTTP 200 and `{"result":{"":"directory not found"}}`, so a status-only
-check would misread the transient failure as success — success requires every per-dir
-result to be `OK`); it **retries** up to 3 times with a short backoff, because those SMB
-listing failures are intermittent (observed: the same refresh fails once, then succeeds
-seconds later); and a `failed` outcome is **non-fatal** — the mount stays fully usable and
-folders just warm lazily on first browse. Gated on `streaming` (a Cache Only union mount
-reads local upstreams — nothing remote to enumerate, and no RC API) and once per mount
-session via the pure `SyncManager.shouldWarmListingsOnMount` + a `listingWarmedMounts` set
-(re-arms on unmount, mirroring the data warm), so a fresh whole-tree refresh never fires
-every tick. Measurable via `synctray.mount.listing_warm` + the `Mount listing warm` log.
-Covered by `ConfigSelfTest` AC-LW1.
+profile mounted **streaming**, warms every directory listing up front
+(`VFSCacheService.refreshAllListings`) — so subsequent browsing is served from the 1000 h
+listing cache (~0.1 s) everywhere, not just under pinned folders. It is **metadata only —
+no file bytes are downloaded**, so it is cheap enough to run tree-wide and needs no
+pinned-dir gating.
+
+**Why a per-subtree DESCENT, not one recursive `/vfs/refresh`.** rclone's recursive refresh
+is unreliable on large SMB trees: it answers HTTP 200 with `{"result":{"<dir>":"directory
+not found"}}` for a big subtree while succeeding on small ones (measured on the real
+Synology mount, rclone 1.73.2: the whole `Reaper` subtree fails on **every** attempt,
+`Reaper/Live` and `Media` succeed). So a single root recursive call reliably fails, and
+retrying that same call never helps — the first implementation did exactly that and silently
+no-op'd on the real mount (telemetry showed `listing_warm.outcome=failed`, 3/3 attempts,
+while Finder stayed slow). The fix descends: for each directory it tries the cheap recursive
+refresh first (one call warms a small subtree); only where that returns a non-`OK` result
+does it cache that one level with a **non-recursive** refresh (which always succeeds once the
+RC server is up) and recurse into the children, enumerated via `operations/list` (server-side
+— no NFS read; its own `recurse` option returns nothing on this backend, so it is used one
+level at a time). The walk is bounded (`maxDirectories` 5000, `maxDepth` 12) and honours
+cancellation. Success is still "every per-dir result is `OK`" (`listingResultAllOK` — a
+`directory not found` on an otherwise-200 response is the descend signal, not a success), and
+a transport error on the **root** node retries with backoff (`startRetries`) to ride out the
+window right after the mount edge before the RC server has started. A `failed`/partial
+outcome is **non-fatal** — the mount stays fully usable and folders warm lazily on first
+browse. `startListingWarm` passes `profile.fullRemotePath` as the rclone Fs so the descent
+can list subdirectories.
+
+Gated on `streaming` (a Cache Only union mount reads local upstreams — nothing remote to
+enumerate, and no RC API) and once per mount session via the pure
+`SyncManager.shouldWarmListingsOnMount` + a `listingWarmedMounts` set (re-arms on unmount,
+mirroring the data warm), so the walk never fires every tick. Measurable via
+`synctray.mount.listing_warm` (`listing_warm.directories_warmed`/`_failed`) + the `Mount
+listing warm` log. Covered by `ConfigSelfTest` AC-LW1 (the once-per-mount gate) and AC-LW2
+(the descent's result-parsing + path-join primitives).
 
 **Spotlight exclusion on mount — the OTHER "Loading…" cause, and why a warm listing cache
 isn't enough on its own.** Even with every folder listing warm (above), Finder can still

@@ -2476,17 +2476,20 @@ final class TelemetryService {
     /// (`SyncManager.startListingWarm` → `VFSCacheService.refreshAllListings`), fired once
     /// per mount session. This is metadata-only — it populates rclone's dir-listing cache so
     /// first-browse of every folder in Finder is instant instead of a live SMB round trip; it
-    /// downloads no file bytes. `outcome` is `completed`/`failed`/`skipped`, `attempts` counts
-    /// the retry rounds a flaky remote needed. A `failed` outcome is non-fatal — the mount is
-    /// fully usable, folders just warm lazily on first browse — so it logs at warn, not error.
-    func recordListingWarm(profileId: UUID, profileName: String, outcome: String, attempts: Int, durationSeconds: Double) {
+    /// downloads no file bytes. `outcome` is `completed`/`failed`/`skipped`; `directoriesWarmed`
+    /// and `directoriesFailed` are the per-subtree descent's successful vs failed refresh nodes
+    /// (a recursive refresh that warmed a whole subtree in one call counts as one warmed). A
+    /// `failed`/partial outcome is non-fatal — the mount is fully usable, folders just warm
+    /// lazily on first browse — so it logs at warn, not error.
+    func recordListingWarm(profileId: UUID, profileName: String, outcome: String, directoriesWarmed: Int, directoriesFailed: Int, durationSeconds: Double) {
         guard SyncTraySettings.telemetryEnabled else { return }
         ensureSetup()
         let attrs: [String: AttributeValue] = [
             "synctray.profile.id": .string(profileId.uuidString),
             "synctray.profile.name": .string(profileName),
             "listing_warm.outcome": .string(outcome),
-            "listing_warm.attempts": .int(attempts),
+            "listing_warm.directories_warmed": .int(directoriesWarmed),
+            "listing_warm.directories_failed": .int(directoriesFailed),
         ]
         mountListingWarmCounter?.add(value: 1, attribute: attrs)
         mountListingWarmDurationHistogram?.record(value: durationSeconds, attributes: attrs)

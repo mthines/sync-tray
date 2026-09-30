@@ -327,80 +327,135 @@ final class VFSCacheService {
 
     /// Outcome of a whole-tree LISTING warm (`refreshAllListings`) — metadata only, no data.
     struct ListingWarmResult: Equatable {
-        /// `completed` when rclone reported the recursive root refresh `OK`; `failed` when
-        /// every attempt returned a transient error (e.g. an SMB `directory not found` on
-        /// the cold root readdir); `skipped` when there was no RC port to talk to.
+        /// `completed` when the descent cached at least one directory listing; `failed` when it
+        /// cached none (the RC server never answered, or every refresh errored); `skipped` when
+        /// there was no RC port to talk to.
         let outcome: String
-        /// How many attempts ran (1...maxAttempts). 0 only for `skipped`.
-        let attempts: Int
-        /// Wall-clock seconds for the whole warm, retries included.
+        /// Directory refreshes that succeeded. A recursive refresh that warmed a whole subtree
+        /// in one call counts as ONE here — this is successful refresh *operations*, a rough
+        /// size proxy, not a literal directory count.
+        let directoriesWarmed: Int
+        /// Directory nodes where BOTH the recursive and the fallback non-recursive refresh
+        /// failed (e.g. the RC server errored on that node).
+        let directoriesFailed: Int
+        /// Wall-clock seconds for the whole walk.
         let durationSeconds: Double
     }
 
-    /// Warm the **listing** cache for a streaming mount's ENTIRE tree in one recursive
-    /// `/vfs/refresh` — the directory-enumeration cache Finder browsing needs, which is
-    /// SEPARATE from `--vfs-cache-mode full`'s file-DATA cache. This downloads no bytes: it
-    /// only makes rclone fetch every directory listing once, up front, so the first Finder
-    /// open of any folder is instant (0.1s from `--dir-cache-time`'s cache) instead of a
-    /// live 8–12s SMB round-trip per cold folder — the "Loading…" spinner.
+    /// Warm the **listing** cache for a streaming mount's ENTIRE tree — the directory-
+    /// enumeration cache Finder browsing needs, SEPARATE from `--vfs-cache-mode full`'s file-
+    /// DATA cache. Downloads no bytes: it only makes rclone fetch every directory listing once,
+    /// up front, so the first Finder open of any folder is instant (0.1s from `--dir-cache-time`'s
+    /// cache) instead of a live 8–12s SMB round-trip per cold folder — the "Loading…" spinner.
     ///
-    /// Unlike `refreshDirectory`, this inspects the JSON body: rclone answers a cold-root
-    /// SMB readdir failure with HTTP 200 and `{"result": {"": "directory not found"}}`, so a
-    /// status-only check would read that transient failure as success. Those failures are
-    /// intermittent on a flaky SMB backend (observed: the same root refresh fails once, then
-    /// succeeds seconds later), so this retries a few times with a short backoff before
-    /// giving up. A `failed` result is non-fatal — the mount still works, browsing is just
-    /// cold — so callers record it and move on rather than surfacing an error.
+    /// **Why a descent and not one recursive `/vfs/refresh`.** rclone's recursive refresh is
+    /// unreliable on large SMB subtrees: it answers HTTP 200 with
+    /// `{"result":{"<dir>":"directory not found"}}` for a big tree while succeeding on small
+    /// ones (observed on a Synology SMB mount, rclone 1.73.2: the whole `Reaper` subtree fails
+    /// EVERY time, `Reaper/Live` succeeds). A single root recursive call therefore reliably
+    /// fails, and retrying that same call never helps — the previous implementation did exactly
+    /// that and silently no-op'd on real mounts. So this DESCENDS: it tries the cheap recursive
+    /// refresh on a node first (one call warms a small subtree), and only where that fails does
+    /// it cache that one level with a NON-recursive refresh (which never fails once the RC
+    /// server is up) and recurse into the children, enumerated via `operations/list`
+    /// (server-side — no NFS read, and its own `recurse` option returns nothing on this backend
+    /// so it's used one level at a time). The walk is bounded by `maxDirectories` and `maxDepth`
+    /// so a pathological tree can't run away, and honours cancellation. A `failed`/partial
+    /// outcome is non-fatal — the mount still works, browsing is just cold — so callers record
+    /// it and move on.
+    ///
+    /// `fs` is the mount's rclone Fs (e.g. `synology:Kaiju/KAIJU`, from `SyncProfile.fullRemotePath`),
+    /// needed for `operations/list`. `startRetries` rides out the window right after the mount
+    /// edge where the RC server hasn't started yet: only a transport error on the ROOT node
+    /// retries with backoff, so a genuinely-up server that merely reports a big-subtree failure
+    /// falls straight through to the descent. `requestTimeout` is long because the recursive
+    /// refresh makes rclone walk a subtree server-side; `shallowTimeout` is short because the
+    /// per-level non-recursive refresh has no such walk, so a wedged node fails fast rather than
+    /// stalling the whole sequential descent.
     func refreshAllListings(
+        fs: String,
         port: Int,
-        maxAttempts: Int = 3,
-        retryDelay: TimeInterval = 3,
-        requestTimeout: TimeInterval = 300
+        maxDirectories: Int = 5000,
+        maxDepth: Int = 12,
+        startRetries: Int = 4,
+        startRetryDelay: TimeInterval = 3,
+        requestTimeout: TimeInterval = 300,
+        shallowTimeout: TimeInterval = 30
     ) async -> ListingWarmResult {
         let start = Date()
         guard port > 0 else {
-            return ListingWarmResult(outcome: "skipped", attempts: 0, durationSeconds: 0)
+            return ListingWarmResult(
+                outcome: "skipped", directoriesWarmed: 0, directoriesFailed: 0, durationSeconds: 0)
         }
-        var attempt = 0
-        while attempt < maxAttempts {
-            attempt += 1
-            if (try? await refreshRootRecursive(port: port, timeout: requestTimeout)) == true {
-                return ListingWarmResult(
-                    outcome: "completed", attempts: attempt,
-                    durationSeconds: Date().timeIntervalSince(start))
+        var stack: [(dir: String, depth: Int)] = [("", 0)]
+        var warmed = 0
+        var failed = 0
+        var visited = 0
+        var startAttempt = 0
+        while let node = stack.popLast(), visited < maxDirectories {
+            if Task.isCancelled { break }
+            // Cheap path: one recursive call caches this whole subtree, when rclone can walk it.
+            // `nil` = transport error (RC not answering); `false` = HTTP 200 but a non-`OK`
+            // result (the big-SMB-subtree case); `true` = every directory `OK`.
+            let recursive = try? await refreshListing(
+                dir: node.dir, recursive: true, port: port, timeout: requestTimeout)
+            if recursive == true {
+                warmed += 1
+                visited += 1
+                continue
             }
-            if attempt < maxAttempts {
-                try? await Task.sleep(nanoseconds: UInt64(retryDelay * 1_000_000_000))
+            // RC not answering yet AND this is the root: the mount just came up. Wait and retry
+            // the root a few times before committing to a failed walk.
+            if recursive == nil, node.dir.isEmpty, startAttempt < startRetries {
+                startAttempt += 1
+                try? await Task.sleep(nanoseconds: UInt64(startRetryDelay * 1_000_000_000))
+                stack.append(node)
+                continue
+            }
+            visited += 1
+            // Recursive walk failed. Cache THIS level's listing directly (non-recursive always
+            // succeeds when the RC server is up), then descend into the children. A SHORT timeout
+            // here (not the recursive walk's long one) so one wedged RC node fails fast instead of
+            // stalling the sequential descent for minutes — the descent runs many of these, and a
+            // single-level refresh has no server-side tree walk to wait on.
+            if (try? await refreshListing(
+                dir: node.dir, recursive: false, port: port, timeout: shallowTimeout)) == true {
+                warmed += 1
+            } else {
+                failed += 1
+            }
+            guard node.depth < maxDepth else { continue }
+            let children = (try? await listSubdirectories(fs: fs, dir: node.dir, port: port)) ?? []
+            for child in children {
+                stack.append((Self.listingChildPath(parent: node.dir, child: child), node.depth + 1))
             }
         }
         return ListingWarmResult(
-            outcome: "failed", attempts: attempt,
+            outcome: warmed > 0 ? "completed" : "failed",
+            directoriesWarmed: warmed, directoriesFailed: failed,
             durationSeconds: Date().timeIntervalSince(start))
     }
 
-    /// One recursive `/vfs/refresh` of the mount root, returning whether rclone actually
-    /// enumerated it. `true` iff the response is HTTP 200 AND every per-directory result in
-    /// the body is `OK` (rclone reports a partial/failed walk as a non-`OK` value like
-    /// `directory not found` while still returning 200). Throws on transport failure.
-    ///
-    /// `timeout` is set EXPLICITLY and long (default 300s) because this is the one RC call
-    /// that must outlast a whole-tree server-side walk: rclone enumerates every directory
-    /// before responding, and on exactly the large/slow SMB trees this warm targets (the
-    /// per-cold-folder readdir this feature replaces is already 8–12s) that recursive walk
-    /// can far exceed URLSession's ~60s default. Inheriting the default would time the
-    /// request out mid-walk — and, with the retry loop above, likely time out all attempts —
-    /// reporting `failed` and degrading to the very lazy first-browse behaviour the feature
-    /// exists to eliminate. The sibling single-dir RC calls use a 2s timeout precisely
-    /// because they are NOT recursive; this one is.
-    private func refreshRootRecursive(port: Int, timeout: TimeInterval = 300) async throws -> Bool {
+    /// One `/vfs/refresh` of `dir`. `recursive` walks the whole subtree in one call (fast when
+    /// it works, unreliable on large SMB trees — see `refreshAllListings`); non-recursive caches
+    /// only `dir`'s own listing and always succeeds once the RC server is up. Returns `true` iff
+    /// HTTP 200 AND every per-directory result value is `OK` — rclone reports a partial/failed
+    /// walk as a non-`OK` value (e.g. `directory not found`) on an otherwise-200 response.
+    /// Throws on transport failure. `timeout` is long by default because the recursive form
+    /// makes rclone enumerate server-side before responding, which on a large/slow SMB tree can
+    /// far exceed URLSession's ~60s default.
+    private func refreshListing(
+        dir: String, recursive: Bool, port: Int, timeout: TimeInterval
+    ) async throws -> Bool {
         let url = URL(string: "http://localhost:\(port)/vfs/refresh")!
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.timeoutInterval = timeout
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        // Same string-typed params as refreshDirectory (rclone rejects a JSON boolean here).
-        // dir "" = the mount root; recursive walks the whole tree in one call.
-        let body: [String: Any] = ["dir": "", "recursive": "true"]
+        // rclone rejects a JSON boolean here (`value must be string "recursive"=true`), so the
+        // recursive flag is the STRING "true"; omitted entirely for a non-recursive refresh.
+        var body: [String: Any] = ["dir": dir]
+        if recursive { body["recursive"] = "true" }
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
 
         let (data, response) = try await URLSession.shared.data(for: request)
@@ -408,14 +463,51 @@ final class VFSCacheService {
               httpResponse.statusCode == 200 else {
             throw VFSCacheError.rcRequestFailed
         }
-        // { "result": { "<dir>": "OK" | "directory not found" | ... } } — success only when
-        // every reported directory is OK. An empty/absent result map is treated as failure.
         guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let result = json["result"] as? [String: String],
-              !result.isEmpty else {
+              let result = json["result"] as? [String: String] else {
             return false
         }
-        return result.values.allSatisfy { $0 == "OK" }
+        return Self.listingResultAllOK(result)
+    }
+
+    /// `true` iff a `/vfs/refresh` result map is non-empty and every per-directory value is `OK`.
+    /// rclone reports a partial/failed recursive walk as a non-`OK` value on an otherwise-200
+    /// response, so an all-`OK` map is the only real success; an empty map is not a success.
+    static func listingResultAllOK(_ result: [String: String]) -> Bool {
+        !result.isEmpty && result.values.allSatisfy { $0 == "OK" }
+    }
+
+    /// List the immediate SUBDIRECTORIES of `dir` under `fs` via rclone's `operations/list`
+    /// (`dirsOnly`, one level — its `recurse` option returns nothing on this SMB backend).
+    /// Server-side: reads the remote directly, so it warms nothing and touches no NFS. Returns
+    /// child directory NAMES (not paths). Short timeout — a single-level list.
+    private func listSubdirectories(
+        fs: String, dir: String, port: Int, timeout: TimeInterval = 30
+    ) async throws -> [String] {
+        let url = URL(string: "http://localhost:\(port)/operations/list")!
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.timeoutInterval = timeout
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        let body: [String: Any] = ["fs": fs, "remote": dir, "opt": ["dirsOnly": true]]
+        request.httpBody = try JSONSerialization.data(withJSONObject: body)
+
+        let (data, response) = try await URLSession.shared.data(for: request)
+        guard let httpResponse = response as? HTTPURLResponse,
+              httpResponse.statusCode == 200 else {
+            throw VFSCacheError.rcRequestFailed
+        }
+        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let list = json["list"] as? [[String: Any]] else {
+            return []
+        }
+        return list.compactMap { $0["Name"] as? String }
+    }
+
+    /// Join a parent mount-relative dir and a child name into the child's mount-relative path.
+    /// The root is the empty string, so a top-level child is just its own name (no leading `/`).
+    static func listingChildPath(parent: String, child: String) -> String {
+        parent.isEmpty ? child : "\(parent)/\(child)"
     }
 
     /// Forget (evict) a directory from VFS cache via rclone RC API

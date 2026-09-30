@@ -55,6 +55,7 @@ enum ConfigSelfTest {
             testWarmSkipsCachedFiles,
             testMountMonitorAutoWarm,
             testListingWarmOnMount,
+            testListingWarmDescentPrimitives,
             testSpotlightMarkerWrite,
             testMountPollDecision,
             testLegacyOfflineLinkCleanup,
@@ -1050,6 +1051,36 @@ enum ConfigSelfTest {
             return report("AC-LW1", "listing-warm-on-mount", false, "(remount did not re-warm after re-arm)")
         }
         return report("AC-LW1", "listing-warm-on-mount", true)
+    }
+
+    // MARK: - AC-LW2 — listing-warm descent primitives (result parsing + path join)
+
+    /// The whole-tree listing warm is a per-subtree DESCENT because rclone's recursive
+    /// `/vfs/refresh` is unreliable on large SMB trees (it returns HTTP 200 with a non-`OK`
+    /// per-dir value like `directory not found`). Two pure primitives decide the descent's
+    /// control flow: `listingResultAllOK` (is a refresh result a real success?) and
+    /// `listingChildPath` (join parent + child into a mount-relative path, with "" as root).
+    /// These have no network dependency, so they're the testable core of the fix.
+    private static func testListingWarmDescentPrimitives() -> Bool {
+        // Only an all-`OK`, non-empty result is a success. A `directory not found` (the big-SMB-
+        // subtree signature that must trigger a descend) and an empty map are both failures.
+        guard VFSCacheService.listingResultAllOK(["": "OK"]),
+              VFSCacheService.listingResultAllOK(["Reaper/Live": "OK", "Reaper/Live/Sub": "OK"]) else {
+            return report("AC-LW2", "listing-warm-descent", false, "(all-OK result not accepted)")
+        }
+        guard !VFSCacheService.listingResultAllOK(["Reaper": "directory not found"]),
+              !VFSCacheService.listingResultAllOK(["A": "OK", "B": "directory not found"]),
+              !VFSCacheService.listingResultAllOK([:]) else {
+            return report("AC-LW2", "listing-warm-descent", false, "(non-OK or empty result accepted)")
+        }
+        // Root is "": a top-level child is its own name; deeper children nest with "/", no
+        // leading slash. This is the path fed back to `/vfs/refresh` dir + `operations/list` remote.
+        guard VFSCacheService.listingChildPath(parent: "", child: "Reaper") == "Reaper",
+              VFSCacheService.listingChildPath(parent: "Reaper", child: "Live") == "Reaper/Live",
+              VFSCacheService.listingChildPath(parent: "Reaper/Material", child: "Songs") == "Reaper/Material/Songs" else {
+            return report("AC-LW2", "listing-warm-descent", false, "(child path join wrong)")
+        }
+        return report("AC-LW2", "listing-warm-descent", true)
     }
 
     // MARK: - AC-SM1 — Spotlight-exclusion marker write on mount
