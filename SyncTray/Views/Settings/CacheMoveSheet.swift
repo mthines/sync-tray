@@ -156,19 +156,21 @@ struct CacheMoveSheet: View {
                 .foregroundStyle(.secondary)
             }
 
+            // An overlapping sibling always moves too, so its files waiting to upload block
+            // the move itself (`SyncManager.migrateCacheDirectory` refuses with the same
+            // reason) — say so up front instead of after a click.
+            if let moveBlockedReason {
+                Label(moveBlockedReason, systemImage: "exclamationmark.triangle")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+            }
+
             if !sameRootIds.isEmpty {
                 VStack(alignment: .leading, spacing: 4) {
                     Text("These profiles also use the old cache directory. Move their caches too?")
                         .font(.caption.weight(.medium))
                     ForEach(sameRootIds, id: \.self) { id in
-                        Toggle(profileStore.profile(for: id)?.name ?? "Profile", isOn: Binding(
-                            get: { coMigrateSameRoot.contains(id) },
-                            set: { on in
-                                if on { coMigrateSameRoot.insert(id) } else { coMigrateSameRoot.remove(id) }
-                            }
-                        ))
-                        .toggleStyle(.checkbox)
-                        .font(.caption)
+                        sameRootToggle(for: id)
                     }
                 }
             }
@@ -185,6 +187,7 @@ struct CacheMoveSheet: View {
                         .frame(maxWidth: .infinity)
                 }
                 .buttonStyle(.borderedProminent)
+                .disabled(moveBlockedReason != nil)
 
                 if isPendingSaveMode {
                     Button {
@@ -202,6 +205,41 @@ struct CacheMoveSheet: View {
                     .buttonStyle(.bordered)
                 }
             }
+        }
+    }
+
+    /// Why "Move existing cached files" can't run: the moving profile or an overlapping
+    /// sibling (which always moves with it) has Cache Only files waiting to upload. Same
+    /// decision `SyncManager.migrateCacheDirectory` makes; nil when the move can run.
+    private var moveBlockedReason: String? {
+        guard let movingProfile else { return nil }
+        return SyncManager.cacheMoveBlockedReason(
+            moving: movingProfile,
+            coMigrate: overlappingIds.compactMap { profileStore.profile(for: $0) },
+            pendingUploads: SyncManager.pendingUploadCount(of:)
+        )
+    }
+
+    /// A same-root sibling's opt-in checkbox. A sibling with Cache Only files waiting to
+    /// upload can't be ticked: moving it would strand them under the old cache directory
+    /// (its own run through `migrateCacheDirectory` would refuse anyway).
+    @ViewBuilder
+    private func sameRootToggle(for id: UUID) -> some View {
+        let pending = syncManager.pendingUploadCount(for: id)
+        Toggle(profileStore.profile(for: id)?.name ?? "Profile", isOn: Binding(
+            get: { coMigrateSameRoot.contains(id) && pending == 0 },
+            set: { on in
+                if on { coMigrateSameRoot.insert(id) } else { coMigrateSameRoot.remove(id) }
+            }
+        ))
+        .toggleStyle(.checkbox)
+        .font(.caption)
+        .disabled(pending > 0)
+        if pending > 0 {
+            Text("\(pending) \(pending == 1 ? "file" : "files") waiting to upload from Cache Only — upload them in that profile first to move its cache too.")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .padding(.leading, 20)
         }
     }
 
@@ -290,7 +328,11 @@ struct CacheMoveSheet: View {
             let doneSummary = outcome.result == .completed
                 ? summary(for: outcome)
                 : "Nothing was cached yet — the new location is saved."
-            let extraTargets = sameRootIds.filter { coMigrateSameRoot.contains($0) }
+            // A sibling ticked before it gained Cache Only uploads shows unticked now; skip
+            // it here too rather than start a move `migrateCacheDirectory` will refuse.
+            let extraTargets = sameRootIds.filter {
+                coMigrateSameRoot.contains($0) && syncManager.pendingUploadCount(for: $0) == 0
+            }
             guard !extraTargets.isEmpty else {
                 step = .done(doneSummary)
                 return
@@ -300,6 +342,11 @@ struct CacheMoveSheet: View {
             step = .cancelledChoice
         case .failed(let reason, let rolledBack):
             errorMessage = "Move failed (\(reason.rawValue))" + (rolledBack ? " — already-moved files were rolled back." : ".")
+            step = .choosing
+        case .preflightRejected(.pendingUploads(let reason)):
+            // A profile this move would repoint still has Cache Only files waiting to
+            // upload; the reason names it. Choosing another destination wouldn't help.
+            errorMessage = reason
             step = .choosing
         case .preflightRejected(let rejection):
             // Route back to a step where `destination` is actually editable.
