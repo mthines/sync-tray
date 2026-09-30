@@ -789,7 +789,9 @@ final class SyncManager: ObservableObject {
 
         case .reinstall:
             do {
-                try setupService.uninstall(profile: updatedProfile)
+                // Keeps the bisync listings while they still apply, so a settings edit
+                // never forces a full --resync (see `uninstallForReinstall`).
+                try setupService.uninstallForReinstall(from: currentProfile, to: updatedProfile)
             } catch {
                 // Ignore uninstall errors, matching ProfileDetailView.reinstallSync.
             }
@@ -1205,12 +1207,10 @@ final class SyncManager: ObservableObject {
                     var arguments: [String]
 
                     if syncMode == .bisync {
-                        // --resync-mode newer: prefer the newest version per file so a
-                        // stale remote copy never overwrites fresher local edits (the
-                        // bare --resync default is path1 = remote wins).
-                        arguments = ["bisync", effectiveRemotePath, localSyncPath,
-                                     "--resync", "--resync-mode", "newer",
-                                     "--verbose", "--use-json-log", "--stats", "2s"]
+                        // Same arguments as every other SyncTray resync: newer wins, never
+                        // a bare --resync (remote wins). See `resyncArguments`.
+                        arguments = SyncSetupService.resyncArguments(
+                            remote: effectiveRemotePath, localPath: localSyncPath)
                     } else if syncDirection == .localToRemote {
                         arguments = ["sync", localSyncPath, effectiveRemotePath,
                                      "--verbose", "--use-json-log", "--stats", "2s"]

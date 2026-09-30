@@ -265,7 +265,7 @@ tail -f ~/.local/log/synctray-sync-{shortId}.log
 
 ### rclone bisync Cache
 
-Located at `~/.cache/rclone/bisync/`. Use "Fix Sync Issues" in the app to force a `--resync`.
+Located at `~/Library/Caches/rclone/bisync/`. Use "Fix Sync Issues" in the app to force a `--resync --resync-mode newer`; a reinstall keeps these files (CLAUDE.md Critical Rule 7).
 
 ### Lock Files
 
