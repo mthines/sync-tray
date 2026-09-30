@@ -368,7 +368,10 @@ final class VFSCacheService {
     /// needed for `operations/list`. `startRetries` rides out the window right after the mount
     /// edge where the RC server hasn't started yet: only a transport error on the ROOT node
     /// retries with backoff, so a genuinely-up server that merely reports a big-subtree failure
-    /// falls straight through to the descent.
+    /// falls straight through to the descent. `requestTimeout` is long because the recursive
+    /// refresh makes rclone walk a subtree server-side; `shallowTimeout` is short because the
+    /// per-level non-recursive refresh has no such walk, so a wedged node fails fast rather than
+    /// stalling the whole sequential descent.
     func refreshAllListings(
         fs: String,
         port: Int,
@@ -376,7 +379,8 @@ final class VFSCacheService {
         maxDepth: Int = 12,
         startRetries: Int = 4,
         startRetryDelay: TimeInterval = 3,
-        requestTimeout: TimeInterval = 300
+        requestTimeout: TimeInterval = 300,
+        shallowTimeout: TimeInterval = 30
     ) async -> ListingWarmResult {
         let start = Date()
         guard port > 0 else {
@@ -410,9 +414,12 @@ final class VFSCacheService {
             }
             visited += 1
             // Recursive walk failed. Cache THIS level's listing directly (non-recursive always
-            // succeeds when the RC server is up), then descend into the children.
+            // succeeds when the RC server is up), then descend into the children. A SHORT timeout
+            // here (not the recursive walk's long one) so one wedged RC node fails fast instead of
+            // stalling the sequential descent for minutes — the descent runs many of these, and a
+            // single-level refresh has no server-side tree walk to wait on.
             if (try? await refreshListing(
-                dir: node.dir, recursive: false, port: port, timeout: requestTimeout)) == true {
+                dir: node.dir, recursive: false, port: port, timeout: shallowTimeout)) == true {
                 warmed += 1
             } else {
                 failed += 1
