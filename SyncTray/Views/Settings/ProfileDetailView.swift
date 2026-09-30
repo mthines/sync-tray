@@ -4271,7 +4271,7 @@ struct ProfileDetailView: View {
 /// "Don't Sync" patterns for Two-Way and One-Way profiles: the same pattern list and syntax
 /// as Offline Files' "Don't Download", stored in `syncExcludePatterns` and written as rclone
 /// exclude rules into the profile's filter file. Edits save immediately (like "Don't
-/// Download") and apply from the next sync — no reinstall, so no `--resync`.
+/// Download") and apply from the next sync — no reinstall.
 struct DontSyncSection: View {
     let profile: SyncProfile
     @ObservedObject var profileStore: ProfileStore

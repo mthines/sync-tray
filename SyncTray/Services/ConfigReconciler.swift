@@ -147,9 +147,8 @@ extension SyncManager {
     ///
     /// DELIBERATELY not part of `reconcileAction`'s `needsReinstall` set: the sync script
     /// re-reads the filter file on every run, so rewriting it is all the change needs. A
-    /// reinstall would be actively harmful here — `SyncSetupService.uninstall` clears the
-    /// profile's bisync listings, so the reinstall of a two-way profile ends in a full
-    /// `--resync`. Pure — no I/O.
+    /// reinstall would unload the agent — stopping any sync in progress — and rewrite the
+    /// script, plist and config for a change that needs none of them. Pure — no I/O.
     nonisolated static func syncFilterReconcileNeeded(from current: SyncProfile, to updated: SyncProfile) -> Bool {
         !updated.isMountMode
             && updated.isEnabled

@@ -5349,9 +5349,9 @@ enum ConfigSelfTest {
 
     // MARK: - AC-DS4 — a pattern edit rewrites the filter and NEVER reinstalls
 
-    /// A reinstall of a two-way profile clears its bisync listings and forces a full
-    /// `--resync`, so a "Don't Sync" edit must stay out of `reconcileAction`'s reinstall set
-    /// and go through the orthogonal filter reconcile instead.
+    /// The sync script re-reads the filter file on every run, so a "Don't Sync" edit must
+    /// stay out of `reconcileAction`'s reinstall set (a reinstall unloads the agent and stops
+    /// any sync in progress) and go through the orthogonal filter reconcile instead.
     private static func testSyncFilterReconcileTrigger() -> Bool {
         func fired(from current: SyncProfile, to updated: SyncProfile) -> [UUID] {
             var calls: [UUID] = []
@@ -5364,7 +5364,7 @@ enum ConfigSelfTest {
         changed.syncExcludePatterns = ["*.bak"]
 
         guard SyncManager.reconcileAction(from: bisync, to: changed) == .none else {
-            return report("AC-DS4", "sync-filter-reconcile", false, "(pattern edit would reinstall — that forces a --resync)")
+            return report("AC-DS4", "sync-filter-reconcile", false, "(pattern edit would reinstall the agent)")
         }
         guard fired(from: bisync, to: changed) == [bisync.id] else {
             return report("AC-DS4", "sync-filter-reconcile", false, "(pattern edit on an enabled bisync profile did not rewrite the filter)")

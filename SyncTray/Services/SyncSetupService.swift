@@ -1756,8 +1756,7 @@ final class SyncSetupService {
     /// one error; the "Don't Sync" editor, the external-edit path and the CLI surface it.
     ///
     /// The sync script reads this file on every run (`--filter-from`), so a change applies to
-    /// the next sync with no reinstall. That matters: a reinstall of a two-way profile clears
-    /// its bisync listings and forces a full `--resync`, which a filter edit must not cause.
+    /// the next sync with no reinstall, and without stopping a sync in progress.
     /// - Parameter path: where to write; defaults to `profile.filterFilePath` (a different
     ///   path lets `ConfigSelfTest` exercise the real write without touching `~/.config`).
     func writeExcludeFilter(for profile: SyncProfile, at path: String? = nil) throws {
