@@ -320,6 +320,12 @@ struct OfflineFilesSection: View {
                                 .font(.caption)
                         }
                         .controlSize(.small)
+                        // The Cache Only overlay lives under the cache directory; a move with
+                        // files still waiting to upload would strand them.
+                        .disabled(syncManager.pendingUploadCount(for: profile.id) > 0)
+                        .help(SyncManager.cacheDirectoryChangeBlockedReason(
+                            pendingUploads: syncManager.pendingUploadCount(for: profile.id))
+                            ?? "Move the cache to another folder")
                     }
                 }
             } else {

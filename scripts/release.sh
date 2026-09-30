@@ -237,6 +237,7 @@ build_release() {
         clean build \
         ONLY_ACTIVE_ARCH=NO \
         DASH0_AUTH_TOKEN="${DASH0_AUTH_TOKEN:-}" \
+        SYNCTRAY_RELEASE_CHANNEL=stable \
         2>&1)
 
     if [ $? -ne 0 ]; then

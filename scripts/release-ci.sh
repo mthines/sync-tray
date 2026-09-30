@@ -47,6 +47,17 @@ cd "$PROJECT_DIR"
 
 log_info "CI release ${TAG} (beta=${IS_BETA})"
 
+# Release channel and exact release version, baked into Info.plist as
+# SyncTrayReleaseChannel / SyncTrayReleaseVersion so App Settings can show the
+# real version (e.g. 0.81.0-beta.75.1) plus a "Beta" tag. CFBundleShortVersionString
+# can't carry either: a beta only tags the PR head and never bumps it, so it still
+# reads the last stable version the PR branched from.
+if [ "$IS_BETA" = "true" ]; then
+  RELEASE_CHANNEL="beta"
+else
+  RELEASE_CHANNEL="stable"
+fi
+
 if [ -z "${DASH0_AUTH_TOKEN:-}" ]; then
   log_warning "DASH0_AUTH_TOKEN not set — telemetry token will not be embedded"
 fi
@@ -65,6 +76,8 @@ xcodebuild -project "$XCODEPROJ" \
   ONLY_ACTIVE_ARCH=NO \
   CODE_SIGNING_ALLOWED=NO \
   DASH0_AUTH_TOKEN="${DASH0_AUTH_TOKEN:-}" \
+  SYNCTRAY_RELEASE_CHANNEL="$RELEASE_CHANNEL" \
+  SYNCTRAY_RELEASE_VERSION="$VERSION" \
   | tail -20
 
 APP_PATH="$BUILD_DIR/DerivedData/Build/Products/Release/${PROJECT_NAME}.app"
@@ -73,6 +86,20 @@ BINARY="$APP_PATH/Contents/MacOS/${PROJECT_NAME}"
 if [ ! -f "$BINARY" ]; then
   log_error "Binary not found at $BINARY — build produced an empty app bundle"
 fi
+
+# Fail closed if the channel or version didn't reach the bundle: a beta that can't
+# identify itself, shows the wrong version, or a stable build labelled beta, is
+# exactly what the Settings version row exists to prevent.
+assert_built_plist_key() {
+  local key="$1" expected="$2" actual
+  actual=$(/usr/libexec/PlistBuddy -c "Print :${key}" "$APP_PATH/Contents/Info.plist" 2>/dev/null || echo "")
+  if [ "$actual" != "$expected" ]; then
+    log_error "Built Info.plist has ${key}='${actual}', expected '${expected}'"
+  fi
+}
+assert_built_plist_key SyncTrayReleaseChannel "$RELEASE_CHANNEL"
+assert_built_plist_key SyncTrayReleaseVersion "$VERSION"
+log_success "Release channel: ${RELEASE_CHANNEL} (${VERSION})"
 
 ARCH_INFO=$(lipo -info "$BINARY" 2>/dev/null | sed 's/.*: //' || echo "unknown")
 log_success "Build OK ($ARCH_INFO)"

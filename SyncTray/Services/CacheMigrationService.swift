@@ -191,6 +191,9 @@ enum CacheMigrationPreflightRejection: Error, Equatable {
     case destinationUnwritable
     case insufficientSpace(requiredBytes: Int64, availableBytes: Int64)
     case plan(CacheMigrationRejection)
+    /// A profile the move would repoint still has Cache Only files waiting to upload
+    /// (`SyncManager.cacheMoveBlockedReason`); carries that user-facing reason.
+    case pendingUploads(String)
     /// `isCancelled` fired before or during the source-tree enumeration
     /// (finding 6) — `CacheMigrationRunner.migrate` normalizes this back to
     /// the top-level `CacheMigrationOutcome.Result.cancelled` every caller
