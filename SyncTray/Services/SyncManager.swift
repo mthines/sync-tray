@@ -69,6 +69,11 @@ final class SyncManager: ObservableObject {
     /// supersedes rather than coalesces). Re-armed when the profile is seen unmounted, so a
     /// later remount warms again and picks up files added on the remote in the meantime.
     private var autoWarmedMounts: Set<UUID> = []
+    /// Profiles whose whole-tree LISTING cache this session has warmed for the current mount
+    /// (see `startListingWarm`). Parallel to `autoWarmedMounts` but gated on *streaming*, not
+    /// on pinned dirs — every streaming mount gets its directory listings warmed so Finder
+    /// browsing is instant, whether or not the user pinned anything. Re-armed on unmount.
+    private var listingWarmedMounts: Set<UUID> = []
     // Mount read-health probe bookkeeping (in-memory; see `probeMountReadHealth`).
     private var lastMountReadProbe: [UUID: Date] = [:]
     // Last time this app session wrote each profile's Cache Only partial-file list.
@@ -2478,6 +2483,29 @@ final class SyncManager: ObservableObject {
         warmTasks[profileId]?.cancel()
     }
 
+    /// Warm the whole-tree directory-LISTING cache for a streaming mount via the RC API
+    /// (`VFSCacheService.refreshAllListings`) so Finder browsing is instant across the tree,
+    /// not just under pinned folders. Metadata only — no bytes are downloaded. Fire-and-record:
+    /// a `failed` outcome (every retry hit a transient SMB listing error) is non-fatal, the
+    /// mount still works, so it's recorded for telemetry and dropped. Runs at .utility off the
+    /// main actor; gated once-per-mount by `shouldWarmListingsOnMount`, so no supersede/cancel
+    /// bookkeeping is needed (unlike the data warm).
+    func startListingWarm(for profileId: UUID) {
+        guard let profile = profileStore.profiles.first(where: { $0.id == profileId }),
+              profile.isMountMode, profile.rcPort > 0 else { return }
+        let port = profile.rcPort
+        let name = profile.name
+        Task.detached(priority: .utility) {
+            let result = await VFSCacheService.shared.refreshAllListings(port: port)
+            await MainActor.run {
+                TelemetryService.shared.recordListingWarm(
+                    profileId: profileId, profileName: name,
+                    outcome: result.outcome, attempts: result.attempts,
+                    durationSeconds: result.durationSeconds)
+            }
+        }
+    }
+
     // MARK: - Cache Directory Migration
 
     /// Cancel an in-flight cache-directory migration for a profile. The
@@ -3359,6 +3387,28 @@ final class SyncManager: ObservableObject {
         return alreadyWarmed.insert(profileId).inserted
     }
 
+    /// Decide whether to warm a streaming mount's whole-tree LISTING cache — exactly once per
+    /// mount session. Distinct from `shouldAutoWarmOnMount` in one way that is the whole point:
+    /// it does NOT require pinned dirs. The data warm only runs for pinned folders (it
+    /// downloads bytes, which is expensive); this warms directory *listings* for the entire
+    /// tree (metadata only, cheap), so first-browse-after-mount is instant everywhere, not
+    /// just under pinned folders. Only for `streaming` — a Cache Only union mount is local
+    /// (nothing remote to enumerate) and exposes no RC API. Re-arms when the profile is seen
+    /// unmounted, mirroring the data warm so a later remount warms fresh listings again.
+    static func shouldWarmListingsOnMount(
+        isMounted: Bool,
+        isStreaming: Bool,
+        profileId: UUID,
+        alreadyWarmed: inout Set<UUID>
+    ) -> Bool {
+        guard isMounted else {
+            alreadyWarmed.remove(profileId)   // re-arm for the next mount
+            return false
+        }
+        guard isStreaming else { return false }
+        return alreadyWarmed.insert(profileId).inserted
+    }
+
     /// Reconcile mount states without blocking the main thread: snapshot the mount
     /// profiles on the main actor, probe `/sbin/mount` on a background queue, then
     /// merge results back on the main actor. Used by the repeating 5s monitor so the
@@ -3433,6 +3483,19 @@ final class SyncManager: ObservableObject {
                         alreadyWarmed: &self.autoWarmedMounts
                     ) {
                         self.startWarm(for: profile.id, trigger: "startup")
+                    }
+
+                    // Warm the whole-tree LISTING cache once per streaming mount (metadata
+                    // only, no data download) so Finder browsing is instant everywhere, not
+                    // just under pinned folders — the fix for the "Loading…" spinner on a
+                    // cold folder's first open. Independent of the pinned-dir data warm above.
+                    if Self.shouldWarmListingsOnMount(
+                        isMounted: isMounted,
+                        isStreaming: (newMode ?? .streaming) == .streaming,
+                        profileId: profile.id,
+                        alreadyWarmed: &self.listingWarmedMounts
+                    ) {
+                        self.startListingWarm(for: profile.id)
                     }
                 }
                 // Republish to the FinderSync extension whenever the set of mounted

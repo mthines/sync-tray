@@ -145,6 +145,8 @@ final class TelemetryService {
     private var mountModeChangesCounter: LongCounterSdk?
     private var mountAutoResumeCounter: LongCounterSdk?
     private var mountCacheOnlyFallbackCounter: LongCounterSdk?
+    private var mountListingWarmCounter: LongCounterSdk?
+    private var mountListingWarmDurationHistogram: DoubleHistogramMeterSdk?
     private var activeOverlayUploadSpans: [UUID: any Span] = [:]
 
     // MARK: - Providers (kept alive for shutdown)
@@ -548,6 +550,16 @@ final class TelemetryService {
             .counterBuilder(name: "synctray.mount.cache_only_fallback")
             .setDescription("Cache Only was requested (streamCacheOnly=true) but the mount settled on streaming instead — e.g. the partial-file list could not be built")
             .setUnit("1")
+            .build()
+        mountListingWarmCounter = meter
+            .counterBuilder(name: "synctray.mount.listing_warm")
+            .setDescription("Whole-tree directory-listing warm runs on a streaming Stream mount (completed, failed, skipped)")
+            .setUnit("1")
+            .build()
+        mountListingWarmDurationHistogram = meter
+            .histogramBuilder(name: "synctray.mount.listing_warm.duration")
+            .setDescription("Duration of a whole-tree directory-listing warm run on mount (seconds)")
+            .setUnit("s")
             .build()
     }
 
@@ -2449,6 +2461,27 @@ final class TelemetryService {
         ]
         mountModeChangesCounter?.add(value: 1, attribute: attrs)
         emitLog(severity: .info, body: "Mount mode changed", attributes: attrs)
+    }
+
+    /// Record a whole-tree directory-*listing* warm run on a streaming Stream mount
+    /// (`SyncManager.startListingWarm` → `VFSCacheService.refreshAllListings`), fired once
+    /// per mount session. This is metadata-only — it populates rclone's dir-listing cache so
+    /// first-browse of every folder in Finder is instant instead of a live SMB round trip; it
+    /// downloads no file bytes. `outcome` is `completed`/`failed`/`skipped`, `attempts` counts
+    /// the retry rounds a flaky remote needed. A `failed` outcome is non-fatal — the mount is
+    /// fully usable, folders just warm lazily on first browse — so it logs at warn, not error.
+    func recordListingWarm(profileId: UUID, profileName: String, outcome: String, attempts: Int, durationSeconds: Double) {
+        guard SyncTraySettings.telemetryEnabled else { return }
+        ensureSetup()
+        let attrs: [String: AttributeValue] = [
+            "synctray.profile.id": .string(profileId.uuidString),
+            "synctray.profile.name": .string(profileName),
+            "listing_warm.outcome": .string(outcome),
+            "listing_warm.attempts": .int(attempts),
+        ]
+        mountListingWarmCounter?.add(value: 1, attribute: attrs)
+        mountListingWarmDurationHistogram?.record(value: durationSeconds, attributes: attrs)
+        emitLog(severity: outcome == "completed" ? .info : .warn, body: "Mount listing warm", attributes: attrs)
     }
 
     /// Profiles whose Cache Only list write has failed since its last success. A failed
