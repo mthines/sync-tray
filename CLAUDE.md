@@ -721,7 +721,11 @@ volume. Two deliberate design points:
   streaming mount), so it persists and is present at every FUTURE mount BEFORE Spotlight
   evaluates the volume — the one hidden dotfile synced to the NAS is the accepted, standard
   cost (rclone-mount setups do exactly this). The first-ever mount may still get partially
-  indexed before the write lands; every mount after is clean.
+  indexed before the write lands; every mount after is clean. The marker can't be scoped
+  per-client, so a side effect is that it also disables Spotlight indexing of that share for
+  ANY other Mac that mounts the same NAS path directly (not just SyncTray's stream mount) —
+  accepted, since a Spotlight-indexed streamed share is the very cost this removes, and a NAS
+  share is rarely something users Spotlight-search as a local volume anyway.
 
 Measurable via `synctray.mount.spotlight_marker` + the `Mount Spotlight marker` log. Covered
 by `ConfigSelfTest` AC-SM1.
