@@ -141,7 +141,7 @@
     "mountResilient": {
       "type": "boolean",
       "default": true,
-      "description": "Mount mode only. When true (default), the mount is hardened against a stalled backend freezing Finder: rclone gets '--timeout 30s --contimeout 10s' (vs 5m/1m defaults) so it releases a held NFS RPC fast, and the NFS backend is mounted '-o soft,timeo=100,retrans=3' so a wedged rclone NFS server returns a bounded I/O error instead of the default 'hard' mount's uninterruptible hang. The soft options are NFS-only (not FUSE), so a macFUSE profile gets only the rclone timeouts. Set false to revert to the classic hard mount."
+      "description": "Mount mode only. When true (default), the mount is hardened against a stalled backend freezing Finder: rclone gets '--timeout 30s --contimeout 10s' (vs 5m/1m defaults). rclone's NFS server is local and always answers, so '--timeout' makes a wedged backend return a bounded NFS error for the held RPC in ~30s instead of blocking the reading process for minutes. The mount stays the macOS default 'hard' mount — SyncTray does NOT pass '-o soft' (a soft mount cached an EPERM on a transient stall, which Finder showed as a sticky 'permission denied' until remount; a hard mount self-heals once the backend answers). Set false to revert to rclone's stock 5m/1m timeouts."
     }
   },
   "required": [
