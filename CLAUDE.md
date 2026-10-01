@@ -686,6 +686,17 @@ the warm faster (the link is the bound) but to make it **visible** and **yieldab
   keeps warming — safe; unlike auto-resume, which fails closed). Pause state is in-memory and
   cleared when a run ends, so a later warm the user asks for starts un-paused. Telemetry:
   `synctray.offline.warm.paused` (`warm.pause_source`: manual/auto). Covered by AC-WV1/AC-WV2.
+- **Self-healing back-off on a struggling link.** `warmDirectory`'s per-file read task reports
+  whether it FAILED (threw mid-read, or got zero bytes for a non-empty file — the degraded-SMB
+  "fetch a few KB, stall, retry" signature) instead of swallowing the error with `try?`. After
+  `warmFailureBackoffThreshold` (3) consecutive failures the warm sleeps
+  `warmFailureBackoffCooldown` (60 s) before retrying, so a link that can't complete downloads
+  degrades gracefully instead of looping at ~1 MB/s re-fetching doomed files forever (observed
+  thrash: one 28 MB WAV re-attempted 8× back-to-back, never completing, while the mount card
+  flickered between a starting and a reset transfer). It resumes on its own. Surfaced via the
+  `onStall` callback → `WarmProgress.backingOff`, which `menuBarSummary` renders as "Caching
+  offline — paused (slow link)", and recorded as `synctray.offline.warm.paused` with
+  `warm.pause_source=backoff`. A cancelled read is never counted as a failure.
 
 **Warm on mount detection, not just app-driven mounts.** A Stream profile with
 `mountAtStartup` is mounted by launchd at login/reboot (`RunAtLoad`) *without the app*,

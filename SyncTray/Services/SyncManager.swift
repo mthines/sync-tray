@@ -3180,6 +3180,16 @@ final class SyncManager: ObservableObject {
                 await self?.isDirectoryPinned(dir, profileId: profileId) ?? false
             }, shouldPause: { [weak self] in
                 await self?.isWarmPaused(for: profileId) ?? false
+            }, onStall: { [weak self] backingOff in
+                await MainActor.run {
+                    guard let self, var p = self.warmProgress[profileId] else { return }
+                    p.backingOff = backingOff
+                    self.warmProgress[profileId] = p
+                    if backingOff, let name = self.profileStore.profile(for: profileId)?.name {
+                        TelemetryService.shared.recordWarmPause(
+                            profileId: profileId, profileName: name, paused: true, source: "backoff")
+                    }
+                }
             }, onStart: { [weak self] name in
                 await MainActor.run {
                     guard let self, var p = self.warmProgress[profileId] else { return }

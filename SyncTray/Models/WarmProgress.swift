@@ -23,6 +23,7 @@ struct WarmProgress: Equatable {
     var bytesTotal: Int64       // 0 = unknown; excludes already-cached bytes
     var filesAlreadyCached: Int   // files skipped because they were already fully offline
     var bytesAlreadyCached: Int64 // bytes represented by those skipped files
+    var backingOff: Bool          // link is struggling — the warm has paused itself to let it recover
     var startedAt: Date
     var finishedAt: Date?
 
@@ -36,6 +37,7 @@ struct WarmProgress: Equatable {
         self.bytesTotal = 0
         self.filesAlreadyCached = 0
         self.bytesAlreadyCached = 0
+        self.backingOff = false
         self.startedAt = startedAt
         self.finishedAt = nil
     }
@@ -114,7 +116,9 @@ struct WarmProgress: Equatable {
     var menuBarSummary: String? {
         switch phase {
         case .preparing: return "Preparing offline cache…"
-        case .downloading: return "Caching offline — \(formattedBytesProgress)"
+        case .downloading:
+            if backingOff { return "Caching offline — paused (slow link)" }
+            return "Caching offline — \(formattedBytesProgress)"
         case .completed, .failed: return nil
         }
     }

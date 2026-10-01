@@ -2779,6 +2779,13 @@ enum ConfigSelfTest {
               unknown.hasPrefix("Caching offline — "), !unknown.contains(" / ") else {
             return report("AC-WV1", "warm-menu-summary", false, "(downloading unknown-total shape)")
         }
+        // Backing off (bad link) → a distinct "paused (slow link)" summary, not a byte figure.
+        p.bytesTotal = 180 * 1_000_000_000
+        p.backingOff = true
+        guard p.menuBarSummary == "Caching offline — paused (slow link)" else {
+            return report("AC-WV1", "warm-menu-summary", false, "(backing-off copy)")
+        }
+        p.backingOff = false
         // Completed / failed → nil, so a caller renders it only while a run is live.
         p.phase = .completed
         guard p.menuBarSummary == nil else {
