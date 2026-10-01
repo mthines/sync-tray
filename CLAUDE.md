@@ -139,33 +139,37 @@ the warm too — no separate knob. Covered by `ConfigSelfTest` AC-BW1.
 
 **Mount resilience (`mountResilient`, Stream mode only, default true):** a per-profile
 "Resilient Mount" toggle (Advanced Options, mount mode) that stops a stalled backend
-from freezing Finder — and the whole machine — when the NAS drops. The default macOS
-NFS mount is `hard`: every process touching the volume (Finder, Spotlight, an open
-app) blocks **uninterruptibly** until the server answers, which is the freeze users
-hit when `rclone nfsmount`'s local NFS server stalls waiting on an unreachable remote.
-When on, the generated mount command adds, at the shared mount point (both streaming
-and Cache Only, before the dry-run seam):
+from freezing Finder — and the whole machine — when the NAS drops, **without** turning a
+transient stall into a stuck "permission denied". When on, the generated mount command
+adds, at the shared mount point (both streaming and Cache Only, before the dry-run seam):
 - `--timeout 30s --contimeout 10s` — rclone's IO-idle / connect timeouts, down from its
-  5m / 1m defaults, so rclone gives up on a wedged backend fast and **releases the NFS
-  RPC it is holding open** (that held RPC is what the reading process blocks on). Valid
-  on both the `nfsmount` and `mount` (macFUSE) subcommands.
-- `-o soft,timeo=100,retrans=3` — **NFS-client** options, passed via rclone's
-  `-o/--option`, on the **nfsmount backend only**. `soft` is what actually breaks the
-  infinite hang: a macOS `hard` mount retries forever regardless of `timeo`/`retrans`,
-  while `soft` returns a bounded I/O error (`timeo` is in 0.1s units ⇒ 10s per RPC,
-  `retrans=3` ⇒ ~30s to error). These are **not** FUSE options, so they are never passed
-  to the macFUSE `mount` subcommand — a macFUSE profile gets only the rclone timeouts.
+  5m / 1m defaults. rclone's NFS server (go-nfs) is **local and always answers**;
+  `--timeout` bounds the backend read sitting behind each NFS RPC, so a wedged backend
+  makes rclone **return a bounded NFS error** for that RPC in ~30s instead of holding it
+  open for minutes. That returned error is what unblocks the reading process. Valid on
+  both the `nfsmount` and `mount` (macFUSE) subcommands.
 
-Default ON because the freeze is the common pain; the toggle exists so a user who hits
-a soft-mount edge case (a transient read EIO on a very slow but recovering backend) can
-revert to the classic hard mount. Data safety is unaffected: writes go through rclone's
-VFS cache (local disk) and its own retrying write-back, not synchronously over the NFS
-wire, so a soft-timed-out read RPC never drops a queued write. Emitted into the derived
-`{shortId}.json` as `mountResilient`; changing it is in `reconcileAction`'s reinstall
-set (the stream remounts). Covered by `ConfigSelfTest` AC-FR1 (default/round-trip,
-reconcile, and dry-run flag emission incl. the nfs-only `-o soft` distinction). Pairs
-with the bandwidth cap above: the cap keeps the mount from *causing* the stall, this
-keeps a stall from *freezing* the machine.
+The mount stays the macOS **default `hard` mount — SyncTray no longer passes `-o soft`.**
+A prior release added `-o soft,timeo=100,retrans=3` (nfsmount only) to bound the freeze
+client-side, but on a flaky backend (observed live on an SMB/Synology mount over a
+congested mesh) `soft` made the NFS *client* give up on a transient stall and cache an
+**EPERM**, which Finder surfaced as "you don't have permission to see its contents" + red
+no-access badges on folders the backend could list fine seconds later — and the denial
+**stuck until the next remount**. A `hard` mount instead propagates rclone's own bounded
+error and **self-heals**: once the backend answers again the next access succeeds, with no
+cached denial. The freeze `soft` was meant to prevent is already covered by the rclone
+`--timeout` above (rclone answers the RPC), so the client-side give-up only cost
+correctness without buying freeze-protection it still owned.
+
+Default ON because the freeze is the common pain and the hard mount no longer has the
+soft downside; the toggle still lets a user drop back to rclone's stock 5m/1m timeouts
+(resilient off). Data safety is unaffected: writes go through rclone's VFS cache (local
+disk) and its own retrying write-back, not synchronously over the NFS wire. Emitted into
+the derived `{shortId}.json` as `mountResilient`; changing it is in `reconcileAction`'s
+reinstall set (the stream remounts). Covered by `ConfigSelfTest` AC-FR1 (default/round-trip,
+reconcile, and dry-run flag emission — resilient-on emits the rclone timeouts and **no**
+`-o soft` on either backend). Pairs with the bandwidth cap above: the cap keeps the mount
+from *causing* the stall, this keeps a stall from *freezing* the machine.
 
 **NFS backend caveats:** writes require `--vfs-cache-mode` ≥ `writes` (default is
 `full`, so this is satisfied). The NFS client couples access/modification times,

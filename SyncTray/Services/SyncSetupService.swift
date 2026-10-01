@@ -1473,23 +1473,30 @@ final class SyncSetupService {
                 fi
 
                 # Mount resilience: stop a stalled backend from freezing Finder (and every
-                # process touching the volume). Applied to BOTH mount commands (streaming +
+                # process touching the volume) WITHOUT converting a transient stall into a
+                # sticky "permission denied". Applied to BOTH mount commands (streaming +
                 # Cache Only), before the dry-run seam so the rendered command carries it.
                 #   --timeout 30s / --contimeout 10s : rclone's IO-idle and connect timeouts,
-                #     down from its 5m/1m defaults, so rclone gives up on a wedged backend
-                #     fast and releases the NFS RPC it is holding open (that held RPC is what
-                #     the reading process blocks on). Valid for both nfsmount and macFUSE.
-                #   -o soft,timeo=100,retrans=3 : NFS CLIENT options (nfsmount only). The
-                #     default macOS mount is `hard`, which retries forever regardless of
-                #     timeo/retrans — so a wedged rclone NFS server hangs Finder
-                #     uninterruptibly. `soft` returns a bounded I/O error instead
-                #     (timeo is in 0.1s units => 10s per RPC, 3 retrans => ~30s to error).
-                #     Not FUSE options, so never passed to the `mount` (macFUSE) subcommand.
+                #     down from its 5m/1m defaults. rclone's NFS server (go-nfs) is LOCAL and
+                #     always answers; --timeout bounds the backend read behind each NFS RPC, so
+                #     a wedged backend makes rclone RETURN A BOUNDED NFS ERROR for that RPC in
+                #     ~30s instead of holding it open for minutes. That returned error — not a
+                #     client-side `soft` give-up — is what unblocks the reading process. Valid
+                #     for both nfsmount and macFUSE.
+                #
+                # We deliberately use the macOS DEFAULT `hard` NFS mount — NO `-o soft`. On a
+                # flaky backend (observed live on an SMB/Synology mount over a congested mesh),
+                # `soft,timeo=100,retrans=3` made the NFS CLIENT give up on a transient stall
+                # and cache an EPERM, which Finder surfaced as "you don't have permission to
+                # see its contents" + red no-access badges on folders the backend could list
+                # fine seconds later — and that denial stuck until the next remount. A `hard`
+                # mount instead propagates rclone's own bounded error and SELF-HEALS: once the
+                # backend answers again, the next access succeeds, with no cached denial. The
+                # freeze the `soft` option was added to prevent is already handled by the
+                # rclone --timeout above (rclone answers the RPC), so the client-side give-up
+                # only cost correctness without buying freeze-protection it still owned.
                 if [[ "$MOUNT_RESILIENT" == "true" || "$MOUNT_RESILIENT" == "True" || "$MOUNT_RESILIENT" == "1" ]]; then
                     RCLONE_CMD="$RCLONE_CMD --timeout 30s --contimeout 10s"
-                    if [[ "$MOUNT_SUBCMD" == "nfsmount" ]]; then
-                        RCLONE_CMD="$RCLONE_CMD -o soft,timeo=100,retrans=3"
-                    fi
                 fi
 
                 # Bandwidth cap: rclone --bwlimit on BOTH mount commands (streaming +

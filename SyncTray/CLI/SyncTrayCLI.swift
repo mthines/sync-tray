@@ -223,8 +223,8 @@ enum SyncTrayCLI {
       vfsCachePath, allowNonEmptyMount, mountAtStartup,
       streamCacheOnly, isMuted, rcPort,
       downloadConnections, bandwidthLimit (rclone --bwlimit: '', 'off',
-      '10M', or '1M:512k'), mountResilient (true|false — soft/bounded mount
-      so a stalled backend can't freeze Finder), pinnedDirectories
+      '10M', or '1M:512k'), mountResilient (true|false — bounded-timeout
+      hard mount so a stalled backend can't freeze Finder), pinnedDirectories
       (comma-separated), warmExcludePatterns (comma-separated),
       syncExcludePatterns (comma-separated).
       Use enable/disable for isEnabled.

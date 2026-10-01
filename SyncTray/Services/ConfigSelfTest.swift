@@ -695,9 +695,12 @@ enum ConfigSelfTest {
     /// `mountResilient` (default true) hardens a Stream mount against a stalled backend
     /// freezing Finder. It must default to true (including for a config that predates the
     /// field), survive the round-trip, reinstall on change, and render the right flags:
-    /// `--timeout`/`--contimeout` on every backend, and the NFS `-o soft…` options on the
-    /// nfsmount backend ONLY (they are not FUSE options — passing them to macFUSE would
-    /// break the mount). When off, none of these appear.
+    /// `--timeout`/`--contimeout` on every backend — and NEVER the NFS `-o soft` options.
+    /// A soft mount converted a transient backend stall into a sticky EPERM ("permission
+    /// denied" + red badges) that Finder would not re-try until remount; resilience now
+    /// relies on rclone's own `--timeout` (its local NFS server answers the RPC with a
+    /// bounded error) over the macOS default `hard` mount, which self-heals. When off,
+    /// none of these appear.
     private static func testMountResilient() -> Bool {
         let name = "AC-FR1", slug = "mount-resilient"
 
@@ -736,17 +739,19 @@ enum ConfigSelfTest {
         let root = "\(selfTestRoot)/fr1-\(UUID().uuidString)"
         try? fm.createDirectory(atPath: "\(root)/mnt", withIntermediateDirectories: true)
 
-        // NFS backend, resilient on → --timeout/--contimeout AND the -o soft options.
+        // NFS backend, resilient on → --timeout/--contimeout and a HARD mount (no -o soft).
+        // The soft mount's client-side give-up cached an EPERM on a transient stall; the
+        // rclone timeout bounds the freeze without it, so resilience must NOT emit -o soft.
         var nfsOn = mountFixtureProfile(localPath: "\(root)/mnt", cachePath: "\(root)/cache")
         nfsOn.mountBackend = .nfs
         nfsOn.mountResilient = true
         let nfsOnCmd = dryRunMountScript(profile: nfsOn, rcloneConfig: "").cmd ?? ""
         guard nfsOnCmd.contains("--timeout 30s"), nfsOnCmd.contains("--contimeout 10s"),
-              nfsOnCmd.contains("-o soft,timeo=100,retrans=3") else {
-            return report(name, slug, false, "(nfs resilient mount missing flags: \(nfsOnCmd))")
+              !nfsOnCmd.contains("-o soft") else {
+            return report(name, slug, false, "(nfs resilient mount wrong flags: \(nfsOnCmd))")
         }
 
-        // macFUSE backend, resilient on → rclone timeouts but NOT the NFS -o soft options.
+        // macFUSE backend, resilient on → rclone timeouts, and likewise no NFS -o soft.
         var fuseOn = mountFixtureProfile(localPath: "\(root)/mnt", cachePath: "\(root)/cache")
         fuseOn.mountBackend = .macfuse
         fuseOn.mountResilient = true

@@ -2017,11 +2017,11 @@ struct ProfileDetailView: View {
                             .font(.subheadline.weight(.medium))
                     }
                     Text("Stops a stalled server from freezing Finder and the whole computer. "
-                        + "Bounds rclone's timeouts and mounts the NFS volume \"soft\", so when "
-                        + "the remote drops you get a quick error on an uncached file instead of "
-                        + "an app that hangs until the server comes back. Recommended on; turn it "
-                        + "off only if you see occasional read errors on a slow-but-working remote. "
-                        + "Changing this remounts the stream.")
+                        + "Bounds rclone's timeouts so a wedged backend returns a quick error on "
+                        + "an uncached file instead of hanging until the server comes back — and "
+                        + "the mount recovers on its own once the server responds again. "
+                        + "Recommended on; turn it off only to fall back to rclone's much longer "
+                        + "default timeouts. Changing this remounts the stream.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)

@@ -91,7 +91,7 @@ extension SyncManager {
             // (a Stream mount remounted) to take effect.
             current.bandwidthLimit != updated.bandwidthLimit ||
             // Emitted into the script's {shortId}.json as the mount's --timeout/--contimeout
-            // and NFS soft-mount options, so a change needs the agent reinstalled and the
+            // (hard mount — no NFS -o soft), so a change needs the agent reinstalled and the
             // stream remounted to take effect.
             current.mountResilient != updated.mountResilient ||
             current.mountAtStartup != updated.mountAtStartup ||

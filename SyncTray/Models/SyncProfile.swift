@@ -80,20 +80,18 @@ struct SyncProfile: Identifiable, Codable, Equatable {
     /// script — and trimmed; an invalid value is rejected at the boundary, never written.
     var bandwidthLimit: String
     /// Mount resilience (Stream mode only, default true). When on, the generated mount
-    /// command bounds how long a stalled backend can hang the mount: rclone's
-    /// `--timeout 30s --contimeout 10s` (down from rclone's 5m/1m defaults) so rclone
-    /// gives up on a wedged backend fast and releases the held NFS RPC, and — for the
-    /// NFS backend only — the macOS NFS client is mounted `-o soft,timeo=100,retrans=3`
-    /// so a stalled rclone NFS server surfaces as a bounded I/O error instead of the
-    /// default `hard` mount's uninterruptible hang that freezes Finder (and any process
-    /// touching the volume) until the server responds. This is the knob for "the whole
-    /// computer freezes when the NAS drops": the `soft` options are what actually break
-    /// the infinite hang, since a macOS `hard` mount retries forever regardless of
-    /// `timeo`/`retrans`. Default ON because the freeze is the common pain; the toggle
-    /// exists so a user who hits a soft-mount edge case (a transient read EIO under a
-    /// very slow but recovering backend) can revert to the classic hard mount. The
-    /// `-o soft…` options are NFS-only — they are not FUSE options, so a macFUSE-backed
-    /// profile gets only the rclone `--timeout`/`--contimeout` bounds.
+    /// command bounds how long a stalled backend can hang the mount via rclone's
+    /// `--timeout 30s --contimeout 10s` (down from rclone's 5m/1m defaults): rclone's NFS
+    /// server is local and always answers, so `--timeout` makes a wedged backend return a
+    /// bounded NFS error for the held RPC in ~30s instead of blocking the reading process
+    /// for minutes. The mount stays the macOS default `hard` mount — SyncTray does NOT pass
+    /// `-o soft`. A prior release mounted the NFS client `-o soft,timeo=100,retrans=3`, but
+    /// on a flaky backend `soft` made the client cache an EPERM on a transient stall, which
+    /// Finder showed as "you don't have permission to see its contents" + red badges that
+    /// stuck until remount; a `hard` mount self-heals once the backend answers again, and
+    /// the rclone `--timeout` already covers the freeze. Default ON because the freeze is
+    /// the common pain and the hard mount no longer has the soft downside; off drops back to
+    /// rclone's stock 5m/1m timeouts. Applies to both the nfsmount and macFUSE backends.
     var mountResilient: Bool
 
     /// Short ID for file naming (first 8 chars of UUID)
