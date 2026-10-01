@@ -328,8 +328,9 @@ final class VFSCacheService {
     /// Outcome of a whole-tree LISTING warm (`refreshAllListings`) — metadata only, no data.
     struct ListingWarmResult: Equatable {
         /// `completed` when the descent cached at least one directory listing; `failed` when it
-        /// cached none (the RC server never answered, or every refresh errored); `skipped` when
-        /// there was no RC port to talk to.
+        /// cached none (the RC server never answered, or every refresh errored); `aborted` when it
+        /// backed off after too many consecutive refresh failures (the backend connection is
+        /// dropping — don't flood it); `skipped` when there was no RC port to talk to.
         let outcome: String
         /// Directory refreshes that succeeded. A recursive refresh that warmed a whole subtree
         /// in one call counts as ONE here — this is successful refresh *operations*, a rough
@@ -380,7 +381,8 @@ final class VFSCacheService {
         startRetries: Int = 4,
         startRetryDelay: TimeInterval = 3,
         requestTimeout: TimeInterval = 300,
-        shallowTimeout: TimeInterval = 30
+        shallowTimeout: TimeInterval = 30,
+        maxConsecutiveFailures: Int = 4
     ) async -> ListingWarmResult {
         let start = Date()
         guard port > 0 else {
@@ -392,6 +394,15 @@ final class VFSCacheService {
         var failed = 0
         var visited = 0
         var startAttempt = 0
+        // Back-off guard. The non-recursive refresh ALWAYS succeeds against a healthy backend
+        // (the big-SMB-subtree case fails the recursive walk but the shallow refresh is fine), so
+        // a run of shallow failures means the backend itself is failing — the connection is
+        // dropping its reads. Keep walking then and the descent floods a dying NAS with hundreds
+        // of listing requests, which on a flaky/congested link is self-amplifying: the mount
+        // never attaches, launchd restarts it, the warm re-fires, the network hangs. So abort the
+        // whole walk once failures run consecutively, and surface it as `aborted` for telemetry.
+        var consecutiveFailures = 0
+        var aborted = false
         while let node = stack.popLast(), visited < maxDirectories {
             if Task.isCancelled { break }
             // Cheap path: one recursive call caches this whole subtree, when rclone can walk it.
@@ -402,6 +413,7 @@ final class VFSCacheService {
             if recursive == true {
                 warmed += 1
                 visited += 1
+                consecutiveFailures = 0
                 continue
             }
             // RC not answering yet AND this is the root: the mount just came up. Wait and retry
@@ -413,16 +425,23 @@ final class VFSCacheService {
                 continue
             }
             visited += 1
-            // Recursive walk failed. Cache THIS level's listing directly (non-recursive always
-            // succeeds when the RC server is up), then descend into the children. A SHORT timeout
-            // here (not the recursive walk's long one) so one wedged RC node fails fast instead of
-            // stalling the sequential descent for minutes — the descent runs many of these, and a
-            // single-level refresh has no server-side tree walk to wait on.
+            // Recursive walk failed. Cache THIS level's listing directly (non-recursive succeeds
+            // against a healthy backend), then descend into the children. A SHORT timeout here (not
+            // the recursive walk's long one) so one wedged node fails fast instead of stalling the
+            // sequential descent — the descent runs many of these, and a single-level refresh has
+            // no server-side tree walk to wait on.
             if (try? await refreshListing(
                 dir: node.dir, recursive: false, port: port, timeout: shallowTimeout)) == true {
                 warmed += 1
+                consecutiveFailures = 0
             } else {
                 failed += 1
+                consecutiveFailures += 1
+                if Self.listingDescentShouldAbort(
+                    consecutiveFailures: consecutiveFailures, threshold: maxConsecutiveFailures) {
+                    aborted = true
+                    break
+                }
             }
             guard node.depth < maxDepth else { continue }
             let children = (try? await listSubdirectories(fs: fs, dir: node.dir, port: port)) ?? []
@@ -430,10 +449,24 @@ final class VFSCacheService {
                 stack.append((Self.listingChildPath(parent: node.dir, child: child), node.depth + 1))
             }
         }
+        let outcome: String
+        if aborted {
+            outcome = "aborted"
+        } else {
+            outcome = warmed > 0 ? "completed" : "failed"
+        }
         return ListingWarmResult(
-            outcome: warmed > 0 ? "completed" : "failed",
+            outcome: outcome,
             directoriesWarmed: warmed, directoriesFailed: failed,
             durationSeconds: Date().timeIntervalSince(start))
+    }
+
+    /// Whether the listing-warm descent should abort because the backend is failing: `threshold`
+    /// or more directory refreshes have failed in a row. A healthy backend never fails the
+    /// non-recursive refresh (the big-subtree case fails only the recursive walk), so a run of
+    /// failures is the signal that the connection is dropping and the walk must stop flooding it.
+    static func listingDescentShouldAbort(consecutiveFailures: Int, threshold: Int) -> Bool {
+        threshold > 0 && consecutiveFailures >= threshold
     }
 
     /// One `/vfs/refresh` of `dir`. `recursive` walks the whole subtree in one call (fast when
