@@ -63,6 +63,24 @@ final class SyncManager: ObservableObject {
     /// `warmPinnedDirectories`, which every warm entry point routes through.
     @Published private(set) var warmProgress: [UUID: WarmProgress] = [:]
 
+    /// The user's manual "Pause caching" toggle per profile. When true, the warm loop stops
+    /// starting new file reads (already-scheduled reads finish), handing a saturated slow link
+    /// back to interactive use. Published so the menu bar and Offline Files reflect it live.
+    /// Not persisted — a pause is a now-decision, cleared when the warm run ends; a fresh run
+    /// starts un-paused.
+    @Published private(set) var warmManuallyPaused: [UUID: Bool] = [:]
+
+    /// Auto-pause deadline per profile: while `now < this`, the warm is paused because an app
+    /// was seen actively reading the mount (the lsof busy check). Refreshed each time the
+    /// check still finds an interactive reader, so the warm resumes a cooldown after the app
+    /// goes quiet. In-memory only; drives `isWarmPaused` alongside the manual flag.
+    private var warmAutoPauseUntil: [UUID: Date] = [:]
+
+    /// How long one interactive-reader sighting pauses the warm. The busy check runs on the
+    /// mount monitor's 5s cadence, so the cooldown outlives a couple of ticks — a brief gap in
+    /// the app's reads doesn't thrash the warm back on and straight off again.
+    static let warmAutoPauseCooldown: TimeInterval = 30
+
     /// In-flight warming tasks per profile, kept so a warm run can be cancelled when the
     /// cache is cleared, the profile is unmounted, or a new run supersedes it. Without this,
     /// clearing the cache mid-warm just re-downloads the files the warmer is still reading.
@@ -2492,6 +2510,63 @@ final class SyncManager: ObservableObject {
     /// Start a warming run for a profile as a cancellable, tracked task, superseding any run
     /// already in flight. This is the entry point every trigger uses so the run can later be
     /// stopped (`cancelWarm`) when the cache is cleared or the profile is unmounted.
+    /// Whether the offline warm is currently paused for a profile — either the user's manual
+    /// toggle or a live auto-pause cooldown. Read by the warm loop's pause gate and by the UI.
+    func isWarmPaused(for profileId: UUID) -> Bool {
+        if warmManuallyPaused[profileId] == true { return true }
+        if let until = warmAutoPauseUntil[profileId], Date() < until { return true }
+        return false
+    }
+
+    /// Whether the pause is specifically the user's manual one (for the toggle's on/off state).
+    func isWarmManuallyPaused(for profileId: UUID) -> Bool {
+        warmManuallyPaused[profileId] == true
+    }
+
+    /// The user's "Pause/Resume caching" toggle. Pausing stops the warm starting new reads;
+    /// resuming also clears any live auto-pause cooldown so the warm resumes immediately (the
+    /// 5s monitor re-pauses on the next tick only if an app is still reading). Manual pause is
+    /// not persisted — it governs the current run only.
+    func setWarmPaused(_ paused: Bool, for profileId: UUID) {
+        warmManuallyPaused[profileId] = paused ? true : nil
+        if !paused { warmAutoPauseUntil[profileId] = nil }
+        if let name = profileStore.profile(for: profileId)?.name {
+            TelemetryService.shared.recordWarmPause(
+                profileId: profileId, profileName: name, paused: paused, source: "manual")
+        }
+    }
+
+    /// On the mount-monitor cadence, for each profile with a LIVE warm, lsof the mount for an
+    /// interactive reader (a real app — not Finder or the warmer itself) and, if found,
+    /// (re)arm the auto-pause cooldown. lsof runs off the main actor since it can block on a
+    /// slow mount. No live warm ⇒ no probe, so the cost is paid only while warming.
+    private func refreshWarmAutoPause(for profiles: [SyncProfile]) {
+        let targets = profiles
+            .filter { warmProgress[$0.id]?.isActive == true }
+            .map { ($0.id, $0.name, $0.localSyncPath) }
+        guard !targets.isEmpty else { return }
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let probed: [(UUID, String, Bool)] = targets.map { id, name, mount in
+                (id, name, Self.shouldAutoPauseWarm(lsofOutput: Self.runLsofBusyCheck(mountPoint: mount)))
+            }
+            DispatchQueue.main.async {
+                guard let self else { return }
+                let now = Date()
+                for (id, name, pause) in probed where pause {
+                    let wasPaused = self.isWarmPaused(for: id)
+                    self.warmAutoPauseUntil[id] = now.addingTimeInterval(Self.warmAutoPauseCooldown)
+                    // Record/log only the idle→paused edge, not every re-arm, so a long busy
+                    // stretch is one event rather than one every 5s.
+                    if !wasPaused {
+                        TelemetryService.shared.recordWarmPause(
+                            profileId: id, profileName: name, paused: true, source: "auto")
+                        SyncTraySettings.debugLog("'\(name)': offline warm auto-paused — an app is reading the mount")
+                    }
+                }
+            }
+        }
+    }
+
     func startWarm(for profileId: UUID, dirs: [String]? = nil, trigger: String = "manual") {
         // Anti-thrash cooldown for the AUTOMATIC warm only. The "startup" warm re-fires on every
         // mount detection, so a mount that can't attach and keeps getting restarted by launchd
@@ -3103,6 +3178,8 @@ final class SyncManager: ObservableObject {
             if Task.isCancelled { break }  // cache cleared or profile unmounted mid-run
             await cacheService.warmDirectory(dir, for: profile, concurrency: profile.downloadConnections, isStillPinned: { [weak self] in
                 await self?.isDirectoryPinned(dir, profileId: profileId) ?? false
+            }, shouldPause: { [weak self] in
+                await self?.isWarmPaused(for: profileId) ?? false
             }, onStart: { [weak self] name in
                 await MainActor.run {
                     guard let self, var p = self.warmProgress[profileId] else { return }
@@ -3132,6 +3209,10 @@ final class SyncManager: ObservableObject {
         }
 
         let cancelled = Task.isCancelled
+        // Pause state governs the current run only — clear it so the next warm starts fresh
+        // (a lingering manual pause would silently stall a later run the user did ask for).
+        warmManuallyPaused[profileId] = nil
+        warmAutoPauseUntil[profileId] = nil
         if var p = warmProgress[profileId] {
             let files = p.filesDone
             let bytes = p.bytesDone
@@ -3599,6 +3680,10 @@ final class SyncManager: ObservableObject {
                     self.updateAppGroupMountPaths()
                 }
                 self.checkAutoResume(mountProfiles: mountProfiles)
+                // Yield the link to interactive use: if an app is actively reading a mount
+                // that is currently warming, pause the warm (re-armed each tick; see
+                // `refreshWarmAutoPause`). Only touches profiles with a live warm.
+                self.refreshWarmAutoPause(for: mountProfiles)
             }
         }
     }
@@ -3922,6 +4007,31 @@ final class SyncManager: ObservableObject {
             }
         }
         return names
+    }
+
+    /// The warmer's own process name, excluded from the warm-auto-pause reader set: SyncTray
+    /// holds every file it is warming open on the mount, so counting itself would make the
+    /// warm pause itself the instant it started reading.
+    nonisolated static let warmerProcessName = "SyncTray"
+
+    /// Processes that, when found reading the mount, should auto-pause the offline warm so the
+    /// link is handed to interactive use. It's `blockingProcesses` (daemons already filtered)
+    /// minus the warmer itself — i.e. a real app (Reaper, Preview, a DAW) actively touching
+    /// files. Finder is intentionally NOT here (it is in the ignored-daemon set): Finder keeps
+    /// a mounted volume open persistently, so treating it as a reader would pause the warm for
+    /// the entire life of any open Finder window. The manual "Pause caching" toggle covers the
+    /// idle-Finder-browsing case instead. Pure; covered by ConfigSelfTest AC-WV2.
+    nonisolated static func warmInteractiveReaders(lsofOutput: String) -> [String] {
+        blockingProcesses(lsofOutput: lsofOutput).filter { $0 != warmerProcessName }
+    }
+
+    /// Whether an interactive reader was seen — the decision to arm the auto-pause cooldown.
+    /// A failed/`nil` lsof run does NOT pause: unlike auto-resume (which fails closed to avoid
+    /// unmounting under an open app), a missed pause only means the warm keeps running, which
+    /// is the safe default — the user can always pause manually. Covered by AC-WV2.
+    nonisolated static func shouldAutoPauseWarm(lsofOutput: String?) -> Bool {
+        guard let lsofOutput else { return false }
+        return !warmInteractiveReaders(lsofOutput: lsofOutput).isEmpty
     }
 
     /// For each mounted profile in an AUTOMATIC Cache Only mode, probe the primary (reusing

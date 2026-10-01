@@ -661,6 +661,32 @@ the whole pinned set. `cacheSubtreeRoots(for:)` derives the `{vfs, vfsMeta}` roo
 from the profile (sharing `cacheRelativePath(for:)` with `cacheDirectory(for:)`), and the
 per-file lookup keys on the **mount-relative** path. Covered by `ConfigSelfTest`'s AC-23.
 
+**Warm visibility + pause — a big pinned tree over a slow link, made legible.** Pinning a
+large tree (e.g. `Reaper/Live`) means "download all of this now"; over a degraded link that
+one-time fill runs for a long time and *saturates the link*, so interactive Finder browsing —
+even of already-cached folders — stalls behind the warm's own reads. The fix is not to make
+the warm faster (the link is the bound) but to make it **visible** and **yieldable**:
+- **Visibility.** `WarmProgress.menuBarSummary` (pure, the single source of the compact copy,
+  AC-WV1) renders the otherwise-invisible background download in the **menu bar** ("Caching
+  offline — 103 GB / 180 GB") and alongside the existing detailed `OfflineFilesSection`
+  progress row — so a long fill reads as temporary, not as a broken mount.
+- **Pause.** The warm loop (`VFSCacheService.warmDirectory`) takes a `shouldPause` gate: while
+  paused it stops *starting* new file reads (already-scheduled reads finish; at the usual low
+  concurrency that's a file or two), handing the link back to the foreground. Two pause
+  sources, both via `SyncManager.isWarmPaused(for:)`: the user's **manual** "Pause caching"
+  toggle (`setWarmPaused`, menu bar + Offline Files), and an **auto-pause** when an app is seen
+  reading the mount. Auto-pause reuses the auto-resume `lsof` busy-check:
+  `SyncManager.warmInteractiveReaders(lsofOutput:)` = `blockingProcesses` (daemons already
+  filtered) minus the warmer's own `"SyncTray"` process; a non-empty result arms a
+  `warmAutoPauseCooldown` (30 s), re-armed each 5 s monitor tick while the app keeps reading
+  (`refreshWarmAutoPause`, probed only for profiles with a LIVE warm). **Finder is deliberately
+  NOT a reader** (it's in the ignored-daemon set) — it holds a mounted volume open forever, so
+  counting it would pause the warm for the life of any open Finder window; the manual toggle
+  covers the idle-Finder-browsing case. A failed/`nil` lsof does NOT pause (a missed pause just
+  keeps warming — safe; unlike auto-resume, which fails closed). Pause state is in-memory and
+  cleared when a run ends, so a later warm the user asks for starts un-paused. Telemetry:
+  `synctray.offline.warm.paused` (`warm.pause_source`: manual/auto). Covered by AC-WV1/AC-WV2.
+
 **Warm on mount detection, not just app-driven mounts.** A Stream profile with
 `mountAtStartup` is mounted by launchd at login/reboot (`RunAtLoad`) *without the app*,
 so when the app later launches it finds the volume already mounted and

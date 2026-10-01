@@ -889,6 +889,7 @@ final class VFSCacheService {
         for profile: SyncProfile,
         concurrency: Int = defaultWarmConcurrency,
         isStillPinned: @Sendable () async -> Bool,
+        shouldPause: (@Sendable () async -> Bool)? = nil,
         onStart: (@Sendable (_ name: String) async -> Void)? = nil,
         onProgress: (@Sendable (_ bytes: Int64) async -> Void)? = nil,
         onFileComplete: (@Sendable (_ name: String) async -> Void)? = nil
@@ -930,6 +931,18 @@ final class VFSCacheService {
                     SyncTraySettings.debugLog("warmDirectory: '\(dir)' was unpinned during warming, stopping")
                     break
                 }
+
+                // Pause gate — yield the link to interactive use. While a pause is in effect
+                // (the user's manual "Pause caching" toggle, or an auto-pause because an app is
+                // actively reading the mount), stop STARTING new file reads so a saturated,
+                // slow link is handed back to the foreground. Already-scheduled reads finish;
+                // at the usual low concurrency that's at most a file or two. Poll so a resume
+                // takes hold within ~2s, and keep honouring cancellation/unpin so a cleared
+                // cache or unmount still breaks out of the wait.
+                while await shouldPause?() == true, !Task.isCancelled, await isStillPinned() {
+                    try? await Task.sleep(nanoseconds: 2_000_000_000)
+                }
+                if Task.isCancelled { break }
 
                 guard let rv = try? fileURL.resourceValues(forKeys: [.fileSizeKey, .isRegularFileKey]),
                       rv.isRegularFile == true else { continue }

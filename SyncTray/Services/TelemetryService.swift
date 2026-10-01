@@ -131,6 +131,7 @@ final class TelemetryService {
     private var cachedReadProbeCounter: LongCounterSdk?
     private var warmFilesCounter: LongCounterSdk?
     private var warmBytesCounter: LongCounterSdk?
+    private var warmPausedCounter: LongCounterSdk?
     private var externalConfigEditCounter: LongCounterSdk?
     private var cliInvokedCounter: LongCounterSdk?
     private var cacheMigrationCounter: LongCounterSdk?
@@ -477,6 +478,11 @@ final class TelemetryService {
             .counterBuilder(name: "synctray.offline.warm.bytes")
             .setDescription("Bytes read through the mount while warming the VFS content cache")
             .setUnit("By")
+            .build()
+        warmPausedCounter = meter
+            .counterBuilder(name: "synctray.offline.warm.paused")
+            .setDescription("Offline warm pause/resume events (manual toggle or auto-pause when an app reads the mount)")
+            .setUnit("1")
             .build()
 
         externalConfigEditCounter = meter
@@ -2153,6 +2159,22 @@ final class TelemetryService {
         let profileName: String
         let concurrency: Int
         let trigger: String
+    }
+
+    /// Record an offline-warm pause or resume. `source` is `"manual"` (the user's toggle) or
+    /// `"auto"` (an app was detected reading the mount). Auto events fire only on the
+    /// idle→paused edge, not every monitor tick, so the counter tracks distinct pauses.
+    func recordWarmPause(profileId: UUID, profileName: String, paused: Bool, source: String) {
+        guard SyncTraySettings.telemetryEnabled else { return }
+        ensureSetup()
+        let attrs: [String: AttributeValue] = [
+            "synctray.profile.id": .string(profileId.uuidString),
+            "synctray.profile.name": .string(profileName),
+            "warm.pause_state": .string(paused ? "paused" : "resumed"),
+            "warm.pause_source": .string(source),
+        ]
+        warmPausedCounter?.add(value: 1, attribute: attrs)
+        emitLog(severity: .info, body: paused ? "Offline warm paused" : "Offline warm resumed", attributes: attrs)
     }
 
     /// Start a `synctray warm` span for an offline-file warming run. No-op (returns an

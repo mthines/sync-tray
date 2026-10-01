@@ -469,6 +469,26 @@ struct OfflineFilesSection: View {
                                     .foregroundStyle(.secondary)
                                     .layoutPriority(1)
                             }
+                            // Pause/resume — hand the (often saturated, slow) link back to
+                            // interactive browsing. Auto-pause (an app reading the mount) shows
+                            // the same "Paused" state but is driven by the monitor, not here.
+                            HStack(spacing: 8) {
+                                let manualPaused = syncManager.isWarmManuallyPaused(for: profile.id)
+                                let autoPaused = !manualPaused && syncManager.isWarmPaused(for: profile.id)
+                                Button(manualPaused ? "Resume Caching" : "Pause Caching") {
+                                    syncManager.setWarmPaused(!manualPaused, for: profile.id)
+                                }
+                                .controlSize(.small)
+                                if autoPaused {
+                                    Text("Paused — an app is using these files")
+                                        .font(.caption2)
+                                        .foregroundStyle(.orange)
+                                } else if manualPaused {
+                                    Text("Paused — browsing has priority")
+                                        .font(.caption2)
+                                        .foregroundStyle(.orange)
+                                }
+                            }
                             // One row per file currently reading through the mount, so all
                             // parallel downloads are visible (not just the latest to start).
                             if w.inFlightFiles.isEmpty {

@@ -104,4 +104,18 @@ struct WarmProgress: Equatable {
         let rate = Int64(bytesPerSecond.rounded())
         return ByteCountFormatter.string(fromByteCount: rate, countStyle: .file) + "/s"
     }
+
+    /// Compact one-line summary for cramped surfaces (the menu bar, a status-card caption):
+    /// "Preparing offline cache…" while estimating, then "Caching offline — 103 MB / 2.1 GB"
+    /// (or just the amount done when the total is still unknown). `nil` once the run ends, so
+    /// a caller can render it only while a warm is live. Pure — the single source of this
+    /// copy, shared by every compact surface so they can't drift; covered by ConfigSelfTest
+    /// AC-WV1.
+    var menuBarSummary: String? {
+        switch phase {
+        case .preparing: return "Preparing offline cache…"
+        case .downloading: return "Caching offline — \(formattedBytesProgress)"
+        case .completed, .failed: return nil
+        }
+    }
 }
