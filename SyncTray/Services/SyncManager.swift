@@ -79,6 +79,16 @@ final class SyncManager: ObservableObject {
     /// on pinned dirs — every streaming mount gets its directory listings warmed so Finder
     /// browsing is instant, whether or not the user pinned anything. Re-armed on unmount.
     private var listingWarmedMounts: Set<UUID> = []
+    /// When this session last STARTED each warm (keyed by profile), for the anti-thrash cooldown.
+    /// Both the listing warm and the automatic ("startup") data warm re-arm on unmount, so a mount
+    /// that thrashes (launchd `KeepAlive` restarting a backend that can't attach) would otherwise
+    /// re-fire the warms on every restart — exactly when the backend is already struggling, which
+    /// is what turned one slow NAS into a machine-wide network hang. The cooldown stops a rapid
+    /// remount from re-flooding.
+    private var lastListingWarmStart: [UUID: Date] = [:]
+    private var lastAutoDataWarmStart: [UUID: Date] = [:]
+    /// Minimum gap between automatic warms for the same profile, across mount sessions.
+    static let warmRefireCooldown: TimeInterval = 180
     // Mount read-health probe bookkeeping (in-memory; see `probeMountReadHealth`).
     private var lastMountReadProbe: [UUID: Date] = [:]
     // Last time this app session wrote each profile's Cache Only partial-file list.
@@ -2483,6 +2493,18 @@ final class SyncManager: ObservableObject {
     /// already in flight. This is the entry point every trigger uses so the run can later be
     /// stopped (`cancelWarm`) when the cache is cleared or the profile is unmounted.
     func startWarm(for profileId: UUID, dirs: [String]? = nil, trigger: String = "manual") {
+        // Anti-thrash cooldown for the AUTOMATIC warm only. The "startup" warm re-fires on every
+        // mount detection, so a mount that can't attach and keeps getting restarted by launchd
+        // would re-flood a struggling backend with pinned-file downloads (the dominant load in the
+        // observed network-hang incident). A user-driven warm ("manual"/"finder_pin") is an
+        // explicit action and is never throttled.
+        if trigger == "startup" {
+            if let last = lastAutoDataWarmStart[profileId],
+               Date().timeIntervalSince(last) < Self.warmRefireCooldown {
+                return
+            }
+            lastAutoDataWarmStart[profileId] = Date()
+        }
         let previous = warmTasks[profileId]
         previous?.cancel()  // supersede any run in flight
         warmTasks[profileId] = Task { [weak self] in
@@ -2515,6 +2537,14 @@ final class SyncManager: ObservableObject {
     func startListingWarm(for profileId: UUID) {
         guard let profile = profileStore.profiles.first(where: { $0.id == profileId }),
               profile.isMountMode, profile.rcPort > 0 else { return }
+        // Anti-thrash cooldown: a mount that can't attach gets restarted by launchd and re-fires
+        // this warm on every restart. Skip if we warmed this profile very recently, so a rapid
+        // remount loop can't re-flood a backend that is already struggling to answer.
+        if let last = lastListingWarmStart[profileId],
+           Date().timeIntervalSince(last) < Self.warmRefireCooldown {
+            return
+        }
+        lastListingWarmStart[profileId] = Date()
         let port = profile.rcPort
         let name = profile.name
         let fs = profile.fullRemotePath

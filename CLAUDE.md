@@ -709,13 +709,32 @@ outcome is **non-fatal** — the mount stays fully usable and folders warm lazil
 browse. `startListingWarm` passes `profile.fullRemotePath` as the rclone Fs so the descent
 can list subdirectories.
 
+**Back-off guard — the descent must not flood a failing backend.** The non-recursive refresh
+ALWAYS succeeds against a healthy backend (the big-subtree case fails only the recursive
+walk, not the shallow one), so a run of shallow failures means the backend connection itself
+is dropping its reads. Continuing to walk then is actively harmful on a flaky/congested link
+(e.g. SMB over a double-NAT mesh): the descent fires hundreds of listing requests at a NAS
+that's already failing, which is self-amplifying — the mount never attaches, launchd's
+`KeepAlive` restarts it, the warm re-fires, and the whole machine's network hangs (observed
+live: 5 agent restarts, each re-flooding, until the mount was stopped). So the descent counts
+CONSECUTIVE refresh failures and aborts the whole walk at `maxConsecutiveFailures` (4),
+reporting `outcome=aborted` (the pure `VFSCacheService.listingDescentShouldAbort`). Two things
+back this up: the per-level `shallowTimeout` (30s, not the recursive 300s) bounds each failing
+call, and a cooldown (`SyncManager.warmRefireCooldown`, 180s) stops a thrashing mount from
+re-firing on every restart — applied to BOTH the listing warm (`lastListingWarmStart`) and the
+automatic ("startup") pinned-DATA warm (`lastAutoDataWarmStart` in `startWarm`), since the data
+warm's file downloads were actually the dominant load in the observed hang. (A user-driven
+`manual`/`finder_pin` warm is an explicit action and is never throttled.) These were the
+amplifiers that turned one slow NAS into a network-wide hang.
+
 Gated on `streaming` (a Cache Only union mount reads local upstreams — nothing remote to
 enumerate, and no RC API) and once per mount session via the pure
 `SyncManager.shouldWarmListingsOnMount` + a `listingWarmedMounts` set (re-arms on unmount,
 mirroring the data warm), so the walk never fires every tick. Measurable via
-`synctray.mount.listing_warm` (`listing_warm.directories_warmed`/`_failed`) + the `Mount
-listing warm` log. Covered by `ConfigSelfTest` AC-LW1 (the once-per-mount gate) and AC-LW2
-(the descent's result-parsing + path-join primitives).
+`synctray.mount.listing_warm` (`listing_warm.outcome` incl. `aborted`,
+`listing_warm.directories_warmed`/`_failed`) + the `Mount listing warm` log. Covered by
+`ConfigSelfTest` AC-LW1 (the once-per-mount gate) and AC-LW2 (the descent's result-parsing,
+path-join, and abort-threshold primitives).
 
 **Spotlight exclusion on mount — the OTHER "Loading…" cause, and why a warm listing cache
 isn't enough on its own.** Even with every folder listing warm (above), Finder can still

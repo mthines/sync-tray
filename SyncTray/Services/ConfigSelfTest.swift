@@ -1080,6 +1080,14 @@ enum ConfigSelfTest {
               VFSCacheService.listingChildPath(parent: "Reaper/Material", child: "Songs") == "Reaper/Material/Songs" else {
             return report("AC-LW2", "listing-warm-descent", false, "(child path join wrong)")
         }
+        // Back-off guard: abort only AT/above the threshold, never below, and never when disabled
+        // (threshold 0). This is what stops a flaky-backend warm from flooding a dying NAS.
+        guard !VFSCacheService.listingDescentShouldAbort(consecutiveFailures: 3, threshold: 4),
+              VFSCacheService.listingDescentShouldAbort(consecutiveFailures: 4, threshold: 4),
+              VFSCacheService.listingDescentShouldAbort(consecutiveFailures: 9, threshold: 4),
+              !VFSCacheService.listingDescentShouldAbort(consecutiveFailures: 100, threshold: 0) else {
+            return report("AC-LW2", "listing-warm-descent", false, "(abort threshold wrong)")
+        }
         return report("AC-LW2", "listing-warm-descent", true)
     }
 
