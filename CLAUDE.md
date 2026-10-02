@@ -978,7 +978,7 @@ is the separate, fail-closed schema-drift gate.
 |------|---------|
 | `MenuBarView.swift` | Menu bar dropdown with profile status, recent changes, quick actions |
 | `SettingsView.swift` | Settings window with profile list and detail editor |
-| `AppSettingsView.swift` | Global app settings — launch at login, telemetry toggle, debug logging; About shows the exact release version (`SyncTrayReleaseVersion`, falling back to `CFBundleShortVersionString`) with a **Beta** tag on `/beta` builds (`SyncTrayReleaseChannel`). Both are build-time Info.plist keys, because a beta never bumps `CFBundleShortVersionString`; see DEVELOPMENT.md "Release Channel and Version" |
+| `AppSettingsView.swift` | Global app settings — launch at login, telemetry toggle, debug logging; About shows the exact release version (`SyncTrayReleaseVersion`, falling back to `CFBundleShortVersionString`) with a **Beta** tag on `/beta` builds (`SyncTrayReleaseChannel`) or a **Development** tag on a local debug build (`#if DEBUG`, purple vs the beta's orange) — the latter is how you tell a `.dev`-id dev instance apart from the installed production app when both run at once. Version keys are build-time Info.plist keys, because a beta never bumps `CFBundleShortVersionString`; see DEVELOPMENT.md "Release Channel and Version" |
 | `ProfileListView.swift` | Sidebar list of profiles with add/delete controls |
 | `StatusHeaderView.swift` | Header showing current sync state and progress |
 | `SyncProgressDetailView.swift` | Detailed per-file transfer progress during sync |
