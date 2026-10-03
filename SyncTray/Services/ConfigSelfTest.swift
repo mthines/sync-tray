@@ -4802,6 +4802,15 @@ enum ConfigSelfTest {
             return report(name, slug, false, "(unterminated tail block not removed cleanly)")
         }
 
+        // An empty include list must be byte-identical to the input even when the input (e.g. a
+        // hand-edited file with no managed blocks at all) ends in a trailing newline — the no-folders
+        // path must never apply trailing-blank-line trimming, which is only safe/needed when a tail
+        // block is about to be re-appended (AC-3).
+        let trailingNewlineInput = "- a\n- b\n"
+        guard SyncExcludeFilter.merged(existing: trailingNewlineInput, patterns: [], includeFolders: []) == trailingNewlineInput else {
+            return report(name, slug, false, "(empty-folder merge stripped a trailing newline, breaking byte identity)")
+        }
+
         return report(name, slug, true)
     }
 

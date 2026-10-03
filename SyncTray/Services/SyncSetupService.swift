@@ -2170,13 +2170,15 @@ enum SyncExcludeFilter {
     /// so existing call sites (and their byte-for-byte expectations) are unaffected.
     static func merged(existing: String, patterns: [String], includeFolders: [String] = []) -> String {
         let withoutExcludeBlock = strippingManagedBlock(from: existing, begin: beginMarker, end: endMarker)
+        // Stripping a managed block that was actually present can leave its one-blank-line
+        // separator attached to the trailing end of what's left — detect that case BEFORE
+        // stripping, so the trim below only ever removes a stripping artifact, never a
+        // hand-edited file's own genuine trailing newline (AC-3: an input with no tail block at
+        // all, and no folders requested, must come back byte-identical).
+        let hadIncludeBlock = withoutExcludeBlock.contains(includeBeginMarker)
         let withoutEitherBlock = strippingManagedBlock(from: withoutExcludeBlock, begin: includeBeginMarker, end: includeEndMarker)
-        // Each managed block contributes a one-blank-line separator on the side facing the
-        // user's own content; with a block on BOTH sides (head exclude + tail include) a
-        // re-strip can leave that separator attached to either end of `userContent`, which
-        // would otherwise break idempotency (re-merging would see different "user content"
-        // on every pass). Trim both ends to canonicalize.
-        let userContent = droppingTrailingBlankLines(droppingLeadingBlankLines(withoutEitherBlock))
+        let leadingTrimmed = droppingLeadingBlankLines(withoutEitherBlock)
+        let userContent = hadIncludeBlock ? droppingTrailingBlankLines(leadingTrimmed) : leadingTrimmed
         let excludeRules = Self.rules(for: patterns)
         let folderRules = includeRules(for: includeFolders)
 
