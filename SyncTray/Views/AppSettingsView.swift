@@ -105,7 +105,7 @@ struct AppSettingsView: View {
             Toggle(isOn: $telemetryEnabled) {
                 VStack(alignment: .leading, spacing: 2) {
                     Text("Share usage data")
-                    Text("Sync results, error types, and feature usage. No file names, paths, or credentials.")
+                    Text("Sync results, error types, feature usage, profile names. No file names, paths, remote names, or credentials.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }

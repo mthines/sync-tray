@@ -1,6 +1,6 @@
 # Telemetry Instrumentation Guide
 
-This project uses OpenTelemetry (opentelemetry-swift 1.17.1) for anonymous, opt-in telemetry.
+This project uses OpenTelemetry (opentelemetry-swift 1.17.1) for pseudonymous, opt-in telemetry.
 All telemetry is gated behind `SyncTraySettings.telemetryEnabled` — methods are no-ops when disabled.
 
 ## Architecture

@@ -65,7 +65,7 @@ See [CLAUDE.md](CLAUDE.md) for full architecture documentation.
 
 ## OpenTelemetry (Telemetry)
 
-SyncTray includes opt-in, anonymous telemetry powered by [OpenTelemetry](https://opentelemetry.io/) and exported to [Dash0](https://dash0.com/).
+SyncTray includes opt-in, pseudonymous telemetry powered by [OpenTelemetry](https://opentelemetry.io/) and exported to [Dash0](https://dash0.com/).
 
 ### How It Works
 
@@ -86,7 +86,7 @@ Two things are required:
 
    > Without valid auth headers, the telemetry service skips initialization entirely (no wasted network requests).
 
-2. **Toggle "Anonymous Usage Data" ON** in the app's Settings window.
+2. **Toggle "Share usage data" ON** in the app's Settings window.
 
 ### Environment Variables
 
@@ -151,7 +151,7 @@ open build/Build/Products/Debug/SyncTray.app
 
 ### Disabling Telemetry
 
-- **In the app:** Toggle "Anonymous Usage Data" OFF in Settings. All telemetry methods become no-ops.
+- **In the app:** Toggle "Share usage data" OFF in Settings. All telemetry methods become no-ops.
 - **No auth configured:** If neither `OTEL_EXPORTER_OTLP_HEADERS` nor `DASH0_AUTH_TOKEN` is set (in env, `.env` file, or Info.plist), the service skips setup entirely.
 
 ### Running a Local Collector (Optional)
@@ -220,7 +220,7 @@ Every signal includes these resource attributes (overridable via `OTEL_RESOURCE_
 | `service.name`                | `synctray`           | `OTEL_SERVICE_NAME` env var        |
 | `service.namespace`           | `synctray`           | Hardcoded                          |
 | `service.version`             | App bundle version   | `CFBundleShortVersionString`       |
-| `service.instance.id`         | Anonymous UUID       | Generated on first opt-in          |
+| `service.instance.id`         | Random UUID          | Generated on first opt-in          |
 | `deployment.environment.name` | —                    | `OTEL_RESOURCE_ATTRIBUTES` env var |
 | `os.type`                     | `darwin`             | Hardcoded                          |
 | `os.version`                  | macOS version string | `ProcessInfo`                      |
