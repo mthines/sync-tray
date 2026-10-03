@@ -124,7 +124,7 @@
     "reset": {
       "executor": "nx:run-commands",
       "options": {
-        "command": "pnpm dlx nx reset",
+        "command": "pnpm dlx nx@21.6.11 reset",
         "cwd": "{projectRoot}"
       },
       "cache": false
