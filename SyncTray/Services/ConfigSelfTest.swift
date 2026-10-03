@@ -104,6 +104,8 @@ enum ConfigSelfTest {
             testReinstallTeardownRouting,
             testSyncScriptSessionNameParity,
             testMountModeParse,
+            testWarmMenuBarSummary,
+            testWarmAutoPauseReaders,
             testMountNoFallbackOverride,
             testCacheSuffixConsolidation,
             testCacheSuffixPairSafety,
@@ -2753,6 +2755,83 @@ enum ConfigSelfTest {
             return report("AC-MM1", "mount-mode-parse", false, "(isCacheOnly/isAutomatic mismatch)")
         }
         return report("AC-MM1", "mount-mode-parse", true)
+    }
+
+    // MARK: - AC-WV1 — warm-progress compact summary (menu bar / status card)
+
+    private static func testWarmMenuBarSummary() -> Bool {
+        // Preparing → fixed copy.
+        var p = WarmProgress()
+        guard p.menuBarSummary == "Preparing offline cache…" else {
+            return report("AC-WV1", "warm-menu-summary", false, "(preparing copy)")
+        }
+        // Downloading with a known total → "Caching offline — <done> / <total>".
+        p.phase = .downloading
+        p.bytesDone = 103 * 1_000_000_000
+        p.bytesTotal = 180 * 1_000_000_000
+        guard let known = p.menuBarSummary,
+              known.hasPrefix("Caching offline — "), known.contains(" / ") else {
+            return report("AC-WV1", "warm-menu-summary", false, "(downloading known-total shape)")
+        }
+        // Downloading with an unknown total → amount done, no " / ".
+        p.bytesTotal = 0
+        guard let unknown = p.menuBarSummary,
+              unknown.hasPrefix("Caching offline — "), !unknown.contains(" / ") else {
+            return report("AC-WV1", "warm-menu-summary", false, "(downloading unknown-total shape)")
+        }
+        // Backing off (bad link) → a distinct "paused (slow link)" summary, not a byte figure.
+        p.bytesTotal = 180 * 1_000_000_000
+        p.backingOff = true
+        guard p.menuBarSummary == "Caching offline — paused (slow link)" else {
+            return report("AC-WV1", "warm-menu-summary", false, "(backing-off copy)")
+        }
+        p.backingOff = false
+        // Completed / failed → nil, so a caller renders it only while a run is live.
+        p.phase = .completed
+        guard p.menuBarSummary == nil else {
+            return report("AC-WV1", "warm-menu-summary", false, "(completed should be nil)")
+        }
+        p.phase = .failed("x")
+        guard p.menuBarSummary == nil else {
+            return report("AC-WV1", "warm-menu-summary", false, "(failed should be nil)")
+        }
+        return report("AC-WV1", "warm-menu-summary", true)
+    }
+
+    // MARK: - AC-WV2 — warm auto-pause reader detection
+
+    private static func testWarmAutoPauseReaders() -> Bool {
+        // `lsof -F pc` emits a p<pid> line then a c<command> line per open file.
+        let reaper = "p1\ncReaper\np2\ncReaper\n"
+        let daemonsOnly = "p1\ncFinder\np2\ncmds_stores\np3\ncmdworker_shared\np4\ncQuickLookUIService\n"
+        let warmerOnly = "p1\ncSyncTray\n"
+        let mixed = "p1\ncSyncTray\np2\ncReaper\np3\ncFinder\n"
+
+        // A real app reading the mount → interactive reader present → pause.
+        guard SyncManager.warmInteractiveReaders(lsofOutput: reaper) == ["Reaper"],
+              SyncManager.shouldAutoPauseWarm(lsofOutput: reaper) else {
+            return report("AC-WV2", "warm-auto-pause", false, "(real app should pause)")
+        }
+        // Only background daemons / Finder → no pause (Finder holds a mounted volume forever).
+        guard SyncManager.warmInteractiveReaders(lsofOutput: daemonsOnly).isEmpty,
+              !SyncManager.shouldAutoPauseWarm(lsofOutput: daemonsOnly) else {
+            return report("AC-WV2", "warm-auto-pause", false, "(daemons/Finder must not pause)")
+        }
+        // The warmer itself (SyncTray) is excluded, or the warm would pause itself instantly.
+        guard SyncManager.warmInteractiveReaders(lsofOutput: warmerOnly).isEmpty,
+              !SyncManager.shouldAutoPauseWarm(lsofOutput: warmerOnly) else {
+            return report("AC-WV2", "warm-auto-pause", false, "(warmer must be excluded)")
+        }
+        // Mixed: only the real app survives the SyncTray/Finder filtering.
+        guard SyncManager.warmInteractiveReaders(lsofOutput: mixed) == ["Reaper"],
+              SyncManager.shouldAutoPauseWarm(lsofOutput: mixed) else {
+            return report("AC-WV2", "warm-auto-pause", false, "(mixed should keep only the app)")
+        }
+        // A failed/nil lsof run does NOT pause — a missed pause just keeps warming (safe).
+        guard !SyncManager.shouldAutoPauseWarm(lsofOutput: nil) else {
+            return report("AC-WV2", "warm-auto-pause", false, "(nil lsof must not pause)")
+        }
+        return report("AC-WV2", "warm-auto-pause", true)
     }
 
     // MARK: - AC-CK2 — mount mode never streams through the fallback

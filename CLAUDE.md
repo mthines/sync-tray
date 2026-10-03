@@ -661,6 +661,43 @@ the whole pinned set. `cacheSubtreeRoots(for:)` derives the `{vfs, vfsMeta}` roo
 from the profile (sharing `cacheRelativePath(for:)` with `cacheDirectory(for:)`), and the
 per-file lookup keys on the **mount-relative** path. Covered by `ConfigSelfTest`'s AC-23.
 
+**Warm visibility + pause — a big pinned tree over a slow link, made legible.** Pinning a
+large tree (e.g. `Reaper/Live`) means "download all of this now"; over a degraded link that
+one-time fill runs for a long time and *saturates the link*, so interactive Finder browsing —
+even of already-cached folders — stalls behind the warm's own reads. The fix is not to make
+the warm faster (the link is the bound) but to make it **visible** and **yieldable**:
+- **Visibility.** `WarmProgress.menuBarSummary` (pure, the single source of the compact copy,
+  AC-WV1) renders the otherwise-invisible background download in the **menu bar** ("Caching
+  offline — 103 GB / 180 GB") and alongside the existing detailed `OfflineFilesSection`
+  progress row — so a long fill reads as temporary, not as a broken mount.
+- **Pause.** The warm loop (`VFSCacheService.warmDirectory`) takes a `shouldPause` gate: while
+  paused it stops *starting* new file reads (already-scheduled reads finish; at the usual low
+  concurrency that's a file or two), handing the link back to the foreground. Two pause
+  sources, both via `SyncManager.isWarmPaused(for:)`: the user's **manual** "Pause caching"
+  toggle (`setWarmPaused`, menu bar + Offline Files), and an **auto-pause** when an app is seen
+  reading the mount. Auto-pause reuses the auto-resume `lsof` busy-check:
+  `SyncManager.warmInteractiveReaders(lsofOutput:)` = `blockingProcesses` (daemons already
+  filtered) minus the warmer's own `"SyncTray"` process; a non-empty result arms a
+  `warmAutoPauseCooldown` (30 s), re-armed each 5 s monitor tick while the app keeps reading
+  (`refreshWarmAutoPause`, probed only for profiles with a LIVE warm). **Finder is deliberately
+  NOT a reader** (it's in the ignored-daemon set) — it holds a mounted volume open forever, so
+  counting it would pause the warm for the life of any open Finder window; the manual toggle
+  covers the idle-Finder-browsing case. A failed/`nil` lsof does NOT pause (a missed pause just
+  keeps warming — safe; unlike auto-resume, which fails closed). Pause state is in-memory and
+  cleared when a run ends, so a later warm the user asks for starts un-paused. Telemetry:
+  `synctray.offline.warm.paused` (`warm.pause_source`: manual/auto). Covered by AC-WV1/AC-WV2.
+- **Self-healing back-off on a struggling link.** `warmDirectory`'s per-file read task reports
+  whether it FAILED (threw mid-read, or got zero bytes for a non-empty file — the degraded-SMB
+  "fetch a few KB, stall, retry" signature) instead of swallowing the error with `try?`. After
+  `warmFailureBackoffThreshold` (3) consecutive failures the warm sleeps
+  `warmFailureBackoffCooldown` (60 s) before retrying, so a link that can't complete downloads
+  degrades gracefully instead of looping at ~1 MB/s re-fetching doomed files forever (observed
+  thrash: one 28 MB WAV re-attempted 8× back-to-back, never completing, while the mount card
+  flickered between a starting and a reset transfer). It resumes on its own. Surfaced via the
+  `onStall` callback → `WarmProgress.backingOff`, which `menuBarSummary` renders as "Caching
+  offline — paused (slow link)", and recorded as `synctray.offline.warm.paused` with
+  `warm.pause_source=backoff`. A cancelled read is never counted as a failure.
+
 **Warm on mount detection, not just app-driven mounts.** A Stream profile with
 `mountAtStartup` is mounted by launchd at login/reboot (`RunAtLoad`) *without the app*,
 so when the app later launches it finds the volume already mounted and
@@ -941,7 +978,7 @@ is the separate, fail-closed schema-drift gate.
 |------|---------|
 | `MenuBarView.swift` | Menu bar dropdown with profile status, recent changes, quick actions |
 | `SettingsView.swift` | Settings window with profile list and detail editor |
-| `AppSettingsView.swift` | Global app settings — launch at login, telemetry toggle, debug logging; About shows the exact release version (`SyncTrayReleaseVersion`, falling back to `CFBundleShortVersionString`) with a **Beta** tag on `/beta` builds (`SyncTrayReleaseChannel`). Both are build-time Info.plist keys, because a beta never bumps `CFBundleShortVersionString`; see DEVELOPMENT.md "Release Channel and Version" |
+| `AppSettingsView.swift` | Global app settings — launch at login, telemetry toggle, debug logging; About shows the exact release version (`SyncTrayReleaseVersion`, falling back to `CFBundleShortVersionString`) with a **Beta** tag on `/beta` builds (`SyncTrayReleaseChannel`) or a **Development** tag on a local debug build (`#if DEBUG`, purple vs the beta's orange) — the latter is how you tell a `.dev`-id dev instance apart from the installed production app when both run at once. Version keys are build-time Info.plist keys, because a beta never bumps `CFBundleShortVersionString`; see DEVELOPMENT.md "Release Channel and Version" |
 | `ProfileListView.swift` | Sidebar list of profiles with add/delete controls |
 | `StatusHeaderView.swift` | Header showing current sync state and progress |
 | `SyncProgressDetailView.swift` | Detailed per-file transfer progress during sync |
