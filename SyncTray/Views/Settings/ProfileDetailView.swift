@@ -4454,7 +4454,7 @@ struct SyncOnlyFoldersSection: View {
                     .font(.caption)
             }
             .buttonStyle(.link)
-            .disabled(rcloneRemote.isEmpty)
+            .disabled(liveProfile.rcloneRemote.isEmpty)
 
             // Kept by SyncManager, not this view: it survives the view being recreated and
             // also covers a failed write from an edit made outside the app.
@@ -4476,9 +4476,14 @@ struct SyncOnlyFoldersSection: View {
             folders = updated.syncIncludeFolders
         }
         .sheet(isPresented: $showingBrowser) {
+            // Rooted at the SAVED profile's remote/path (liveProfile), not the form's
+            // possibly-unsaved rcloneRemote/remotePath: a pick here persists immediately
+            // (below), so browsing against an unsaved root could save folders relative to
+            // a path the saved profile doesn't actually have yet — silently syncing nothing
+            // once the include block's trailing "- **" takes effect against the real root.
             RemoteFolderBrowserSheet(
-                remoteName: rcloneRemote,
-                root: remotePath
+                remoteName: liveProfile.rcloneRemote,
+                root: liveProfile.remotePath
             ) { picked in
                 var updated = folders
                 for folder in picked where !updated.contains(folder) {
