@@ -4654,7 +4654,10 @@ struct RemoteFolderBrowserSheet: View {
                     Text("\(selectedFolders.count) selected").font(.caption).foregroundStyle(.secondary)
                     Button("Add \(selectedFolders.count) \(selectedFolders.count == 1 ? "Folder" : "Folders")") {
                         if case .multiple(_, let onSelect) = selection {
-                            onSelect(selectedFolders.map(relativeToBrowseRoot))
+                            // `selectedFolders` is a Set, so iteration order is unspecified (and
+                            // varies run to run) — sort before handing the list back so the
+                            // resulting syncIncludeFolders order is stable and reviewable.
+                            onSelect(selectedFolders.map(relativeToBrowseRoot).sorted())
                         }
                         dismiss()
                     }
