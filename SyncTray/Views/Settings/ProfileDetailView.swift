@@ -4440,8 +4440,13 @@ struct SyncOnlyFoldersSection: View {
                 rowIcon: "folder",
                 patterns: folders
             ) { updated in
-                folders = updated
                 syncManager.updateSyncIncludeFolders(updated, for: profile.id)
+                // Re-derive from the stored profile rather than trusting the editor's raw
+                // proposed list: normalization/validation can silently drop or no-op an entry
+                // (a duplicate once normalized, or an invalid path like "." / ".."), in which
+                // case updateSyncIncludeFolders writes nothing — reflecting the raw list here
+                // would leave a row on screen for a folder that never actually syncs.
+                folders = liveProfile.syncIncludeFolders
             }
 
             Button(action: { showingBrowser = true }) {
