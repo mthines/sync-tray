@@ -1026,7 +1026,11 @@ that `exec`s the running app's binary with whatever subcommand you pass —
 resolve (matches the existing `~/.local/bin/synctray-sync.sh` convention). The
 shim is idempotent and marker-guarded: it refreshes on every launch (so it
 survives a `brew upgrade`/app move) but is never written over a file that
-isn't SyncTray's own.
+isn't SyncTray's own. The app's executable path is **single-quoted** in the shim
+(`'` escaped as `'\''`), never spliced into a `"…"` string: the bundle's own name
+isn't covered by its code signature, so a renamed `.app` containing `$(…)`, a
+backtick or `"` would otherwise run as shell code on every `synctray` call.
+Covered by `ConfigSelfTest` AC-CLI4 and AC-SEC3.
 
 **Inspect** (read-only):
 

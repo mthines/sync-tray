@@ -115,6 +115,7 @@ enum ConfigSelfTest {
             testScriptNoShellEval,
             testAdditionalFlagsSplitting,
             testRCAPIAuthenticated,
+            testShimQuotesExecutablePath,
             testCacheOnlyUnionConfig,
             testCacheOnlyUnionBehaviour,
             testMountModeSelection,
@@ -2319,7 +2320,7 @@ enum ConfigSelfTest {
             return report("AC-CLI4", "shim-install-idempotent-nonclobber", false, "(install failed on an absent shim path)")
         }
         guard let contents = try? String(contentsOfFile: shimPath, encoding: .utf8),
-              contents.contains("exec \"/tmp/fake-synctray-binary\" \"$@\"") else {
+              contents.contains("exec '/tmp/fake-synctray-binary' \"$@\"") else {
             return report("AC-CLI4", "shim-install-idempotent-nonclobber", false, "(shim content missing exec line)")
         }
         guard let attrs = try? FileManager.default.attributesOfItem(atPath: shimPath),
@@ -3318,6 +3319,64 @@ enum ConfigSelfTest {
                 .flatMap({ String(data: $0, encoding: .utf8) }),
               decoded.hasPrefix("\(SyncProfile.rcUser):"), decoded.count > SyncProfile.rcUser.count + 32 else {
             return report(name, slug, false, "(app RC Authorization header missing or malformed: \(result.rcAuthHeader ?? "nil"))")
+        }
+        return report(name, slug, true)
+    }
+
+    // MARK: - AC-SEC3 — the CLI shim never re-parses the app's path as shell code
+
+    /// `CLIShimInstaller` splices the app's executable path into a sh script, and a
+    /// bundle's own name is not covered by its code signature — so a `.app` renamed to
+    /// contain `$(…)`, a backtick, `"`, `'` or `$VAR` must stay literal text. Asserts the
+    /// exact single-quoted exec lines, then runs the shim against a stub at that hostile
+    /// path: the stub receives the args verbatim and nothing in the path executes.
+    private static func testShimQuotesExecutablePath() -> Bool {
+        let name = "AC-SEC3", slug = "shim-quotes-executable-path"
+        let fm = FileManager.default
+        let root = "\(selfTestRoot)/sec3-\(UUID().uuidString)"
+        let marker = "\(root)/PWNED"
+        // Relative `touch PWNED` — the shim runs with `root` as its working directory.
+        let appDir = "\(root)/a'b$(touch PWNED)\"c`touch PWNED`d $HOME"
+        let executable = "\(appDir)/SyncTray"
+        let shimPath = "\(root)/bin/synctray"
+        guard (try? fm.createDirectory(atPath: appDir, withIntermediateDirectories: true)) != nil,
+              (try? "#!/bin/sh\nprintf '%s\\n' \"$@\"\n".write(toFile: executable, atomically: true, encoding: .utf8)) != nil,
+              (try? fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: executable)) != nil else {
+            return report(name, slug, false, "(could not create the stub executable)")
+        }
+        guard CLIShimInstaller.install(executablePath: executable, shimPath: shimPath),
+              let contents = try? String(contentsOfFile: shimPath, encoding: .utf8) else {
+            return report(name, slug, false, "(install failed)")
+        }
+        let quoted = "'\(root)/a'\\''b$(touch PWNED)\"c`touch PWNED`d $HOME/SyncTray'"
+        let lines = contents.components(separatedBy: "\n")
+        guard lines.contains("  exec \(quoted) help"), lines.contains("exec \(quoted) \"$@\"") else {
+            return report(name, slug, false, "(shim exec lines not single-quoted: \(contents))")
+        }
+
+        func runShim(_ args: [String]) -> (status: Int32, stdout: String) {
+            let proc = Process()
+            proc.executableURL = URL(fileURLWithPath: "/bin/sh")
+            proc.arguments = [shimPath] + args
+            proc.currentDirectoryURL = URL(fileURLWithPath: root)
+            let pipe = Pipe()
+            proc.standardOutput = pipe
+            proc.standardError = Pipe()
+            guard (try? proc.run()) != nil else { return (-1, "") }
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            proc.waitUntilExit()
+            return (proc.terminationStatus, String(data: data, encoding: .utf8) ?? "")
+        }
+        let forwarded = runShim(["status", "a b"])
+        guard forwarded.status == 0, forwarded.stdout == "status\na b\n" else {
+            return report(name, slug, false, "(stub did not receive args verbatim: exit=\(forwarded.status) out=\(forwarded.stdout))")
+        }
+        let bare = runShim([])
+        guard bare.status == 0, bare.stdout == "help\n" else {
+            return report(name, slug, false, "(bare shim did not forward help: exit=\(bare.status) out=\(bare.stdout))")
+        }
+        guard !fm.fileExists(atPath: marker) else {
+            return report(name, slug, false, "(the executable path was executed as shell code)")
         }
         return report(name, slug, true)
     }

@@ -51,12 +51,19 @@ enum CLIShimInstaller {
         // bare — a bare launch starts the GUI/menu-bar app, which is surprising
         // for a command typed in a terminal. `open -a SyncTray` remains the way
         // to launch the app. Any subcommand is forwarded verbatim.
+        //
+        // The path is single-quoted for sh: inside '…' nothing expands, so a bundle
+        // renamed to contain `$(…)`, a backtick, `"` or `$VAR` (the bundle's own name
+        // is not covered by its code signature) stays literal text instead of running
+        // as shell code on every `synctray` call. An embedded ' becomes '\'' (close,
+        // escaped quote, reopen). Covered by ConfigSelfTest AC-SEC3.
+        let quotedPath = "'" + executablePath.replacingOccurrences(of: "'", with: "'\\''") + "'"
         let script = """
         \(ownershipMarker)
         if [ "$#" -eq 0 ]; then
-          exec "\(executablePath)" help
+          exec \(quotedPath) help
         fi
-        exec "\(executablePath)" "$@"
+        exec \(quotedPath) "$@"
         """
 
         do {
