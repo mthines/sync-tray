@@ -1598,17 +1598,27 @@ final class SyncSetupService {
             # User-supplied extra flags are split into argv with shell-like QUOTING rules
             # (shlex) but are never evaluated: `$(...)`, backticks, `;`, `|` and friends
             # stay literal text inside an rclone argument instead of running as commands.
+            # Each token then gets the old eval's `~` and `$VAR` / `${VAR}` expansion back as
+            # PURE string substitution (os.path.expandvars, then expanduser — also on the
+            # value of a `--flag=~/path` token), which can never execute anything. An unset
+            # variable stays literal rather than expanding to empty.
             # One python helper both validates and splits, so the two can never disagree.
             split_additional_flags() {
                 python3 -c "
-            import shlex, sys
+            import os, shlex, sys
             try:
                 tokens = shlex.split(sys.argv[1])
             except ValueError as err:
                 sys.stderr.write('additionalRcloneFlags: ' + str(err) + chr(10))
                 sys.exit(2)
+            def expand(tok):
+                tok = os.path.expanduser(os.path.expandvars(tok))
+                flag, sep, value = tok.partition('=')
+                if sep and flag.startswith('-') and value.startswith('~'):
+                    tok = flag + sep + os.path.expanduser(value)
+                return tok
             for a in tokens:
-                sys.stdout.write(a + chr(0))
+                sys.stdout.write(expand(a) + chr(0))
             " "$1"
             }
             if [[ -n "$ADDITIONAL_FLAGS" ]]; then

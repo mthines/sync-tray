@@ -3119,7 +3119,8 @@ enum ConfigSelfTest {
     // MARK: - AC-SEC1b — additionalRcloneFlags: split, never evaluated, never silently dropped
 
     /// Drives the script's real extra-flags block through the shared dry-run seam (which
-    /// sits after it): a `$(...)` token reaches rclone as literal text and never runs, and
+    /// sits after it): a `$(...)` token reaches rclone as literal text and never runs, `~`
+    /// and `$VAR` still expand (as string substitution only), and
     /// an unparseable value (unbalanced quote) fails the run instead of running rclone
     /// without the user's flags.
     private static func testAdditionalFlagsSplitting() -> Bool {
@@ -3142,6 +3143,18 @@ enum ConfigSelfTest {
         }
         guard !fm.fileExists(atPath: marker) else {
             return report(name, slug, false, "(an additionalRcloneFlags value was executed as shell code)")
+        }
+
+        // `~` and `$VAR` keep expanding as before the eval was removed — as plain string
+        // substitution, including the value half of a `--flag=~/path` token.
+        let home = ProcessInfo.processInfo.environment["HOME"] ?? NSHomeDirectory()
+        var tilde = mountFixtureProfile(localPath: local, cachePath: cache)
+        tilde.additionalRcloneFlags = "--exclude-from ~/x.txt --log-file=~/y.log --filter-from $HOME/z.txt"
+        let exp = dryRunMountScript(profile: tilde, rcloneConfig: rcloneConfig)
+        let expected = ["--exclude-from", "\(home)/x.txt", "--log-file=\(home)/y.log",
+                        "--filter-from", "\(home)/z.txt"]
+        guard exp.exitCode == 0, Array(exp.args.suffix(expected.count)) == expected else {
+            return report(name, slug, false, "(~ / $VAR not expanded in extra flags: \(exp.args) log=\(exp.log))")
         }
 
         var malformed = mountFixtureProfile(localPath: local, cachePath: cache)
