@@ -122,6 +122,11 @@
       "items": { "type": "string" },
       "description": "\"Don't Sync\" glob patterns for Two-Way (bisync) and One-Way (sync) profiles — same syntax as warmExcludePatterns: case-sensitive, '*' within one path segment, '?' one character, '**' across segments (e.g. \"*.bak\", \"**/BACKUP/**\"). Matched against each file's name and its path relative to the sync folder. Written as rclone exclude rules into a managed block of the profile's exclude filter file; matching files stop syncing in both directions and nothing is deleted. Ignored in mount mode."
     },
+    "syncIncludeFolders": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Selective folders (Option A) for Two-Way (bisync) and One-Way (sync) profiles — literal folder paths (no globs) relative to the profile's root pair (remotePath on the remote side, localSyncPath on the local side). When non-empty, ONLY these folders sync; an empty list (the default) keeps 'sync everything'. Entries with a '.'/'..'/empty path segment are dropped. Compiled into a managed TAIL block of the exclude filter file (after the 'Don't Sync' head block), so every exclude still wins first-match. Ignored in mount mode. Not emitted into the derived {shortId}.json. An include-list change on an enabled bisync profile schedules a one-time --resync --resync-mode newer via a script-consumed token marker ({shortId}.resync-pending) — never a reinstall."
+    },
     "rcPort": {
       "type": "integer",
       "description": "Port for rclone's RC (remote control) API (mount mode)."

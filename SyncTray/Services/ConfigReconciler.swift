@@ -142,17 +142,21 @@ extension SyncManager {
     }
 
     /// Whether a profile edit needs the exclude filter file rewritten: the "Don't Sync"
-    /// patterns changed on an enabled Two-Way / One-Way profile. A disabled profile has no
-    /// filter file in use; enabling it installs, and `install` writes the file then.
+    /// patterns OR the "Sync Only These Folders" selective-folder list changed on an enabled
+    /// Two-Way / One-Way profile. A disabled profile has no filter file in use; enabling it
+    /// installs, and `install` writes the file then.
     ///
     /// DELIBERATELY not part of `reconcileAction`'s `needsReinstall` set: the sync script
     /// re-reads the filter file on every run, so rewriting it is all the change needs. A
     /// reinstall would unload the agent — stopping any sync in progress — and rewrite the
-    /// script, plist and config for a change that needs none of them. Pure — no I/O.
+    /// script, plist and config for a change that needs none of them. (A bisync profile whose
+    /// include folders actually change gets its own orthogonal signal — the resync-pending
+    /// marker `SyncSetupService.writeExcludeFilter` writes — never a reinstall.) Pure — no I/O.
     nonisolated static func syncFilterReconcileNeeded(from current: SyncProfile, to updated: SyncProfile) -> Bool {
         !updated.isMountMode
             && updated.isEnabled
-            && current.syncExcludePatterns != updated.syncExcludePatterns
+            && (current.syncExcludePatterns != updated.syncExcludePatterns
+                || current.syncIncludeFolders != updated.syncIncludeFolders)
     }
 
     /// Decide whether an edit should rewrite the exclude filter file and, if so, invoke
@@ -196,6 +200,19 @@ extension SyncManager {
         }
         guard filterWriteAttempted else { return }
         recordSyncFilterWrite(error: filterError, for: updated.id)
+    }
+
+    /// In-app "Sync Only These Folders" edit: persist the new folder list, then rewrite the
+    /// filter file through the same gate `updateSyncExcludePatterns` uses — a bisync profile
+    /// whose compiled rules actually change picks up the resync-pending marker there, never a
+    /// reinstall. Applies from the next sync.
+    func updateSyncIncludeFolders(_ folders: [String], for profileId: UUID) {
+        guard let current = profileStore.profile(for: profileId) else { return }
+        var updated = current
+        updated.syncIncludeFolders = SyncProfile.normalizedSyncIncludeFolders(folders)
+        guard updated != current else { return }
+        profileStore.update(updated)
+        applySyncFilterReconcile(from: current, to: updated)
     }
 
     /// Rewrite a profile's exclude filter file, logging (not throwing) on failure — the

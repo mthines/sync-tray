@@ -1090,6 +1090,9 @@ final class TelemetryService {
                 // "Don't Sync" adoption (two-way / one-way). Count only: the patterns
                 // themselves can name folders, so they never leave the machine.
                 "config.sync_exclude_pattern_count": .int(profile.isMountMode ? 0 : profile.syncExcludePatterns.count),
+                // "Sync Only These Folders" adoption (two-way / one-way). Count only — the
+                // folder names themselves never leave the machine.
+                "config.sync_include_folder_count": .int(profile.isMountMode ? 0 : profile.syncIncludeFolders.count),
                 "config.allow_non_empty_mount": .bool(profile.allowNonEmptyMount),
                 "config.download_connections": .int(profile.isMountMode ? profile.downloadConnections : 0),
                 "config.has_bandwidth_limit": .bool(!profile.bandwidthLimit.isEmpty),
