@@ -126,6 +126,19 @@ struct SyncProfile: Identifiable, Codable, Equatable {
         "\(NSHomeDirectory())/.config/synctray/profiles"
     }
 
+    /// HTTP Basic user for a Stream mount's rclone RC API (the password is the secret
+    /// in `rcAuthPath(port:)`). Mirrored by the sync script's `RCLONE_RC_USER`.
+    static let rcUser = "synctray"
+
+    /// 0600 file holding the RC API secret for the mount listening on `port`. Written by
+    /// the sync script (the mount can start under launchd with no app running) and read by
+    /// `VFSCacheService.rcRequest`. Kept OUTSIDE `~/.config/synctray`, which the config
+    /// watcher and `MigrationRunner` treat as profile/settings JSON. The script derives
+    /// the same path as `$HOME/.local/state/synctray/rc/$RC_PORT.auth` — rename both.
+    static func rcAuthPath(port: Int) -> String {
+        "\(NSHomeDirectory())/.local/state/synctray/rc/\(port).auth"
+    }
+
     /// Profile-specific config file (JSON)
     var configPath: String {
         "\(Self.configDirectory)/\(shortId).json"

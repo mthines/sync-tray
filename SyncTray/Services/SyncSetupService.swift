@@ -1406,8 +1406,36 @@ final class SyncSetupService {
                     # Cache Only mount never exposes the RC API (nothing there needs
                     # refreshing/warming while the mount is deliberately not talking to the
                     # remote).
+                    #
+                    # The RC API is AUTHENTICATED, never --rc-no-auth: it listens on a
+                    # localhost TCP port that every local process (any user, and a web page
+                    # via a cross-origin form POST — rc accepts query-string params) can
+                    # reach, and it exposes operations/delete, core/command and friends.
+                    # The secret lives in a 0600 file only this user can read (the app reads
+                    # the same file — `SyncProfile.rcAuthPath(port:)`) and reaches rclone via
+                    # RCLONE_RC_USER/RCLONE_RC_PASS, never argv, so `ps` can't reveal it.
                     if [[ "$RC_PORT" != "0" && -n "$RC_PORT" ]]; then
-                        RCLONE_CMD+=(--rc "--rc-addr=localhost:$RC_PORT" --rc-no-auth)
+                        RC_AUTH_FILE="$HOME/.local/state/synctray/rc/$RC_PORT.auth"
+                        if [[ ! -s "$RC_AUTH_FILE" ]]; then
+                            ( umask 077
+                              mkdir -p "$(dirname "$RC_AUTH_FILE")"
+                              python3 -c 'import secrets; print(secrets.token_hex(32))' > "$RC_AUTH_FILE.tmp.$$" \\
+                                  && mv -f "$RC_AUTH_FILE.tmp.$$" "$RC_AUTH_FILE" )
+                        fi
+                        # umask only applies when mkdir creates the directory; enforce the
+                        # modes on every start so a pre-existing dir/file can't stay readable.
+                        chmod 700 "$(dirname "$RC_AUTH_FILE")" 2>/dev/null
+                        chmod 600 "$RC_AUTH_FILE" 2>/dev/null
+                        RC_SECRET="$(head -n 1 "$RC_AUTH_FILE" 2>/dev/null)"
+                        if [[ -n "$RC_SECRET" ]]; then
+                            export RCLONE_RC_USER="synctray"
+                            export RCLONE_RC_PASS="$RC_SECRET"
+                            RCLONE_CMD+=(--rc "--rc-addr=localhost:$RC_PORT")
+                        else
+                            # Never fall back to an open RC server — the mount still works
+                            # without RC; only app-side cache warming/refresh is unavailable.
+                            echo "$(date '+%Y-%m-%d %H:%M:%S') - RC API disabled: could not create the RC credential file" >> "$LOG_FILE"
+                        fi
                     fi
                 else
                     # CACHE ONLY — a writable "synctray-overlay" directory layered in FRONT of
@@ -1662,6 +1690,7 @@ final class SyncSetupService {
                 # self-test prove a path with shell metacharacters stays ONE inert
                 # argument (AC-SEC1).
                 printf 'SYNCTRAY_DRY_RUN_ARG=%s\\n' "${RCLONE_CMD[@]}"
+                echo "SYNCTRAY_DRY_RUN_RC_AUTH=${RCLONE_RC_PASS:+set}"
                 echo "SYNCTRAY_DRY_RUN_ENV_OVERRIDES=$(env | grep -c '^RCLONE_CONFIG_' || true)"
                 rm -f "$LOCK_FILE"
                 trap - EXIT

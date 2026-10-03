@@ -113,6 +113,7 @@ enum ConfigSelfTest {
             testMountCommandQuoting,
             testScriptNoShellEval,
             testAdditionalFlagsSplitting,
+            testRCAPIAuthenticated,
             testCacheOnlyUnionConfig,
             testCacheOnlyUnionBehaviour,
             testMountModeSelection,
@@ -2631,6 +2632,12 @@ enum ConfigSelfTest {
         /// runtime decisions (e.g. "using fallback: X") that never surface in `cmd` for a
         /// mode (like Cache Only) whose rendered command doesn't reference the remote name.
         let log: String
+        /// True when the script exported an RC password (`SYNCTRAY_DRY_RUN_RC_AUTH=set`).
+        var rcAuth = false
+        /// Mode bits of the RC credential file, captured before cleanup deletes it.
+        var rcAuthFileMode: Int?
+        /// The app's RC `Authorization` header for this port, captured before cleanup.
+        var rcAuthHeader: String?
         /// The command's argv, one element per `SYNCTRAY_DRY_RUN_ARG=` line — exactly what
         /// rclone receives from the script's `"${RCLONE_CMD[@]}"` expansion.
         var args: [String] = []
@@ -2656,6 +2663,12 @@ enum ConfigSelfTest {
         // writes to it must be cleaned up here, the single place every dry-run
         // test funnels through, rather than duplicated per call site.
         defer { try? FileManager.default.removeItem(atPath: profile.logPath) }
+        // A streaming dry run generates the RC credential under the real
+        // ~/.local/state (production path). Remove it afterwards — but only if this run
+        // created it, so a real profile that happens to share the port keeps its secret.
+        let rcAuthPath = SyncProfile.rcAuthPath(port: profile.rcPort)
+        let rcAuthPreexisted = FileManager.default.fileExists(atPath: rcAuthPath)
+        defer { if !rcAuthPreexisted { try? FileManager.default.removeItem(atPath: rcAuthPath) } }
         let dir = "\(selfTestRoot)/mountscript-\(UUID().uuidString)"
         try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
         // In production, `SyncSetupService.install(profile:)` always creates
@@ -2706,12 +2719,14 @@ enum ConfigSelfTest {
         let data = pipe.fileHandleForReading.readDataToEndOfFile()
         let output = String(data: data, encoding: .utf8) ?? ""
 
-        var mode: String?, cmd: String?, envOverrides: Int?, args: [String] = []
+        var mode: String?, cmd: String?, envOverrides: Int?, args: [String] = [], rcAuth = false
         for line in output.split(separator: "\n", omittingEmptySubsequences: false) {
             if line.hasPrefix("SYNCTRAY_DRY_RUN_MODE=") {
                 mode = String(line.dropFirst("SYNCTRAY_DRY_RUN_MODE=".count))
             } else if line.hasPrefix("SYNCTRAY_DRY_RUN_CMD=") {
                 cmd = String(line.dropFirst("SYNCTRAY_DRY_RUN_CMD=".count))
+            } else if line == "SYNCTRAY_DRY_RUN_RC_AUTH=set" {
+                rcAuth = true
             } else if line.hasPrefix("SYNCTRAY_DRY_RUN_ARG=") {
                 args.append(String(line.dropFirst("SYNCTRAY_DRY_RUN_ARG=".count)))
             } else if line.hasPrefix("SYNCTRAY_DRY_RUN_ENV_OVERRIDES=") {
@@ -2721,7 +2736,10 @@ enum ConfigSelfTest {
         let logContent = (try? String(contentsOfFile: profile.logPath, encoding: .utf8)) ?? ""
         return DryRunResult(
             mode: mode, cmd: cmd, envOverrides: envOverrides, output: output,
-            exitCode: proc.terminationStatus, scriptPath: scriptPath, log: logContent, args: args)
+            exitCode: proc.terminationStatus, scriptPath: scriptPath, log: logContent, rcAuth: rcAuth,
+            rcAuthFileMode: (try? FileManager.default.attributesOfItem(atPath: rcAuthPath))?[.posixPermissions] as? Int,
+            rcAuthHeader: VFSCacheService.rcAuthorizationHeader(port: profile.rcPort),
+            args: args)
     }
 
     /// A minimal rclone config defining `name` as an `alias` remote rooted at `path` — the
@@ -3242,6 +3260,52 @@ enum ConfigSelfTest {
         guard bad.exitCode != 0, bad.args.isEmpty,
               bad.log.contains("Invalid additionalRcloneFlags") else {
             return report(name, slug, false, "(unparseable flags did not fail the run: exit=\(bad.exitCode) args=\(bad.args) log=\(bad.log))")
+        }
+        return report(name, slug, true)
+    }
+
+    // MARK: - AC-SEC2 — the streaming mount's RC API requires authentication
+
+    /// The RC API listens on a localhost TCP port any local process (or a web page via a
+    /// cross-origin form POST) can reach, so it must never run `--rc-no-auth`. Asserts the
+    /// streaming command enables RC without `--rc-no-auth`, the script exported the RC
+    /// password (env, never argv), the credential file is 0600, and the app's request
+    /// helper sends the matching Basic header.
+    private static func testRCAPIAuthenticated() -> Bool {
+        let name = "AC-SEC2", slug = "rc-api-authenticated"
+        let fm = FileManager.default
+        let root = "\(selfTestRoot)/sec2-\(UUID().uuidString)"
+        let local = "\(root)/mnt", cache = "\(root)/cache", target = "\(root)/remote-target"
+        for dir in [local, cache, target] {
+            try? fm.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        }
+        let profile = mountFixtureProfile(localPath: local, cachePath: cache)
+        defer { try? fm.removeItem(atPath: profile.cacheOnlyConfigPath) }
+        let authPath = SyncProfile.rcAuthPath(port: profile.rcPort)
+        guard !fm.fileExists(atPath: authPath) else {
+            return report(name, slug, true, "(skipped: a real profile owns port \(profile.rcPort))")
+        }
+        let result = dryRunMountScript(
+            profile: profile, rcloneConfig: aliasRcloneConfig(name: "synology", path: target))
+        guard result.mode == MountMode.streaming.rawValue else {
+            return report(name, slug, false, "(fixture did not dry-run streaming: \(result.output) log=\(result.log))")
+        }
+        guard result.args.contains("--rc"),
+              result.args.contains("--rc-addr=localhost:\(profile.rcPort)"),
+              !result.args.contains("--rc-no-auth") else {
+            return report(name, slug, false, "(RC flags wrong: \(result.args))")
+        }
+        guard result.rcAuth, !result.args.contains(where: { $0.hasPrefix("--rc-pass") }) else {
+            return report(name, slug, false, "(RC password not exported via env, or leaked into argv)")
+        }
+        guard result.rcAuthFileMode == 0o600 else {
+            return report(name, slug, false, "(RC credential file mode \(String(result.rcAuthFileMode ?? -1, radix: 8)), want 600)")
+        }
+        guard let header = result.rcAuthHeader, header.hasPrefix("Basic "),
+              let decoded = Data(base64Encoded: String(header.dropFirst("Basic ".count)))
+                .flatMap({ String(data: $0, encoding: .utf8) }),
+              decoded.hasPrefix("\(SyncProfile.rcUser):"), decoded.count > SyncProfile.rcUser.count + 32 else {
+            return report(name, slug, false, "(app RC Authorization header missing or malformed: \(result.rcAuthHeader ?? "nil"))")
         }
         return report(name, slug, true)
     }
