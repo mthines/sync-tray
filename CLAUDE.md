@@ -184,7 +184,9 @@ file's `vfsMeta` sidecar (`vfscache.Item._save`, found by sampling
 (~6.6 MB/s), and a large live handle cache (~30k entries — go-nfs
 `CachingHandler.FromHandle` scans `LRU.Keys()` per READ) pushed one real mount to
 ~0.2 MB/s. A "cached files are slow" report is therefore usually the cache disk, not a
-cache miss — confirm with `core/stats` bytes (0 = served from cache), or in Dash0 via
+cache miss — confirm with `core/stats` bytes (0 = served from cache; the RC API needs
+auth: `curl -u synctray:$(cat ~/.local/state/synctray/rc/<rc-port>.auth) -X POST
+localhost:<rc-port>/core/stats`, same for pprof), or in Dash0 via
 `synctray.mount.cached_read.throughput` grouped by `cache.fs_type` (the heartbeat's
 read-health probe, `SyncManager.probeMountReadHealth`, AC-RH1). User-facing
 guidance lives in README → Troubleshooting → "Mount mode: Slow file access".
@@ -617,14 +619,16 @@ app**. So the FinderSync menu only appears in a **code-signed** build:
   Caveat: if you enable **both** the dev and release extensions, Finder shows two
   "SyncTray" submenus — disable one while iterating. `scripts/dev.sh` targets the `.dev`
   id and the in-app enabled-check switches id via `#if DEBUG`.
-- **CI / release build unsigned on purpose.** `CODE_SIGNING_ALLOWED=NO` is **not**
-  hardcoded in the project — it is passed on the `xcodebuild` command line by both the
-  CI `test` job (`.github/workflows/ci.yml`) and `scripts/release-ci.sh`. This keeps the
+- **CI / release build unsigned, then signed for release.** `CODE_SIGNING_ALLOWED=NO` is
+  **not** hardcoded in the project — it is passed on the `xcodebuild` command line by both
+  the CI `test` job (`.github/workflows/ci.yml`) and `scripts/release-ci.sh`. This keeps the
   build gate green without signing credentials while letting local dev sign normally.
-  Consequence: the brew-distributed (unsigned) app **cannot** show the offline menu —
-  shipping it requires Developer ID signing + notarization + App Group provisioning.
-  The release pipeline (`scripts/release-ci.sh`) does this automatically when the
-  signing secrets are present; setup is documented in [`docs/release-signing.md`](docs/release-signing.md).
+  The offline menu needs Developer ID signing + notarization + App Group provisioning,
+  so `scripts/release-ci.sh` re-signs the built app with Developer ID and notarizes it
+  before publishing. It does this with the signing secrets and
+  **refuses to publish without them** — the cask no longer strips quarantine, so an
+  un-notarized release can't be installed (the local `scripts/release.sh` refuses
+  outright). Setup is documented in [`docs/release-signing.md`](docs/release-signing.md).
   Local dev-setup steps live in [`DEVELOPMENT.md`](DEVELOPMENT.md).
 
 #### Cross-Target String Constants
@@ -660,6 +664,43 @@ files already offline"), so a re-warm of a warm cache is near-instant instead of
 the whole pinned set. `cacheSubtreeRoots(for:)` derives the `{vfs, vfsMeta}` roots purely
 from the profile (sharing `cacheRelativePath(for:)` with `cacheDirectory(for:)`), and the
 per-file lookup keys on the **mount-relative** path. Covered by `ConfigSelfTest`'s AC-23.
+
+**Warm visibility + pause — a big pinned tree over a slow link, made legible.** Pinning a
+large tree (e.g. `Reaper/Live`) means "download all of this now"; over a degraded link that
+one-time fill runs for a long time and *saturates the link*, so interactive Finder browsing —
+even of already-cached folders — stalls behind the warm's own reads. The fix is not to make
+the warm faster (the link is the bound) but to make it **visible** and **yieldable**:
+- **Visibility.** `WarmProgress.menuBarSummary` (pure, the single source of the compact copy,
+  AC-WV1) renders the otherwise-invisible background download in the **menu bar** ("Caching
+  offline — 103 GB / 180 GB") and alongside the existing detailed `OfflineFilesSection`
+  progress row — so a long fill reads as temporary, not as a broken mount.
+- **Pause.** The warm loop (`VFSCacheService.warmDirectory`) takes a `shouldPause` gate: while
+  paused it stops *starting* new file reads (already-scheduled reads finish; at the usual low
+  concurrency that's a file or two), handing the link back to the foreground. Two pause
+  sources, both via `SyncManager.isWarmPaused(for:)`: the user's **manual** "Pause caching"
+  toggle (`setWarmPaused`, menu bar + Offline Files), and an **auto-pause** when an app is seen
+  reading the mount. Auto-pause reuses the auto-resume `lsof` busy-check:
+  `SyncManager.warmInteractiveReaders(lsofOutput:)` = `blockingProcesses` (daemons already
+  filtered) minus the warmer's own `"SyncTray"` process; a non-empty result arms a
+  `warmAutoPauseCooldown` (30 s), re-armed each 5 s monitor tick while the app keeps reading
+  (`refreshWarmAutoPause`, probed only for profiles with a LIVE warm). **Finder is deliberately
+  NOT a reader** (it's in the ignored-daemon set) — it holds a mounted volume open forever, so
+  counting it would pause the warm for the life of any open Finder window; the manual toggle
+  covers the idle-Finder-browsing case. A failed/`nil` lsof does NOT pause (a missed pause just
+  keeps warming — safe; unlike auto-resume, which fails closed). Pause state is in-memory and
+  cleared when a run ends, so a later warm the user asks for starts un-paused. Telemetry:
+  `synctray.offline.warm.paused` (`warm.pause_source`: manual/auto). Covered by AC-WV1/AC-WV2.
+- **Self-healing back-off on a struggling link.** `warmDirectory`'s per-file read task reports
+  whether it FAILED (threw mid-read, or got zero bytes for a non-empty file — the degraded-SMB
+  "fetch a few KB, stall, retry" signature) instead of swallowing the error with `try?`. After
+  `warmFailureBackoffThreshold` (3) consecutive failures the warm sleeps
+  `warmFailureBackoffCooldown` (60 s) before retrying, so a link that can't complete downloads
+  degrades gracefully instead of looping at ~1 MB/s re-fetching doomed files forever (observed
+  thrash: one 28 MB WAV re-attempted 8× back-to-back, never completing, while the mount card
+  flickered between a starting and a reset transfer). It resumes on its own. Surfaced via the
+  `onStall` callback → `WarmProgress.backingOff`, which `menuBarSummary` renders as "Caching
+  offline — paused (slow link)", and recorded as `synctray.offline.warm.paused` with
+  `warm.pause_source=backoff`. A cancelled read is never counted as a failure.
 
 **Warm on mount detection, not just app-driven mounts.** A Stream profile with
 `mountAtStartup` is mounted by launchd at login/reboot (`RunAtLoad`) *without the app*,
@@ -941,7 +982,7 @@ is the separate, fail-closed schema-drift gate.
 |------|---------|
 | `MenuBarView.swift` | Menu bar dropdown with profile status, recent changes, quick actions |
 | `SettingsView.swift` | Settings window with profile list and detail editor |
-| `AppSettingsView.swift` | Global app settings — launch at login, telemetry toggle, debug logging; About shows the exact release version (`SyncTrayReleaseVersion`, falling back to `CFBundleShortVersionString`) with a **Beta** tag on `/beta` builds (`SyncTrayReleaseChannel`). Both are build-time Info.plist keys, because a beta never bumps `CFBundleShortVersionString`; see DEVELOPMENT.md "Release Channel and Version" |
+| `AppSettingsView.swift` | Global app settings — launch at login, telemetry toggle, debug logging; About shows the exact release version (`SyncTrayReleaseVersion`, falling back to `CFBundleShortVersionString`) with a **Beta** tag on `/beta` builds (`SyncTrayReleaseChannel`) or a **Development** tag on a local debug build (`#if DEBUG`, purple vs the beta's orange) — the latter is how you tell a `.dev`-id dev instance apart from the installed production app when both run at once. Version keys are build-time Info.plist keys, because a beta never bumps `CFBundleShortVersionString`; see DEVELOPMENT.md "Release Channel and Version" |
 | `ProfileListView.swift` | Sidebar list of profiles with add/delete controls |
 | `StatusHeaderView.swift` | Header showing current sync state and progress |
 | `SyncProgressDetailView.swift` | Detailed per-file transfer progress during sync |
@@ -1264,6 +1305,10 @@ func doBackgroundWork() {
 ```
 
 ### 2. Process Execution
+- The generated sync script builds every rclone command as a bash **array** and runs
+  `"${RCLONE_CMD[@]}"` — never a string passed to `eval`. Profile values (paths, remotes,
+  `additionalRcloneFlags`) must reach rclone as literal arguments; extra flags are split with
+  `shlex` and never evaluated. Covered by `ConfigSelfTest` AC-SEC1.
 - Always run external processes (rclone, shell commands) on background threads
 - Use `Process` with pipes for stdout/stderr
 - Set `readabilityHandler` for real-time output streaming
@@ -1403,7 +1448,7 @@ open ~/Library/Developer/Xcode/DerivedData/SyncTray-*/Build/Products/Debug/SyncT
 
 ## Telemetry
 
-Anonymous, opt-in telemetry using OpenTelemetry (opentelemetry-swift 1.17.1). All methods are no-ops unless `SyncTraySettings.telemetryEnabled` is true. See `.claude/rules/telemetry.md` for the full instrumentation guide and how to add new telemetry.
+Pseudonymous, opt-in telemetry using OpenTelemetry (opentelemetry-swift 1.17.1). All methods are no-ops unless `SyncTraySettings.telemetryEnabled` is true. See `.claude/rules/telemetry.md` for the full instrumentation guide and how to add new telemetry.
 
 ### Three signals
 - **Traces**: Sync lifecycle spans with real duration (start→complete/fail), mount/unmount spans
@@ -1441,6 +1486,7 @@ Priority: process env vars > `~/.config/synctray/.env` > Info.plist. Key vars: `
 | `~/Library/LaunchAgents/com.synctray.sync.{shortId}.plist` | launchd schedule |
 | `~/.local/log/synctray-sync-{shortId}.log` | Sync logs |
 | `/tmp/synctray-sync-{shortId}.lock` | Lock file (prevents concurrent syncs) |
+| `~/.local/state/synctray/rc/{rcPort}.auth` | Mount mode only — 0600 secret for the streaming mount's rclone RC API. Generated by the sync script, passed to rclone as `RCLONE_RC_USER`/`RCLONE_RC_PASS` (env, never argv), read by `VFSCacheService.rcRequest` for HTTP Basic auth. The RC API never runs `--rc-no-auth` (any local process, or a web page via a cross-origin form POST, could otherwise drive it). Covered by `ConfigSelfTest` AC-SEC2. |
 | `/tmp/synctray-mount-{shortId}.mode` | Mount mode only — the currently active `MountMode` token (`streaming`/`cache-only-manual`/`cache-only-pending`/`cache-only-offline`), rewritten on every mount start |
 | `~/.config/synctray/profiles/{shortId}.cacheonly.rclone.conf` | Mount mode only — chmod-0600 `union` remote config for the Cache-only overlay mount |
 | `{vfsCachePath}/vfs/{primaryRemoteName}/{path}/…` | Mount mode only — VFS cached file **data**, keyed by the profile's own primary remote name (see "Cache key" above) |

@@ -234,11 +234,7 @@ brew install --cask synctray
 
 Download the latest `.zip` from [Releases](../../releases), extract, and drag `SyncTray.app` to `/Applications`.
 
-**Note:** Since the app isn't notarized, you'll need to allow it once:
-
-```bash
-xattr -cr /Applications/SyncTray.app
-```
+Releases are signed with a Developer ID and notarized by Apple, so Gatekeeper opens them normally — no `xattr` workaround needed.
 
 ### Option 3: Build from Source
 
@@ -449,13 +445,7 @@ SyncTray creates these files (per profile):
 
 ### "App can't be opened" warning
 
-macOS blocks unsigned apps. Fix with:
-
-**Fix (run once in Terminal):**
-
-```bash
-xattr -cr /Applications/SyncTray.app
-```
+Releases are notarized, so this should only happen with an old (pre-notarization) release or a downloaded build that isn't notarized. Update to the latest release. To open a build you trust anyway, open it once, then allow it under **System Settings → Privacy & Security → Open Anyway** (on macOS 14 and earlier, right-click the app → **Open** also works). Avoid `xattr -cr` on a downloaded app: it strips the quarantine flag and skips Gatekeeper's checks entirely.
 
 ### Sync shows error state
 
@@ -573,11 +563,10 @@ Uses [Conventional Commits](https://www.conventionalcommits.org/):
 
 ### Creating a Release
 
-```bash
-./scripts/release.sh           # Auto-detect from commits
-./scripts/release.sh --minor   # Force minor bump
-./scripts/release.sh v1.2.3    # Exact version
-```
+Releases are published by CI: merging a `feat:`/`fix:` PR to `main` bumps the version,
+builds, signs, notarizes, and updates the Homebrew tap (`scripts/release-ci.sh`).
+A local `scripts/release.sh` run refuses, since it can't notarize — see
+[`docs/release-signing.md`](docs/release-signing.md).
 
 ---
 

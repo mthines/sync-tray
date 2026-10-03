@@ -104,11 +104,16 @@ enum ConfigSelfTest {
             testReinstallTeardownRouting,
             testSyncScriptSessionNameParity,
             testMountModeParse,
+            testWarmMenuBarSummary,
+            testWarmAutoPauseReaders,
             testMountNoFallbackOverride,
             testCacheSuffixConsolidation,
             testCacheSuffixPairSafety,
             testCacheSuffixEmptyDestination,
             testMountCommandQuoting,
+            testScriptNoShellEval,
+            testAdditionalFlagsSplitting,
+            testRCAPIAuthenticated,
             testCacheOnlyUnionConfig,
             testCacheOnlyUnionBehaviour,
             testMountModeSelection,
@@ -667,7 +672,7 @@ enum ConfigSelfTest {
         var capped = mountFixtureProfile(localPath: "\(root)/mnt", cachePath: "\(root)/cache")
         capped.bandwidthLimit = "5M"
         let cappedResult = dryRunMountScript(profile: capped, rcloneConfig: "")
-        guard let cappedCmd = cappedResult.cmd, cappedCmd.contains("--bwlimit \"5M\"") else {
+        guard let cappedCmd = cappedResult.cmd, cappedCmd.contains("--bwlimit 5M") else {
             return report(name, slug, false, "(mount command missing --bwlimit: \(cappedResult.cmd ?? "nil"))")
         }
         // ...and is absent when empty.
@@ -2627,6 +2632,15 @@ enum ConfigSelfTest {
         /// runtime decisions (e.g. "using fallback: X") that never surface in `cmd` for a
         /// mode (like Cache Only) whose rendered command doesn't reference the remote name.
         let log: String
+        /// True when the script exported an RC password (`SYNCTRAY_DRY_RUN_RC_AUTH=set`).
+        var rcAuth = false
+        /// Mode bits of the RC credential file, captured before cleanup deletes it.
+        var rcAuthFileMode: Int?
+        /// The app's RC `Authorization` header for this port, captured before cleanup.
+        var rcAuthHeader: String?
+        /// The command's argv, one element per `SYNCTRAY_DRY_RUN_ARG=` line — exactly what
+        /// rclone receives from the script's `"${RCLONE_CMD[@]}"` expansion.
+        var args: [String] = []
     }
 
     /// Render the shared script + this profile's derived config into a fresh temp dir, then
@@ -2649,6 +2663,12 @@ enum ConfigSelfTest {
         // writes to it must be cleaned up here, the single place every dry-run
         // test funnels through, rather than duplicated per call site.
         defer { try? FileManager.default.removeItem(atPath: profile.logPath) }
+        // A streaming dry run generates the RC credential under the real
+        // ~/.local/state (production path). Remove it afterwards — but only if this run
+        // created it, so a real profile that happens to share the port keeps its secret.
+        let rcAuthPath = SyncProfile.rcAuthPath(port: profile.rcPort)
+        let rcAuthPreexisted = FileManager.default.fileExists(atPath: rcAuthPath)
+        defer { if !rcAuthPreexisted { try? FileManager.default.removeItem(atPath: rcAuthPath) } }
         let dir = "\(selfTestRoot)/mountscript-\(UUID().uuidString)"
         try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
         // In production, `SyncSetupService.install(profile:)` always creates
@@ -2699,12 +2719,16 @@ enum ConfigSelfTest {
         let data = pipe.fileHandleForReading.readDataToEndOfFile()
         let output = String(data: data, encoding: .utf8) ?? ""
 
-        var mode: String?, cmd: String?, envOverrides: Int?
+        var mode: String?, cmd: String?, envOverrides: Int?, args: [String] = [], rcAuth = false
         for line in output.split(separator: "\n", omittingEmptySubsequences: false) {
             if line.hasPrefix("SYNCTRAY_DRY_RUN_MODE=") {
                 mode = String(line.dropFirst("SYNCTRAY_DRY_RUN_MODE=".count))
             } else if line.hasPrefix("SYNCTRAY_DRY_RUN_CMD=") {
                 cmd = String(line.dropFirst("SYNCTRAY_DRY_RUN_CMD=".count))
+            } else if line == "SYNCTRAY_DRY_RUN_RC_AUTH=set" {
+                rcAuth = true
+            } else if line.hasPrefix("SYNCTRAY_DRY_RUN_ARG=") {
+                args.append(String(line.dropFirst("SYNCTRAY_DRY_RUN_ARG=".count)))
             } else if line.hasPrefix("SYNCTRAY_DRY_RUN_ENV_OVERRIDES=") {
                 envOverrides = Int(line.dropFirst("SYNCTRAY_DRY_RUN_ENV_OVERRIDES=".count))
             }
@@ -2712,7 +2736,10 @@ enum ConfigSelfTest {
         let logContent = (try? String(contentsOfFile: profile.logPath, encoding: .utf8)) ?? ""
         return DryRunResult(
             mode: mode, cmd: cmd, envOverrides: envOverrides, output: output,
-            exitCode: proc.terminationStatus, scriptPath: scriptPath, log: logContent)
+            exitCode: proc.terminationStatus, scriptPath: scriptPath, log: logContent, rcAuth: rcAuth,
+            rcAuthFileMode: (try? FileManager.default.attributesOfItem(atPath: rcAuthPath))?[.posixPermissions] as? Int,
+            rcAuthHeader: VFSCacheService.rcAuthorizationHeader(port: profile.rcPort),
+            args: args)
     }
 
     /// A minimal rclone config defining `name` as an `alias` remote rooted at `path` — the
@@ -2753,6 +2780,83 @@ enum ConfigSelfTest {
             return report("AC-MM1", "mount-mode-parse", false, "(isCacheOnly/isAutomatic mismatch)")
         }
         return report("AC-MM1", "mount-mode-parse", true)
+    }
+
+    // MARK: - AC-WV1 — warm-progress compact summary (menu bar / status card)
+
+    private static func testWarmMenuBarSummary() -> Bool {
+        // Preparing → fixed copy.
+        var p = WarmProgress()
+        guard p.menuBarSummary == "Preparing offline cache…" else {
+            return report("AC-WV1", "warm-menu-summary", false, "(preparing copy)")
+        }
+        // Downloading with a known total → "Caching offline — <done> / <total>".
+        p.phase = .downloading
+        p.bytesDone = 103 * 1_000_000_000
+        p.bytesTotal = 180 * 1_000_000_000
+        guard let known = p.menuBarSummary,
+              known.hasPrefix("Caching offline — "), known.contains(" / ") else {
+            return report("AC-WV1", "warm-menu-summary", false, "(downloading known-total shape)")
+        }
+        // Downloading with an unknown total → amount done, no " / ".
+        p.bytesTotal = 0
+        guard let unknown = p.menuBarSummary,
+              unknown.hasPrefix("Caching offline — "), !unknown.contains(" / ") else {
+            return report("AC-WV1", "warm-menu-summary", false, "(downloading unknown-total shape)")
+        }
+        // Backing off (bad link) → a distinct "paused (slow link)" summary, not a byte figure.
+        p.bytesTotal = 180 * 1_000_000_000
+        p.backingOff = true
+        guard p.menuBarSummary == "Caching offline — paused (slow link)" else {
+            return report("AC-WV1", "warm-menu-summary", false, "(backing-off copy)")
+        }
+        p.backingOff = false
+        // Completed / failed → nil, so a caller renders it only while a run is live.
+        p.phase = .completed
+        guard p.menuBarSummary == nil else {
+            return report("AC-WV1", "warm-menu-summary", false, "(completed should be nil)")
+        }
+        p.phase = .failed("x")
+        guard p.menuBarSummary == nil else {
+            return report("AC-WV1", "warm-menu-summary", false, "(failed should be nil)")
+        }
+        return report("AC-WV1", "warm-menu-summary", true)
+    }
+
+    // MARK: - AC-WV2 — warm auto-pause reader detection
+
+    private static func testWarmAutoPauseReaders() -> Bool {
+        // `lsof -F pc` emits a p<pid> line then a c<command> line per open file.
+        let reaper = "p1\ncReaper\np2\ncReaper\n"
+        let daemonsOnly = "p1\ncFinder\np2\ncmds_stores\np3\ncmdworker_shared\np4\ncQuickLookUIService\n"
+        let warmerOnly = "p1\ncSyncTray\n"
+        let mixed = "p1\ncSyncTray\np2\ncReaper\np3\ncFinder\n"
+
+        // A real app reading the mount → interactive reader present → pause.
+        guard SyncManager.warmInteractiveReaders(lsofOutput: reaper) == ["Reaper"],
+              SyncManager.shouldAutoPauseWarm(lsofOutput: reaper) else {
+            return report("AC-WV2", "warm-auto-pause", false, "(real app should pause)")
+        }
+        // Only background daemons / Finder → no pause (Finder holds a mounted volume forever).
+        guard SyncManager.warmInteractiveReaders(lsofOutput: daemonsOnly).isEmpty,
+              !SyncManager.shouldAutoPauseWarm(lsofOutput: daemonsOnly) else {
+            return report("AC-WV2", "warm-auto-pause", false, "(daemons/Finder must not pause)")
+        }
+        // The warmer itself (SyncTray) is excluded, or the warm would pause itself instantly.
+        guard SyncManager.warmInteractiveReaders(lsofOutput: warmerOnly).isEmpty,
+              !SyncManager.shouldAutoPauseWarm(lsofOutput: warmerOnly) else {
+            return report("AC-WV2", "warm-auto-pause", false, "(warmer must be excluded)")
+        }
+        // Mixed: only the real app survives the SyncTray/Finder filtering.
+        guard SyncManager.warmInteractiveReaders(lsofOutput: mixed) == ["Reaper"],
+              SyncManager.shouldAutoPauseWarm(lsofOutput: mixed) else {
+            return report("AC-WV2", "warm-auto-pause", false, "(mixed should keep only the app)")
+        }
+        // A failed/nil lsof run does NOT pause — a missed pause just keeps warming (safe).
+        guard !SyncManager.shouldAutoPauseWarm(lsofOutput: nil) else {
+            return report("AC-WV2", "warm-auto-pause", false, "(nil lsof must not pause)")
+        }
+        return report("AC-WV2", "warm-auto-pause", true)
     }
 
     // MARK: - AC-CK2 — mount mode never streams through the fallback
@@ -3019,24 +3123,6 @@ enum ConfigSelfTest {
 
     // MARK: - AC-CK4 — mount command keeps a spaced path as ONE argument
 
-    /// Word-split `cmd` exactly the way the script's `eval "$RCLONE_CMD"` does, returning the
-    /// resulting argv. A path whose quotes were consumed at assignment time (a bare `"`
-    /// rendered into the script instead of `\"`) splits into several words here — the same
-    /// split rclone would receive.
-    private static func evalArgv(_ cmd: String) -> [String] {
-        let proc = Process()
-        proc.executableURL = URL(fileURLWithPath: "/bin/bash")
-        proc.arguments = ["-c", "eval \"set -- $1\"; printf '%s\\0' \"$@\"", "_", cmd]
-        let pipe = Pipe()
-        proc.standardOutput = pipe
-        do { try proc.run() } catch { return [] }
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        proc.waitUntilExit()
-        return (String(data: data, encoding: .utf8) ?? "")
-            .split(separator: "\0", omittingEmptySubsequences: false)
-            .dropLast().map(String.init)
-    }
-
     private static func argFollowing(_ flag: String, in argv: [String]) -> String? {
         guard let i = argv.firstIndex(of: flag), i + 1 < argv.count else { return nil }
         return argv[i + 1]
@@ -3056,11 +3142,11 @@ enum ConfigSelfTest {
         defer { try? fm.removeItem(atPath: streaming.cacheOnlyConfigPath) }
         let s = dryRunMountScript(
             profile: streaming, rcloneConfig: aliasRcloneConfig(name: "synology", path: target))
-        guard s.mode == MountMode.streaming.rawValue, let sCmd = s.cmd else {
+        guard s.mode == MountMode.streaming.rawValue, s.cmd != nil else {
             return report("AC-CK4", "mount-command-quoting", false,
                           "(streaming fixture did not dry-run streaming: \(s.output) log=\(s.log))")
         }
-        let sArgv = evalArgv(sCmd)
+        let sArgv = s.args
         guard sArgv.contains(local),
               argFollowing("--cache-dir", in: sArgv) == cache,
               argFollowing("--volname", in: sArgv) == "My Mount"
@@ -3073,11 +3159,11 @@ enum ConfigSelfTest {
         let cacheOnly = mountFixtureProfile(localPath: local, cachePath: cache, streamCacheOnly: true)
         defer { try? fm.removeItem(atPath: cacheOnly.cacheOnlyConfigPath) }
         let c = dryRunMountScript(profile: cacheOnly, rcloneConfig: "")
-        guard c.mode == MountMode.cacheOnlyManual.rawValue, let cCmd = c.cmd else {
+        guard c.mode == MountMode.cacheOnlyManual.rawValue, c.cmd != nil else {
             return report("AC-CK4", "mount-command-quoting", false,
                           "(cache-only fixture did not dry-run cache-only: \(c.output) log=\(c.log))")
         }
-        let cArgv = evalArgv(cCmd)
+        let cArgv = c.args
         guard cArgv.contains(local),
               argFollowing("--cache-dir", in: cArgv) == cacheOnly.cacheOnlyCachePath,
               argFollowing("--exclude-from", in: cArgv) == cacheOnly.cacheOnlyExcludePath,
@@ -3088,6 +3174,140 @@ enum ConfigSelfTest {
                           "(cache-only command splits a spaced path: \(cArgv))")
         }
         return report("AC-CK4", "mount-command-quoting", true)
+    }
+
+    // MARK: - AC-SEC1 — the generated script never re-parses a value as shell code
+
+    /// A path containing shell metacharacters must reach rclone as ONE literal argument and
+    /// never execute. The script used to build a string and `eval` it, so a folder named
+    /// `$(touch x)` ran `touch x`. Asserts on the argv the script actually hands rclone, plus
+    /// a static check that no `eval` of the rclone command survives in the script.
+    private static func testScriptNoShellEval() -> Bool {
+        let name = "AC-SEC1", slug = "script-no-shell-eval"
+        let fm = FileManager.default
+        let root = "\(selfTestRoot)/sec1-\(UUID().uuidString)"
+        let marker = "\(root)/injected"
+        let local = "\(root)/a \"quoted\" $(touch \(marker)) `touch \(marker)` ;x"
+        let cache = "\(root)/cache"
+        let target = "\(root)/remote-target"
+        for dir in [local, cache, target] {
+            try? fm.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        }
+        let profile = mountFixtureProfile(localPath: local, cachePath: cache)
+        defer { try? fm.removeItem(atPath: profile.cacheOnlyConfigPath) }
+        let result = dryRunMountScript(
+            profile: profile, rcloneConfig: aliasRcloneConfig(name: "synology", path: target))
+        guard result.mode == MountMode.streaming.rawValue else {
+            return report(name, slug, false, "(fixture did not dry-run streaming: \(result.output) log=\(result.log))")
+        }
+        guard result.args.contains(local) else {
+            return report(name, slug, false, "(metacharacter path was not passed as one argument: \(result.args))")
+        }
+        guard !fm.fileExists(atPath: marker) else {
+            return report(name, slug, false, "(a path value was executed as shell code)")
+        }
+        let script = SyncSetupService.shared.generateSyncScript()
+        guard !script.contains("eval \"$RCLONE_CMD\""), script.contains("\"${RCLONE_CMD[@]}\"") else {
+            return report(name, slug, false, "(script still evals the rclone command string)")
+        }
+        return report(name, slug, true)
+    }
+
+    // MARK: - AC-SEC1b — additionalRcloneFlags: split, never evaluated, never silently dropped
+
+    /// Drives the script's real extra-flags block through the shared dry-run seam (which
+    /// sits after it): a `$(...)` token reaches rclone as literal text and never runs, `~`
+    /// and `$VAR` still expand (as string substitution only), and
+    /// an unparseable value (unbalanced quote) fails the run instead of running rclone
+    /// without the user's flags.
+    private static func testAdditionalFlagsSplitting() -> Bool {
+        let name = "AC-SEC1b", slug = "additional-flags-splitting"
+        let fm = FileManager.default
+        let root = "\(selfTestRoot)/sec1b-\(UUID().uuidString)"
+        let marker = "\(root)/injected"
+        let local = "\(root)/mnt", cache = "\(root)/cache", target = "\(root)/remote-target"
+        for dir in [local, cache, target] {
+            try? fm.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        }
+        let rcloneConfig = aliasRcloneConfig(name: "synology", path: target)
+
+        var literal = mountFixtureProfile(localPath: local, cachePath: cache)
+        literal.additionalRcloneFlags = "--exclude \"$(touch \(marker))\""
+        defer { try? fm.removeItem(atPath: literal.cacheOnlyConfigPath) }
+        let lit = dryRunMountScript(profile: literal, rcloneConfig: rcloneConfig)
+        guard lit.exitCode == 0, Array(lit.args.suffix(2)) == ["--exclude", "$(touch \(marker))"] else {
+            return report(name, slug, false, "(metacharacter flag value not passed literally: \(lit.args) out=\(lit.output) log=\(lit.log))")
+        }
+        guard !fm.fileExists(atPath: marker) else {
+            return report(name, slug, false, "(an additionalRcloneFlags value was executed as shell code)")
+        }
+
+        // `~` and `$VAR` keep expanding as before the eval was removed — as plain string
+        // substitution, including the value half of a `--flag=~/path` token.
+        let home = ProcessInfo.processInfo.environment["HOME"] ?? NSHomeDirectory()
+        var tilde = mountFixtureProfile(localPath: local, cachePath: cache)
+        tilde.additionalRcloneFlags = "--exclude-from ~/x.txt --log-file=~/y.log --filter-from $HOME/z.txt"
+        let exp = dryRunMountScript(profile: tilde, rcloneConfig: rcloneConfig)
+        let expected = ["--exclude-from", "\(home)/x.txt", "--log-file=\(home)/y.log",
+                        "--filter-from", "\(home)/z.txt"]
+        guard exp.exitCode == 0, Array(exp.args.suffix(expected.count)) == expected else {
+            return report(name, slug, false, "(~ / $VAR not expanded in extra flags: \(exp.args) log=\(exp.log))")
+        }
+
+        var malformed = mountFixtureProfile(localPath: local, cachePath: cache)
+        malformed.additionalRcloneFlags = "--exclude \"unterminated"
+        let bad = dryRunMountScript(profile: malformed, rcloneConfig: rcloneConfig)
+        guard bad.exitCode != 0, bad.args.isEmpty,
+              bad.log.contains("Invalid additionalRcloneFlags") else {
+            return report(name, slug, false, "(unparseable flags did not fail the run: exit=\(bad.exitCode) args=\(bad.args) log=\(bad.log))")
+        }
+        return report(name, slug, true)
+    }
+
+    // MARK: - AC-SEC2 — the streaming mount's RC API requires authentication
+
+    /// The RC API listens on a localhost TCP port any local process (or a web page via a
+    /// cross-origin form POST) can reach, so it must never run `--rc-no-auth`. Asserts the
+    /// streaming command enables RC without `--rc-no-auth`, the script exported the RC
+    /// password (env, never argv), the credential file is 0600, and the app's request
+    /// helper sends the matching Basic header.
+    private static func testRCAPIAuthenticated() -> Bool {
+        let name = "AC-SEC2", slug = "rc-api-authenticated"
+        let fm = FileManager.default
+        let root = "\(selfTestRoot)/sec2-\(UUID().uuidString)"
+        let local = "\(root)/mnt", cache = "\(root)/cache", target = "\(root)/remote-target"
+        for dir in [local, cache, target] {
+            try? fm.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        }
+        let profile = mountFixtureProfile(localPath: local, cachePath: cache)
+        defer { try? fm.removeItem(atPath: profile.cacheOnlyConfigPath) }
+        let authPath = SyncProfile.rcAuthPath(port: profile.rcPort)
+        guard !fm.fileExists(atPath: authPath) else {
+            return report(name, slug, true, "(skipped: a real profile owns port \(profile.rcPort))")
+        }
+        let result = dryRunMountScript(
+            profile: profile, rcloneConfig: aliasRcloneConfig(name: "synology", path: target))
+        guard result.mode == MountMode.streaming.rawValue else {
+            return report(name, slug, false, "(fixture did not dry-run streaming: \(result.output) log=\(result.log))")
+        }
+        guard result.args.contains("--rc"),
+              result.args.contains("--rc-addr=localhost:\(profile.rcPort)"),
+              !result.args.contains("--rc-no-auth") else {
+            return report(name, slug, false, "(RC flags wrong: \(result.args))")
+        }
+        guard result.rcAuth, !result.args.contains(where: { $0.hasPrefix("--rc-pass") }) else {
+            return report(name, slug, false, "(RC password not exported via env, or leaked into argv)")
+        }
+        guard result.rcAuthFileMode == 0o600 else {
+            return report(name, slug, false, "(RC credential file mode \(String(result.rcAuthFileMode ?? -1, radix: 8)), want 600)")
+        }
+        guard let header = result.rcAuthHeader, header.hasPrefix("Basic "),
+              let decoded = Data(base64Encoded: String(header.dropFirst("Basic ".count)))
+                .flatMap({ String(data: $0, encoding: .utf8) }),
+              decoded.hasPrefix("\(SyncProfile.rcUser):"), decoded.count > SyncProfile.rcUser.count + 32 else {
+            return report(name, slug, false, "(app RC Authorization header missing or malformed: \(result.rcAuthHeader ?? "nil"))")
+        }
+        return report(name, slug, true)
     }
 
     // MARK: - AC-CO1 — Cache Only union config + command composition
@@ -3116,7 +3336,7 @@ enum ConfigSelfTest {
         else {
             return report("AC-CO1", "cache-only-union-config", false, "(command missing expected flags: \(cmd))")
         }
-        guard !cmd.contains("--cache-dir \"\(cache)\"") else {
+        guard argFollowing("--cache-dir", in: result.args) != cache else {
             return report("AC-CO1", "cache-only-union-config", false, "(cache-only mount reused the streaming --cache-dir)")
         }
         // Cache Only must use the same long dir-cache-time as streaming (1000h): its union
@@ -5684,8 +5904,9 @@ enum ConfigSelfTest {
         }
         // The sync script's first-run bootstrap is a resync SyncTray starts too.
         let script = SyncSetupService.shared.generateSyncScript()
-        guard script.contains("BOOTSTRAP_FLAGS=\"--resync --resync-mode newer\""),
-              !script.contains("BOOTSTRAP_FLAGS=\"--resync\"") else {
+        guard script.contains("BOOTSTRAP_ARGS=(--resync --resync-mode newer)"),
+              !script.contains("BOOTSTRAP_ARGS=(--resync)"),
+              !script.contains("RCLONE_CMD+=(--resync") else {
             return report("AC-RI4", "resync-never-bare", false, "(the sync script's bootstrap is not newer-wins)")
         }
         return report("AC-RI4", "resync-never-bare", true)

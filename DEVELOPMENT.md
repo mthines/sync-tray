@@ -31,8 +31,10 @@ cp Config/Signing.local.xcconfig.example Config/Signing.local.xcconfig   # then 
 ```
 
 Your Team ID lives only in the gitignored `Config/Signing.local.xcconfig`, never in
-the committed project. CI and release builds are unsigned by design (they pass
-`CODE_SIGNING_ALLOWED=NO`), so no team is needed there.
+the committed project. CI and release builds compile unsigned (they pass
+`CODE_SIGNING_ALLOWED=NO`), so no team is needed there; `scripts/release-ci.sh`
+then signs the release with Developer ID from CI secrets and notarizes it
+(see [`docs/release-signing.md`](docs/release-signing.md)).
 
 To exercise the extension:
 
@@ -65,7 +67,7 @@ See [CLAUDE.md](CLAUDE.md) for full architecture documentation.
 
 ## OpenTelemetry (Telemetry)
 
-SyncTray includes opt-in, anonymous telemetry powered by [OpenTelemetry](https://opentelemetry.io/) and exported to [Dash0](https://dash0.com/).
+SyncTray includes opt-in, pseudonymous telemetry powered by [OpenTelemetry](https://opentelemetry.io/) and exported to [Dash0](https://dash0.com/).
 
 ### How It Works
 
@@ -86,7 +88,7 @@ Two things are required:
 
    > Without valid auth headers, the telemetry service skips initialization entirely (no wasted network requests).
 
-2. **Toggle "Anonymous Usage Data" ON** in the app's Settings window.
+2. **Toggle "Share usage data" ON** in the app's Settings window.
 
 ### Environment Variables
 
@@ -140,7 +142,7 @@ A `/beta` build shows its exact version (e.g. `0.81.0-beta.75.1 (1)`) followed b
 
 Both are baked in at build time the same way as the token above. The build settings `SYNCTRAY_RELEASE_CHANNEL` and `SYNCTRAY_RELEASE_VERSION` are empty by default. For every release, `scripts/release-ci.sh` passes the channel (`beta` or `stable`) and the tagged version without its `v`. Info.plist expands them into `SyncTrayReleaseChannel` and `SyncTrayReleaseVersion`. The script then reads both keys back from the built bundle and fails the release if either doesn't match.
 
-The app shows `SyncTrayReleaseVersion` when it is set and falls back to `CFBundleShortVersionString` otherwise. For a CI stable release the two are identical. The local `scripts/release.sh` passes only `stable` and leaves the version to its Info.plist bump. Dev builds leave both empty, so they show the plist version and no tag. To preview a beta locally:
+The app shows `SyncTrayReleaseVersion` when it is set and falls back to `CFBundleShortVersionString` otherwise. For a CI stable release the two are identical. (The local `scripts/release.sh` refuses to run, because it can't notarize, so every release comes from CI.) Dev builds leave both empty, so they show the plist version and no tag. To preview a beta locally:
 
 ```bash
 xcodebuild -scheme SyncTray -configuration Debug -derivedDataPath build \
@@ -151,7 +153,7 @@ open build/Build/Products/Debug/SyncTray.app
 
 ### Disabling Telemetry
 
-- **In the app:** Toggle "Anonymous Usage Data" OFF in Settings. All telemetry methods become no-ops.
+- **In the app:** Toggle "Share usage data" OFF in Settings. All telemetry methods become no-ops.
 - **No auth configured:** If neither `OTEL_EXPORTER_OTLP_HEADERS` nor `DASH0_AUTH_TOKEN` is set (in env, `.env` file, or Info.plist), the service skips setup entirely.
 
 ### Running a Local Collector (Optional)
@@ -220,7 +222,7 @@ Every signal includes these resource attributes (overridable via `OTEL_RESOURCE_
 | `service.name`                | `synctray`           | `OTEL_SERVICE_NAME` env var        |
 | `service.namespace`           | `synctray`           | Hardcoded                          |
 | `service.version`             | App bundle version   | `CFBundleShortVersionString`       |
-| `service.instance.id`         | Anonymous UUID       | Generated on first opt-in          |
+| `service.instance.id`         | Random UUID          | Generated on first opt-in          |
 | `deployment.environment.name` | —                    | `OTEL_RESOURCE_ATTRIBUTES` env var |
 | `os.type`                     | `darwin`             | Hardcoded                          |
 | `os.version`                  | macOS version string | `ProcessInfo`                      |

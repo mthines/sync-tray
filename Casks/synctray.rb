@@ -1,6 +1,6 @@
 cask "synctray" do
-  version "0.91.0"
-  sha256 "3a3de5f0ee6aa4c14ad3b121045743505c905e43057b196dc7510495dcba3411"
+  version "0.95.0"
+  sha256 "f8c9d0ffe91246ce7a467329f17d847747c5af5b3a5e5aa971c7a5b659508a9c"
 
   url "https://github.com/mthines/sync-tray/releases/download/v#{version}/SyncTray-v#{version}-macOS.zip"
   name "SyncTray"
@@ -8,12 +8,6 @@ cask "synctray" do
   homepage "https://github.com/mthines/sync-tray"
 
   depends_on macos: :ventura
-
-  # Remove quarantine attribute (app is not notarized yet)
-  preflight do
-    system_command "/usr/bin/xattr",
-                   args: ["-cr", "#{staged_path}/SyncTray.app"]
-  end
 
   app "SyncTray.app"
 

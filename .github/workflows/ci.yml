@@ -301,6 +301,24 @@ jobs:
       - name: Fetch all tags
         run: git fetch --tags --force
 
+      # A release must be signed + notarized (release-ci.sh refuses otherwise), so
+      # fail here — before a version commit or tag is pushed — when the secrets are
+      # missing, rather than leave an orphaned tag behind a refused release.
+      - name: Require signing + notary secrets
+        env:
+          MACOS_CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          NOTARY_KEY_P8_BASE64: ${{ secrets.NOTARY_KEY_P8_BASE64 }}
+          NOTARY_KEY_ID: ${{ secrets.NOTARY_KEY_ID }}
+          NOTARY_ISSUER_ID: ${{ secrets.NOTARY_ISSUER_ID }}
+        run: |
+          for var in MACOS_CERTIFICATE_P12_BASE64 MACOS_CERTIFICATE_PASSWORD NOTARY_KEY_P8_BASE64 NOTARY_KEY_ID NOTARY_ISSUER_ID; do
+            if [ -z "${!var:-}" ]; then
+              echo "::error::$var is not set — a release must be signed + notarized (docs/release-signing.md)."
+              exit 1
+            fi
+          done
+
       - name: Calculate version
         id: version
         env:
@@ -437,8 +455,8 @@ jobs:
           RELEASE_VERSION: ${{ needs.version.outputs.tag }}
           PR_NUMBER: ${{ needs.detect-changes.outputs.pr_number }}
           IS_BETA: ${{ needs.detect-changes.outputs.is_beta }}
-          # Developer ID signing + notarization (optional — release-ci.sh builds
-          # unsigned when these are absent). See docs/release-signing.md.
+          # Developer ID signing + notarization (required — release-ci.sh refuses
+          # to publish without them). See docs/release-signing.md.
           MACOS_CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
           MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
           NOTARY_KEY_P8_BASE64: ${{ secrets.NOTARY_KEY_P8_BASE64 }}

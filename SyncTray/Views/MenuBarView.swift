@@ -72,6 +72,19 @@ struct MenuBarView: View {
                                 + (pending > 0 ? " · \(pending) to upload" : ""))
                                 .font(.system(size: 9))
                                 .foregroundColor(.secondary)
+
+                            // Offline-cache warming: surface the otherwise-invisible
+                            // background download so a long, link-saturating warm reads as a
+                            // temporary fill ("Caching offline — 103 GB / 180 GB"), not a
+                            // broken-feeling mount. Only while a run is live.
+                            if let warm = syncManager.warmProgress[profile.id],
+                               let summary = warm.menuBarSummary {
+                                let paused = syncManager.isWarmPaused(for: profile.id)
+                                Text(summary + (paused ? " · Paused" : ""))
+                                    .font(.system(size: 9))
+                                    .foregroundColor(paused ? .orange : .secondary)
+                                    .lineLimit(1)
+                            }
                         }
                     }
 
@@ -132,6 +145,20 @@ struct MenuBarView: View {
                         }
                         .buttonStyle(.plain)
                         .help(syncManager.isNotificationsMuted(for: profile.id) ? "Unmute profile notifications" : "Mute profile notifications")
+
+                        // Pause/resume offline caching — shown only while a warm is live, so
+                        // the user can hand the (often slow, saturated) link back to browsing
+                        // without opening Settings.
+                        if syncManager.warmProgress[profile.id]?.isActive == true {
+                            let manualPaused = syncManager.isWarmManuallyPaused(for: profile.id)
+                            Button(action: { syncManager.setWarmPaused(!manualPaused, for: profile.id) }) {
+                                Image(systemName: manualPaused ? "play.circle" : "pause.circle")
+                                    .font(.system(size: 10))
+                                    .foregroundColor(manualPaused ? .orange : .secondary)
+                            }
+                            .buttonStyle(.plain)
+                            .help(manualPaused ? "Resume caching offline files" : "Pause caching to speed up browsing")
+                        }
 
                         // Open in Finder button — opens the local sync folder
                         // (or the mount point, for Stream profiles). Hidden when no

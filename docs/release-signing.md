@@ -1,12 +1,13 @@
 # Release signing & notarization
 
 The **Finder "Available Offline" extension only loads in a Developer-ID-signed,
-notarized app.** The brew release is ad-hoc signed today, so Gatekeeper rejects it
-and macOS never registers the extension. This guide turns on real signing.
+notarized app**, and the Homebrew cask no longer strips the quarantine attribute,
+so an un-notarized release is blocked by Gatekeeper on install.
 
-The CI pipeline is already wired (`scripts/release-ci.sh` + `.github/workflows/ci.yml`):
-it **stays unsigned until the secrets below exist**, then automatically signs +
-notarizes every release. So nothing breaks while you complete the one-time setup.
+The CI pipeline is wired (`scripts/release-ci.sh` + `.github/workflows/ci.yml`)
+to sign + notarize every release with the secrets below. **They are required:**
+without them `release-ci.sh` refuses to publish (a `DRY_RUN` still builds), and
+the local `scripts/release.sh` refuses outright because it can't notarize.
 
 - [Part 1 — Apple Developer account (one-time)](#part-1--apple-developer-account-one-time)
 - [Part 2 — GitHub repository secrets](#part-2--github-repository-secrets)
@@ -76,15 +77,15 @@ Repo → **Settings → Secrets and variables → Actions → New repository sec
 | `NOTARY_KEY_ID` | the API Key ID |
 | `NOTARY_ISSUER_ID` | the API Issuer ID |
 
-That's it — the next release picks them up automatically. (Signing runs if the two
-`MACOS_CERTIFICATE_*` secrets are present; notarization runs if the three `NOTARY_*`
-secrets are also present.)
+That's it — the next release picks them up automatically. All five are required:
+the `version` job refuses a release before any tag is pushed when any of them is
+missing, and `release-ci.sh` checks again before it builds.
 
 ---
 
 ## Part 3 — What the pipeline does
 
-`scripts/release-ci.sh`, when the secrets are set:
+`scripts/release-ci.sh`, on every release:
 
 1. Imports the `.p12` into a throwaway keychain and finds the *Developer ID Application* identity.
 2. Signs inside-out with **hardened runtime** + secure timestamp: nested frameworks →

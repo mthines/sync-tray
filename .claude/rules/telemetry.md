@@ -1,6 +1,6 @@
 # Telemetry Instrumentation Guide
 
-This project uses OpenTelemetry (opentelemetry-swift 1.17.1) for anonymous, opt-in telemetry.
+This project uses OpenTelemetry (opentelemetry-swift 1.17.1) for pseudonymous, opt-in telemetry.
 All telemetry is gated behind `SyncTraySettings.telemetryEnabled` — methods are no-ops when disabled.
 
 ## Architecture
@@ -115,7 +115,9 @@ For operations with real duration (like syncs), use the `activeSyncSpans` patter
 - Only use low-cardinality, bounded values (enum cases, profile names, error types)
 - Profile names are user-chosen display names (e.g., "Work", "Personal"), not paths
 - Error messages are categorized into types (e.g., "network", "timeout", "permission_denied")
-  via `categorizeError()` — the raw message is truncated to 256 chars max
+  via `categorizeError()` — the raw message is **never** sent (not as an attribute, not as
+  a span status description): it routinely carries paths and remote names, and the in-app
+  privacy disclosure (`TelemetryDetailsSheet`) promises "never the raw message"
 - **Carve-out:** `vcs.repository.url.full` (the *source code* repository's origin
   remote, e.g. `https://github.com/mthines/sync-tray`) is exempt from the remote-URL
   ban above. It identifies the codebase the binary was built from, not a user's sync
@@ -231,6 +233,7 @@ rollout. No event is emitted on a fresh install.
 | `synctray.offline.warm.throughput` | Histogram | Average read throughput of a warming run, MB/s — the primary signal for slow-fallback diagnosis (the SFTP fallback caps aggregate throughput) |
 | `synctray.offline.warm.files` | Counter | Files warmed into the VFS content cache (`warm.outcome`: completed/cancelled) |
 | `synctray.offline.warm.bytes` | Counter | Bytes read through the mount while warming (`warm.outcome`: completed/cancelled) |
+| `synctray.offline.warm.paused` | Counter | Offline-warm pause/resume events (`warm.pause_state`: paused/resumed; `warm.pause_source`: manual = the user's toggle, auto = an app was detected reading the mount, backoff = the warm hit a run of failed reads and paused itself to let a struggling link recover). The warm stops starting new file reads while paused, handing a saturated slow link back to interactive browsing. Auto/backoff events fire on the idle→paused edge |
 | `synctray.mount.cached_read.throughput` | Histogram | Throughput of a timed 8 MB read of an already fully-cached file THROUGH a Stream mount, MB/s (`cache.fs_type`, `cache.volume`, `mount.backend`). The signal for "cached files are slow": healthy APFS ≈ 100 MB/s, an exFAT USB cache ≈ 0.2–7 MB/s |
 | `synctray.mount.cached_read.first_byte` | Histogram | Time from open to the first 64 KB of that probe read, seconds (same labels) — the "file takes ages to open" symptom |
 | `synctray.mount.cached_read.probes` | Counter | Mount read-health probes by `mount.read_health`: `healthy` (≥20 MB/s), `slow` (1–20), `degraded` (<1), `remote_fetch` (the "fully cached" file pulled bytes from the remote — cache-correctness, not speed), `no_candidate`, `failed` |
@@ -294,6 +297,7 @@ All key lifecycle events are emitted as structured OTel logs:
 - Cache Only fell back to streaming: a `streamCacheOnly` profile whose mount settled on streaming instead (the silent script fallback) — a WARN `Cache Only fell back to streaming`, one per mode-change edge, alongside the `synctray.mount.cache_only_fallback` counter. The invisible "I enabled Cache Only but it's still streaming" case made observable
 - CLI invoked: one `CLI invoked` record per headless `synctray` run (`cli.command`, `cli.result`, `cli.exit_code`, `cli.duration_seconds`) — info on success, warn on a non-zero exit. Bounded verb only; never args, paths, profile names, or remotes. Emitted by `TelemetryService.recordCLIInvocation`, gated on the telemetry opt-in, flushed by `flushForExit` (a SILENT force-flush of all three signals — unlike `shutdown()`, it prints nothing, so CLI stdout stays clean)
 - Offline warm started/completed/cancelled: a pinned-folder warming run began (`Offline warm started`, with `warm.trigger`, `warm.directory_count`, `warm.concurrency`) or ended (`Offline warm completed` or `Offline warm cancelled`, with `warm.outcome`, `warm.files`, `warm.bytes`, `warm.duration_seconds`, `warm.throughput_mbps`). A run is cancelled when the cache is cleared, the profile is unmounted, or a newer run supersedes it. Use `synctray.offline.warm.throughput` to spot the slow-fallback case; filter `warm.outcome=completed` to exclude interrupted runs from throughput analysis.
+- Offline warm paused/resumed: `Offline warm paused` / `Offline warm resumed` (`warm.pause_state`, `warm.pause_source`: manual/auto) when the warm yields the link to interactive use — the user's "Pause caching" toggle, or an auto-pause because an app (not Finder or the warmer itself) was seen reading the mount. Paired with the `synctray.offline.warm.paused` counter.
 - Cache Only list write failed: warn-level `Cache Only list write failed` (`error.type`, bucketed by `categorizeError`) when the app cannot build a Stream profile's Cache Only partial-file list. The failed walk removes any stale list, so that profile's next offline mount streams instead of mounting Cache Only. Emitted once per failure run — the heartbeat retries every few minutes, and the next failure after a successful write reports again. Never the error text or a path.
 - Mount Spotlight marker: `Mount Spotlight marker` once per streaming mount session (`spotlight_marker.outcome`: written/exists/failed/skipped) — info on written/exists, warn otherwise. Records dropping `.metadata_never_index` at the mount root so macOS Spotlight stops bulk-indexing the freshly-mounted network volume (the read storm that saturates the download slots and leaves Finder's listing queued behind the indexer). Never a path — profile id/name only.
 - Mount listing warm: `Mount listing warm` once per streaming mount session (`listing_warm.outcome`, `listing_warm.directories_warmed`, `listing_warm.directories_failed`) — info when `completed`, warn on `failed`/`aborted`/`skipped` (`aborted` = the descent backed off after consecutive failures to avoid flooding a failing backend). A per-subtree descent of `/vfs/refresh` (recursive where rclone can walk a subtree, non-recursive + `operations/list` descend where it can't — rclone's recursive refresh returns `directory not found` on large SMB trees) that populates the directory-*listing* cache so first-browse of every folder is instant instead of a live SMB round trip (the "Loading…" spinner). Metadata only — downloads no file bytes; a `failed`/partial outcome is non-fatal, the mount stays fully usable and folders warm lazily on first browse. Never a path or remote name.
