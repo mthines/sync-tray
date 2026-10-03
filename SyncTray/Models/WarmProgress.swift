@@ -23,6 +23,7 @@ struct WarmProgress: Equatable {
     var bytesTotal: Int64       // 0 = unknown; excludes already-cached bytes
     var filesAlreadyCached: Int   // files skipped because they were already fully offline
     var bytesAlreadyCached: Int64 // bytes represented by those skipped files
+    var backingOff: Bool          // link is struggling — the warm has paused itself to let it recover
     var startedAt: Date
     var finishedAt: Date?
 
@@ -36,6 +37,7 @@ struct WarmProgress: Equatable {
         self.bytesTotal = 0
         self.filesAlreadyCached = 0
         self.bytesAlreadyCached = 0
+        self.backingOff = false
         self.startedAt = startedAt
         self.finishedAt = nil
     }
@@ -103,5 +105,21 @@ struct WarmProgress: Equatable {
     var formattedRate: String {
         let rate = Int64(bytesPerSecond.rounded())
         return ByteCountFormatter.string(fromByteCount: rate, countStyle: .file) + "/s"
+    }
+
+    /// Compact one-line summary for cramped surfaces (the menu bar, a status-card caption):
+    /// "Preparing offline cache…" while estimating, then "Caching offline — 103 MB / 2.1 GB"
+    /// (or just the amount done when the total is still unknown). `nil` once the run ends, so
+    /// a caller can render it only while a warm is live. Pure — the single source of this
+    /// copy, shared by every compact surface so they can't drift; covered by ConfigSelfTest
+    /// AC-WV1.
+    var menuBarSummary: String? {
+        switch phase {
+        case .preparing: return "Preparing offline cache…"
+        case .downloading:
+            if backingOff { return "Caching offline — paused (slow link)" }
+            return "Caching offline — \(formattedBytesProgress)"
+        case .completed, .failed: return nil
+        }
     }
 }

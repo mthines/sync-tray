@@ -1541,28 +1541,6 @@ final class SyncSetupService {
                     RCLONE_CMD+=(--bwlimit "$BANDWIDTH_LIMIT")
                 fi
 
-                # DRY-RUN TEST SEAM
-                #
-                # Reading through a real NFS/FUSE mount requires an actual rclone mount and
-                # macOS-level permissions this project's self-test harness cannot assume (and
-                # this codebase has no XCTest target - see CLAUDE.md's Testing section). Set
-                # SYNCTRAY_DRY_RUN=1 to render the fully-resolved mode + command instead of
-                # calling rclone, so ConfigSelfTest can assert on script BEHAVIOR (mode
-                # selection, union config, exclude list, flag composition) without ever
-                # mounting anything.
-                if [[ "$SYNCTRAY_DRY_RUN" == "1" ]]; then
-                    echo "SYNCTRAY_DRY_RUN_MODE=$MOUNT_MODE"
-                    echo "SYNCTRAY_DRY_RUN_CMD=${RCLONE_CMD[*]}"
-                    # One line per argv element, exactly as rclone will receive it — lets a
-                    # self-test prove a path with shell metacharacters stays ONE inert
-                    # argument (AC-SEC1).
-                    printf 'SYNCTRAY_DRY_RUN_ARG=%s\\n' "${RCLONE_CMD[@]}"
-                    echo "SYNCTRAY_DRY_RUN_RC_AUTH=${RCLONE_RC_PASS:+set}"
-                    echo "SYNCTRAY_DRY_RUN_ENV_OVERRIDES=$(env | grep -c '^RCLONE_CONFIG_' || true)"
-                    rm -f "$LOCK_FILE"
-                    trap - EXIT
-                    exit 0
-                fi
             elif [[ "$SYNC_MODE" == "bisync" ]]; then
                 # Two-way bidirectional sync
                 echo "$(date '+%Y-%m-%d %H:%M:%S') - Starting bisync" >> "$LOG_FILE"
@@ -1613,17 +1591,17 @@ final class SyncSetupService {
                 return ''.join('_' if ch in REPLACED else ch for ch in p)
             print(canon(sys.argv[1]) + '..' + canon(sys.argv[2]))
             " "$REMOTE" "$LOCAL_PATH")
-                BOOTSTRAP_FLAGS=""
+                BOOTSTRAP_ARGS=()
                 if [[ ! -e "$BISYNC_WORKDIR/$SESSION_NAME.path1.lst" && ! -e "$BISYNC_WORKDIR/$SESSION_NAME.path1.lst-new" ]] \\
                     || [[ ! -e "$BISYNC_WORKDIR/$SESSION_NAME.path2.lst" && ! -e "$BISYNC_WORKDIR/$SESSION_NAME.path2.lst-new" ]]; then
                     echo "$(date '+%Y-%m-%d %H:%M:%S') - Bootstrapping sync state (--resync, newer wins): first run for this transport pair" >> "$LOG_FILE"
-                    BOOTSTRAP_FLAGS="--resync --resync-mode newer"
+                    BOOTSTRAP_ARGS=(--resync --resync-mode newer)
                 fi
 
                 RCLONE_CMD=("$RCLONE_BIN" bisync "$REMOTE" "$LOCAL_PATH" --verbose --use-json-log --stats 2s --filter-from "$FILTER_FILE" --resilient --recover --conflict-resolve newer --conflict-loser num --conflict-suffix "sync-conflict-{DateOnly}-")
 
-                if [[ -n "$BOOTSTRAP_FLAGS" ]]; then
-                    RCLONE_CMD+=(--resync --resync-mode newer)
+                if [[ ${#BOOTSTRAP_ARGS[@]} -gt 0 ]]; then
+                    RCLONE_CMD+=("${BOOTSTRAP_ARGS[@]}")
                 fi
             else
                 # One-way sync
@@ -1645,15 +1623,44 @@ final class SyncSetupService {
             # User-supplied extra flags are split into argv with shell-like QUOTING rules
             # (shlex) but are never evaluated: `$(...)`, backticks, `;`, `|` and friends
             # stay literal text inside an rclone argument instead of running as commands.
+            # Each token then gets the old eval's `~` and `$VAR` / `${VAR}` expansion back as
+            # PURE string substitution (os.path.expandvars, then expanduser — also on the
+            # value of a `--flag=~/path` token), which can never execute anything. An unset
+            # variable stays literal rather than expanding to empty.
+            # One python helper both validates and splits, so the two can never disagree.
+            split_additional_flags() {
+                python3 -c "
+            import os, shlex, sys
+            try:
+                tokens = shlex.split(sys.argv[1])
+            except ValueError as err:
+                sys.stderr.write('additionalRcloneFlags: ' + str(err) + chr(10))
+                sys.exit(2)
+            def expand(tok):
+                tok = os.path.expanduser(os.path.expandvars(tok))
+                flag, sep, value = tok.partition('=')
+                if sep and flag.startswith('-') and value.startswith('~'):
+                    tok = flag + sep + os.path.expanduser(value)
+                return tok
+            for a in tokens:
+                sys.stdout.write(expand(a) + chr(0))
+            " "$1"
+            }
             if [[ -n "$ADDITIONAL_FLAGS" ]]; then
+                # Validate BEFORE the read loop: process substitution swallows python's exit
+                # status, so an unparseable value (e.g. an unbalanced quote) would otherwise
+                # run rclone silently WITHOUT the user's flags. Fail the run instead (the
+                # EXIT trap releases the lock).
+                if ! FLAGS_PARSE_ERROR=$(split_additional_flags "$ADDITIONAL_FLAGS" 2>&1 >/dev/null); then
+                    echo "$FLAGS_PARSE_ERROR" >> "$LOG_FILE"
+                    echo "$(date '+%Y-%m-%d %H:%M:%S') - Invalid additionalRcloneFlags (could not parse quoting) - not running rclone" >> "$LOG_FILE"
+                    echo "$(date '+%Y-%m-%d %H:%M:%S') - Sync failed with exit code 1" >> "$LOG_FILE"
+                    exit 1
+                fi
                 ADDITIONAL_ARGS=()
                 while IFS= read -r -d '' arg; do
                     ADDITIONAL_ARGS+=("$arg")
-                done < <(python3 -c "
-            import shlex, sys
-            for a in shlex.split(sys.argv[1]):
-                sys.stdout.write(a + chr(0))
-            " "$ADDITIONAL_FLAGS")
+                done < <(split_additional_flags "$ADDITIONAL_FLAGS")
                 RCLONE_CMD+=("${ADDITIONAL_ARGS[@]}")
             fi
 
@@ -1661,6 +1668,30 @@ final class SyncSetupService {
             # dry-run seam above, so exclude mount here to avoid a duplicate flag.
             if [[ -n "$BANDWIDTH_LIMIT" && "$SYNC_MODE" != "mount" ]]; then
                 RCLONE_CMD+=(--bwlimit "$BANDWIDTH_LIMIT")
+            fi
+
+            # DRY-RUN TEST SEAM
+            #
+            # Reading through a real NFS/FUSE mount requires an actual rclone mount and
+            # macOS-level permissions this project's self-test harness cannot assume (and
+            # this codebase has no XCTest target - see CLAUDE.md's Testing section). Set
+            # SYNCTRAY_DRY_RUN=1 to render the fully-resolved mode + command instead of
+            # calling rclone, so ConfigSelfTest can assert on script BEHAVIOR (mode
+            # selection, union config, exclude list, flag composition) without ever
+            # mounting anything. Shared by every mode and placed AFTER the extra-flags and
+            # bandwidth blocks, so the rendered argv is exactly what rclone would receive.
+            if [[ "$SYNCTRAY_DRY_RUN" == "1" ]]; then
+                echo "SYNCTRAY_DRY_RUN_MODE=$MOUNT_MODE"
+                echo "SYNCTRAY_DRY_RUN_CMD=${RCLONE_CMD[*]}"
+                # One line per argv element, exactly as rclone will receive it — lets a
+                # self-test prove a path with shell metacharacters stays ONE inert
+                # argument (AC-SEC1).
+                printf 'SYNCTRAY_DRY_RUN_ARG=%s\\n' "${RCLONE_CMD[@]}"
+                echo "SYNCTRAY_DRY_RUN_RC_AUTH=${RCLONE_RC_PASS:+set}"
+                echo "SYNCTRAY_DRY_RUN_ENV_OVERRIDES=$(env | grep -c '^RCLONE_CONFIG_' || true)"
+                rm -f "$LOCK_FILE"
+                trap - EXIT
+                exit 0
             fi
 
             # Run sync command. Executed straight from the argv array — never `eval` — so a

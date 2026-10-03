@@ -227,14 +227,33 @@ struct AppSettingsView: View {
         .font(.caption)
     }
 
-    /// The Version row, followed by a "Beta" tag when this is a beta release.
+    /// The Version row, followed by a channel tag: "Development" for a local debug build,
+    /// "Beta" for a beta release, nothing for a stable release. The tag is what lets you tell
+    /// a dev instance apart from the installed production app when both are running at once
+    /// (they otherwise share this screen) — the dev build also uses the `.dev` bundle id, so
+    /// the two coexist. Dev and beta are mutually exclusive (a beta is a Release CI build), but
+    /// each is rendered independently.
     private var versionRow: some View {
         HStack(spacing: 6) {
             infoRow("Version", value: appVersion)
-            if isBetaBuild {
+            if isDevelopmentBuild {
+                developmentTag
+            } else if isBetaBuild {
                 betaTag
             }
         }
+    }
+
+    private var developmentTag: some View {
+        Text("Development")
+            .font(.caption2.weight(.semibold))
+            .foregroundStyle(.primary)
+            .padding(.horizontal, 6)
+            .padding(.vertical, 2)
+            .background(Color.purple.opacity(0.18))
+            .clipShape(Capsule())
+            .help("You're running a local development (debug) build of SyncTray, not the installed production app")
+            .accessibilityLabel("Development build")
     }
 
     private var betaTag: some View {
@@ -247,6 +266,16 @@ struct AppSettingsView: View {
             .clipShape(Capsule())
             .help("You're running a beta release of SyncTray")
             .accessibilityLabel("Beta release")
+    }
+
+    /// True only for a local debug build (the `.dev` bundle id). Compiled out of Release/beta
+    /// builds, so it can never falsely tag a shipped app as development.
+    private var isDevelopmentBuild: Bool {
+        #if DEBUG
+        return true
+        #else
+        return false
+        #endif
     }
 
     /// The version shown in About. CI release builds carry the exact version they

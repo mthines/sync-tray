@@ -867,6 +867,17 @@ final class VFSCacheService {
     /// every real warm passes the profile's `downloadConnections` explicitly.
     static let defaultWarmConcurrency = 2
 
+    /// Consecutive file-read failures before the warm backs off. On a healthy link a stray
+    /// failure is nothing; a *run* of them means the backend can't complete downloads right now
+    /// (the degraded-SMB "fetch a few KB, stall, retry" loop), so continuing just burns the
+    /// link re-trying doomed files. Three in a row is a confident "the link is struggling".
+    static let warmFailureBackoffThreshold = 3
+
+    /// How long the warm sleeps when it backs off before trying again. Long enough that a
+    /// struggling link isn't re-hammered every few seconds; short enough that the warm resumes
+    /// on its own once the link recovers, with no user action.
+    static let warmFailureBackoffCooldown: TimeInterval = 60
+
     /// Warm a single directory by: first calling `/vfs/refresh` (listing cache), then
     /// reading file bytes through the NFS mount to populate the rclone VFS content cache.
     ///
@@ -895,6 +906,8 @@ final class VFSCacheService {
         for profile: SyncProfile,
         concurrency: Int = defaultWarmConcurrency,
         isStillPinned: @Sendable () async -> Bool,
+        shouldPause: (@Sendable () async -> Bool)? = nil,
+        onStall: (@Sendable (_ backingOff: Bool) async -> Void)? = nil,
         onStart: (@Sendable (_ name: String) async -> Void)? = nil,
         onProgress: (@Sendable (_ bytes: Int64) async -> Void)? = nil,
         onFileComplete: (@Sendable (_ name: String) async -> Void)? = nil
@@ -926,15 +939,48 @@ final class VFSCacheService {
         let mountPrefixLen = mountPath.count + 1
 
         // Bounded-concurrency task group: keep up to `maxConcurrent` file reads in flight,
-        // starting a new one each time a running one completes.
-        await withTaskGroup(of: Void.self) { group in
+        // starting a new one each time a running one completes. Each task returns whether its
+        // read FAILED, so the loop can tell a doomed-link stall from a clean finish and back
+        // off instead of thrashing (see `warmFailureBackoffThreshold`).
+        await withTaskGroup(of: Bool.self) { group in
             var running = 0
+            var consecutiveFailures = 0
             for case let fileURL as URL in enumerator {
                 // Between scheduling files, honour cancellation and a mid-warm unpin.
                 if Task.isCancelled { break }
                 guard await isStillPinned() else {
                     SyncTraySettings.debugLog("warmDirectory: '\(dir)' was unpinned during warming, stopping")
                     break
+                }
+
+                // Pause gate — yield the link to interactive use. While a pause is in effect
+                // (the user's manual "Pause caching" toggle, or an auto-pause because an app is
+                // actively reading the mount), stop STARTING new file reads so a saturated,
+                // slow link is handed back to the foreground. Already-scheduled reads finish;
+                // at the usual low concurrency that's at most a file or two. Poll so a resume
+                // takes hold within ~2s, and keep honouring cancellation/unpin so a cleared
+                // cache or unmount still breaks out of the wait.
+                while await shouldPause?() == true, !Task.isCancelled, await isStillPinned() {
+                    try? await Task.sleep(nanoseconds: 2_000_000_000)
+                }
+                if Task.isCancelled { break }
+
+                // Back-off gate — a run of failed reads means the backend can't complete
+                // downloads right now (the degraded-SMB "fetch a few KB, stall, retry" loop
+                // that otherwise burns the link forever without ever caching a file). Rather
+                // than keep opening doomed files, sleep a cooldown and let the link recover,
+                // then retry. Self-healing: no user action, resumes on its own. Surfaced via
+                // onStall so the UI reads "paused (slow link)" instead of a silent stall.
+                if consecutiveFailures >= Self.warmFailureBackoffThreshold {
+                    SyncTraySettings.debugLog("warmDirectory: '\(dir)' — \(consecutiveFailures) consecutive read failures, backing off \(Int(Self.warmFailureBackoffCooldown))s")
+                    await onStall?(true)
+                    let deadline = Date().addingTimeInterval(Self.warmFailureBackoffCooldown)
+                    while Date() < deadline, !Task.isCancelled, await isStillPinned() {
+                        try? await Task.sleep(nanoseconds: 2_000_000_000)
+                    }
+                    await onStall?(false)
+                    consecutiveFailures = 0   // give the link another chance after the cooldown
+                    if Task.isCancelled { break }
                 }
 
                 guard let rv = try? fileURL.resourceValues(forKeys: [.fileSizeKey, .isRegularFileKey]),
@@ -960,7 +1006,9 @@ final class VFSCacheService {
                 if isFullyCached(mountRelativePath: mountRel, size: size, roots: roots) { continue }
 
                 if running >= maxConcurrent {
-                    await group.next()      // wait for a slot
+                    if let failed = await group.next() {   // wait for a slot, note its outcome
+                        consecutiveFailures = failed ? consecutiveFailures + 1 : 0
+                    }
                     running -= 1
                 }
                 running += 1
@@ -970,17 +1018,31 @@ final class VFSCacheService {
                     // content cache (not the RC /vfs/refresh call above). Report each chunk
                     // as it arrives so byte progress advances mid-file. 1 MB chunks keep the
                     // NFS round-trips (and the main-actor progress hops) low on slow links.
+                    // Returns true if the read FAILED so the loop can back off a bad link.
                     guard let fileHandle = FileHandle(forReadingAtPath: path) else {
                         await onFileComplete?(name)
-                        return
+                        return true   // couldn't even open the file — count as a failure
                     }
                     let chunkSize = 1024 * 1024  // 1 MB
-                    while let chunk = try? fileHandle.read(upToCount: chunkSize), !chunk.isEmpty {
-                        await onProgress?(Int64(chunk.count))
-                        if Task.isCancelled { break }
+                    var bytesRead = 0
+                    var readThrew = false
+                    do {
+                        while true {
+                            let chunk = try fileHandle.read(upToCount: chunkSize)
+                            guard let chunk, !chunk.isEmpty else { break }   // clean EOF
+                            bytesRead += chunk.count
+                            await onProgress?(Int64(chunk.count))
+                            if Task.isCancelled { break }
+                        }
+                    } catch {
+                        readThrew = true   // an EIO/timeout mid-read on a stalling backend
                     }
                     try? fileHandle.close()
                     await onFileComplete?(name)
+                    // A cancelled read isn't a failure. Otherwise it failed if the read threw,
+                    // or produced zero bytes for a non-empty file (couldn't fetch anything).
+                    if Task.isCancelled { return false }
+                    return readThrew || (bytesRead == 0 && size > 0)
                 }
             }
             await group.waitForAll()

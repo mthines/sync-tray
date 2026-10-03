@@ -104,12 +104,15 @@ enum ConfigSelfTest {
             testReinstallTeardownRouting,
             testSyncScriptSessionNameParity,
             testMountModeParse,
+            testWarmMenuBarSummary,
+            testWarmAutoPauseReaders,
             testMountNoFallbackOverride,
             testCacheSuffixConsolidation,
             testCacheSuffixPairSafety,
             testCacheSuffixEmptyDestination,
             testMountCommandQuoting,
             testScriptNoShellEval,
+            testAdditionalFlagsSplitting,
             testRCAPIAuthenticated,
             testCacheOnlyUnionConfig,
             testCacheOnlyUnionBehaviour,
@@ -2776,6 +2779,83 @@ enum ConfigSelfTest {
         return report("AC-MM1", "mount-mode-parse", true)
     }
 
+    // MARK: - AC-WV1 — warm-progress compact summary (menu bar / status card)
+
+    private static func testWarmMenuBarSummary() -> Bool {
+        // Preparing → fixed copy.
+        var p = WarmProgress()
+        guard p.menuBarSummary == "Preparing offline cache…" else {
+            return report("AC-WV1", "warm-menu-summary", false, "(preparing copy)")
+        }
+        // Downloading with a known total → "Caching offline — <done> / <total>".
+        p.phase = .downloading
+        p.bytesDone = 103 * 1_000_000_000
+        p.bytesTotal = 180 * 1_000_000_000
+        guard let known = p.menuBarSummary,
+              known.hasPrefix("Caching offline — "), known.contains(" / ") else {
+            return report("AC-WV1", "warm-menu-summary", false, "(downloading known-total shape)")
+        }
+        // Downloading with an unknown total → amount done, no " / ".
+        p.bytesTotal = 0
+        guard let unknown = p.menuBarSummary,
+              unknown.hasPrefix("Caching offline — "), !unknown.contains(" / ") else {
+            return report("AC-WV1", "warm-menu-summary", false, "(downloading unknown-total shape)")
+        }
+        // Backing off (bad link) → a distinct "paused (slow link)" summary, not a byte figure.
+        p.bytesTotal = 180 * 1_000_000_000
+        p.backingOff = true
+        guard p.menuBarSummary == "Caching offline — paused (slow link)" else {
+            return report("AC-WV1", "warm-menu-summary", false, "(backing-off copy)")
+        }
+        p.backingOff = false
+        // Completed / failed → nil, so a caller renders it only while a run is live.
+        p.phase = .completed
+        guard p.menuBarSummary == nil else {
+            return report("AC-WV1", "warm-menu-summary", false, "(completed should be nil)")
+        }
+        p.phase = .failed("x")
+        guard p.menuBarSummary == nil else {
+            return report("AC-WV1", "warm-menu-summary", false, "(failed should be nil)")
+        }
+        return report("AC-WV1", "warm-menu-summary", true)
+    }
+
+    // MARK: - AC-WV2 — warm auto-pause reader detection
+
+    private static func testWarmAutoPauseReaders() -> Bool {
+        // `lsof -F pc` emits a p<pid> line then a c<command> line per open file.
+        let reaper = "p1\ncReaper\np2\ncReaper\n"
+        let daemonsOnly = "p1\ncFinder\np2\ncmds_stores\np3\ncmdworker_shared\np4\ncQuickLookUIService\n"
+        let warmerOnly = "p1\ncSyncTray\n"
+        let mixed = "p1\ncSyncTray\np2\ncReaper\np3\ncFinder\n"
+
+        // A real app reading the mount → interactive reader present → pause.
+        guard SyncManager.warmInteractiveReaders(lsofOutput: reaper) == ["Reaper"],
+              SyncManager.shouldAutoPauseWarm(lsofOutput: reaper) else {
+            return report("AC-WV2", "warm-auto-pause", false, "(real app should pause)")
+        }
+        // Only background daemons / Finder → no pause (Finder holds a mounted volume forever).
+        guard SyncManager.warmInteractiveReaders(lsofOutput: daemonsOnly).isEmpty,
+              !SyncManager.shouldAutoPauseWarm(lsofOutput: daemonsOnly) else {
+            return report("AC-WV2", "warm-auto-pause", false, "(daemons/Finder must not pause)")
+        }
+        // The warmer itself (SyncTray) is excluded, or the warm would pause itself instantly.
+        guard SyncManager.warmInteractiveReaders(lsofOutput: warmerOnly).isEmpty,
+              !SyncManager.shouldAutoPauseWarm(lsofOutput: warmerOnly) else {
+            return report("AC-WV2", "warm-auto-pause", false, "(warmer must be excluded)")
+        }
+        // Mixed: only the real app survives the SyncTray/Finder filtering.
+        guard SyncManager.warmInteractiveReaders(lsofOutput: mixed) == ["Reaper"],
+              SyncManager.shouldAutoPauseWarm(lsofOutput: mixed) else {
+            return report("AC-WV2", "warm-auto-pause", false, "(mixed should keep only the app)")
+        }
+        // A failed/nil lsof run does NOT pause — a missed pause just keeps warming (safe).
+        guard !SyncManager.shouldAutoPauseWarm(lsofOutput: nil) else {
+            return report("AC-WV2", "warm-auto-pause", false, "(nil lsof must not pause)")
+        }
+        return report("AC-WV2", "warm-auto-pause", true)
+    }
+
     // MARK: - AC-CK2 — mount mode never streams through the fallback
 
     private static func testMountNoFallbackOverride() -> Bool {
@@ -3126,6 +3206,57 @@ enum ConfigSelfTest {
         let script = SyncSetupService.shared.generateSyncScript()
         guard !script.contains("eval \"$RCLONE_CMD\""), script.contains("\"${RCLONE_CMD[@]}\"") else {
             return report(name, slug, false, "(script still evals the rclone command string)")
+        }
+        return report(name, slug, true)
+    }
+
+    // MARK: - AC-SEC1b — additionalRcloneFlags: split, never evaluated, never silently dropped
+
+    /// Drives the script's real extra-flags block through the shared dry-run seam (which
+    /// sits after it): a `$(...)` token reaches rclone as literal text and never runs, `~`
+    /// and `$VAR` still expand (as string substitution only), and
+    /// an unparseable value (unbalanced quote) fails the run instead of running rclone
+    /// without the user's flags.
+    private static func testAdditionalFlagsSplitting() -> Bool {
+        let name = "AC-SEC1b", slug = "additional-flags-splitting"
+        let fm = FileManager.default
+        let root = "\(selfTestRoot)/sec1b-\(UUID().uuidString)"
+        let marker = "\(root)/injected"
+        let local = "\(root)/mnt", cache = "\(root)/cache", target = "\(root)/remote-target"
+        for dir in [local, cache, target] {
+            try? fm.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        }
+        let rcloneConfig = aliasRcloneConfig(name: "synology", path: target)
+
+        var literal = mountFixtureProfile(localPath: local, cachePath: cache)
+        literal.additionalRcloneFlags = "--exclude \"$(touch \(marker))\""
+        defer { try? fm.removeItem(atPath: literal.cacheOnlyConfigPath) }
+        let lit = dryRunMountScript(profile: literal, rcloneConfig: rcloneConfig)
+        guard lit.exitCode == 0, Array(lit.args.suffix(2)) == ["--exclude", "$(touch \(marker))"] else {
+            return report(name, slug, false, "(metacharacter flag value not passed literally: \(lit.args) out=\(lit.output) log=\(lit.log))")
+        }
+        guard !fm.fileExists(atPath: marker) else {
+            return report(name, slug, false, "(an additionalRcloneFlags value was executed as shell code)")
+        }
+
+        // `~` and `$VAR` keep expanding as before the eval was removed — as plain string
+        // substitution, including the value half of a `--flag=~/path` token.
+        let home = ProcessInfo.processInfo.environment["HOME"] ?? NSHomeDirectory()
+        var tilde = mountFixtureProfile(localPath: local, cachePath: cache)
+        tilde.additionalRcloneFlags = "--exclude-from ~/x.txt --log-file=~/y.log --filter-from $HOME/z.txt"
+        let exp = dryRunMountScript(profile: tilde, rcloneConfig: rcloneConfig)
+        let expected = ["--exclude-from", "\(home)/x.txt", "--log-file=\(home)/y.log",
+                        "--filter-from", "\(home)/z.txt"]
+        guard exp.exitCode == 0, Array(exp.args.suffix(expected.count)) == expected else {
+            return report(name, slug, false, "(~ / $VAR not expanded in extra flags: \(exp.args) log=\(exp.log))")
+        }
+
+        var malformed = mountFixtureProfile(localPath: local, cachePath: cache)
+        malformed.additionalRcloneFlags = "--exclude \"unterminated"
+        let bad = dryRunMountScript(profile: malformed, rcloneConfig: rcloneConfig)
+        guard bad.exitCode != 0, bad.args.isEmpty,
+              bad.log.contains("Invalid additionalRcloneFlags") else {
+            return report(name, slug, false, "(unparseable flags did not fail the run: exit=\(bad.exitCode) args=\(bad.args) log=\(bad.log))")
         }
         return report(name, slug, true)
     }
@@ -5778,8 +5909,9 @@ enum ConfigSelfTest {
         }
         // The sync script's first-run bootstrap is a resync SyncTray starts too.
         let script = SyncSetupService.shared.generateSyncScript()
-        guard script.contains("BOOTSTRAP_FLAGS=\"--resync --resync-mode newer\""),
-              !script.contains("BOOTSTRAP_FLAGS=\"--resync\"") else {
+        guard script.contains("BOOTSTRAP_ARGS=(--resync --resync-mode newer)"),
+              !script.contains("BOOTSTRAP_ARGS=(--resync)"),
+              !script.contains("RCLONE_CMD+=(--resync") else {
             return report("AC-RI4", "resync-never-bare", false, "(the sync script's bootstrap is not newer-wins)")
         }
         return report("AC-RI4", "resync-never-bare", true)
