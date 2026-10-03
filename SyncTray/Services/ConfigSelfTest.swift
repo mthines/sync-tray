@@ -5138,8 +5138,17 @@ enum ConfigSelfTest {
         try? "".write(toFile: listing1, atomically: true, encoding: .utf8)
         try? "".write(toFile: listing2, atomically: true, encoding: .utf8)
         defer {
-            try? fm.removeItem(atPath: listing1)
-            try? fm.removeItem(atPath: listing2)
+            // The two REAL bisync runs below also write their own session files into this
+            // FIXED, non-configurable, non-selfTestRoot-scoped directory (.lst-old backups,
+            // renamed .lst-new, a .lck, etc.) — remove every file this session could have
+            // left behind, not just the two listings this fixture pre-seeded, so repeated
+            // self-test runs don't pile up stray session files under the user's real
+            // rclone bisync cache.
+            if let entries = try? fm.contentsOfDirectory(atPath: workDir) {
+                for entry in entries where entry.hasPrefix("\(session).") {
+                    try? fm.removeItem(atPath: "\(workDir)/\(entry)")
+                }
+            }
             SyncSetupService.shared.removeBisyncLock(for: scriptProfile)
         }
 
