@@ -9,12 +9,6 @@ cask "synctray" do
 
   depends_on macos: :ventura
 
-  # Remove quarantine attribute (app is not notarized yet)
-  preflight do
-    system_command "/usr/bin/xattr",
-                   args: ["-cr", "#{staged_path}/SyncTray.app"]
-  end
-
   app "SyncTray.app"
 
   # Quit SyncTray before upgrading/uninstalling so its quit handler terminates the
