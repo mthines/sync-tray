@@ -617,13 +617,13 @@ app**. So the FinderSync menu only appears in a **code-signed** build:
   Caveat: if you enable **both** the dev and release extensions, Finder shows two
   "SyncTray" submenus — disable one while iterating. `scripts/dev.sh` targets the `.dev`
   id and the in-app enabled-check switches id via `#if DEBUG`.
-- **CI / release build unsigned on purpose.** `CODE_SIGNING_ALLOWED=NO` is **not**
-  hardcoded in the project — it is passed on the `xcodebuild` command line by both the
-  CI `test` job (`.github/workflows/ci.yml`) and `scripts/release-ci.sh`. This keeps the
+- **CI / release build unsigned, then signed for release.** `CODE_SIGNING_ALLOWED=NO` is
+  **not** hardcoded in the project — it is passed on the `xcodebuild` command line by both
+  the CI `test` job (`.github/workflows/ci.yml`) and `scripts/release-ci.sh`. This keeps the
   build gate green without signing credentials while letting local dev sign normally.
-  Consequence: the brew-distributed (unsigned) app **cannot** show the offline menu —
-  shipping it requires Developer ID signing + notarization + App Group provisioning.
-  The release pipeline (`scripts/release-ci.sh`) does this with the signing secrets and
+  The offline menu needs Developer ID signing + notarization + App Group provisioning,
+  so `scripts/release-ci.sh` re-signs the built app with Developer ID and notarizes it
+  before publishing. It does this with the signing secrets and
   **refuses to publish without them** — the cask no longer strips quarantine, so an
   un-notarized release can't be installed (the local `scripts/release.sh` refuses
   outright). Setup is documented in [`docs/release-signing.md`](docs/release-signing.md).

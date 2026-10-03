@@ -140,7 +140,7 @@ A `/beta` build shows its exact version (e.g. `0.81.0-beta.75.1 (1)`) followed b
 
 Both are baked in at build time the same way as the token above. The build settings `SYNCTRAY_RELEASE_CHANNEL` and `SYNCTRAY_RELEASE_VERSION` are empty by default. For every release, `scripts/release-ci.sh` passes the channel (`beta` or `stable`) and the tagged version without its `v`. Info.plist expands them into `SyncTrayReleaseChannel` and `SyncTrayReleaseVersion`. The script then reads both keys back from the built bundle and fails the release if either doesn't match.
 
-The app shows `SyncTrayReleaseVersion` when it is set and falls back to `CFBundleShortVersionString` otherwise. For a CI stable release the two are identical. The local `scripts/release.sh` passes only `stable` and leaves the version to its Info.plist bump. Dev builds leave both empty, so they show the plist version and no tag. To preview a beta locally:
+The app shows `SyncTrayReleaseVersion` when it is set and falls back to `CFBundleShortVersionString` otherwise. For a CI stable release the two are identical. (The local `scripts/release.sh` refuses to run, because it can't notarize, so every release comes from CI.) Dev builds leave both empty, so they show the plist version and no tag. To preview a beta locally:
 
 ```bash
 xcodebuild -scheme SyncTray -configuration Debug -derivedDataPath build \

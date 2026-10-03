@@ -31,16 +31,16 @@ log_success() { echo -e "${GREEN}✓${NC} $1"; }
 log_warning() { echo -e "${YELLOW}⚠${NC} $1"; }
 log_error() { echo -e "${RED}✗${NC} $1" >&2; exit 1; }
 
+if [ -z "${CI:-}" ]; then
+  log_error "This script is designed to run in CI only — releases are published by CI on merge to main."
+fi
+
 # Fail fast: a real release must be notarized (see the signing section below),
 # so refuse before the build when the secrets it needs aren't configured.
 if [ "${DRY_RUN:-}" != "true" ]; then
   for var in MACOS_CERTIFICATE_P12_BASE64 MACOS_CERTIFICATE_PASSWORD NOTARY_KEY_P8_BASE64 NOTARY_KEY_ID NOTARY_ISSUER_ID; do
     [ -n "${!var:-}" ] || log_error "$var is not set — a release must be signed + notarized (docs/release-signing.md)."
   done
-fi
-
-if [ -z "${CI:-}" ]; then
-  log_error "This script is designed to run in CI only — releases are published by CI on merge to main."
 fi
 
 VERSION="${RELEASE_VERSION#v}"
