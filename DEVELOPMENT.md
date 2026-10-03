@@ -31,8 +31,10 @@ cp Config/Signing.local.xcconfig.example Config/Signing.local.xcconfig   # then 
 ```
 
 Your Team ID lives only in the gitignored `Config/Signing.local.xcconfig`, never in
-the committed project. CI and release builds are unsigned by design (they pass
-`CODE_SIGNING_ALLOWED=NO`), so no team is needed there.
+the committed project. CI and release builds compile unsigned (they pass
+`CODE_SIGNING_ALLOWED=NO`), so no team is needed there; `scripts/release-ci.sh`
+then signs the release with Developer ID from CI secrets and notarizes it
+(see [`docs/release-signing.md`](docs/release-signing.md)).
 
 To exercise the extension:
 

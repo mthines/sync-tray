@@ -77,15 +77,15 @@ Repo → **Settings → Secrets and variables → Actions → New repository sec
 | `NOTARY_KEY_ID` | the API Key ID |
 | `NOTARY_ISSUER_ID` | the API Issuer ID |
 
-That's it — the next release picks them up automatically. (Signing runs if the two
-`MACOS_CERTIFICATE_*` secrets are present; notarization runs if the three `NOTARY_*`
-secrets are also present.)
+That's it — the next release picks them up automatically. All five are required:
+the `version` job and `release-ci.sh` refuse a release (before any tag is pushed)
+when any of them is missing.
 
 ---
 
 ## Part 3 — What the pipeline does
 
-`scripts/release-ci.sh`, when the secrets are set:
+`scripts/release-ci.sh`, on every release:
 
 1. Imports the `.p12` into a throwaway keychain and finds the *Developer ID Application* identity.
 2. Signs inside-out with **hardened runtime** + secure timestamp: nested frameworks →
