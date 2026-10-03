@@ -13,7 +13,7 @@
     "install:full:launch": "pnpm dlx nx@21.6.11 run synctray:install:full:launch",
     "dev": "pnpm dlx nx@21.6.11 run synctray:dev",
     "release": "pnpm dlx nx@21.6.11 run synctray:release",
-    "reset": "nx reset"
+    "reset": "pnpm dlx nx@21.6.11 reset"
   },
   "devDependencies": {
     "nx": "21.6.11"
