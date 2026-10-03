@@ -183,11 +183,13 @@ struct SyncProfile: Identifiable, Codable, Equatable {
     /// `--resync --resync-mode newer` (newer copy wins) instead of its usual incremental
     /// sync, then removes the marker on exit 0 ONLY if its content still matches the token
     /// it read at start (so an edit landing mid-run re-arms rather than being swallowed).
-    /// Written by `SyncSetupService.writeExcludeFilter` after the filter file, only when a
+    /// Written by `SyncSetupService.writeExcludeFilter` BEFORE the filter file, only when a
     /// bisync profile's compiled include rules change (see CLAUDE.md "Critical Rule 7" —
-    /// this is the resync-safe alternative to deleting bisync listings). Removed by a plain
-    /// `uninstall` (disable/delete) alongside the filter file. Never emitted into the
-    /// derived `{shortId}.json` — the script derives this same path on its own.
+    /// this is the resync-safe alternative to deleting bisync listings). Marker-before-filter
+    /// so a write failure can only ever strand a stale marker (an extra, harmless resync),
+    /// never lose one. Removed by a plain `uninstall` (disable/delete) alongside the filter
+    /// file. Never emitted into the derived `{shortId}.json` — the script derives this same
+    /// path on its own.
     var resyncPendingPath: String {
         "\(Self.configDirectory)/\(shortId).resync-pending"
     }

@@ -2053,9 +2053,10 @@ final class SyncSetupService {
     /// the next sync with no reinstall, and without stopping a sync in progress.
     ///
     /// When the write actually changes the compiled include rules on an ENABLED bisync
-    /// profile, a fresh token is written to the resync-pending marker right after the filter
+    /// profile, a fresh token is written to the resync-pending marker right BEFORE the filter
     /// file — the script-consumed signal (see CLAUDE.md "Critical Rule 7") that the next
     /// bisync run should `--resync --resync-mode newer` instead of its usual incremental sync.
+    /// (Marker-before-filter, not after: see the comment at the write site for why.)
     /// One-way profiles, and a filter write that doesn't change the include rules, never touch
     /// the marker.
     /// - Parameters:
