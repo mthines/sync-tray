@@ -52,7 +52,7 @@ jobs:
       checkout_ref: ${{ steps.detect.outputs.checkout_ref }}
       run_build: ${{ steps.detect.outputs.run_build }}
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
 
@@ -191,7 +191,7 @@ jobs:
     if: needs.detect-changes.outputs.run_build == 'true' && github.event_name != 'issue_comment'
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.detect-changes.outputs.checkout_ref }}
 
@@ -292,7 +292,7 @@ jobs:
       tag: ${{ steps.version.outputs.tag }}
       created: ${{ steps.tag.outputs.created }}
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           ref: ${{ needs.detect-changes.outputs.checkout_ref }}
@@ -441,7 +441,7 @@ jobs:
       contents: write
       pull-requests: write
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           ref: ${{ needs.version.outputs.tag }}
