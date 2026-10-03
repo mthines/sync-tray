@@ -319,6 +319,18 @@ struct ProfileDetailView: View {
                             syncMode: syncMode,
                             syncDirection: syncDirection
                         )
+
+                        // Sync Only These Folders (selective folders, Option A) — syncs just
+                        // these subfolders instead of everything under the root pair.
+                        Divider().padding(.vertical, 4)
+                        sectionHeader("Sync Only These Folders", icon: "checklist")
+                        SyncOnlyFoldersSection(
+                            profile: profile,
+                            profileStore: profileStore,
+                            syncManager: syncManager,
+                            syncMode: syncMode,
+                            syncDirection: syncDirection
+                        )
                     }
 
                     Divider().padding(.vertical, 4)
@@ -2191,6 +2203,7 @@ struct ProfileDetailView: View {
         // write back an older copy held by this view.
         if let live = profileStore.profile(for: profile.id) {
             updatedProfile.syncExcludePatterns = live.syncExcludePatterns
+            updatedProfile.syncIncludeFolders = live.syncIncludeFolders
             updatedProfile.warmExcludePatterns = live.warmExcludePatterns
             updatedProfile.pinnedDirectories = live.pinnedDirectories
         }
@@ -4375,27 +4388,163 @@ struct DontSyncSection: View {
     }
 }
 
+/// Selective folders (Option A): when non-empty, ONLY these folders sync (both directions
+/// for a two-way profile, uploaded/downloaded for a one-way profile) instead of everything
+/// under the profile's root pair. Folders are literal paths relative to `remotePath` (and,
+/// symmetrically, `localSyncPath`) — picked via `RemoteFolderBrowserSheet` in multi-select
+/// mode, or typed by hand. Applies immediately on change, exactly like `DontSyncSection`.
+struct SyncOnlyFoldersSection: View {
+    let profile: SyncProfile
+    @ObservedObject var profileStore: ProfileStore
+    @ObservedObject var syncManager: SyncManager
+    /// The form's current mode/direction (may be unsaved), so the caption matches what the
+    /// user is looking at. The picker itself roots at `liveProfile` — see the `.sheet` below.
+    let syncMode: SyncMode
+    let syncDirection: SyncDirection
+
+    @State private var folders: [String] = []
+    @State private var showingBrowser = false
+
+    private var liveProfile: SyncProfile {
+        profileStore.profile(for: profile.id) ?? profile
+    }
+
+    private var caption: String {
+        if folders.isEmpty {
+            return "Every folder syncs."
+        }
+        if syncMode == .bisync {
+            return "Only these folders sync, in both directions. Files outside them stay "
+                + "where they are on both sides. Changing the list makes the next sync "
+                + "re-check both sides (the newer copy wins)."
+        } else if syncDirection == .localToRemote {
+            return "Only these folders are uploaded. Files outside them that are already "
+                + "on the remote stay."
+        } else {
+            return "Only these folders are downloaded. Files outside them that are already "
+                + "on this Mac stay."
+        }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            ExcludePatternListEditor(
+                title: "Sync only these folders",
+                caption: caption,
+                emptyText: "Every folder syncs",
+                placeholder: "Folder path (e.g., Projects or Music/Live)",
+                rowIcon: "folder",
+                patterns: folders
+            ) { updated in
+                syncManager.updateSyncIncludeFolders(updated, for: profile.id)
+                // Re-derive from the stored profile rather than trusting the editor's raw
+                // proposed list: normalization/validation can silently drop or no-op an entry
+                // (a duplicate once normalized, or an invalid path like "." / ".."), in which
+                // case updateSyncIncludeFolders writes nothing — reflecting the raw list here
+                // would leave a row on screen for a folder that never actually syncs.
+                folders = liveProfile.syncIncludeFolders
+            }
+
+            Button(action: { showingBrowser = true }) {
+                Label("Choose Folders…", systemImage: "folder.badge.plus")
+                    .font(.caption)
+            }
+            .buttonStyle(.link)
+            .disabled(liveProfile.rcloneRemote.isEmpty)
+
+            // Kept by SyncManager, not this view: it survives the view being recreated and
+            // also covers a failed write from an edit made outside the app.
+            if let error = syncManager.syncFilterErrors[profile.id] {
+                Label(error, systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption)
+                    .foregroundStyle(.red)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .onAppear { folders = liveProfile.syncIncludeFolders }
+        .onChange(of: profile.id) { _ in
+            folders = liveProfile.syncIncludeFolders
+        }
+        // Mirror edits made outside this view (CLI, a hand-edited .profile.json).
+        .onReceive(profileStore.$profiles) { profiles in
+            guard let updated = profiles.first(where: { $0.id == profile.id }),
+                  updated.syncIncludeFolders != folders else { return }
+            folders = updated.syncIncludeFolders
+        }
+        .sheet(isPresented: $showingBrowser) {
+            // Rooted at the SAVED profile's remote/path (liveProfile), not the form's
+            // possibly-unsaved rcloneRemote/remotePath: a pick here persists immediately
+            // (below), so browsing against an unsaved root could save folders relative to
+            // a path the saved profile doesn't actually have yet — silently syncing nothing
+            // once the include block's trailing "- **" takes effect against the real root.
+            RemoteFolderBrowserSheet(
+                remoteName: liveProfile.rcloneRemote,
+                root: liveProfile.remotePath
+            ) { picked in
+                var updated = folders
+                for folder in picked where !updated.contains(folder) {
+                    updated.append(folder)
+                }
+                folders = updated
+                syncManager.updateSyncIncludeFolders(updated, for: profile.id)
+            }
+        }
+    }
+}
+
 /// Browse folders on an rclone remote and pick one directly, instead of guessing the
 /// path layout (which differs by protocol — e.g. SFTP vs SMB rooting on the same NAS).
 /// Navigable: tap a folder to descend, use the breadcrumb to go back, "Use This Folder"
 /// to select the current path. Lists via `rclone lsf --dirs-only` so names with spaces
 /// parse correctly (unlike the older whitespace-split parser).
 struct RemoteFolderBrowserSheet: View {
+    /// `single`: pick one folder; the returned path is relative to the remote's actual root
+    /// (today's behaviour, unchanged). `multiple`: pick any number of folders confined under
+    /// `root` (a path relative to the remote's actual root, e.g. the profile's `remotePath`);
+    /// the breadcrumb's "Root" means `root`, browsing can't go above it, and every returned
+    /// path is relative to `root`, not to the remote's actual root.
+    enum Selection {
+        case single(onSelect: (String) -> Void)
+        case multiple(root: String, onSelect: ([String]) -> Void)
+    }
+
     let remoteName: String
-    let initialPath: String
-    let onSelect: (String) -> Void
+    let selection: Selection
     @Environment(\.dismiss) private var dismiss
 
     @State private var currentPath: String
     @State private var folders: [String] = []
     @State private var isLoading = false
     @State private var errorMessage: String?
+    /// Full paths (relative to the remote's actual root) selected in multi-select mode.
+    @State private var selectedFolders: Set<String> = []
 
+    /// The path (relative to the remote's actual root) this sheet treats as "Root" — `""`
+    /// for single-select (browses the whole remote, as before), or the confinement root for
+    /// multi-select.
+    private let browseRoot: String
+
+    /// Single-select initializer — the existing call site, behaviour unchanged.
     init(remoteName: String, initialPath: String, onSelect: @escaping (String) -> Void) {
+        self.init(remoteName: remoteName, selection: .single(onSelect: onSelect), startPath: initialPath, browseRoot: "")
+    }
+
+    /// Multi-select initializer, confined to and relative to `root`.
+    init(remoteName: String, root: String, onSelect: @escaping ([String]) -> Void) {
+        let normalizedRoot = root.trimmingCharacters(in: CharacterSet(charactersIn: "/ "))
+        self.init(remoteName: remoteName, selection: .multiple(root: normalizedRoot, onSelect: onSelect), startPath: normalizedRoot, browseRoot: normalizedRoot)
+    }
+
+    private init(remoteName: String, selection: Selection, startPath: String, browseRoot: String) {
         self.remoteName = remoteName
-        self.initialPath = initialPath
-        self.onSelect = onSelect
-        _currentPath = State(initialValue: initialPath.trimmingCharacters(in: CharacterSet(charactersIn: "/ ")))
+        self.selection = selection
+        self.browseRoot = browseRoot
+        _currentPath = State(initialValue: startPath.trimmingCharacters(in: CharacterSet(charactersIn: "/ ")))
+    }
+
+    private var isMultiSelect: Bool {
+        if case .multiple = selection { return true }
+        return false
     }
 
     private var bareRemote: String {
@@ -4406,6 +4555,24 @@ struct RemoteFolderBrowserSheet: View {
         currentPath.isEmpty ? "\(bareRemote): (root)" : "\(bareRemote):\(currentPath)"
     }
 
+    /// `currentPath` with the confinement `browseRoot` prefix stripped, for breadcrumb
+    /// rendering — `currentPath` itself for single-select, since `browseRoot` is `""`.
+    private var pathRelativeToBrowseRoot: String {
+        guard !browseRoot.isEmpty else { return currentPath }
+        if currentPath == browseRoot { return "" }
+        let prefix = browseRoot + "/"
+        return currentPath.hasPrefix(prefix) ? String(currentPath.dropFirst(prefix.count)) : ""
+    }
+
+    /// A full (remote-root-relative) path relative to `browseRoot`, for the folders this
+    /// sheet returns in multi-select mode.
+    private func relativeToBrowseRoot(_ fullPath: String) -> String {
+        guard !browseRoot.isEmpty else { return fullPath }
+        if fullPath == browseRoot { return "" }
+        let prefix = browseRoot + "/"
+        return fullPath.hasPrefix(prefix) ? String(fullPath.dropFirst(prefix.count)) : fullPath
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack {
@@ -4414,14 +4581,16 @@ struct RemoteFolderBrowserSheet: View {
                 if isLoading { ProgressView().controlSize(.small) }
             }
 
-            // Breadcrumb
+            // Breadcrumb — "Root" means `browseRoot` (the remote's actual root for
+            // single-select; the confinement root for multi-select).
             HStack(spacing: 4) {
-                Button("Root") { currentPath = ""; loadFolders() }.buttonStyle(.link)
-                let parts = currentPath.split(separator: "/").map(String.init)
+                Button("Root") { currentPath = browseRoot; loadFolders() }.buttonStyle(.link)
+                let parts = pathRelativeToBrowseRoot.split(separator: "/").map(String.init)
                 ForEach(Array(parts.enumerated()), id: \.offset) { idx, part in
                     Text("/").foregroundStyle(.secondary)
                     Button(part) {
-                        currentPath = parts[0...idx].joined(separator: "/")
+                        let relative = parts[0...idx].joined(separator: "/")
+                        currentPath = browseRoot.isEmpty ? relative : "\(browseRoot)/\(relative)"
                         loadFolders()
                     }.buttonStyle(.link)
                 }
@@ -4447,20 +4616,29 @@ struct RemoteFolderBrowserSheet: View {
                     ScrollView {
                         LazyVStack(alignment: .leading, spacing: 1) {
                             ForEach(folders, id: \.self) { folder in
-                                Button(action: {
-                                    currentPath = currentPath.isEmpty ? folder : "\(currentPath)/\(folder)"
-                                    loadFolders()
-                                }) {
-                                    HStack {
-                                        Image(systemName: "folder.fill").foregroundStyle(.blue)
-                                        Text(folder).lineLimit(1)
-                                        Spacer()
-                                        Image(systemName: "chevron.right").font(.caption2).foregroundStyle(.tertiary)
+                                let fullPath = currentPath.isEmpty ? folder : "\(currentPath)/\(folder)"
+                                HStack {
+                                    if isMultiSelect {
+                                        Button(action: { toggleSelection(fullPath) }) {
+                                            Image(systemName: selectedFolders.contains(fullPath)
+                                                  ? "checkmark.square.fill" : "square")
+                                                .foregroundStyle(selectedFolders.contains(fullPath) ? .blue : .secondary)
+                                        }
+                                        .buttonStyle(.plain)
+                                        .accessibilityLabel(selectedFolders.contains(fullPath) ? "Deselect \(folder)" : "Select \(folder)")
                                     }
-                                    .contentShape(Rectangle())
-                                    .padding(.vertical, 4).padding(.horizontal, 6)
+                                    Button(action: { currentPath = fullPath; loadFolders() }) {
+                                        HStack {
+                                            Image(systemName: "folder.fill").foregroundStyle(.blue)
+                                            Text(folder).lineLimit(1)
+                                            Spacer()
+                                            Image(systemName: "chevron.right").font(.caption2).foregroundStyle(.tertiary)
+                                        }
+                                        .contentShape(Rectangle())
+                                    }
+                                    .buttonStyle(.plain)
                                 }
-                                .buttonStyle(.plain)
+                                .padding(.vertical, 4).padding(.horizontal, 6)
                             }
                         }
                     }
@@ -4473,18 +4651,43 @@ struct RemoteFolderBrowserSheet: View {
             HStack {
                 Button("Cancel") { dismiss() }
                 Spacer()
-                Text(displayPath).font(.caption.monospaced()).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
-                Button("Use This Folder") {
-                    onSelect(currentPath)
-                    dismiss()
+                if isMultiSelect {
+                    Text("\(selectedFolders.count) selected").font(.caption).foregroundStyle(.secondary)
+                    Button("Add \(selectedFolders.count) \(selectedFolders.count == 1 ? "Folder" : "Folders")") {
+                        if case .multiple(_, let onSelect) = selection {
+                            // `selectedFolders` is a Set, so iteration order is unspecified (and
+                            // varies run to run) — sort before handing the list back so the
+                            // resulting syncIncludeFolders order is stable and reviewable.
+                            onSelect(selectedFolders.map(relativeToBrowseRoot).sorted())
+                        }
+                        dismiss()
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(selectedFolders.isEmpty)
+                } else {
+                    Text(displayPath).font(.caption.monospaced()).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
+                    Button("Use This Folder") {
+                        if case .single(let onSelect) = selection {
+                            onSelect(currentPath)
+                        }
+                        dismiss()
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(currentPath.isEmpty)
                 }
-                .buttonStyle(.borderedProminent)
-                .disabled(currentPath.isEmpty)
             }
         }
         .padding(16)
         .frame(width: 440, height: 480)
         .onAppear { loadFolders() }
+    }
+
+    private func toggleSelection(_ fullPath: String) {
+        if selectedFolders.contains(fullPath) {
+            selectedFolders.remove(fullPath)
+        } else {
+            selectedFolders.insert(fullPath)
+        }
     }
 
     private func loadFolders() {

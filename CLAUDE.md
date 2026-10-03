@@ -945,6 +945,82 @@ deletions against the prior listing — and since an abort leaves that listing
 unchanged, every later run aborts too until the pattern is removed. Adding broad
 patterns in steps avoids it. Covered by `ConfigSelfTest` AC-DS1–AC-DS5.
 
+**"Sync Only These Folders" (`syncIncludeFolders`) — selective folder sync for
+Two-Way and One-Way profiles.** A per-profile allowlist (profile editor's "Sync
+Only These Folders" section, sharing `ExcludePatternListEditor`'s row chrome
+with "Don't Sync" via a `rowIcon` parameter, plus a multi-select
+`RemoteFolderBrowserSheet` rooted at the profile's `remotePath`) for the inverse
+case: instead of excluding a few folders, sync ONLY the listed ones. Entries
+are relative paths normalized by `SyncProfile.normalizedSyncIncludeFolders`
+(leading/trailing slashes stripped, de-duplicated, validated against `.`/`..`/
+empty segments via `isValidSyncIncludeFolder`). `SyncExcludeFilter.includeRules(for:)`
+compiles the list into rclone filter rules — one escaped `+ /<folder>/**` per
+entry (metacharacters `*?[]{}\` backslash-escaped via `rcloneLiteral`, so a
+folder name that happens to contain one is matched literally, not as a glob),
+followed by a single `- **` catch-all — and rclone's own unanchored-parent
+traversal auto-includes every ancestor directory of a kept folder, so no
+explicit parent-dir rule is needed (confirmed against a real `rclone lsf -R`
+run). An empty list compiles to nothing (byte-identical to having no tail
+block at all) — the feature is fully opt-in.
+
+**A SECOND, independent managed block — the tail, not the head.** Unlike the
+"Don't Sync" exclude patterns (top-of-file block, above), the include rules
+live in their own managed block at the BOTTOM of `{shortId}-exclude.txt`,
+because rclone's filter rules are first-match-wins top-to-bottom: the exclude
+block's `-` patterns must still win over anything below them, and the
+catch-all `- **` the include block ends with must come after any hand-written
+`+` rules a user left in the middle. `SyncExcludeFilter.merged` therefore
+manages two independent begin/end marker pairs in the same file
+(`beginMarker`/`endMarker` for excludes, `includeBeginMarker`/`includeEndMarker`
+for includes) and reassembles as: exclude block (if any patterns) → user's own
+hand-written content → include block (if any folders) — stripping and
+re-emitting both blocks on every write so the merge stays idempotent.
+
+**Changing the list is orthogonal to the launchd reconcile, same as "Don't
+Sync" — except on a bisync profile it also schedules a safe resync.**
+`ConfigReconciler.syncFilterReconcileNeeded` returns `true` for a
+`syncIncludeFolders` diff exactly like a `syncExcludePatterns` diff, so
+`reconcileAction` still returns `.none` (no reinstall, no remount) and the
+same `applySyncFilterReconcileIfNeeded` → `writeExcludeFilter` path rewrites
+the file. But narrowing or widening the include list changes which files
+bisync's cached listings describe — continuing with the stale listing could
+delete files that are suddenly out of scope. Rather than discard the
+listings (forbidden by Critical Rule 7, above), `writeExcludeFilter` detects
+an include-rule CHANGE (comparing the compiled include block before/after,
+so an exclude-only edit never triggers this) on a `.bisync` profile and writes
+a fresh UUID token to `{shortId}.resync-pending`. The generated sync script
+checks this marker before building its bootstrap args: a present token makes
+it run `--resync --resync-mode newer` (the newer copy wins on conflict, matching every
+other SyncTray-initiated resync) instead of a plain bisync, logging "sync
+folders changed". The marker is removed only after a bisync that exits 0
+AND whose token still matches what was read at script start (`if [[
+"$CURRENT_RESYNC_TOKEN" == "$RESYNC_TOKEN" ]]; then rm -f "$RESYNC_MARKER";
+fi`) — so a marker written by a second edit mid-run is never erased by the
+first run's own completion; the next scheduled run picks it up instead. One-way
+profiles never get a marker (there's no bisync listing to protect) and
+`uninstall` removes a stale marker when the profile is disabled or deleted.
+
+**The marker clears only once every session that could run it has consumed
+it — not just whichever session happens to succeed first.** A profile with a
+fallback remote configured (see "Fallback Remote Pipeline" below) can have
+TWO distinct bisync sessions: the primary's own, and — only when the
+fallback does a full remote-reference swap rather than an env-var transport
+override, which preserves the session name — the fallback's own. Each has
+its own separate listing cache on disk. If the primary session cleared the
+marker on its own first success, a fallback session that later activates
+would run against stale pre-edit listings with no marker to trigger its own
+resync, eventually tripping bisync's `--max-delete` safety abort. The script
+computes `REQUIRED_SESSIONS` (the primary's session name, plus the
+fallback's full-swap session name when distinct) up front and records each
+session's consumption of the current token in `{shortId}.resync-pending.consumed`
+(first line: the token; following lines: consumed session names) — the
+marker and its consumption record are deleted together only once every
+required session appears in that file. A fallback that's configured but
+never actually activates simply leaves its slot unconsumed indefinitely,
+which is correct: that session's listings haven't been resynced because that
+session has never run.
+Covered by `ConfigSelfTest` AC-SI1–AC-SI6.
+
 **Self-write suppression.** `ConfigSelfWriteRegistry` tracks the content hash
 of every file SyncTray itself writes; `ConfigFileWatcher.shouldReconcile`
 drops an FSEvent whose file content hash matches a just-noted self-write, so
@@ -1485,7 +1561,9 @@ Priority: process env vars > `~/.config/synctray/.env` > Info.plist. Key vars: `
 | Path | Purpose |
 |------|---------|
 | `~/.config/synctray/profiles/{shortId}.json` | Profile config |
-| `~/.config/synctray/profiles/{shortId}-exclude.txt` | Exclude filter (user-editable; SyncTray owns only the "Don't Sync" block at the top) |
+| `~/.config/synctray/profiles/{shortId}-exclude.txt` | Exclude filter (user-editable; SyncTray owns two managed blocks — the "Don't Sync" exclude block at the TOP and, when `syncIncludeFolders` is non-empty, the "Sync Only These Folders" include block at the BOTTOM) |
+| `~/.config/synctray/profiles/{shortId}.resync-pending` | Two-Way (bisync) profiles only, created only when `syncIncludeFolders` changes — a UUID token the sync script reads to schedule a safe `--resync --resync-mode newer` instead of a plain bisync, removed only after every required bisync session (see `.resync-pending.consumed`) has consumed it with an unchanged token |
+| `~/.config/synctray/profiles/{shortId}.resync-pending.consumed` | Two-Way (bisync) profiles only — per-token record of which bisync session(s) have already run their one-time resync for the current `.resync-pending` token; deleted together with the marker once every required session (primary, and the fallback's own session on a full remote swap) has consumed it |
 | `~/.local/bin/synctray-sync.sh` | Shared sync script (all profiles) |
 | `~/Library/LaunchAgents/com.synctray.sync.{shortId}.plist` | launchd schedule |
 | `~/.local/log/synctray-sync-{shortId}.log` | Sync logs |

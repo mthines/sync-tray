@@ -276,6 +276,13 @@ final class SyncSetupService {
             try fm.removeItem(atPath: profile.filterFilePath)
         }
 
+        if !keepingSyncState, fm.fileExists(atPath: profile.resyncPendingPath) {
+            try fm.removeItem(atPath: profile.resyncPendingPath)
+        }
+        if !keepingSyncState, fm.fileExists(atPath: profile.resyncConsumedPath) {
+            try fm.removeItem(atPath: profile.resyncConsumedPath)
+        }
+
         // Clean up /tmp lock file
         if fm.fileExists(atPath: profile.lockFilePath) {
             try? fm.removeItem(atPath: profile.lockFilePath)
@@ -711,6 +718,10 @@ final class SyncSetupService {
             FALLBACK_PATH=$(parse_json "fallbackRemotePath" "")
             FALLBACK_REQUIRES_CACHE_REBUILD=$(parse_json "fallbackRequiresCacheRebuild" "false")
             REMOTE_PATH=$(parse_json "remotePath" "")
+            # Captured BEFORE the fallback block below can reassign $REMOTE to the fallback's
+            # own reference — the selective-folders resync marker (further down) needs the
+            # primary's own session name regardless of which transport this particular run uses.
+            PRIMARY_REMOTE_REF="$REMOTE"
             # Default to the kext-free NFS backend when the key is absent — the Swift
             # model decodes the same default. Keep the two in lockstep so a profile
             # whose JSON predates the mountBackend field mounts via nfsmount (no macFUSE
@@ -1594,10 +1605,81 @@ final class SyncSetupService {
                 return ''.join('_' if ch in REPLACED else ch for ch in p)
             print(canon(sys.argv[1]) + '..' + canon(sys.argv[2]))
             " "$REMOTE" "$LOCAL_PATH")
+
+                # Every DISTINCT bisync session this profile could ever run under — the
+                # primary's own reference, and (only when the fallback does a full
+                # remote-reference swap rather than an env-var transport override, which
+                # preserves the session name — see "Fallback Remote Pipeline" in CLAUDE.md)
+                # the fallback's own reference. Each has its OWN separate bisync listing
+                # cache on disk, so a selective-folders resync must be proven against each
+                # one independently before the marker below is cleared. Same canon() as
+                # SESSION_NAME above, duplicated rather than factored into a shared function
+                # so the SESSION_NAME snippet above stays byte-for-byte what AC-RI6 expects.
+                PRIMARY_SESSION_NAME=$(python3 -c "
+            import sys
+            BS = chr(92)
+            REPLACED = ' ' + chr(9) + chr(10) + chr(12) + chr(13) + BS + '/:?*'
+            def canon(p):
+                p = p.strip('/' + BS)
+                return ''.join('_' if ch in REPLACED else ch for ch in p)
+            print(canon(sys.argv[1]) + '..' + canon(sys.argv[2]))
+            " "$PRIMARY_REMOTE_REF" "$LOCAL_PATH")
+                REQUIRED_SESSIONS=("$PRIMARY_SESSION_NAME")
+                # Mirrors the EXACT condition the fallback block above uses to decide between an
+                # env-var transport override (same session, same listings) and swapping the whole
+                # REMOTE reference (a distinct session): a non-empty FALLBACK_PATH forces a full
+                # swap even when the wire type is otherwise identical (FALLBACK_REQUIRES_CACHE_REBUILD
+                # stays false in that case — it only tracks a wire-type difference).
+                if [[ -n "$FALLBACK_REMOTE" ]] && [[ -n "$FALLBACK_PATH" || "$FALLBACK_REQUIRES_CACHE_REBUILD" == "true" || "$FALLBACK_REQUIRES_CACHE_REBUILD" == "True" ]]; then
+                    FALLBACK_SESSION_NAME=$(python3 -c "
+            import sys
+            BS = chr(92)
+            REPLACED = ' ' + chr(9) + chr(10) + chr(12) + chr(13) + BS + '/:?*'
+            def canon(p):
+                p = p.strip('/' + BS)
+                return ''.join('_' if ch in REPLACED else ch for ch in p)
+            print(canon(sys.argv[1]) + '..' + canon(sys.argv[2]))
+            " "${FALLBACK_REMOTE}:${FALLBACK_PATH:-$REMOTE_PATH}" "$LOCAL_PATH")
+                    if [[ "$FALLBACK_SESSION_NAME" != "${REQUIRED_SESSIONS[0]}" ]]; then
+                        REQUIRED_SESSIONS+=("$FALLBACK_SESSION_NAME")
+                    fi
+                fi
+
+                # Selective-folders resync marker (see SyncSetupService.writeExcludeFilter /
+                # CLAUDE.md "Critical Rule 7"): a token file dropped NEXT TO the filter file
+                # right after an include-folder edit changes the compiled rules on an enabled
+                # bisync profile. Reading it here (under the lock, before deciding bootstrap
+                # args) and only clearing it later if its content is UNCHANGED means a marker
+                # that lands mid-run re-arms the NEXT run instead of being silently swallowed.
+                # RESYNC_CONSUMED tracks which of REQUIRED_SESSIONS have already run their
+                # one-time resync for the CURRENT token, so a fallback session (its own,
+                # separate bisync listings) succeeding first can never clear the marker out
+                # from under a primary session that hasn't run its own resync yet, or vice
+                # versa.
+                RESYNC_MARKER=""
+                RESYNC_TOKEN=""
+                RESYNC_CONSUMED=""
+                RESYNC_ALREADY_CONSUMED=""
+                if [[ "$FILTER_FILE" == *-exclude.txt ]]; then
+                    RESYNC_MARKER="${FILTER_FILE%-exclude.txt}.resync-pending"
+                    RESYNC_CONSUMED="${RESYNC_MARKER}.consumed"
+                    if [[ -e "$RESYNC_MARKER" ]]; then
+                        RESYNC_TOKEN=$(cat "$RESYNC_MARKER" 2>/dev/null || true)
+                        if [[ -n "$RESYNC_TOKEN" && -e "$RESYNC_CONSUMED" ]] \\
+                            && [[ "$(sed -n '1p' "$RESYNC_CONSUMED" 2>/dev/null)" == "$RESYNC_TOKEN" ]] \\
+                            && grep -qxF "$SESSION_NAME" <(tail -n +2 "$RESYNC_CONSUMED" 2>/dev/null); then
+                            RESYNC_ALREADY_CONSUMED=1
+                        fi
+                    fi
+                fi
+
                 BOOTSTRAP_ARGS=()
                 if [[ ! -e "$BISYNC_WORKDIR/$SESSION_NAME.path1.lst" && ! -e "$BISYNC_WORKDIR/$SESSION_NAME.path1.lst-new" ]] \\
                     || [[ ! -e "$BISYNC_WORKDIR/$SESSION_NAME.path2.lst" && ! -e "$BISYNC_WORKDIR/$SESSION_NAME.path2.lst-new" ]]; then
                     echo "$(date '+%Y-%m-%d %H:%M:%S') - Bootstrapping sync state (--resync, newer wins): first run for this transport pair" >> "$LOG_FILE"
+                    BOOTSTRAP_ARGS=(--resync --resync-mode newer)
+                elif [[ -n "$RESYNC_TOKEN" && -z "$RESYNC_ALREADY_CONSUMED" ]]; then
+                    echo "$(date '+%Y-%m-%d %H:%M:%S') - Bootstrapping sync state (--resync, newer wins): sync folders changed" >> "$LOG_FILE"
                     BOOTSTRAP_ARGS=(--resync --resync-mode newer)
                 fi
 
@@ -1707,6 +1789,29 @@ final class SyncSetupService {
             if [[ $EXIT_CODE -eq 0 ]]; then
                 if [[ "$SYNC_MODE" == "bisync" ]]; then
                     echo "$(date '+%Y-%m-%d %H:%M:%S') - Bisync completed successfully" >> "$LOG_FILE"
+                    # Record this run's resync, and clear the marker ONLY once every session
+                    # this profile could ever run under has consumed it — never just because
+                    # THIS session (primary or fallback) happened to succeed first.
+                    # Only if the marker still holds the SAME token we read at the top of
+                    # this run: an edit that lands mid-run writes a fresh token, so this
+                    # run's success must not erase the later edit's pending state.
+                    if [[ -n "$RESYNC_TOKEN" && -e "$RESYNC_MARKER" ]]; then
+                        CURRENT_RESYNC_TOKEN=$(cat "$RESYNC_MARKER" 2>/dev/null || true)
+                        if [[ "$CURRENT_RESYNC_TOKEN" == "$RESYNC_TOKEN" ]]; then
+                            if [[ ! -e "$RESYNC_CONSUMED" ]] || [[ "$(sed -n '1p' "$RESYNC_CONSUMED" 2>/dev/null)" != "$RESYNC_TOKEN" ]]; then
+                                printf '%s\n' "$RESYNC_TOKEN" > "$RESYNC_CONSUMED"
+                            fi
+                            grep -qxF "$SESSION_NAME" "$RESYNC_CONSUMED" 2>/dev/null || echo "$SESSION_NAME" >> "$RESYNC_CONSUMED"
+
+                            ALL_SESSIONS_CONSUMED=1
+                            for required_session in "${REQUIRED_SESSIONS[@]}"; do
+                                grep -qxF "$required_session" "$RESYNC_CONSUMED" 2>/dev/null || ALL_SESSIONS_CONSUMED=0
+                            done
+                            if [[ "$ALL_SESSIONS_CONSUMED" == "1" ]]; then
+                                rm -f "$RESYNC_MARKER" "$RESYNC_CONSUMED"
+                            fi
+                        fi
+                    fi
                 else
                     echo "$(date '+%Y-%m-%d %H:%M:%S') - Sync completed successfully" >> "$LOG_FILE"
                 fi
@@ -1933,9 +2038,11 @@ final class SyncSetupService {
     }
 
     /// Write the exclude filter file for a profile: the default rules when the file doesn't
-    /// exist yet (a user's own edits are never overwritten afterwards), plus the managed
-    /// "Don't Sync" block regenerated from `profile.syncExcludePatterns`. Touches the file only
-    /// when its content actually changes, and never for mount profiles (no filter file).
+    /// exist yet (a user's own edits are never overwritten afterwards), the managed "Don't
+    /// Sync" head block regenerated from `profile.syncExcludePatterns`, and the managed "Sync
+    /// Only These Folders" tail block regenerated from `profile.syncIncludeFolders`. Touches
+    /// the file only when its content actually changes, and never for mount profiles (no
+    /// filter file).
     ///
     /// An existing file that can't be read as UTF-8 text is left untouched (never replaced
     /// with the defaults) and reported by throwing `SetupError.excludeFilterUnreadable`, so
@@ -1944,9 +2051,20 @@ final class SyncSetupService {
     ///
     /// The sync script reads this file on every run (`--filter-from`), so a change applies to
     /// the next sync with no reinstall, and without stopping a sync in progress.
-    /// - Parameter path: where to write; defaults to `profile.filterFilePath` (a different
-    ///   path lets `ConfigSelfTest` exercise the real write without touching `~/.config`).
-    func writeExcludeFilter(for profile: SyncProfile, at path: String? = nil) throws {
+    ///
+    /// When the write actually changes the compiled include rules on an ENABLED bisync
+    /// profile, a fresh token is written to the resync-pending marker right BEFORE the filter
+    /// file — the script-consumed signal (see CLAUDE.md "Critical Rule 7") that the next
+    /// bisync run should `--resync --resync-mode newer` instead of its usual incremental sync.
+    /// (Marker-before-filter, not after: see the comment at the write site for why.)
+    /// One-way profiles, and a filter write that doesn't change the include rules, never touch
+    /// the marker.
+    /// - Parameters:
+    ///   - path: where to write the filter; defaults to `profile.filterFilePath` (a different
+    ///     path lets `ConfigSelfTest` exercise the real write without touching `~/.config`).
+    ///   - markerPath: where to write the resync-pending token; defaults to
+    ///     `profile.resyncPendingPath` (overridable for the same self-test reason).
+    func writeExcludeFilter(for profile: SyncProfile, at path: String? = nil, resyncMarkerAt markerPath: String? = nil) throws {
         guard !profile.isMountMode else { return }
         let filterPath = path ?? profile.filterFilePath
         var existing: String?
@@ -1958,11 +2076,28 @@ final class SyncSetupService {
             }
             existing = text
         }
+        let previousIncludeRules = SyncExcludeFilter.includeRules(in: existing ?? "")
         let updated = SyncExcludeFilter.merged(
             existing: existing ?? Self.defaultExcludeFilter,
-            patterns: profile.syncExcludePatterns
+            patterns: profile.syncExcludePatterns,
+            includeFolders: profile.syncIncludeFolders
         )
         guard updated != existing else { return }
+
+        // Marker before filter, deliberately: once the filter write below lands, a later
+        // call recomputes `updated` against the now-current file and can equal `existing`
+        // again, hitting the guard above and returning before ever reaching the marker —
+        // silently losing a resync schedule and eventually tripping bisync's --max-delete
+        // abort. Writing the marker first means a mid-write failure here still leaves the
+        // filter unwritten, so the NEXT call re-enters this same branch and retries both;
+        // the only failure direction that survives a retry gap is an extra, harmless
+        // resync (never a missed one).
+        let includeRulesChanged = previousIncludeRules != SyncExcludeFilter.includeRules(in: updated)
+        if includeRulesChanged, profile.syncMode == .bisync {
+            let resolvedMarkerPath = markerPath ?? profile.resyncPendingPath
+            try UUID().uuidString.write(toFile: resolvedMarkerPath, atomically: true, encoding: .utf8)
+        }
+
         try updated.write(toFile: filterPath, atomically: true, encoding: .utf8)
     }
 
@@ -2046,6 +2181,14 @@ enum SyncExcludeFilter {
     static let beginMarker = "# >>> SyncTray \"Don't Sync\" patterns (managed: edit them in SyncTray's profile settings)"
     static let endMarker = "# <<< SyncTray \"Don't Sync\" patterns"
 
+    /// Markers for the "Sync Only These Folders" TAIL block (selective folders, Option A).
+    /// Placed at the END of the filter file — after the head "Don't Sync" block and every
+    /// line the user wrote themselves — so every exclude still wins first-match, and the
+    /// trailing `- **` this block ends with only ever excludes what nothing above already
+    /// decided about.
+    static let includeBeginMarker = "# >>> SyncTray \"Sync Only These Folders\" (managed: edit them in SyncTray's profile settings)"
+    static let includeEndMarker = "# <<< SyncTray \"Sync Only These Folders\""
+
     /// The rclone globs (without the `- ` prefix) that exclude exactly the files `pattern`
     /// matches under SyncTray's matcher. Empty for a blank pattern, or one containing a line
     /// break (which would corrupt the filter file).
@@ -2101,31 +2244,106 @@ enum SyncExcludeFilter {
         return patterns.flatMap { rcloneRules(for: $0) }.filter { seen.insert($0).inserted }
     }
 
-    /// `existing` filter-file text with the managed block regenerated from `patterns`, or
-    /// removed when they yield no rules. The block goes first because rclone applies the first
-    /// rule that matches, so a "Don't Sync" pattern wins even over a hand-written `+` include
-    /// further down. Everything outside the block is kept as written. Idempotent.
-    static func merged(existing: String, patterns: [String]) -> String {
-        let userContent = droppingLeadingBlankLines(strippingManagedBlock(from: existing))
+    /// `existing` filter-file text with the "Don't Sync" HEAD block regenerated from
+    /// `patterns`, the "Sync Only These Folders" TAIL block regenerated from `includeFolders`,
+    /// or either removed when it yields no rules. The exclude block goes first because rclone
+    /// applies the first rule that matches, so a "Don't Sync" pattern wins even over a
+    /// hand-written `+` include further down; the include block goes last so its closing
+    /// `- **` only excludes what nothing above it already decided about. Everything outside
+    /// both blocks is kept as written, in place. Idempotent. `includeFolders` defaults to `[]`
+    /// so existing call sites (and their byte-for-byte expectations) are unaffected.
+    static func merged(existing: String, patterns: [String], includeFolders: [String] = []) -> String {
+        let withoutExcludeBlock = strippingManagedBlock(from: existing, begin: beginMarker, end: endMarker)
+        // Stripping a managed block that was actually present can leave its one-blank-line
+        // separator attached to the trailing end of what's left — detect that case BEFORE
+        // stripping, so the trim below only ever removes a stripping artifact, never a
+        // hand-edited file's own genuine trailing newline (AC-3: an input with no tail block at
+        // all, and no folders requested, must come back byte-identical).
+        let hadIncludeBlock = withoutExcludeBlock.contains(includeBeginMarker)
+        let withoutEitherBlock = strippingManagedBlock(from: withoutExcludeBlock, begin: includeBeginMarker, end: includeEndMarker)
+        let leadingTrimmed = droppingLeadingBlankLines(withoutEitherBlock)
+        let userContent = hadIncludeBlock ? droppingTrailingBlankLines(leadingTrimmed) : leadingTrimmed
         let excludeRules = Self.rules(for: patterns)
-        guard !excludeRules.isEmpty else { return userContent }
-        let block = ([beginMarker] + excludeRules.map { "- \($0)" } + [endMarker]).joined(separator: "\n")
-        return userContent.isEmpty ? block + "\n" : block + "\n\n" + userContent
+        let folderRules = includeRules(for: includeFolders)
+
+        // No folders: preserve the exact pre-existing behavior and byte output (AC-3).
+        guard !folderRules.isEmpty else {
+            guard !excludeRules.isEmpty else { return userContent }
+            let block = ([beginMarker] + excludeRules.map { "- \($0)" } + [endMarker]).joined(separator: "\n")
+            return userContent.isEmpty ? block + "\n" : block + "\n\n" + userContent
+        }
+
+        // A tail block is about to be appended right after this content with its own "\n\n"
+        // separator, so any trailing blank line already on `userContent` (e.g. the FIRST time
+        // folders are added to a hand-edited file that happened to end in a blank line — no
+        // include block existed yet, so the AC-3 trim above did not apply) would double up into
+        // an extra blank line that a later re-merge (which WOULD now see a prior include block)
+        // would trim away — breaking idempotency. Always trim here; a no-op if already trimmed.
+        let trimmedUserContent = droppingTrailingBlankLines(userContent)
+        var sections: [String] = []
+        if !excludeRules.isEmpty {
+            sections.append(([beginMarker] + excludeRules.map { "- \($0)" } + [endMarker]).joined(separator: "\n"))
+        }
+        if !trimmedUserContent.isEmpty {
+            sections.append(trimmedUserContent)
+        }
+        sections.append(([includeBeginMarker] + folderRules + [includeEndMarker]).joined(separator: "\n"))
+        return sections.joined(separator: "\n\n") + "\n"
     }
 
-    /// `text` without SyncTray's managed block. A block whose end marker was deleted by hand
-    /// ends at the first blank line, so the user's own rules below it survive.
-    static func strippingManagedBlock(from text: String) -> String {
+    /// `text` without the managed block delimited by `begin`/`end`. A block whose end marker
+    /// was deleted by hand ends at the first blank line, so the user's own rules below it
+    /// survive.
+    static func strippingManagedBlock(from text: String, begin: String = beginMarker, end: String = endMarker) -> String {
         var lines = text.components(separatedBy: "\n")
         func isLine(_ line: String, _ marker: String) -> Bool {
             line.trimmingCharacters(in: .whitespacesAndNewlines) == marker
         }
-        guard let start = lines.firstIndex(where: { isLine($0, beginMarker) }) else { return text }
-        let end = lines[start...].firstIndex(where: { isLine($0, endMarker) })
+        guard let start = lines.firstIndex(where: { isLine($0, begin) }) else { return text }
+        let blockEnd = lines[start...].firstIndex(where: { isLine($0, end) })
             ?? lines[start...].firstIndex(where: { $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }).map { $0 - 1 }
             ?? lines.count - 1
-        lines.removeSubrange(start...end)
+        lines.removeSubrange(start...blockEnd)
         return lines.joined(separator: "\n")
+    }
+
+    /// One `+ /<escaped>/**` rule per folder followed by a single trailing `- **` that excludes
+    /// everything else — the tail block that implements "sync only these folders". rclone
+    /// auto-adds the parent-directory rules a nested selection (`a/b`) needs to traverse down
+    /// to it. Returns `[]` for an empty list (today's "sync everything" behaviour).
+    static func includeRules(for folders: [String]) -> [String] {
+        guard !folders.isEmpty else { return [] }
+        return folders.map { "+ /\(rcloneLiteral($0))/**" } + ["- **"]
+    }
+
+    /// The lines inside the "Sync Only These Folders" tail block of `text` (`[]` if absent) —
+    /// used to detect whether an edit actually changed the compiled include rules, so the
+    /// bisync resync marker (see `SyncSetupService.writeExcludeFilter`) is written only on a
+    /// real change, never on an unrelated filter-file rewrite.
+    static func includeRules(in text: String) -> [String] {
+        let lines = text.components(separatedBy: "\n")
+        func isLine(_ line: String, _ marker: String) -> Bool {
+            line.trimmingCharacters(in: .whitespacesAndNewlines) == marker
+        }
+        guard let start = lines.firstIndex(where: { isLine($0, includeBeginMarker) }) else { return [] }
+        let contentStart = start + 1
+        let blockEnd = lines[start...].firstIndex(where: { isLine($0, includeEndMarker) })
+            ?? lines[start...].firstIndex(where: { $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }).map { $0 - 1 }
+            ?? lines.count - 1
+        guard contentStart <= blockEnd else { return [] }
+        return Array(lines[contentStart...blockEnd])
+    }
+
+    /// Escapes rclone filter-pattern syntax characters in a literal folder-path segment —
+    /// `* ? [ ] { } \` — a superset of `rcloneGlob`'s escape set, since an include folder is a
+    /// literal path with no glob semantics of its own (wildcards belong in `syncExcludePatterns`).
+    static func rcloneLiteral(_ value: String) -> String {
+        var out = ""
+        for char in value {
+            if "*?[]{}\\".contains(char) { out.append("\\") }
+            out.append(char)
+        }
+        return out
     }
 
     private static func droppingLeadingBlankLines(_ text: String) -> String {
@@ -2133,6 +2351,20 @@ enum SyncExcludeFilter {
         while let first = lines.first, lines.count > 1,
               first.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             lines.removeFirst()
+        }
+        if lines.count == 1, lines[0].trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return "" }
+        return lines.joined(separator: "\n")
+    }
+
+    /// Mirrors `droppingLeadingBlankLines` from the other end — needed because, with a managed
+    /// block on both sides of the user's own content (head exclude + tail include), the
+    /// separator blank line next to the TAIL block can be left attached to the end of the
+    /// stripped user content.
+    private static func droppingTrailingBlankLines(_ text: String) -> String {
+        var lines = text.components(separatedBy: "\n")
+        while let last = lines.last, lines.count > 1,
+              last.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            lines.removeLast()
         }
         if lines.count == 1, lines[0].trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return "" }
         return lines.joined(separator: "\n")

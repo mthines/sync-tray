@@ -166,6 +166,16 @@ For Two-Way and One-Way profiles, skip files you don't want synced with the same
 - Patterns are case-sensitive and apply from the next sync, with no re-sync
 - Stored as rclone exclude rules in a SyncTray-managed block at the top of the profile's exclude filter file; changing the list rewrites only that block
 
+### Sync Only These Folders
+
+For Two-Way and One-Way profiles, the inverse of **Don't Sync**: instead of excluding a few folders, sync ONLY the folders you list — everything else is left alone.
+
+- Pick folders with the multi-select remote folder browser (rooted at your profile's remote path) or type paths manually, relative to the profile's root — for example `Projects/Active` or `Documents`
+- Leave the list empty to sync everything (the default) — this is fully opt-in
+- Stored as rclone include rules in a second SyncTray-managed block at the **bottom** of the profile's exclude filter file (the "Don't Sync" block stays at the top, so its excludes still win)
+- **Two-Way (bisync) profiles**: changing this list schedules a one-time safe resync (`--resync --resync-mode newer`, the newer copy wins on conflict) on the next sync, instead of discarding the profile's sync history — so narrowing or widening the folder list never confuses bisync about what it last saw
+- **One-Way profiles**: takes effect on the next sync with no resync needed
+
 ### One-Click Actions
 
 - **Sync Now**: Trigger immediate sync for all enabled profiles
