@@ -5045,6 +5045,19 @@ enum ConfigSelfTest {
             return report(name, slug, false, "(marker token did not refresh on a real include-rule change)")
         }
 
+        // The token guard is keyed on the INCLUDE rules specifically — a filter-changing edit
+        // that leaves the include folders alone (e.g. a "Don't Sync" pattern change on the
+        // same profile) must rewrite the file WITHOUT touching the marker.
+        bisync.syncExcludePatterns = ["*.bak"]
+        try? SyncSetupService.shared.writeExcludeFilter(for: bisync, at: filterPath, resyncMarkerAt: markerPath)
+        guard let filterAfterPatternChange = try? String(contentsOfFile: filterPath, encoding: .utf8),
+              filterAfterPatternChange.contains("*.bak") else {
+            return report(name, slug, false, "(exclude-pattern change did not rewrite the filter)")
+        }
+        guard (try? String(contentsOfFile: markerPath, encoding: .utf8)) == token2 else {
+            return report(name, slug, false, "(an exclude-pattern-only change wrongly refreshed the resync marker)")
+        }
+
         // One-way profiles never get a marker.
         let oneWayFilter = "\(dir)/oneway-exclude.txt"
         let oneWayMarker = "\(dir)/oneway.resync-pending"
