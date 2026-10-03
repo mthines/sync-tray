@@ -106,6 +106,7 @@ enum ConfigSelfTest {
             testMountModeParse,
             testWarmMenuBarSummary,
             testWarmAutoPauseReaders,
+            testMountModeTransitionText,
             testMountNoFallbackOverride,
             testCacheSuffixConsolidation,
             testCacheSuffixPairSafety,
@@ -2857,6 +2858,17 @@ enum ConfigSelfTest {
             return report("AC-WV2", "warm-auto-pause", false, "(nil lsof must not pause)")
         }
         return report("AC-WV2", "warm-auto-pause", true)
+    }
+
+    // MARK: - AC-MT1 — Cache Only ↔ Streaming switch shows a direction-aware transition
+
+    private static func testMountModeTransitionText() -> Bool {
+        guard SyncManager.MountModeTransition.enteringCacheOnly.statusText == "Switching to Cache Only…",
+              SyncManager.MountModeTransition.resuming.statusText == "Resuming syncing…"
+        else {
+            return report("AC-MT1", "mount-mode-transition", false, "(transition status text mismatch)")
+        }
+        return report("AC-MT1", "mount-mode-transition", true)
     }
 
     // MARK: - AC-CK2 — mount mode never streams through the fallback

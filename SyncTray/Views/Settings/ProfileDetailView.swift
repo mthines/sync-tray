@@ -1549,12 +1549,21 @@ struct ProfileDetailView: View {
     /// sync-oriented Sync Now / Pause controls.
     private var mountManagementSection: some View {
         let mountState = syncManager.mountState(for: profile.id)
+        // A Cache Only ↔ Streaming switch in flight. While set, the mount state is still
+        // `.mounted` but the persisted flag has flipped, so show one "switching" row
+        // instead of the contradictory Streaming + Cache-only status underneath.
+        let transition = syncManager.mountTransitions[profile.id]
         return VStack(alignment: .leading, spacing: 12) {
             // Status
             HStack(spacing: 8) {
                 if !isInstalled {
                     Label("Not installed", systemImage: "circle.dashed")
                         .foregroundColor(.secondary)
+                } else if let transition {
+                    ProgressView().controlSize(.small)
+                    Text(transition.statusText)
+                        .foregroundStyle(.blue)
+                        .lineLimit(2)
                 } else {
                     switch mountState {
                     case .mounting:
@@ -1584,8 +1593,9 @@ struct ProfileDetailView: View {
             }
 
             // Cache-only is applied immediately (see `setCacheOnly`), so the persisted
-            // profile is the truth here — never the form buffer.
-            if isInstalled, profile.streamCacheOnly {
+            // profile is the truth here — never the form buffer. Hidden mid-switch: the
+            // "switching" row above already says where the mount is heading.
+            if isInstalled, profile.streamCacheOnly, transition == nil {
                 VStack(alignment: .leading, spacing: 2) {
                     Label("Cache only — not syncing", systemImage: "icloud.slash")
                         .font(.caption.weight(.medium))
@@ -1598,7 +1608,7 @@ struct ProfileDetailView: View {
             // Mounted-at + volume details. Use the persisted profile values (what
             // the running daemon was installed with), not the form's @State edit
             // buffers, so unsaved edits don't misrepresent the live mount.
-            if isInstalled, mountState == .mounted {
+            if isInstalled, mountState == .mounted, transition == nil {
                 VStack(alignment: .leading, spacing: 2) {
                     Text("Mounted at: \(profile.localSyncPath)")
                     Text("Volume: \((profile.localSyncPath as NSString).lastPathComponent)  ·  Cache: \(profile.vfsCacheMaxSize) / \(profile.vfsCacheMaxAge)")
@@ -1634,25 +1644,27 @@ struct ProfileDetailView: View {
                             Label("Unmount", systemImage: "eject.fill")
                         }
                         .buttonStyle(.borderedProminent)
+                        .disabled(transition != nil)
                     } else {
                         Button(action: { syncManager.mountProfile(profile) }) {
                             Label("Mount", systemImage: "externaldrive.fill.badge.plus")
                         }
                         .buttonStyle(.borderedProminent)
-                        .disabled(mountState == .mounting)
+                        .disabled(mountState == .mounting || transition != nil)
                     }
 
                     cacheOnlyButton(mountState: mountState)
+                        .disabled(transition != nil)
 
                     Button(action: { showingUninstallConfirm = true }) {
                         Label("Uninstall", systemImage: "trash")
                     }
-                    .disabled(mountState == .mounting)
+                    .disabled(mountState == .mounting || transition != nil)
 
                     Button(action: { showingReinstallConfirm = true }) {
                         Label("Reinstall", systemImage: "arrow.clockwise")
                     }
-                    .disabled(!canInstall || isInstalling || mountState == .mounting)
+                    .disabled(!canInstall || isInstalling || mountState == .mounting || transition != nil)
                 } else {
                     Button(action: installSync) {
                         if isInstalling {

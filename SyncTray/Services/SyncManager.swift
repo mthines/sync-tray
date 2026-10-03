@@ -132,6 +132,30 @@ final class SyncManager: ObservableObject {
     /// Now's keep), keyed by profile. Drives the Cache Only status card's progress bar.
     @Published private(set) var overlayUploadProgress: [UUID: OverlaySyncService.OverlayUploadProgress] = [:]
 
+    /// A Stream profile mid-switch between Streaming and Cache Only. The switch is a
+    /// remount (unmount → [reachability probe + overlay drain, when resuming] → mount)
+    /// that takes several seconds; during it `profileMountStates` is still `.mounted`
+    /// and the persisted `streamCacheOnly` flag has ALREADY flipped — so without this
+    /// signal the status card shows a contradictory "Streaming + Cache only" state that
+    /// looks ready immediately. Set the instant the user taps, cleared when the remount
+    /// settles (or when a resume aborts because the primary is unreachable).
+    @Published private(set) var mountTransitions: [UUID: MountModeTransition] = [:]
+
+    /// Direction of an in-flight Cache Only ↔ Streaming switch. The display text is a
+    /// pure function of the case so it can be unit-tested (AC-MT1).
+    enum MountModeTransition: Equatable {
+        case enteringCacheOnly
+        case resuming
+
+        /// Status-row label shown while the switch is in flight.
+        var statusText: String {
+            switch self {
+            case .enteringCacheOnly: return "Switching to Cache Only…"
+            case .resuming:          return "Resuming syncing…"
+            }
+        }
+    }
+
     /// In-flight overlay-upload tasks, so a second start (e.g. a rapid double-tap of
     /// "Upload Now") supersedes rather than races the previous one.
     private var overlayUploadTasks: [UUID: Task<Void, Never>] = [:]
@@ -470,6 +494,7 @@ final class SyncManager: ObservableObject {
                 if setupService.isMounted(profile: profile) {
                     await MainActor.run {
                         profileMountStates[profile.id] = .mounted
+                        mountTransitions[profile.id] = nil
                     }
                     return
                 }
@@ -529,6 +554,9 @@ final class SyncManager: ObservableObject {
                         : "Mount did not establish within 5 minutes"
                     await MainActor.run {
                         profileMountProgress[profile.id] = nil
+                        // The mode switch (if any) is done once the remount settles,
+                        // either way — clear the "Switching…/Resuming…" indicator.
+                        mountTransitions[profile.id] = nil
                         if established {
                             profileMountStates[profile.id] = .mounted
                             TelemetryService.shared.recordMountOperation(
@@ -565,6 +593,7 @@ final class SyncManager: ObservableObject {
                 } else {
                     await MainActor.run {
                         profileMountStates[profile.id] = .failed("Failed to start mount agent")
+                        mountTransitions[profile.id] = nil
                         TelemetryService.shared.recordMountOperation(
                             profileId: profile.id,
                             profileName: profile.name,
@@ -3811,6 +3840,9 @@ final class SyncManager: ObservableObject {
             profileStore.update(updated)
             try? setupService.updateConfig(for: updated)
             TelemetryService.shared.recordSettingChanged(name: "stream_cache_only", enabled: true)
+            // Show the switch immediately — the remount below is several seconds of
+            // unmount + mount during which the mount state is still `.mounted`.
+            mountTransitions[profileId] = .enteringCacheOnly
             // Freshen the partial-file list from the streaming cache as it is right now,
             // before the remount: the script falls back to this copy when it can't read the
             // cache itself (see `refreshCacheOnlyExcludeLists`).
@@ -3823,6 +3855,10 @@ final class SyncManager: ObservableObject {
 
         guard !resumingFromCacheOnly.contains(profileId) else { return }
         resumingFromCacheOnly.insert(profileId)
+        // Show the switch immediately — it starts with a reachability probe and (when the
+        // primary is up) an overlay drain before the remount, all with the mount still
+        // `.mounted`. Cleared when the remount settles, or here if the resume aborts.
+        mountTransitions[profileId] = .resuming
 
         Task {
             defer { Task { @MainActor in self.resumingFromCacheOnly.remove(profileId) } }
@@ -3833,6 +3869,9 @@ final class SyncManager: ObservableObject {
                 updated.streamCacheOnly = false
                 self.profileStore.update(updated)
                 try? self.setupService.updateConfig(for: updated)
+                // No remount happens on this path (the mount stays Cache Only, relabelled
+                // for auto-resume), so clear the transition here or it would spin forever.
+                self.mountTransitions[profileId] = nil
                 TelemetryService.shared.recordSettingChanged(name: "stream_cache_only", enabled: false)
                 TelemetryService.shared.recordOverlayUploadUnreachable(
                     profileId: profile.id, profileName: profile.name, trigger: "resume")
