@@ -12,6 +12,9 @@
 #   GITHUB_TOKEN        - For `gh release create`
 #   HOMEBREW_TAP_TOKEN  - PAT with repo scope on mthines/homebrew-synctray
 #   DASH0_AUTH_TOKEN    - Embedded into the Release build (optional but warns if missing)
+#   MACOS_CERTIFICATE_P12_BASE64, MACOS_CERTIFICATE_PASSWORD,
+#   NOTARY_KEY_P8_BASE64, NOTARY_KEY_ID, NOTARY_ISSUER_ID
+#                       - Developer ID signing + notarization (required unless DRY_RUN)
 #
 # Optional env:
 #   PR_NUMBER           - Required when IS_BETA=true

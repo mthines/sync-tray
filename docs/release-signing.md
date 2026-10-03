@@ -78,8 +78,8 @@ Repo → **Settings → Secrets and variables → Actions → New repository sec
 | `NOTARY_ISSUER_ID` | the API Issuer ID |
 
 That's it — the next release picks them up automatically. All five are required:
-the `version` job and `release-ci.sh` refuse a release (before any tag is pushed)
-when any of them is missing.
+the `version` job refuses a release before any tag is pushed when any of them is
+missing, and `release-ci.sh` checks again before it builds.
 
 ---
 

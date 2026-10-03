@@ -445,7 +445,7 @@ SyncTray creates these files (per profile):
 
 ### "App can't be opened" warning
 
-Releases are notarized, so this should only happen with a build you compiled yourself or an old (pre-notarization) release. Update to the latest release, or for a local build open it once, then allow it under **System Settings → Privacy & Security → Open Anyway** (on macOS 14 and earlier, right-click the app → **Open** also works). Avoid `xattr -cr` on a downloaded app: it strips the quarantine flag and skips Gatekeeper's checks entirely.
+Releases are notarized, so this should only happen with an old (pre-notarization) release or a downloaded build that isn't notarized. Update to the latest release. To open a build you trust anyway, open it once, then allow it under **System Settings → Privacy & Security → Open Anyway** (on macOS 14 and earlier, right-click the app → **Open** also works). Avoid `xattr -cr` on a downloaded app: it strips the quarantine flag and skips Gatekeeper's checks entirely.
 
 ### Sync shows error state
 
