@@ -4811,6 +4811,23 @@ enum ConfigSelfTest {
             return report(name, slug, false, "(empty-folder merge stripped a trailing newline, breaking byte identity)")
         }
 
+        // The FIRST time folders are added to a file that ends in a trailing newline and has no
+        // prior include block, the result must still be idempotent — a naive implementation can
+        // double up a blank line in front of the new tail block on pass 1 (no include block yet,
+        // so the AC-3 trim above doesn't fire) and then trim it away on pass 2 (now there IS a
+        // prior include block), producing two different outputs for the same input.
+        let firstAddWithTrailingNewline = SyncExcludeFilter.merged(existing: trailingNewlineInput, patterns: [], includeFolders: ["Keep"])
+        guard SyncExcludeFilter.merged(existing: firstAddWithTrailingNewline, patterns: [], includeFolders: ["Keep"]) == firstAddWithTrailingNewline else {
+            return report(name, slug, false, "(first-time add with a trailing newline is not idempotent:\n\(firstAddWithTrailingNewline))")
+        }
+        // Clearing back to no folders restores the user's own lines (not necessarily their
+        // exact original trailing-newline byte, which is ambiguous to recover once it has been
+        // wrapped by a tail block and stripped again — that exact-byte guarantee is AC-3's, and
+        // only holds for an include list that was EMPTY all along, asserted above).
+        guard SyncExcludeFilter.merged(existing: firstAddWithTrailingNewline, patterns: [], includeFolders: []) == "- a\n- b" else {
+            return report(name, slug, false, "(clearing after a first-time add with a trailing newline lost user content:\n\(firstAddWithTrailingNewline))")
+        }
+
         return report(name, slug, true)
     }
 
@@ -5100,6 +5117,50 @@ enum ConfigSelfTest {
         let scriptSource = SyncSetupService.shared.generateSyncScript()
         guard scriptSource.contains(#"if [[ "$CURRENT_RESYNC_TOKEN" == "$RESYNC_TOKEN" ]]; then"#) else {
             return report(name, slug, false, "(script's marker removal no longer guards on an unchanged token)")
+        }
+
+        // The REQUIRED_SESSIONS computation must flag a fallback as its OWN distinct bisync
+        // session not only when FALLBACK_REQUIRES_CACHE_REBUILD is true (a wire-type change),
+        // but also whenever FALLBACK_PATH is set — the fallback block above (same script) swaps
+        // the entire REMOTE reference in EITHER case, so REQUIRED_SESSIONS must mirror exactly
+        // the same condition or a same-wire-type fallback with its own path silently falls back
+        // to single-session (pre-fix) behavior. Extract the real snippet and run it for real
+        // rather than asserting on source text, so a change to the condition's wording can't
+        // pass this check while still being wrong.
+        guard let snippetStart = scriptSource.range(of: "PRIMARY_SESSION_NAME=$(python3 -c \"") else {
+            return report(name, slug, false, "(REQUIRED_SESSIONS snippet not found in the sync script)")
+        }
+        guard let snippetEnd = scriptSource.range(of: "# Selective-folders resync marker",
+                                                   range: snippetStart.upperBound..<scriptSource.endIndex) else {
+            let tail = String(scriptSource[snippetStart.lowerBound...].prefix(600))
+            return report(name, slug, false, "(REQUIRED_SESSIONS end marker not found; text after start:\n\(tail))")
+        }
+        let requiredSessionsSnippet = String(scriptSource[snippetStart.lowerBound..<snippetEnd.lowerBound])
+        let probe = Process()
+        probe.executableURL = URL(fileURLWithPath: "/bin/bash")
+        probe.arguments = ["-c", requiredSessionsSnippet + "\necho \"${#REQUIRED_SESSIONS[@]}|${REQUIRED_SESSIONS[*]}\""]
+        probe.environment = [
+            "PRIMARY_REMOTE_REF": "nas:Music",
+            "LOCAL_PATH": "/Users/me/Music",
+            "FALLBACK_REMOTE": "nas-qc",
+            "FALLBACK_PATH": "volume1/Music",
+            "FALLBACK_REQUIRES_CACHE_REBUILD": "false",
+        ]
+        let probeOut = Pipe()
+        probe.standardOutput = probeOut
+        probe.standardError = FileHandle.nullDevice
+        do {
+            try probe.run()
+        } catch {
+            return report(name, slug, false, "(could not run REQUIRED_SESSIONS probe: \(error))")
+        }
+        let probeData = probeOut.fileHandleForReading.readDataToEndOfFile()
+        probe.waitUntilExit()
+        var probeResult = String(decoding: probeData, as: UTF8.self)
+        if probeResult.hasSuffix("\n") { probeResult.removeLast() }
+        let probeParts = probeResult.split(separator: "|", maxSplits: 1).map(String.init)
+        guard probe.terminationStatus == 0, probeParts.first == "2" else {
+            return report(name, slug, false, "(a same-wire-type fallback with its own FALLBACK_PATH did not get its own REQUIRED_SESSIONS entry: \(probeResult))")
         }
 
         // --- Part 2: the real generated script, run for real, against a local-backed alias remote ---

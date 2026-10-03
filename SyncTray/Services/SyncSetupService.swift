@@ -1625,7 +1625,12 @@ final class SyncSetupService {
             print(canon(sys.argv[1]) + '..' + canon(sys.argv[2]))
             " "$PRIMARY_REMOTE_REF" "$LOCAL_PATH")
                 REQUIRED_SESSIONS=("$PRIMARY_SESSION_NAME")
-                if [[ -n "$FALLBACK_REMOTE" ]] && [[ "$FALLBACK_REQUIRES_CACHE_REBUILD" == "true" || "$FALLBACK_REQUIRES_CACHE_REBUILD" == "True" ]]; then
+                # Mirrors the EXACT condition the fallback block above uses to decide between an
+                # env-var transport override (same session, same listings) and swapping the whole
+                # REMOTE reference (a distinct session): a non-empty FALLBACK_PATH forces a full
+                # swap even when the wire type is otherwise identical (FALLBACK_REQUIRES_CACHE_REBUILD
+                # stays false in that case — it only tracks a wire-type difference).
+                if [[ -n "$FALLBACK_REMOTE" ]] && [[ -n "$FALLBACK_PATH" || "$FALLBACK_REQUIRES_CACHE_REBUILD" == "true" || "$FALLBACK_REQUIRES_CACHE_REBUILD" == "True" ]]; then
                     FALLBACK_SESSION_NAME=$(python3 -c "
             import sys
             BS = chr(92)
@@ -2258,12 +2263,19 @@ enum SyncExcludeFilter {
             return userContent.isEmpty ? block + "\n" : block + "\n\n" + userContent
         }
 
+        // A tail block is about to be appended right after this content with its own "\n\n"
+        // separator, so any trailing blank line already on `userContent` (e.g. the FIRST time
+        // folders are added to a hand-edited file that happened to end in a blank line — no
+        // include block existed yet, so the AC-3 trim above did not apply) would double up into
+        // an extra blank line that a later re-merge (which WOULD now see a prior include block)
+        // would trim away — breaking idempotency. Always trim here; a no-op if already trimmed.
+        let trimmedUserContent = droppingTrailingBlankLines(userContent)
         var sections: [String] = []
         if !excludeRules.isEmpty {
             sections.append(([beginMarker] + excludeRules.map { "- \($0)" } + [endMarker]).joined(separator: "\n"))
         }
-        if !userContent.isEmpty {
-            sections.append(userContent)
+        if !trimmedUserContent.isEmpty {
+            sections.append(trimmedUserContent)
         }
         sections.append(([includeBeginMarker] + folderRules + [includeEndMarker]).joined(separator: "\n"))
         return sections.joined(separator: "\n\n") + "\n"
