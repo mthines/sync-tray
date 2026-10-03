@@ -2082,13 +2082,22 @@ final class SyncSetupService {
             includeFolders: profile.syncIncludeFolders
         )
         guard updated != existing else { return }
-        try updated.write(toFile: filterPath, atomically: true, encoding: .utf8)
 
+        // Marker before filter, deliberately: once the filter write below lands, a later
+        // call recomputes `updated` against the now-current file and can equal `existing`
+        // again, hitting the guard above and returning before ever reaching the marker —
+        // silently losing a resync schedule and eventually tripping bisync's --max-delete
+        // abort. Writing the marker first means a mid-write failure here still leaves the
+        // filter unwritten, so the NEXT call re-enters this same branch and retries both;
+        // the only failure direction that survives a retry gap is an extra, harmless
+        // resync (never a missed one).
         let includeRulesChanged = previousIncludeRules != SyncExcludeFilter.includeRules(in: updated)
         if includeRulesChanged, profile.syncMode == .bisync {
             let resolvedMarkerPath = markerPath ?? profile.resyncPendingPath
             try UUID().uuidString.write(toFile: resolvedMarkerPath, atomically: true, encoding: .utf8)
         }
+
+        try updated.write(toFile: filterPath, atomically: true, encoding: .utf8)
     }
 
     private func runCommand(_ command: String, arguments: [String]) -> (
