@@ -574,7 +574,7 @@ struct SetupWizardView: View {
                 .font(.title2)
                 .fontWeight(.semibold)
 
-            Text("SyncTray is built by one person in his spare time. Anonymous usage data tells me which sync modes people actually use, when syncs fail, and where the app gets stuck — so I can fix real problems instead of guessing.")
+            Text("SyncTray is built by one person in his spare time. Usage data tells me which sync modes people actually use, when syncs fail, and where the app gets stuck — so I can fix real problems instead of guessing.")
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
 
@@ -591,7 +591,10 @@ struct SetupWizardView: View {
                         Label("Error categories (e.g. \"timeout\", \"network\")", systemImage: "checkmark.circle.fill")
                             .foregroundStyle(.primary)
                             .labelStyle(ColoredIconLabelStyle(iconColor: .green))
-                        Label("Anonymous machine ID — not reversible to you", systemImage: "checkmark.circle.fill")
+                        Label("Your profile display names (e.g. \"Work\")", systemImage: "checkmark.circle.fill")
+                            .foregroundStyle(.primary)
+                            .labelStyle(ColoredIconLabelStyle(iconColor: .green))
+                        Label("A random install ID and a one-way hash of your Mac's ID", systemImage: "checkmark.circle.fill")
                             .foregroundStyle(.primary)
                             .labelStyle(ColoredIconLabelStyle(iconColor: .green))
                     }
@@ -611,7 +614,7 @@ struct SetupWizardView: View {
                         Label("Remote names, hostnames, or credentials", systemImage: "xmark.circle.fill")
                             .foregroundStyle(.primary)
                             .labelStyle(ColoredIconLabelStyle(iconColor: .red))
-                        Label("Your IP address or personal identifiers", systemImage: "xmark.circle.fill")
+                        Label("Your IP address, name, or email", systemImage: "xmark.circle.fill")
                             .foregroundStyle(.primary)
                             .labelStyle(ColoredIconLabelStyle(iconColor: .red))
                     }
@@ -640,7 +643,7 @@ struct SetupWizardView: View {
 
             // Action buttons — two equal-weight buttons, only tint differs
             HStack(spacing: 12) {
-                Button("Share anonymous data") {
+                Button("Share usage data") {
                     SyncTraySettings.telemetryEnabled = true
                     SyncTraySettings.telemetryBannerDismissedVersion = SyncTraySettings.currentTelemetryConsentVersion
                     TelemetryService.shared.configure()
