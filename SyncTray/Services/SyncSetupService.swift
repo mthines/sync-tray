@@ -1422,6 +1422,9 @@ final class SyncSetupService {
                               python3 -c 'import secrets; print(secrets.token_hex(32))' > "$RC_AUTH_FILE.tmp.$$" \\
                                   && mv -f "$RC_AUTH_FILE.tmp.$$" "$RC_AUTH_FILE" )
                         fi
+                        # umask only applies when mkdir creates the directory; enforce the
+                        # modes on every start so a pre-existing dir/file can't stay readable.
+                        chmod 700 "$(dirname "$RC_AUTH_FILE")" 2>/dev/null
                         chmod 600 "$RC_AUTH_FILE" 2>/dev/null
                         RC_SECRET="$(head -n 1 "$RC_AUTH_FILE" 2>/dev/null)"
                         if [[ -n "$RC_SECRET" ]]; then
