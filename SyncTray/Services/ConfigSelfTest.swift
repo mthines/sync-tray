@@ -110,6 +110,7 @@ enum ConfigSelfTest {
             testCacheSuffixEmptyDestination,
             testMountCommandQuoting,
             testScriptNoShellEval,
+            testAdditionalFlagsSplitting,
             testCacheOnlyUnionConfig,
             testCacheOnlyUnionBehaviour,
             testMountModeSelection,
@@ -3111,6 +3112,44 @@ enum ConfigSelfTest {
         let script = SyncSetupService.shared.generateSyncScript()
         guard !script.contains("eval \"$RCLONE_CMD\""), script.contains("\"${RCLONE_CMD[@]}\"") else {
             return report(name, slug, false, "(script still evals the rclone command string)")
+        }
+        return report(name, slug, true)
+    }
+
+    // MARK: - AC-SEC1b — additionalRcloneFlags: split, never evaluated, never silently dropped
+
+    /// Drives the script's real extra-flags block through the shared dry-run seam (which
+    /// sits after it): a `$(...)` token reaches rclone as literal text and never runs, and
+    /// an unparseable value (unbalanced quote) fails the run instead of running rclone
+    /// without the user's flags.
+    private static func testAdditionalFlagsSplitting() -> Bool {
+        let name = "AC-SEC1b", slug = "additional-flags-splitting"
+        let fm = FileManager.default
+        let root = "\(selfTestRoot)/sec1b-\(UUID().uuidString)"
+        let marker = "\(root)/injected"
+        let local = "\(root)/mnt", cache = "\(root)/cache", target = "\(root)/remote-target"
+        for dir in [local, cache, target] {
+            try? fm.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        }
+        let rcloneConfig = aliasRcloneConfig(name: "synology", path: target)
+
+        var literal = mountFixtureProfile(localPath: local, cachePath: cache)
+        literal.additionalRcloneFlags = "--exclude \"$(touch \(marker))\""
+        defer { try? fm.removeItem(atPath: literal.cacheOnlyConfigPath) }
+        let lit = dryRunMountScript(profile: literal, rcloneConfig: rcloneConfig)
+        guard lit.exitCode == 0, Array(lit.args.suffix(2)) == ["--exclude", "$(touch \(marker))"] else {
+            return report(name, slug, false, "(metacharacter flag value not passed literally: \(lit.args) out=\(lit.output) log=\(lit.log))")
+        }
+        guard !fm.fileExists(atPath: marker) else {
+            return report(name, slug, false, "(an additionalRcloneFlags value was executed as shell code)")
+        }
+
+        var malformed = mountFixtureProfile(localPath: local, cachePath: cache)
+        malformed.additionalRcloneFlags = "--exclude \"unterminated"
+        let bad = dryRunMountScript(profile: malformed, rcloneConfig: rcloneConfig)
+        guard bad.exitCode != 0, bad.args.isEmpty,
+              bad.log.contains("Invalid additionalRcloneFlags") else {
+            return report(name, slug, false, "(unparseable flags did not fail the run: exit=\(bad.exitCode) args=\(bad.args) log=\(bad.log))")
         }
         return report(name, slug, true)
     }
