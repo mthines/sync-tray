@@ -279,6 +279,9 @@ final class SyncSetupService {
         if !keepingSyncState, fm.fileExists(atPath: profile.resyncPendingPath) {
             try fm.removeItem(atPath: profile.resyncPendingPath)
         }
+        if !keepingSyncState, fm.fileExists(atPath: profile.resyncConsumedPath) {
+            try fm.removeItem(atPath: profile.resyncConsumedPath)
+        }
 
         // Clean up /tmp lock file
         if fm.fileExists(atPath: profile.lockFilePath) {
@@ -715,6 +718,10 @@ final class SyncSetupService {
             FALLBACK_PATH=$(parse_json "fallbackRemotePath" "")
             FALLBACK_REQUIRES_CACHE_REBUILD=$(parse_json "fallbackRequiresCacheRebuild" "false")
             REMOTE_PATH=$(parse_json "remotePath" "")
+            # Captured BEFORE the fallback block below can reassign $REMOTE to the fallback's
+            # own reference — the selective-folders resync marker (further down) needs the
+            # primary's own session name regardless of which transport this particular run uses.
+            PRIMARY_REMOTE_REF="$REMOTE"
             # Default to the kext-free NFS backend when the key is absent — the Swift
             # model decodes the same default. Keep the two in lockstep so a profile
             # whose JSON predates the mountBackend field mounts via nfsmount (no macFUSE
@@ -1598,18 +1605,66 @@ final class SyncSetupService {
                 return ''.join('_' if ch in REPLACED else ch for ch in p)
             print(canon(sys.argv[1]) + '..' + canon(sys.argv[2]))
             " "$REMOTE" "$LOCAL_PATH")
+
+                # Every DISTINCT bisync session this profile could ever run under — the
+                # primary's own reference, and (only when the fallback does a full
+                # remote-reference swap rather than an env-var transport override, which
+                # preserves the session name — see "Fallback Remote Pipeline" in CLAUDE.md)
+                # the fallback's own reference. Each has its OWN separate bisync listing
+                # cache on disk, so a selective-folders resync must be proven against each
+                # one independently before the marker below is cleared. Same canon() as
+                # SESSION_NAME above, duplicated rather than factored into a shared function
+                # so the SESSION_NAME snippet above stays byte-for-byte what AC-RI6 expects.
+                PRIMARY_SESSION_NAME=$(python3 -c "
+            import sys
+            BS = chr(92)
+            REPLACED = ' ' + chr(9) + chr(10) + chr(12) + chr(13) + BS + '/:?*'
+            def canon(p):
+                p = p.strip('/' + BS)
+                return ''.join('_' if ch in REPLACED else ch for ch in p)
+            print(canon(sys.argv[1]) + '..' + canon(sys.argv[2]))
+            " "$PRIMARY_REMOTE_REF" "$LOCAL_PATH")
+                REQUIRED_SESSIONS=("$PRIMARY_SESSION_NAME")
+                if [[ -n "$FALLBACK_REMOTE" ]] && [[ "$FALLBACK_REQUIRES_CACHE_REBUILD" == "true" || "$FALLBACK_REQUIRES_CACHE_REBUILD" == "True" ]]; then
+                    FALLBACK_SESSION_NAME=$(python3 -c "
+            import sys
+            BS = chr(92)
+            REPLACED = ' ' + chr(9) + chr(10) + chr(12) + chr(13) + BS + '/:?*'
+            def canon(p):
+                p = p.strip('/' + BS)
+                return ''.join('_' if ch in REPLACED else ch for ch in p)
+            print(canon(sys.argv[1]) + '..' + canon(sys.argv[2]))
+            " "${FALLBACK_REMOTE}:${FALLBACK_PATH:-$REMOTE_PATH}" "$LOCAL_PATH")
+                    if [[ "$FALLBACK_SESSION_NAME" != "${REQUIRED_SESSIONS[0]}" ]]; then
+                        REQUIRED_SESSIONS+=("$FALLBACK_SESSION_NAME")
+                    fi
+                fi
+
                 # Selective-folders resync marker (see SyncSetupService.writeExcludeFilter /
                 # CLAUDE.md "Critical Rule 7"): a token file dropped NEXT TO the filter file
                 # right after an include-folder edit changes the compiled rules on an enabled
                 # bisync profile. Reading it here (under the lock, before deciding bootstrap
                 # args) and only clearing it later if its content is UNCHANGED means a marker
                 # that lands mid-run re-arms the NEXT run instead of being silently swallowed.
+                # RESYNC_CONSUMED tracks which of REQUIRED_SESSIONS have already run their
+                # one-time resync for the CURRENT token, so a fallback session (its own,
+                # separate bisync listings) succeeding first can never clear the marker out
+                # from under a primary session that hasn't run its own resync yet, or vice
+                # versa.
                 RESYNC_MARKER=""
                 RESYNC_TOKEN=""
+                RESYNC_CONSUMED=""
+                RESYNC_ALREADY_CONSUMED=""
                 if [[ "$FILTER_FILE" == *-exclude.txt ]]; then
                     RESYNC_MARKER="${FILTER_FILE%-exclude.txt}.resync-pending"
+                    RESYNC_CONSUMED="${RESYNC_MARKER}.consumed"
                     if [[ -e "$RESYNC_MARKER" ]]; then
                         RESYNC_TOKEN=$(cat "$RESYNC_MARKER" 2>/dev/null || true)
+                        if [[ -n "$RESYNC_TOKEN" && -e "$RESYNC_CONSUMED" ]] \\
+                            && [[ "$(sed -n '1p' "$RESYNC_CONSUMED" 2>/dev/null)" == "$RESYNC_TOKEN" ]] \\
+                            && grep -qxF "$SESSION_NAME" <(tail -n +2 "$RESYNC_CONSUMED" 2>/dev/null); then
+                            RESYNC_ALREADY_CONSUMED=1
+                        fi
                     fi
                 fi
 
@@ -1618,7 +1673,7 @@ final class SyncSetupService {
                     || [[ ! -e "$BISYNC_WORKDIR/$SESSION_NAME.path2.lst" && ! -e "$BISYNC_WORKDIR/$SESSION_NAME.path2.lst-new" ]]; then
                     echo "$(date '+%Y-%m-%d %H:%M:%S') - Bootstrapping sync state (--resync, newer wins): first run for this transport pair" >> "$LOG_FILE"
                     BOOTSTRAP_ARGS=(--resync --resync-mode newer)
-                elif [[ -n "$RESYNC_TOKEN" ]]; then
+                elif [[ -n "$RESYNC_TOKEN" && -z "$RESYNC_ALREADY_CONSUMED" ]]; then
                     echo "$(date '+%Y-%m-%d %H:%M:%S') - Bootstrapping sync state (--resync, newer wins): sync folders changed" >> "$LOG_FILE"
                     BOOTSTRAP_ARGS=(--resync --resync-mode newer)
                 fi
@@ -1729,13 +1784,27 @@ final class SyncSetupService {
             if [[ $EXIT_CODE -eq 0 ]]; then
                 if [[ "$SYNC_MODE" == "bisync" ]]; then
                     echo "$(date '+%Y-%m-%d %H:%M:%S') - Bisync completed successfully" >> "$LOG_FILE"
-                    # Clear the resync-pending marker only if it still holds the SAME token we
-                    # read at the top of this run — an edit that lands mid-run writes a fresh
-                    # token, so this run's success must not erase the later edit's pending state.
+                    # Record this run's resync, and clear the marker ONLY once every session
+                    # this profile could ever run under has consumed it — never just because
+                    # THIS session (primary or fallback) happened to succeed first.
+                    # Only if the marker still holds the SAME token we read at the top of
+                    # this run: an edit that lands mid-run writes a fresh token, so this
+                    # run's success must not erase the later edit's pending state.
                     if [[ -n "$RESYNC_TOKEN" && -e "$RESYNC_MARKER" ]]; then
                         CURRENT_RESYNC_TOKEN=$(cat "$RESYNC_MARKER" 2>/dev/null || true)
                         if [[ "$CURRENT_RESYNC_TOKEN" == "$RESYNC_TOKEN" ]]; then
-                            rm -f "$RESYNC_MARKER"
+                            if [[ ! -e "$RESYNC_CONSUMED" ]] || [[ "$(sed -n '1p' "$RESYNC_CONSUMED" 2>/dev/null)" != "$RESYNC_TOKEN" ]]; then
+                                printf '%s\n' "$RESYNC_TOKEN" > "$RESYNC_CONSUMED"
+                            fi
+                            grep -qxF "$SESSION_NAME" "$RESYNC_CONSUMED" 2>/dev/null || echo "$SESSION_NAME" >> "$RESYNC_CONSUMED"
+
+                            ALL_SESSIONS_CONSUMED=1
+                            for required_session in "${REQUIRED_SESSIONS[@]}"; do
+                                grep -qxF "$required_session" "$RESYNC_CONSUMED" 2>/dev/null || ALL_SESSIONS_CONSUMED=0
+                            done
+                            if [[ "$ALL_SESSIONS_CONSUMED" == "1" ]]; then
+                                rm -f "$RESYNC_MARKER" "$RESYNC_CONSUMED"
+                            fi
                         fi
                     fi
                 else

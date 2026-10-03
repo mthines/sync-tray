@@ -999,6 +999,26 @@ fi`) — so a marker written by a second edit mid-run is never erased by the
 first run's own completion; the next scheduled run picks it up instead. One-way
 profiles never get a marker (there's no bisync listing to protect) and
 `uninstall` removes a stale marker when the profile is disabled or deleted.
+
+**The marker clears only once every session that could run it has consumed
+it — not just whichever session happens to succeed first.** A profile with a
+fallback remote configured (see "Fallback Remote Pipeline" below) can have
+TWO distinct bisync sessions: the primary's own, and — only when the
+fallback does a full remote-reference swap rather than an env-var transport
+override, which preserves the session name — the fallback's own. Each has
+its own separate listing cache on disk. If the primary session cleared the
+marker on its own first success, a fallback session that later activates
+would run against stale pre-edit listings with no marker to trigger its own
+resync, eventually tripping bisync's `--max-delete` safety abort. The script
+computes `REQUIRED_SESSIONS` (the primary's session name, plus the
+fallback's full-swap session name when distinct) up front and records each
+session's consumption of the current token in `{shortId}.resync-pending.consumed`
+(first line: the token; following lines: consumed session names) — the
+marker and its consumption record are deleted together only once every
+required session appears in that file. A fallback that's configured but
+never actually activates simply leaves its slot unconsumed indefinitely,
+which is correct: that session's listings haven't been resynced because that
+session has never run.
 Covered by `ConfigSelfTest` AC-SI1–AC-SI6.
 
 **Self-write suppression.** `ConfigSelfWriteRegistry` tracks the content hash
@@ -1538,7 +1558,8 @@ Priority: process env vars > `~/.config/synctray/.env` > Info.plist. Key vars: `
 |------|---------|
 | `~/.config/synctray/profiles/{shortId}.json` | Profile config |
 | `~/.config/synctray/profiles/{shortId}-exclude.txt` | Exclude filter (user-editable; SyncTray owns two managed blocks — the "Don't Sync" exclude block at the TOP and, when `syncIncludeFolders` is non-empty, the "Sync Only These Folders" include block at the BOTTOM) |
-| `~/.config/synctray/profiles/{shortId}.resync-pending` | Two-Way (bisync) profiles only, created only when `syncIncludeFolders` changes — a UUID token the sync script reads to schedule a safe `--resync --resync-mode newer` instead of a plain bisync, removed only after a successful bisync whose token still matches what the run started with |
+| `~/.config/synctray/profiles/{shortId}.resync-pending` | Two-Way (bisync) profiles only, created only when `syncIncludeFolders` changes — a UUID token the sync script reads to schedule a safe `--resync --resync-mode newer` instead of a plain bisync, removed only after every required bisync session (see `.resync-pending.consumed`) has consumed it with an unchanged token |
+| `~/.config/synctray/profiles/{shortId}.resync-pending.consumed` | Two-Way (bisync) profiles only — per-token record of which bisync session(s) have already run their one-time resync for the current `.resync-pending` token; deleted together with the marker once every required session (primary, and the fallback's own session on a full remote swap) has consumed it |
 | `~/.local/bin/synctray-sync.sh` | Shared sync script (all profiles) |
 | `~/Library/LaunchAgents/com.synctray.sync.{shortId}.plist` | launchd schedule |
 | `~/.local/log/synctray-sync-{shortId}.log` | Sync logs |

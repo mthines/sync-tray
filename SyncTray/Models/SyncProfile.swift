@@ -192,6 +192,14 @@ struct SyncProfile: Identifiable, Codable, Equatable {
         "\(Self.configDirectory)/\(shortId).resync-pending"
     }
 
+    /// Per-session consumption record for `resyncPendingPath` — written by the sync script
+    /// next to the marker so a primary/fallback pair with distinct full-remote-swap sessions
+    /// (see "Fallback Remote Pipeline" in CLAUDE.md) each get their own one-time resync before
+    /// the marker is cleared. Removed alongside the marker by a plain `uninstall`.
+    var resyncConsumedPath: String {
+        "\(resyncPendingPath).consumed"
+    }
+
     var launchdLabel: String {
         "com.synctray.sync.\(shortId)"
     }
