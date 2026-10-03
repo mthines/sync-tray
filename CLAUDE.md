@@ -990,7 +990,7 @@ an include-rule CHANGE (comparing the compiled include block before/after,
 so an exclude-only edit never triggers this) on a `.bisync` profile and writes
 a fresh UUID token to `{shortId}.resync-pending`. The generated sync script
 checks this marker before building its bootstrap args: a present token makes
-it run `--resync --resync-mode newer` (remote wins on conflict, matching every
+it run `--resync --resync-mode newer` (the newer copy wins on conflict, matching every
 other SyncTray-initiated resync) instead of a plain bisync, logging "sync
 folders changed". The marker is removed only after a bisync that exits 0
 AND whose token still matches what was read at script start (`if [[
