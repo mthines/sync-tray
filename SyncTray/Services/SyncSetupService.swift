@@ -2171,7 +2171,12 @@ enum SyncExcludeFilter {
     static func merged(existing: String, patterns: [String], includeFolders: [String] = []) -> String {
         let withoutExcludeBlock = strippingManagedBlock(from: existing, begin: beginMarker, end: endMarker)
         let withoutEitherBlock = strippingManagedBlock(from: withoutExcludeBlock, begin: includeBeginMarker, end: includeEndMarker)
-        let userContent = droppingLeadingBlankLines(withoutEitherBlock)
+        // Each managed block contributes a one-blank-line separator on the side facing the
+        // user's own content; with a block on BOTH sides (head exclude + tail include) a
+        // re-strip can leave that separator attached to either end of `userContent`, which
+        // would otherwise break idempotency (re-merging would see different "user content"
+        // on every pass). Trim both ends to canonicalize.
+        let userContent = droppingTrailingBlankLines(droppingLeadingBlankLines(withoutEitherBlock))
         let excludeRules = Self.rules(for: patterns)
         let folderRules = includeRules(for: includeFolders)
 
@@ -2253,6 +2258,20 @@ enum SyncExcludeFilter {
         while let first = lines.first, lines.count > 1,
               first.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             lines.removeFirst()
+        }
+        if lines.count == 1, lines[0].trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return "" }
+        return lines.joined(separator: "\n")
+    }
+
+    /// Mirrors `droppingLeadingBlankLines` from the other end — needed because, with a managed
+    /// block on both sides of the user's own content (head exclude + tail include), the
+    /// separator blank line next to the TAIL block can be left attached to the end of the
+    /// stripped user content.
+    private static func droppingTrailingBlankLines(_ text: String) -> String {
+        var lines = text.components(separatedBy: "\n")
+        while let last = lines.last, lines.count > 1,
+              last.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            lines.removeLast()
         }
         if lines.count == 1, lines[0].trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return "" }
         return lines.joined(separator: "\n")

@@ -135,6 +135,12 @@ enum ConfigSelfTest {
             testSyncExcludeFilterWrite,
             testSyncFilterReconcileTrigger,
             testSyncExcludePatternsRoundTripAndCLI,
+            testSyncIncludeRules,
+            testSyncIncludeFilterMerge,
+            testSyncIncludeFoldersRealRclone,
+            testSyncIncludeFilterReconcileTrigger,
+            testSyncIncludeFoldersRoundTripAndCLI,
+            testResyncPendingMarker,
         ]
 
         for check in checks {
@@ -2651,11 +2657,22 @@ enum ConfigSelfTest {
     /// probe is wall-clock-capped at 17s and each of its two retries at 7s plus
     /// `probeRetryDelay`). `whileRunning` fires once the script has started, for fixtures
     /// that change the world mid-run.
+    /// - Parameters:
+    ///   - dryRun: when `true` (default), sets `SYNCTRAY_DRY_RUN=1` so the script renders the
+    ///     resolved mode/command and exits BEFORE ever calling rclone — the default, since
+    ///     this process can't read a real mount. `false` lets the script run for real; only
+    ///     meaningful for a sync/bisync profile against a reachable local-filesystem-backed
+    ///     remote (e.g. an `alias` remote), never for mount mode.
+    ///   - configOverrides: key/value pairs merged into the generated profile config JSON
+    ///     before it's written — e.g. pointing `filterPath` at a temp fixture file instead of
+    ///     the profile's real (production) filter path.
     private static func dryRunMountScript(
         profile: SyncProfile,
         rcloneConfig: String,
         timeout: TimeInterval = 30,
         probeRetryDelay: String = "0",
+        dryRun: Bool = true,
+        configOverrides: [String: Any]? = nil,
         whileRunning: ((_ rcloneConfPath: String) -> Void)? = nil
     ) -> DryRunResult {
         // `profile.logPath` is `~/.local/log/synctray-sync-{shortId}.log` — NOT
@@ -2687,8 +2704,17 @@ enum ConfigSelfTest {
         try? SyncSetupService.shared.generateSyncScript().write(
             toFile: scriptPath, atomically: true, encoding: .utf8)
         let configPath = "\(dir)/config.json"
-        try? SyncSetupService.shared.generateProfileConfig(for: profile).write(
-            toFile: configPath, atomically: true, encoding: .utf8)
+        if let overrides = configOverrides,
+           let baseData = SyncSetupService.shared.generateProfileConfig(for: profile).data(using: .utf8),
+           var configDict = (try? JSONSerialization.jsonObject(with: baseData)) as? [String: Any] {
+            for (key, value) in overrides { configDict[key] = value }
+            if let mergedData = try? JSONSerialization.data(withJSONObject: configDict, options: [.prettyPrinted, .sortedKeys]) {
+                try? mergedData.write(to: URL(fileURLWithPath: configPath))
+            }
+        } else {
+            try? SyncSetupService.shared.generateProfileConfig(for: profile).write(
+                toFile: configPath, atomically: true, encoding: .utf8)
+        }
         let rcloneConfPath = "\(dir)/rclone.conf"
         try? rcloneConfig.write(toFile: rcloneConfPath, atomically: true, encoding: .utf8)
 
@@ -2696,7 +2722,7 @@ enum ConfigSelfTest {
         proc.executableURL = URL(fileURLWithPath: "/bin/bash")
         proc.arguments = [scriptPath, configPath]
         var env = ProcessInfo.processInfo.environment
-        env["SYNCTRAY_DRY_RUN"] = "1"
+        if dryRun { env["SYNCTRAY_DRY_RUN"] = "1" }
         env["RCLONE_CONFIG"] = rcloneConfPath
         // The mount branch retries an unreachable primary twice before settling on Cache
         // Only (offline); most fixtures are unreachable ON PURPOSE, so don't pay the
@@ -4683,6 +4709,441 @@ enum ConfigSelfTest {
             return report("AC-DS5", "sync-exclude-roundtrip-cli", false, "(CLI assignment failed: \(p.syncExcludePatterns))")
         }
         return report("AC-DS5", "sync-exclude-roundtrip-cli", true)
+    }
+
+    // MARK: - AC-SI1 — "Sync Only These Folders" folders translate to rclone include rules
+
+    /// Each include folder becomes `+ /<escaped>/**`, followed by one trailing `- **` that
+    /// excludes everything else; an empty list yields no rules at all (today's "sync
+    /// everything" behaviour, byte-identical).
+    private static func testSyncIncludeRules() -> Bool {
+        let name = "AC-SI1", slug = "sync-include-rules"
+        guard SyncExcludeFilter.includeRules(for: []) == [] else {
+            return report(name, slug, false, "(empty list produced rules: \(SyncExcludeFilter.includeRules(for: [])))")
+        }
+        guard SyncExcludeFilter.includeRules(for: ["Keep"]) == ["+ /Keep/**", "- **"] else {
+            return report(name, slug, false, "(single folder: \(SyncExcludeFilter.includeRules(for: ["Keep"])))")
+        }
+        let multi = SyncExcludeFilter.includeRules(for: ["Keep", "Deep/Nested"])
+        guard multi == ["+ /Keep/**", "+ /Deep/Nested/**", "- **"] else {
+            return report(name, slug, false, "(multiple folders order/content wrong: \(multi))")
+        }
+        // `* ? [ ] { } \` are literal to a folder entry but syntax to rclone — escaped.
+        let escaped = SyncExcludeFilter.includeRules(for: ["Music/Live[2024]"])
+        guard escaped == [#"+ /Music/Live\[2024\]/**"#, "- **"] else {
+            return report(name, slug, false, "(escaping wrong: \(escaped))")
+        }
+        let literalInput = #"a*b?c[d]e{f}g\h"#
+        let literalExpected = #"a\*b\?c\[d\]e\{f\}g\\h"#
+        guard SyncExcludeFilter.rcloneLiteral(literalInput) == literalExpected else {
+            return report(name, slug, false, "(rcloneLiteral escape set wrong: \(SyncExcludeFilter.rcloneLiteral(literalInput)))")
+        }
+        return report(name, slug, true)
+    }
+
+    // MARK: - AC-SI2 — the include tail block merges after the head block and user content
+
+    private static func testSyncIncludeFilterMerge() -> Bool {
+        let name = "AC-SI2", slug = "sync-include-merge"
+        let includeBegin = SyncExcludeFilter.includeBeginMarker
+        let includeEnd = SyncExcludeFilter.includeEndMarker
+        let excludeBegin = SyncExcludeFilter.beginMarker
+        let excludeEnd = SyncExcludeFilter.endMarker
+        let userRules = "# macOS metadata\n- ._*\n- .DS_Store"
+        let patterns = ["*.rpp-bak"]
+        let folders = ["Keep", "Deep/Nested"]
+
+        // Folders only — no patterns, no user content.
+        let foldersOnly = SyncExcludeFilter.merged(existing: "", patterns: [], includeFolders: folders)
+        let expectedFoldersOnly = "\(includeBegin)\n+ /Keep/**\n+ /Deep/Nested/**\n- **\n\(includeEnd)\n"
+        guard foldersOnly == expectedFoldersOnly else {
+            return report(name, slug, false, "(folders-only merge wrong:\n\(foldersOnly))")
+        }
+
+        // Head block, user content, tail block — in that order.
+        let full = SyncExcludeFilter.merged(existing: userRules, patterns: patterns, includeFolders: folders)
+        let expectedFull = "\(excludeBegin)\n- *.rpp-bak\n\(excludeEnd)\n\n\(userRules)\n\n\(includeBegin)\n+ /Keep/**\n+ /Deep/Nested/**\n- **\n\(includeEnd)\n"
+        guard full == expectedFull else {
+            return report(name, slug, false, "(head+user+tail order wrong:\n\(full))")
+        }
+
+        // Idempotent.
+        guard SyncExcludeFilter.merged(existing: full, patterns: patterns, includeFolders: folders) == full else {
+            return report(name, slug, false, "(merge with folders is not idempotent)")
+        }
+
+        // Changing the include list leaves the head block and user content untouched.
+        let changedFolders = SyncExcludeFilter.merged(existing: full, patterns: patterns, includeFolders: ["OnlyThis"])
+        guard changedFolders.contains("- *.rpp-bak"), changedFolders.contains(userRules),
+              changedFolders.contains("+ /OnlyThis/**"), !changedFolders.contains("Deep/Nested") else {
+            return report(name, slug, false, "(changing folders lost the head block or user content:\n\(changedFolders))")
+        }
+
+        // Changing the patterns leaves the include tail block and user content untouched.
+        let changedPatterns = SyncExcludeFilter.merged(existing: full, patterns: ["*.tmp"], includeFolders: folders)
+        guard changedPatterns.contains("- *.tmp"), !changedPatterns.contains("rpp-bak"),
+              changedPatterns.contains(userRules), changedPatterns.contains("+ /Keep/**") else {
+            return report(name, slug, false, "(changing patterns lost the include tail block:\n\(changedPatterns))")
+        }
+
+        // Clearing the folders removes the tail block but keeps the head block + user content —
+        // i.e. an empty include list is byte-identical to the pre-folder merge (AC-3).
+        let clearedFolders = SyncExcludeFilter.merged(existing: full, patterns: patterns, includeFolders: [])
+        let expectedCleared = "\(excludeBegin)\n- *.rpp-bak\n\(excludeEnd)\n\n\(userRules)"
+        guard clearedFolders == expectedCleared else {
+            return report(name, slug, false, "(clearing folders didn't restore the pre-folder merge:\n\(clearedFolders))")
+        }
+
+        // A hand-deleted tail end marker: the block ends at the first blank line / EOF, so the
+        // head block and user content above it survive.
+        let singleFolderFull = SyncExcludeFilter.merged(existing: userRules, patterns: patterns, includeFolders: ["Keep"])
+        let brokenTail = singleFolderFull.replacingOccurrences(of: "\n\(includeEnd)\n", with: "\n")
+        guard SyncExcludeFilter.merged(existing: brokenTail, patterns: patterns, includeFolders: []) == expectedCleared else {
+            return report(name, slug, false, "(unterminated tail block not removed cleanly)")
+        }
+
+        return report(name, slug, true)
+    }
+
+    // MARK: - AC-SI3 — the real writer + real rclone only traverse the included folders
+
+    /// Drives the REAL `writeExcludeFilter` writer, then runs the REAL `rclone lsf` binary
+    /// with the resulting filter over a small on-disk tree — proving (not assuming) that
+    /// rclone auto-includes the parent directories a nested selection needs to traverse down
+    /// to it (Risk in plan.md: "rclone does not auto-include parent dirs as assumed").
+    private static func testSyncIncludeFoldersRealRclone() -> Bool {
+        let name = "AC-SI3", slug = "sync-include-real-rclone"
+        guard let rclone = RcloneLocator.resolve() else {
+            return report(name, slug, false, "(rclone not found on PATH)")
+        }
+        let fm = FileManager.default
+        let dir = "\(selfTestRoot)/si3-\(UUID().uuidString)"
+        let layout = ["Keep/a.txt", "Deep/Nested/b.txt", "Deep/other.txt", "Drop/c.txt",
+                      "Keep/.DS_Store", "Keep/x.partial"]
+        for rel in layout {
+            let full = "\(dir)/\(rel)"
+            try? fm.createDirectory(atPath: (full as NSString).deletingLastPathComponent, withIntermediateDirectories: true)
+            try? "x".write(toFile: full, atomically: true, encoding: .utf8)
+        }
+
+        let filterPath = "\(dir)-exclude.txt"
+        var profile = sampleProfile(name: "SI3")
+        profile.syncMode = .bisync
+        profile.syncIncludeFolders = ["Keep", "Deep/Nested"]
+        do {
+            try SyncSetupService.shared.writeExcludeFilter(for: profile, at: filterPath)
+        } catch {
+            return report(name, slug, false, "(writeExcludeFilter threw: \(error))")
+        }
+
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: rclone)
+        proc.arguments = ["lsf", "-R", "--files-only", "--filter-from", filterPath, dir]
+        let pipe = Pipe()
+        proc.standardOutput = pipe
+        proc.standardError = FileHandle.nullDevice
+        do {
+            try proc.run()
+        } catch {
+            return report(name, slug, false, "(could not run rclone lsf: \(error))")
+        }
+        proc.waitUntilExit()
+        let output = String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+        guard proc.terminationStatus == 0 else {
+            return report(name, slug, false, "(rclone lsf exited \(proc.terminationStatus): \(output))")
+        }
+        let listed = Set(output.split(separator: "\n").map(String.init))
+        guard listed.contains("Keep/a.txt"), listed.contains("Deep/Nested/b.txt") else {
+            return report(name, slug, false, "(included files missing: \(listed))")
+        }
+        guard !listed.contains("Drop/c.txt"), !listed.contains("Deep/other.txt"),
+              !listed.contains("Keep/.DS_Store"), !listed.contains("Keep/x.partial") else {
+            return report(name, slug, false, "(excluded files leaked through: \(listed))")
+        }
+        return report(name, slug, true)
+    }
+
+    // MARK: - AC-SI4 — an include-folder edit rewrites the filter and NEVER reinstalls
+
+    /// Mirrors `testSyncFilterReconcileTrigger` (AC-DS4) for `syncIncludeFolders`: the sync
+    /// script re-reads the filter file on every run, so the edit stays out of
+    /// `reconcileAction`'s reinstall set and goes through the orthogonal filter reconcile.
+    private static func testSyncIncludeFilterReconcileTrigger() -> Bool {
+        let name = "AC-SI4", slug = "sync-include-filter-reconcile"
+        func fired(from current: SyncProfile, to updated: SyncProfile) -> [UUID] {
+            var calls: [UUID] = []
+            SyncManager.applySyncFilterReconcileIfNeeded(from: current, to: updated) { calls.append($0.id) }
+            return calls
+        }
+        var bisync = sampleProfile(isEnabled: true)
+        bisync.syncMode = .bisync
+        var changed = bisync
+        changed.syncIncludeFolders = ["Keep"]
+
+        guard SyncManager.reconcileAction(from: bisync, to: changed) == .none else {
+            return report(name, slug, false, "(include-folder edit would reinstall the agent)")
+        }
+        guard SyncManager.syncFilterReconcileNeeded(from: bisync, to: changed) else {
+            return report(name, slug, false, "(syncFilterReconcileNeeded false for an enabled bisync include-folder change)")
+        }
+        guard fired(from: bisync, to: changed) == [bisync.id] else {
+            return report(name, slug, false, "(include-folder edit on an enabled bisync profile did not rewrite the filter)")
+        }
+
+        var oneWay = bisync
+        oneWay.syncMode = .sync
+        var oneWayChanged = oneWay
+        oneWayChanged.syncIncludeFolders = ["Keep"]
+        guard fired(from: oneWay, to: oneWayChanged) == [oneWay.id] else {
+            return report(name, slug, false, "(include-folder edit on a one-way profile did not rewrite the filter)")
+        }
+
+        var mount = bisync
+        mount.syncMode = .mount
+        var mountChanged = mount
+        mountChanged.syncIncludeFolders = ["Keep"]
+        guard !SyncManager.syncFilterReconcileNeeded(from: mount, to: mountChanged),
+              fired(from: mount, to: mountChanged).isEmpty else {
+            return report(name, slug, false, "(mount profile wrongly rewrote a filter for an include-folder change)")
+        }
+
+        var disabled = sampleProfile(isEnabled: false)
+        disabled.syncMode = .bisync
+        var disabledChanged = disabled
+        disabledChanged.syncIncludeFolders = ["Keep"]
+        guard !SyncManager.syncFilterReconcileNeeded(from: disabled, to: disabledChanged),
+              fired(from: disabled, to: disabledChanged).isEmpty else {
+            return report(name, slug, false, "(disabled profile wrongly rewrote a filter for an include-folder change)")
+        }
+
+        var renamed = bisync
+        renamed.name = "Renamed"
+        guard fired(from: bisync, to: renamed).isEmpty else {
+            return report(name, slug, false, "(name-only change wrongly rewrote the filter)")
+        }
+
+        return report(name, slug, true)
+    }
+
+    // MARK: - AC-SI5 — syncIncludeFolders normalizes, round-trips, stays out of the derived
+    // config, and is CLI-settable (invalid entries rejected, nothing written)
+
+    private static func testSyncIncludeFoldersRoundTripAndCLI() -> Bool {
+        let name = "AC-SI5", slug = "sync-include-roundtrip-cli"
+
+        let normalized = SyncProfile.normalizedSyncIncludeFolders([" /A/B/ ", "A/B", "..", "x/../y", "", "/"])
+        guard normalized == ["A/B"] else {
+            return report(name, slug, false, "(normalizer mismatch: \(normalized))")
+        }
+
+        var profile = sampleProfile()
+        profile.syncIncludeFolders = ["Keep", "Deep/Nested"]
+        guard let data = try? JSONEncoder().encode(profile),
+              let decoded = try? JSONDecoder().decode(SyncProfile.self, from: data),
+              decoded.syncIncludeFolders == profile.syncIncludeFolders else {
+            return report(name, slug, false, "(syncIncludeFolders not preserved by encode/decode)")
+        }
+
+        let noKey: [String: Any] = [
+            "id": UUID().uuidString, "name": "NoSyncIncludeKey", "rcloneRemote": "r:",
+            "remotePath": "P", "localSyncPath": "/tmp/x",
+        ]
+        guard let noKeyData = try? JSONSerialization.data(withJSONObject: noKey),
+              let noKeyDecoded = try? JSONDecoder().decode(SyncProfile.self, from: noKeyData),
+              noKeyDecoded.syncIncludeFolders == [] else {
+            return report(name, slug, false, "(missing key did not default to [])")
+        }
+
+        // A hand-edited file can never inject a `.`/`..` escape or a blank entry.
+        let dirtyKey: [String: Any] = [
+            "id": UUID().uuidString, "name": "DirtyKey", "rcloneRemote": "r:",
+            "remotePath": "P", "localSyncPath": "/tmp/x",
+            "syncIncludeFolders": [" /A/B/ ", "A/B", "..", "x/../y", "", "/"],
+        ]
+        guard let dirtyData = try? JSONSerialization.data(withJSONObject: dirtyKey),
+              let dirtyDecoded = try? JSONDecoder().decode(SyncProfile.self, from: dirtyData),
+              dirtyDecoded.syncIncludeFolders == ["A/B"] else {
+            return report(name, slug, false, "(decoder did not normalize a hand-edited syncIncludeFolders list)")
+        }
+
+        // The folders live in the filter file, not the script's derived config.
+        guard !SyncSetupService.shared.generateProfileConfig(for: profile).contains("syncIncludeFolders") else {
+            return report(name, slug, false, "(syncIncludeFolders leaked into the derived config)")
+        }
+
+        var p = sampleProfile()
+        guard SyncTrayCLI.applyProfileAssignment(&p, key: "syncIncludeFolders", value: "Keep, Deep/Nested ,") == nil,
+              p.syncIncludeFolders == ["Keep", "Deep/Nested"] else {
+            return report(name, slug, false, "(CLI assignment failed: \(p.syncIncludeFolders))")
+        }
+        guard let err = SyncTrayCLI.applyProfileAssignment(&p, key: "syncIncludeFolders", value: "Keep,.."),
+              err.contains("..") else {
+            return report(name, slug, false, "(CLI did not reject an invalid syncIncludeFolders entry)")
+        }
+        guard p.syncIncludeFolders == ["Keep", "Deep/Nested"] else {
+            return report(name, slug, false, "(a rejected CLI assignment mutated the profile)")
+        }
+
+        // `profile set` at the execute() level: an invalid entry exits 65 and writes nothing.
+        var wrote = false
+        let env = fakeCLIEnvironment(readProfiles: { [p] }, writeProfile: { _ in wrote = true; return true })
+        let exit = SyncTrayCLI.execute(["profile", "set", p.shortId, "syncIncludeFolders", "Keep,.."], env: env)
+        guard exit == 65, !wrote else {
+            return report(name, slug, false, "(execute did not exit 65 / wrote a file for an invalid syncIncludeFolders entry)")
+        }
+
+        return report(name, slug, true)
+    }
+
+    // MARK: - AC-SI6 — a bisync include-folder change schedules a token-marker resync
+
+    /// Part 1 drives the real writer: a real include-rule change on an enabled bisync profile
+    /// gets a fresh token marker; a no-op rewrite leaves it untouched; a one-way profile never
+    /// gets one; the script-derived marker path (`${FILTER_FILE%-exclude.txt}.resync-pending`)
+    /// equals `SyncProfile.resyncPendingPath` for the profile's real filter path.
+    ///
+    /// Part 2 drives the REAL generated script (not the `SYNCTRAY_DRY_RUN` seam, which exits
+    /// before the marker-removal block runs) through one full bisync round-trip against a
+    /// local-backed `alias` remote: with the marker present, the run bootstraps with
+    /// `--resync --resync-mode newer`, logs "sync folders changed", and clears the marker on
+    /// success because the token it read is still the one on disk; a second, marker-free run
+    /// never logs that reason.
+    private static func testResyncPendingMarker() -> Bool {
+        let name = "AC-SI6", slug = "resync-pending-marker"
+        let fm = FileManager.default
+
+        // --- Part 1: writer behavior ---
+        let dir = "\(selfTestRoot)/si6-writer-\(UUID().uuidString)"
+        try? fm.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        let filterPath = "\(dir)/exclude.txt"
+        let markerPath = "\(dir)/x.resync-pending"
+
+        var bisync = sampleProfile(name: "SI6Writer")
+        bisync.syncMode = .bisync
+
+        try? SyncSetupService.shared.writeExcludeFilter(for: bisync, at: filterPath, resyncMarkerAt: markerPath)
+        guard !fm.fileExists(atPath: markerPath) else {
+            return report(name, slug, false, "(marker written on first filter write with no include folders)")
+        }
+
+        bisync.syncIncludeFolders = ["Keep"]
+        try? SyncSetupService.shared.writeExcludeFilter(for: bisync, at: filterPath, resyncMarkerAt: markerPath)
+        guard let token1 = try? String(contentsOfFile: markerPath, encoding: .utf8), !token1.isEmpty else {
+            return report(name, slug, false, "(no marker written when include rules changed on an enabled bisync profile)")
+        }
+
+        // A no-op rewrite (same folders) doesn't touch the marker.
+        try? SyncSetupService.shared.writeExcludeFilter(for: bisync, at: filterPath, resyncMarkerAt: markerPath)
+        guard (try? String(contentsOfFile: markerPath, encoding: .utf8)) == token1 else {
+            return report(name, slug, false, "(marker token changed on a no-op rewrite)")
+        }
+
+        // A real change refreshes the token.
+        bisync.syncIncludeFolders = ["Keep", "Deep/Nested"]
+        try? SyncSetupService.shared.writeExcludeFilter(for: bisync, at: filterPath, resyncMarkerAt: markerPath)
+        guard let token2 = try? String(contentsOfFile: markerPath, encoding: .utf8), token2 != token1 else {
+            return report(name, slug, false, "(marker token did not refresh on a real include-rule change)")
+        }
+
+        // One-way profiles never get a marker.
+        let oneWayFilter = "\(dir)/oneway-exclude.txt"
+        let oneWayMarker = "\(dir)/oneway.resync-pending"
+        var oneWay = bisync
+        oneWay.syncMode = .sync
+        oneWay.syncIncludeFolders = []
+        try? SyncSetupService.shared.writeExcludeFilter(for: oneWay, at: oneWayFilter, resyncMarkerAt: oneWayMarker)
+        oneWay.syncIncludeFolders = ["Keep"]
+        try? SyncSetupService.shared.writeExcludeFilter(for: oneWay, at: oneWayFilter, resyncMarkerAt: oneWayMarker)
+        guard !fm.fileExists(atPath: oneWayMarker) else {
+            return report(name, slug, false, "(one-way profile wrongly got a resync-pending marker)")
+        }
+
+        // The marker path the script derives from FILTER_FILE must equal the profile's real
+        // `resyncPendingPath` — both are built from the same `{configDirectory}/{shortId}`.
+        let prodFilter = bisync.filterFilePath
+        guard prodFilter.hasSuffix("-exclude.txt") else {
+            return report(name, slug, false, "(filterFilePath does not end in -exclude.txt: \(prodFilter))")
+        }
+        let scriptDerivedMarkerPath = String(prodFilter.dropLast("-exclude.txt".count)) + ".resync-pending"
+        guard scriptDerivedMarkerPath == bisync.resyncPendingPath else {
+            return report(name, slug, false, "(script-derived marker path \(scriptDerivedMarkerPath) != resyncPendingPath \(bisync.resyncPendingPath))")
+        }
+
+        // --- Part 2: the real generated script, run for real, against a local-backed alias remote ---
+        let root = "\(selfTestRoot)/si6-script-\(UUID().uuidString)"
+        let localPath = "\(root)/local"
+        let remoteTarget = "\(root)/remote"
+        let cfgDir = "\(root)/cfg"
+        for d in [localPath, remoteTarget, cfgDir] {
+            try? fm.createDirectory(atPath: d, withIntermediateDirectories: true)
+        }
+        try? fm.createDirectory(atPath: "\(localPath)/Keep", withIntermediateDirectories: true)
+        try? "hello".write(toFile: "\(localPath)/Keep/hello.txt", atomically: true, encoding: .utf8)
+
+        var scriptProfile = sampleProfile(name: "SI6Script")
+        scriptProfile.syncMode = .bisync
+        scriptProfile.rcloneRemote = "si6remote:"
+        scriptProfile.remotePath = ""
+        scriptProfile.localSyncPath = localPath
+        scriptProfile.syncIncludeFolders = ["Keep"]
+
+        let scriptFilterPath = "\(cfgDir)/si6-exclude.txt"
+        let scriptMarkerPath = "\(cfgDir)/si6.resync-pending"
+        try? SyncSetupService.shared.writeExcludeFilter(for: scriptProfile, at: scriptFilterPath, resyncMarkerAt: scriptMarkerPath)
+        guard fm.fileExists(atPath: scriptMarkerPath) else {
+            return report(name, slug, false, "(no marker written for the script fixture)")
+        }
+
+        // Pre-seed bisync "has prior listings" at rclone's own FIXED work dir (never
+        // configurable) so only the marker — not the first-run bootstrap — explains the
+        // resync this run takes. Cleaned up unconditionally afterward.
+        let session = SyncSetupService.bisyncSessionName(for: scriptProfile)
+        let workDir = SyncSetupService.bisyncWorkDir
+        try? fm.createDirectory(atPath: workDir, withIntermediateDirectories: true)
+        let listing1 = "\(workDir)/\(session).path1.lst"
+        let listing2 = "\(workDir)/\(session).path2.lst"
+        try? "".write(toFile: listing1, atomically: true, encoding: .utf8)
+        try? "".write(toFile: listing2, atomically: true, encoding: .utf8)
+        defer {
+            try? fm.removeItem(atPath: listing1)
+            try? fm.removeItem(atPath: listing2)
+            SyncSetupService.shared.removeBisyncLock(for: scriptProfile)
+        }
+
+        let rcloneConfig = aliasRcloneConfig(name: "si6remote", path: remoteTarget)
+        let result = dryRunMountScript(
+            profile: scriptProfile,
+            rcloneConfig: rcloneConfig,
+            timeout: 30,
+            dryRun: false,
+            configOverrides: ["filterPath": scriptFilterPath]
+        )
+        guard result.exitCode == 0 else {
+            return report(name, slug, false, "(real bisync run with marker present exited \(result.exitCode): \(result.log))")
+        }
+        guard result.log.contains("sync folders changed") else {
+            return report(name, slug, false, "(script did not log the marker-driven resync reason: \(result.log))")
+        }
+        guard !fm.fileExists(atPath: scriptMarkerPath) else {
+            return report(name, slug, false, "(marker not cleared after a successful run with an unchanged token)")
+        }
+        guard fm.fileExists(atPath: "\(remoteTarget)/Keep/hello.txt") else {
+            return report(name, slug, false, "(resync did not actually copy the included folder to the remote)")
+        }
+
+        // A second run with no marker present never logs the marker-driven reason.
+        let result2 = dryRunMountScript(
+            profile: scriptProfile,
+            rcloneConfig: rcloneConfig,
+            timeout: 30,
+            dryRun: false,
+            configOverrides: ["filterPath": scriptFilterPath]
+        )
+        guard result2.exitCode == 0, !result2.log.contains("sync folders changed") else {
+            return report(name, slug, false, "(a run with no marker present logged the marker-driven reason: exit=\(result2.exitCode) log=\(result2.log))")
+        }
+
+        return report(name, slug, true)
     }
 
     /// `OverlaySyncService.run` is `async`; these self-tests are synchronous, so bridge with
