@@ -1,13 +1,10 @@
-# Keep the pinned dependencies current. Actions are pinned to commit SHAs and the
-# SwiftPM package to an exact version (Package.resolved), so nothing updates on
-# its own — Dependabot opens a PR when a newer release exists.
+# Actions are pinned to commit SHAs, so they never update on their own —
+# Dependabot opens a PR when a newer release exists. (The SwiftPM pin isn't
+# covered: Dependabot's swift ecosystem needs a Package.swift manifest, and this
+# project resolves packages through the Xcode project instead. Bump it by hand.)
 version: 2
 updates:
   - package-ecosystem: github-actions
-    directory: /
-    schedule:
-      interval: weekly
-  - package-ecosystem: swift
     directory: /
     schedule:
       interval: weekly
