@@ -31,8 +31,16 @@ log_success() { echo -e "${GREEN}✓${NC} $1"; }
 log_warning() { echo -e "${YELLOW}⚠${NC} $1"; }
 log_error() { echo -e "${RED}✗${NC} $1" >&2; exit 1; }
 
+# Fail fast: a real release must be notarized (see the signing section below),
+# so refuse before the build when the secrets it needs aren't configured.
+if [ "${DRY_RUN:-}" != "true" ]; then
+  for var in MACOS_CERTIFICATE_P12_BASE64 MACOS_CERTIFICATE_PASSWORD NOTARY_KEY_P8_BASE64 NOTARY_KEY_ID NOTARY_ISSUER_ID; do
+    [ -n "${!var:-}" ] || log_error "$var is not set — a release must be signed + notarized (docs/release-signing.md)."
+  done
+fi
+
 if [ -z "${CI:-}" ]; then
-  log_error "This script is designed to run in CI only. For local releases use: pnpm release"
+  log_error "This script is designed to run in CI only — releases are published by CI on merge to main."
 fi
 
 VERSION="${RELEASE_VERSION#v}"
@@ -105,13 +113,14 @@ ARCH_INFO=$(lipo -info "$BINARY" 2>/dev/null | sed 's/.*: //' || echo "unknown")
 log_success "Build OK ($ARCH_INFO)"
 
 # =============================================================================
-# Developer ID signing (OPT-IN — only runs when the signing secrets are present).
+# Developer ID signing + notarization (REQUIRED for a published release).
 #
-# Without MACOS_CERTIFICATE_P12_BASE64 the app stays ad-hoc signed exactly as
-# before, so this can never break an existing release; it only *upgrades* the
-# release when configured. A signed + notarized app is REQUIRED for the
-# SyncTrayFinderSync extension (and App Groups) to load on end-user machines —
-# see docs/release-signing.md for the one-time Apple-account + secrets setup.
+# The Homebrew cask no longer strips the quarantine attribute, so an app that
+# isn't notarized is blocked by Gatekeeper on install — a real (non-DRY_RUN)
+# release without the signing + notary secrets is refused (early, before the
+# build, and again after notarization). A signed + notarized app is also what
+# lets the SyncTrayFinderSync extension (and App Groups) load on end-user
+# machines — see docs/release-signing.md for the one-time setup.
 # =============================================================================
 SIGNED="false"
 NOTARIZED="false"

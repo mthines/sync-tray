@@ -445,7 +445,7 @@ SyncTray creates these files (per profile):
 
 ### "App can't be opened" warning
 
-Releases are notarized, so this should only happen with a build you compiled yourself or an old (pre-notarization) release. Update to the latest release, or for a local build right-click the app → **Open** once. Avoid `xattr -cr` on a downloaded app: it strips the quarantine flag and skips Gatekeeper's checks entirely.
+Releases are notarized, so this should only happen with a build you compiled yourself or an old (pre-notarization) release. Update to the latest release, or for a local build open it once, then allow it under **System Settings → Privacy & Security → Open Anyway** (on macOS 14 and earlier, right-click the app → **Open** also works). Avoid `xattr -cr` on a downloaded app: it strips the quarantine flag and skips Gatekeeper's checks entirely.
 
 ### Sync shows error state
 
@@ -563,11 +563,10 @@ Uses [Conventional Commits](https://www.conventionalcommits.org/):
 
 ### Creating a Release
 
-```bash
-./scripts/release.sh           # Auto-detect from commits
-./scripts/release.sh --minor   # Force minor bump
-./scripts/release.sh v1.2.3    # Exact version
-```
+Releases are published by CI: merging a `feat:`/`fix:` PR to `main` bumps the version,
+builds, signs, notarizes, and updates the Homebrew tap (`scripts/release-ci.sh`).
+A local `scripts/release.sh` run refuses, since it can't notarize — see
+[`docs/release-signing.md`](docs/release-signing.md).
 
 ---
 

@@ -378,6 +378,13 @@ main() {
     echo "=================================="
     echo ""
 
+    # This script never signs or notarizes, and the Homebrew cask no longer strips
+    # the quarantine attribute — so anything it published would be blocked by
+    # Gatekeeper on every brew install. Releases are cut by CI on merge to main
+    # (scripts/release-ci.sh), which signs, notarizes, and refuses otherwise.
+    # Refuse before any version bump, tag, or commit is made.
+    log_error "Local releases can't be notarized. Merge to main and CI publishes the release (scripts/release-ci.sh) — see docs/release-signing.md."
+
     # Check for uncommitted changes
     if [ -n "$(git status --porcelain)" ]; then
         log_error "Working directory has uncommitted changes. Please commit or stash them first."

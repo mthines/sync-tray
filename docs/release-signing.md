@@ -1,12 +1,13 @@
 # Release signing & notarization
 
 The **Finder "Available Offline" extension only loads in a Developer-ID-signed,
-notarized app.** The brew release is ad-hoc signed today, so Gatekeeper rejects it
-and macOS never registers the extension. This guide turns on real signing.
+notarized app**, and the Homebrew cask no longer strips the quarantine attribute,
+so an un-notarized release is blocked by Gatekeeper on install.
 
-The CI pipeline is already wired (`scripts/release-ci.sh` + `.github/workflows/ci.yml`):
-it **stays unsigned until the secrets below exist**, then automatically signs +
-notarizes every release. So nothing breaks while you complete the one-time setup.
+The CI pipeline is wired (`scripts/release-ci.sh` + `.github/workflows/ci.yml`)
+to sign + notarize every release with the secrets below. **They are required:**
+without them `release-ci.sh` refuses to publish (a `DRY_RUN` still builds), and
+the local `scripts/release.sh` refuses outright because it can't notarize.
 
 - [Part 1 — Apple Developer account (one-time)](#part-1--apple-developer-account-one-time)
 - [Part 2 — GitHub repository secrets](#part-2--github-repository-secrets)
