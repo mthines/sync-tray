@@ -114,6 +114,7 @@ log_success "Build OK ($ARCH_INFO)"
 # see docs/release-signing.md for the one-time Apple-account + secrets setup.
 # =============================================================================
 SIGNED="false"
+NOTARIZED="false"
 if [ -n "${MACOS_CERTIFICATE_P12_BASE64:-}" ] && [ -n "${MACOS_CERTIFICATE_PASSWORD:-}" ]; then
   log_info "Developer ID signing enabled — importing certificate into a temp keychain..."
   KEYCHAIN="$BUILD_DIR/synctray-signing.keychain-db"
@@ -199,11 +200,24 @@ if [ "$SIGNED" = "true" ] && [ -n "${NOTARY_KEY_P8_BASE64:-}" ] \
   xcrun stapler staple "$APP_PATH"
   xcrun stapler validate "$APP_PATH"
   log_success "Notarized + stapled"
+  NOTARIZED="true"
   # Re-zip so the published archive contains the stapled ticket.
   rm -f "$ZIP_PATH"
   ditto -c -k --sequesterRsrc --keepParent "$APP_PATH" "$ZIP_PATH"
 elif [ "$SIGNED" = "true" ]; then
   log_warning "Signed but NOTARY_* not set — skipping notarization. Gatekeeper will still quarantine the app on download."
+fi
+
+# Fail closed: the Homebrew cask no longer strips the quarantine attribute (that
+# bypassed Gatekeeper for every user), so a release that isn't notarized would be
+# blocked on install. Refuse to publish one rather than ship a broken cask.
+# A DRY_RUN publishes nothing, so it may proceed un-notarized.
+if [ "$NOTARIZED" != "true" ]; then
+  if [ "${DRY_RUN:-}" = "true" ]; then
+    log_warning "DRY_RUN: release is not notarized — a real run would refuse to publish it."
+  else
+    log_error "Release is not notarized (signing/notary secrets missing?) — refusing to publish an app the cask can't install through Gatekeeper."
+  fi
 fi
 
 ZIP_SHA=$(shasum -a 256 "$ZIP_PATH" | awk '{print $1}')

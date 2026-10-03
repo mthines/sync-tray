@@ -234,11 +234,7 @@ brew install --cask synctray
 
 Download the latest `.zip` from [Releases](../../releases), extract, and drag `SyncTray.app` to `/Applications`.
 
-**Note:** Since the app isn't notarized, you'll need to allow it once:
-
-```bash
-xattr -cr /Applications/SyncTray.app
-```
+Releases are signed with a Developer ID and notarized by Apple, so Gatekeeper opens them normally — no `xattr` workaround needed.
 
 ### Option 3: Build from Source
 
@@ -449,13 +445,7 @@ SyncTray creates these files (per profile):
 
 ### "App can't be opened" warning
 
-macOS blocks unsigned apps. Fix with:
-
-**Fix (run once in Terminal):**
-
-```bash
-xattr -cr /Applications/SyncTray.app
-```
+Releases are notarized, so this should only happen with a build you compiled yourself or an old (pre-notarization) release. Update to the latest release, or for a local build right-click the app → **Open** once. Avoid `xattr -cr` on a downloaded app: it strips the quarantine flag and skips Gatekeeper's checks entirely.
 
 ### Sync shows error state
 
