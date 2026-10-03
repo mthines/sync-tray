@@ -2636,6 +2636,8 @@ enum ConfigSelfTest {
         var rcAuth = false
         /// Mode bits of the RC credential file, captured before cleanup deletes it.
         var rcAuthFileMode: Int?
+        /// The app's RC `Authorization` header for this port, captured before cleanup.
+        var rcAuthHeader: String?
         /// The command's argv, one element per `SYNCTRAY_DRY_RUN_ARG=` line — exactly what
         /// rclone receives from the script's `"${RCLONE_CMD[@]}"` expansion.
         var args: [String] = []
@@ -2736,6 +2738,7 @@ enum ConfigSelfTest {
             mode: mode, cmd: cmd, envOverrides: envOverrides, output: output,
             exitCode: proc.terminationStatus, scriptPath: scriptPath, log: logContent, rcAuth: rcAuth,
             rcAuthFileMode: (try? FileManager.default.attributesOfItem(atPath: rcAuthPath))?[.posixPermissions] as? Int,
+            rcAuthHeader: VFSCacheService.rcAuthorizationHeader(port: profile.rcPort),
             args: args)
     }
 
@@ -3282,16 +3285,8 @@ enum ConfigSelfTest {
         guard !fm.fileExists(atPath: authPath) else {
             return report(name, slug, true, "(skipped: a real profile owns port \(profile.rcPort))")
         }
-        // Capture the app-side header while the file exists (the harness deletes it).
-        var header: String?
         let result = dryRunMountScript(
-            profile: profile, rcloneConfig: aliasRcloneConfig(name: "synology", path: target),
-            whileRunning: { _ in
-                for _ in 0..<100 where header == nil {
-                    header = VFSCacheService.rcAuthorizationHeader(port: profile.rcPort)
-                    if header == nil { Thread.sleep(forTimeInterval: 0.05) }
-                }
-            })
+            profile: profile, rcloneConfig: aliasRcloneConfig(name: "synology", path: target))
         guard result.mode == MountMode.streaming.rawValue else {
             return report(name, slug, false, "(fixture did not dry-run streaming: \(result.output) log=\(result.log))")
         }
@@ -3306,11 +3301,11 @@ enum ConfigSelfTest {
         guard result.rcAuthFileMode == 0o600 else {
             return report(name, slug, false, "(RC credential file mode \(String(result.rcAuthFileMode ?? -1, radix: 8)), want 600)")
         }
-        guard let header, header.hasPrefix("Basic "),
+        guard let header = result.rcAuthHeader, header.hasPrefix("Basic "),
               let decoded = Data(base64Encoded: String(header.dropFirst("Basic ".count)))
                 .flatMap({ String(data: $0, encoding: .utf8) }),
               decoded.hasPrefix("\(SyncProfile.rcUser):"), decoded.count > SyncProfile.rcUser.count + 32 else {
-            return report(name, slug, false, "(app RC Authorization header missing or malformed: \(header ?? "nil"))")
+            return report(name, slug, false, "(app RC Authorization header missing or malformed: \(result.rcAuthHeader ?? "nil"))")
         }
         return report(name, slug, true)
     }
