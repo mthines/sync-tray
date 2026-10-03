@@ -5069,6 +5069,17 @@ enum ConfigSelfTest {
             return report(name, slug, false, "(script-derived marker path \(scriptDerivedMarkerPath) != resyncPendingPath \(bisync.resyncPendingPath))")
         }
 
+        // The script's marker-removal block must guard on the token it read at start still
+        // matching what's on disk — an edit landing mid-run writes a fresh token, which must
+        // re-arm the NEXT run instead of being erased by THIS run's own success. (The window
+        // to prove this live is sub-second and not reliably reproducible in a dry run, so this
+        // is a structural check on the generated script text — a deleted/weakened guard here
+        // fails immediately.)
+        let scriptSource = SyncSetupService.shared.generateSyncScript()
+        guard scriptSource.contains(#"if [[ "$CURRENT_RESYNC_TOKEN" == "$RESYNC_TOKEN" ]]; then"#) else {
+            return report(name, slug, false, "(script's marker removal no longer guards on an unchanged token)")
+        }
+
         // --- Part 2: the real generated script, run for real, against a local-backed alias remote ---
         let root = "\(selfTestRoot)/si6-script-\(UUID().uuidString)"
         let localPath = "\(root)/local"
