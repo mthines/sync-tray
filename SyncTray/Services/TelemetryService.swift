@@ -750,7 +750,9 @@ final class TelemetryService {
             span.setAttribute(key: "sync.duration_s", value: .double(duration))
             span.setAttribute(key: "sync.exit_code", value: .int(exitCode))
             span.setAttribute(key: "error.type", value: .string(errorType))
-            span.status = .error(description: errorMessage ?? "Exit code \(exitCode)")
+            // Category only — the raw message can carry paths and remote names, and the
+            // privacy disclosure promises "never the raw message".
+            span.status = .error(description: errorType)
             span.end()
 
             emitLog(
@@ -764,7 +766,6 @@ final class TelemetryService {
                     "sync.exit_code": .int(exitCode),
                     "sync.duration_s": .double(duration),
                     "error.type": .string(errorType),
-                    "error.message": .string(errorMessage ?? "Exit code \(exitCode)"),
                 ],
                 spanContext: span.context
             )
@@ -977,7 +978,6 @@ final class TelemetryService {
                 "synctray.profile.id": .string(profileId.uuidString),
                 "synctray.profile.name": .string(profileName),
                 "error.type": .string(errorType),
-                "error.message": .string(String(errorMessage.prefix(256))),
             ],
             spanContext: spanContext
         )
@@ -1201,7 +1201,6 @@ final class TelemetryService {
         if let errMsg = errorMessage {
             let errorType = categorizeError(errMsg)
             logAttrs["error.type"] = .string(errorType)
-            logAttrs["error.message"] = .string(String(errMsg.prefix(256)))
         }
 
         emitLog(
@@ -1243,9 +1242,8 @@ final class TelemetryService {
             "remote.provider_type": .string(providerType),
             "remote.result": .string(result),
         ]
-        if let errMsg = errorMessage {
+        if errorMessage != nil {
             logAttrs["error.type"] = .string(errorType)
-            logAttrs["error.message"] = .string(String(errMsg.prefix(256)))
         }
 
         emitLog(

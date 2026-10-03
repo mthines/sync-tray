@@ -19,6 +19,7 @@ struct TelemetryDetailsSheet: View {
                         "Which sync mode you use — two-way, one-way, or stream",
                         "How often syncs are triggered and whether they were skipped",
                         "App launch count and number of active profiles",
+                        "The display names you give your profiles (e.g. \"Work\") and which settings each one uses",
                     ]
                 )
 
@@ -27,19 +28,20 @@ struct TelemetryDetailsSheet: View {
                     items: [
                         "File names, folder names, or file contents",
                         "Remote names, hostnames, server addresses, or credentials",
-                        "Your IP address",
-                        "Any data that could identify you personally",
+                        "Error message text — only its category",
+                        "Your IP address (it is never added to the telemetry data)",
+                        "Your name, email, or account details",
                     ]
                 )
 
                 VStack(alignment: .leading, spacing: 8) {
                     Text("How we identify your installation")
                         .font(.headline)
-                    Text("Two anonymous identifiers are included with every event:")
+                    Text("Two pseudonymous identifiers are included with every event. Neither contains your name or account, but they do let events from the same install or Mac be grouped together:")
                         .foregroundStyle(.secondary)
                     Text("• A random ID generated when you first install SyncTray. It changes if you reinstall.")
                         .foregroundStyle(.secondary)
-                    Text("• A one-way hash of your Mac's hardware ID. It survives reinstalls so we can tell when the same machine is reporting — but it cannot be reversed to identify you or your machine.")
+                    Text("• A one-way hash of your Mac's hardware ID. It survives reinstalls so we can tell when the same machine is reporting — but the hardware ID cannot be recovered from it.")
                         .foregroundStyle(.secondary)
                 }
 
