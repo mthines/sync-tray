@@ -1566,17 +1566,17 @@ final class SyncSetupService {
                 return ''.join('_' if ch in REPLACED else ch for ch in p)
             print(canon(sys.argv[1]) + '..' + canon(sys.argv[2]))
             " "$REMOTE" "$LOCAL_PATH")
-                BOOTSTRAP_FLAGS=""
+                BOOTSTRAP_ARGS=()
                 if [[ ! -e "$BISYNC_WORKDIR/$SESSION_NAME.path1.lst" && ! -e "$BISYNC_WORKDIR/$SESSION_NAME.path1.lst-new" ]] \\
                     || [[ ! -e "$BISYNC_WORKDIR/$SESSION_NAME.path2.lst" && ! -e "$BISYNC_WORKDIR/$SESSION_NAME.path2.lst-new" ]]; then
                     echo "$(date '+%Y-%m-%d %H:%M:%S') - Bootstrapping sync state (--resync, newer wins): first run for this transport pair" >> "$LOG_FILE"
-                    BOOTSTRAP_FLAGS="--resync --resync-mode newer"
+                    BOOTSTRAP_ARGS=(--resync --resync-mode newer)
                 fi
 
                 RCLONE_CMD=("$RCLONE_BIN" bisync "$REMOTE" "$LOCAL_PATH" --verbose --use-json-log --stats 2s --filter-from "$FILTER_FILE" --resilient --recover --conflict-resolve newer --conflict-loser num --conflict-suffix "sync-conflict-{DateOnly}-")
 
-                if [[ -n "$BOOTSTRAP_FLAGS" ]]; then
-                    RCLONE_CMD+=(--resync --resync-mode newer)
+                if [[ ${#BOOTSTRAP_ARGS[@]} -gt 0 ]]; then
+                    RCLONE_CMD+=("${BOOTSTRAP_ARGS[@]}")
                 fi
             else
                 # One-way sync
