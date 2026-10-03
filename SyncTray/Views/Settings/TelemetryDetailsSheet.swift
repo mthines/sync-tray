@@ -55,7 +55,7 @@ struct TelemetryDetailsSheet: View {
                 VStack(alignment: .leading, spacing: 8) {
                     Text("How to turn it off")
                         .font(.headline)
-                    Text("Open App Settings (gear icon in the sidebar) and toggle off \"Share anonymous usage data\". Takes effect immediately.")
+                    Text("Open App Settings (gear icon in the sidebar) and toggle off \"Share usage data\". Takes effect immediately.")
                         .foregroundStyle(.secondary)
                 }
             }
