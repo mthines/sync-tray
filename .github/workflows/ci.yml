@@ -52,7 +52,7 @@ jobs:
       checkout_ref: ${{ steps.detect.outputs.checkout_ref }}
       run_build: ${{ steps.detect.outputs.run_build }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0
 
@@ -191,7 +191,7 @@ jobs:
     if: needs.detect-changes.outputs.run_build == 'true' && github.event_name != 'issue_comment'
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           ref: ${{ needs.detect-changes.outputs.checkout_ref }}
 
@@ -208,12 +208,12 @@ jobs:
         run: bash scripts/check-schema-in-sync.sh
 
       - name: Cache SwiftPM dependencies
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
             .spm
             ~/Library/Caches/org.swift.swiftpm
-          key: spm-${{ runner.os }}-${{ hashFiles('**/*.xcodeproj/project.pbxproj') }}
+          key: spm-${{ runner.os }}-${{ hashFiles('**/*.xcodeproj/project.pbxproj', '**/Package.resolved') }}
           restore-keys: |
             spm-${{ runner.os }}-
 
@@ -231,6 +231,7 @@ jobs:
             -destination 'platform=macOS' \
             -configuration Debug \
             -clonedSourcePackagesDirPath .spm \
+            -onlyUsePackageVersionsFromResolvedFile \
             build \
             ONLY_ACTIVE_ARCH=YES \
             CODE_SIGNING_ALLOWED=NO \
@@ -291,7 +292,7 @@ jobs:
       tag: ${{ steps.version.outputs.tag }}
       created: ${{ steps.tag.outputs.created }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0
           ref: ${{ needs.detect-changes.outputs.checkout_ref }}
@@ -440,7 +441,7 @@ jobs:
       contents: write
       pull-requests: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0
           ref: ${{ needs.version.outputs.tag }}
@@ -490,7 +491,7 @@ jobs:
 
       - name: Comment on PR (beta)
         if: needs.detect-changes.outputs.is_beta == 'true'
-        uses: actions/github-script@v7
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7.1.0
         with:
           script: |
             const version = '${{ needs.version.outputs.version }}';

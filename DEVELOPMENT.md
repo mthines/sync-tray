@@ -229,7 +229,7 @@ Every signal includes these resource attributes (overridable via `OTEL_RESOURCE_
 
 ### Dependencies
 
-The telemetry feature uses [opentelemetry-swift](https://github.com/open-telemetry/opentelemetry-swift) (>= 1.0.0) via Swift Package Manager:
+The telemetry feature uses [opentelemetry-swift](https://github.com/open-telemetry/opentelemetry-swift) (pinned to exactly 1.17.1, locked by the committed `Package.resolved`) via Swift Package Manager:
 
 - `OpenTelemetryApi` — API interfaces
 - `OpenTelemetrySdk` — SDK implementation (stable meter API)

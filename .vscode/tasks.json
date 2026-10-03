@@ -4,7 +4,7 @@
         {
             "label": "build",
             "type": "shell",
-            "command": "npx nx run synctray:build",
+            "command": "npx nx@21.6.11 run synctray:build",
             "group": {
                 "kind": "build",
                 "isDefault": true
@@ -14,13 +14,13 @@
         {
             "label": "build:release",
             "type": "shell",
-            "command": "npx nx run synctray:build:release",
+            "command": "npx nx@21.6.11 run synctray:build:release",
             "problemMatcher": []
         },
         {
             "label": "test",
             "type": "shell",
-            "command": "npx nx run synctray:test",
+            "command": "npx nx@21.6.11 run synctray:test",
             "group": {
                 "kind": "test",
                 "isDefault": true
@@ -30,49 +30,49 @@
         {
             "label": "clean",
             "type": "shell",
-            "command": "npx nx run synctray:clean",
+            "command": "npx nx@21.6.11 run synctray:clean",
             "problemMatcher": []
         },
         {
             "label": "install",
             "type": "shell",
-            "command": "npx nx run synctray:install",
+            "command": "npx nx@21.6.11 run synctray:install",
             "problemMatcher": []
         },
         {
             "label": "install:launch",
             "type": "shell",
-            "command": "npx nx run synctray:install:launch",
+            "command": "npx nx@21.6.11 run synctray:install:launch",
             "problemMatcher": []
         },
         {
             "label": "install:full",
             "type": "shell",
-            "command": "npx nx run synctray:install:full",
+            "command": "npx nx@21.6.11 run synctray:install:full",
             "problemMatcher": []
         },
         {
             "label": "install:full:launch",
             "type": "shell",
-            "command": "npx nx run synctray:install:full:launch",
+            "command": "npx nx@21.6.11 run synctray:install:full:launch",
             "problemMatcher": []
         },
         {
             "label": "dev",
             "type": "shell",
-            "command": "npx nx run synctray:dev",
+            "command": "npx nx@21.6.11 run synctray:dev",
             "problemMatcher": []
         },
         {
             "label": "release",
             "type": "shell",
-            "command": "npx nx run synctray:release",
+            "command": "npx nx@21.6.11 run synctray:release",
             "problemMatcher": []
         },
         {
             "label": "reset",
             "type": "shell",
-            "command": "npx nx reset",
+            "command": "npx nx@21.6.11 reset",
             "problemMatcher": []
         }
     ]

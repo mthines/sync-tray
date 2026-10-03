@@ -83,6 +83,7 @@ xcodebuild -project "$XCODEPROJ" \
   -scheme "$PROJECT_NAME" \
   -configuration Release \
   -derivedDataPath "$BUILD_DIR/DerivedData" \
+  -onlyUsePackageVersionsFromResolvedFile \
   clean build \
   ONLY_ACTIVE_ARCH=NO \
   CODE_SIGNING_ALLOWED=NO \

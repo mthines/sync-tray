@@ -1,5 +1,12 @@
 # Xcode
-*.xcodeproj/project.xcworkspace/
+*.xcodeproj/project.xcworkspace/*
+# ...except the SwiftPM lockfile: it pins every (transitive) package to an exact
+# revision so CI/release builds can't silently pick up a new upstream version.
+!*.xcodeproj/project.xcworkspace/xcshareddata/
+*.xcodeproj/project.xcworkspace/xcshareddata/*
+!*.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/
+*.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/*
+!*.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved
 *.xcodeproj/xcuserdata/
 *.xcworkspace/xcuserdata/
 DerivedData/

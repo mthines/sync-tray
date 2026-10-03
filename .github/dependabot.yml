@@ -1,0 +1,10 @@
+# Actions are pinned to commit SHAs, so they never update on their own —
+# Dependabot opens a PR when a newer release exists. (The SwiftPM pin isn't
+# covered: Dependabot's swift ecosystem needs a Package.swift manifest, and this
+# project resolves packages through the Xcode project instead. Bump it by hand.)
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly

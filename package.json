@@ -3,19 +3,19 @@
   "version": "0.0.0",
   "private": true,
   "scripts": {
-    "build": "pnpm dlx nx run synctray:build",
-    "build:release": "pnpm dlx nx run synctray:build:release",
-    "test": "pnpm dlx nx run synctray:test",
-    "clean": "pnpm dlx nx run synctray:clean",
-    "install": "pnpm dlx nx run synctray:install",
-    "install:launch": "pnpm dlx nx run synctray:install:launch",
-    "install:full": "pnpm dlx nx run synctray:install:full",
-    "install:full:launch": "pnpm dlx nx run synctray:install:full:launch",
-    "dev": "pnpm dlx nx run synctray:dev",
-    "release": "pnpm dlx nx run synctray:release",
-    "reset": "nx reset"
+    "build": "pnpm dlx nx@21.6.11 run synctray:build",
+    "build:release": "pnpm dlx nx@21.6.11 run synctray:build:release",
+    "test": "pnpm dlx nx@21.6.11 run synctray:test",
+    "clean": "pnpm dlx nx@21.6.11 run synctray:clean",
+    "install": "pnpm dlx nx@21.6.11 run synctray:install",
+    "install:launch": "pnpm dlx nx@21.6.11 run synctray:install:launch",
+    "install:full": "pnpm dlx nx@21.6.11 run synctray:install:full",
+    "install:full:launch": "pnpm dlx nx@21.6.11 run synctray:install:full:launch",
+    "dev": "pnpm dlx nx@21.6.11 run synctray:dev",
+    "release": "pnpm dlx nx@21.6.11 run synctray:release",
+    "reset": "pnpm dlx nx@21.6.11 reset"
   },
   "devDependencies": {
-    "nx": "^21.0.0"
+    "nx": "21.6.11"
   }
 }
