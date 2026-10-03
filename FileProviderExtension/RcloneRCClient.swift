@@ -1,8 +1,10 @@
 import Foundation
 
 /// Thin async client over rclone's remote-control (RC) HTTP API, served by a
-/// `rclone rcd --rc-addr=127.0.0.1:<port> --rc-no-auth` daemon that the **host app**
-/// launches (the sandboxed extension must not spawn the CLI itself).
+/// `rclone rcd --rc-addr=127.0.0.1:<port>` daemon that the **host app** launches (the
+/// sandboxed extension must not spawn the CLI itself). The daemon must run WITH RC auth
+/// (never `--rc-no-auth`); this client must send HTTP Basic auth like
+/// `VFSCacheService.rcRequest` does before it ships.
 ///
 /// This is the single seam between the File Provider extension and rclone. To later
 /// run rclone in-process via `librclone`, replace the `post` implementation with a

@@ -184,7 +184,9 @@ file's `vfsMeta` sidecar (`vfscache.Item._save`, found by sampling
 (~6.6 MB/s), and a large live handle cache (~30k entries — go-nfs
 `CachingHandler.FromHandle` scans `LRU.Keys()` per READ) pushed one real mount to
 ~0.2 MB/s. A "cached files are slow" report is therefore usually the cache disk, not a
-cache miss — confirm with `core/stats` bytes (0 = served from cache), or in Dash0 via
+cache miss — confirm with `core/stats` bytes (0 = served from cache; the RC API needs
+auth: `curl -u synctray:$(cat ~/.local/state/synctray/rc/<rc-port>.auth) -X POST
+localhost:<rc-port>/core/stats`, same for pprof), or in Dash0 via
 `synctray.mount.cached_read.throughput` grouped by `cache.fs_type` (the heartbeat's
 read-health probe, `SyncManager.probeMountReadHealth`, AC-RH1). User-facing
 guidance lives in README → Troubleshooting → "Mount mode: Slow file access".

@@ -60,8 +60,10 @@ A File Provider extension runs **sandboxed** and cannot freely `posix_spawn` the
 `rclone` CLI. Two viable options:
 
 1. **`rclone rcd` daemon (recommended for v1).** The *host app* (not the sandboxed
-   appex) launches one `rclone rcd --rc-addr=127.0.0.1:<port> --rc-no-auth` process
-   (the same pattern Phase 1 already uses for `--rc`). Both the app and the extension
+   appex) launches one `rclone rcd --rc-addr=127.0.0.1:<port>` process, **with RC
+   auth** (`RCLONE_RC_USER`/`RCLONE_RC_PASS`, the same 0600-secret pattern the
+   streaming mount's `--rc` uses — never `--rc-no-auth`, which lets any local process
+   or a web page's cross-origin POST drive the API). Both the app and the extension
    talk to it over the RC HTTP API on loopback. Lowest risk, reuses Phase 1's RC
    plumbing and the user's existing `rclone.conf`.
 2. **`librclone` via FFI (v2).** Link `librclone` (rclone's RC API compiled as a C
