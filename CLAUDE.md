@@ -1264,6 +1264,10 @@ func doBackgroundWork() {
 ```
 
 ### 2. Process Execution
+- The generated sync script builds every rclone command as a bash **array** and runs
+  `"${RCLONE_CMD[@]}"` — never a string passed to `eval`. Profile values (paths, remotes,
+  `additionalRcloneFlags`) must reach rclone as literal arguments; extra flags are split with
+  `shlex` and never evaluated. Covered by `ConfigSelfTest` AC-SEC1.
 - Always run external processes (rclone, shell commands) on background threads
 - Use `Process` with pipes for stdout/stderr
 - Set `readabilityHandler` for real-time output streaming

@@ -824,10 +824,17 @@ final class SyncSetupService {
             # password containing a double quote produced an unterminated `eval`.)
             dump_remote_as_env() {
                 python3 -c "
-            import json, shlex, sys
+            import json, re, shlex, sys
             remote, prefix = sys.argv[1], sys.argv[2]
+            ident = re.compile('[A-Z0-9_]+')
+            if not ident.fullmatch(prefix):
+                sys.exit(0)
             for k, v in json.load(sys.stdin).get(remote, {}).items():
                 key = k.upper().replace('-', '_')
+                # The NAME half of an export line is not quoted, so only a plain
+                # identifier may reach the caller's eval.
+                if not ident.fullmatch(key):
+                    continue
                 print('export RCLONE_CONFIG_%s_%s=%s' % (prefix, key, shlex.quote(str(v))))
             " "$1" "$2"
             }
@@ -1353,7 +1360,7 @@ final class SyncSetupService {
                     # mount backends share this cache layer, so retention/eviction
                     # (--vfs-cache-max-size / --vfs-cache-max-age) behaves identically.
                     # Note: No --daemon flag - launchd manages the process lifecycle.
-                    RCLONE_CMD="$RCLONE_BIN $MOUNT_SUBCMD \\"$REMOTE\\" \\"$LOCAL_PATH\\" --vfs-cache-mode $VFS_CACHE_MODE --vfs-cache-max-size $VFS_CACHE_MAX_SIZE --cache-dir \\"$VFS_CACHE_PATH\\" --log-level INFO --use-json-log"
+                    RCLONE_CMD=("$RCLONE_BIN" "$MOUNT_SUBCMD" "$REMOTE" "$LOCAL_PATH" --vfs-cache-mode "$VFS_CACHE_MODE" --vfs-cache-max-size "$VFS_CACHE_MAX_SIZE" --cache-dir "$VFS_CACHE_PATH" --log-level INFO --use-json-log)
 
                     # Throughput tuning. Reading a file through the mount (streaming or
                     # offline warming) otherwise trickles: the nfsmount -> rclone-NFS-server
@@ -1392,15 +1399,15 @@ final class SyncSetupService {
                     # the overlay (the pending check reads only the overlay and the Cache Only
                     # mount's own cache, and the overlay drain leaves Dirty streaming entries
                     # alone), and rclone uploads it once Streaming resumes.
-                    RCLONE_CMD="$RCLONE_CMD --buffer-size 128M --vfs-read-ahead 256M --transfers $DOWNLOAD_CONNECTIONS --vfs-read-chunk-size 128M --vfs-read-chunk-size-limit off --attr-timeout 5s --dir-cache-time 1000h --vfs-cache-max-age $VFS_CACHE_MAX_AGE"
-                    RCLONE_CMD="$RCLONE_CMD --volname \\"$MOUNT_VOLNAME\\""
+                    RCLONE_CMD+=(--buffer-size 128M --vfs-read-ahead 256M --transfers "$DOWNLOAD_CONNECTIONS" --vfs-read-chunk-size 128M --vfs-read-chunk-size-limit off --attr-timeout 5s --dir-cache-time 1000h --vfs-cache-max-age "$VFS_CACHE_MAX_AGE")
+                    RCLONE_CMD+=(--volname "$MOUNT_VOLNAME")
 
                     # Add RC (remote control) API for cache management. Streaming-only — a
                     # Cache Only mount never exposes the RC API (nothing there needs
                     # refreshing/warming while the mount is deliberately not talking to the
                     # remote).
                     if [[ "$RC_PORT" != "0" && -n "$RC_PORT" ]]; then
-                        RCLONE_CMD="$RCLONE_CMD --rc --rc-addr=localhost:$RC_PORT --rc-no-auth"
+                        RCLONE_CMD+=(--rc "--rc-addr=localhost:$RC_PORT" --rc-no-auth)
                     fi
                 else
                     # CACHE ONLY — a writable "synctray-overlay" directory layered in FRONT of
@@ -1460,7 +1467,7 @@ final class SyncSetupService {
                     # minute — which surfaced as recurring Finder "loading" that defeats the
                     # whole point of Cache Only (open files as if local). So use the same long
                     # window streaming uses; there is no unreachable remote here to re-list from.
-                    RCLONE_CMD="$RCLONE_BIN $MOUNT_SUBCMD synctray_cacheonly: \\"$LOCAL_PATH\\" --config \\"$CACHE_ONLY_CONFIG_PATH\\" --exclude-from \\"$CACHE_ONLY_EXCLUDE_PATH\\" --vfs-cache-mode writes --cache-dir \\"$CACHE_ONLY_CACHE_PATH\\" --vfs-write-back 2s --dir-cache-time 1000h --log-level INFO --use-json-log --volname \\"$MOUNT_VOLNAME\\""
+                    RCLONE_CMD=("$RCLONE_BIN" "$MOUNT_SUBCMD" synctray_cacheonly: "$LOCAL_PATH" --config "$CACHE_ONLY_CONFIG_PATH" --exclude-from "$CACHE_ONLY_EXCLUDE_PATH" --vfs-cache-mode writes --cache-dir "$CACHE_ONLY_CACHE_PATH" --vfs-write-back 2s --dir-cache-time 1000h --log-level INFO --use-json-log --volname "$MOUNT_VOLNAME")
 
                     echo "$(date '+%Y-%m-%d %H:%M:%S') - Cache Only: union(overlay=$OVERLAY_PATH, cache=$CACHE_DATA_PATH:ro), no --rc" >> "$LOG_FILE"
                 fi
@@ -1469,7 +1476,7 @@ final class SyncSetupService {
                 # NFS backend, so only pass it when mounting via macFUSE. Needed by
                 # both streaming and Cache Only.
                 if [[ "$MOUNT_SUBCMD" == "mount" && ( "$ALLOW_NON_EMPTY" == "true" || "$ALLOW_NON_EMPTY" == "True" || "$ALLOW_NON_EMPTY" == "1" ) ]]; then
-                    RCLONE_CMD="$RCLONE_CMD --allow-non-empty"
+                    RCLONE_CMD+=(--allow-non-empty)
                 fi
 
                 # Mount resilience: stop a stalled backend from freezing Finder (and every
@@ -1496,7 +1503,7 @@ final class SyncSetupService {
                 # rclone --timeout above (rclone answers the RPC), so the client-side give-up
                 # only cost correctness without buying freeze-protection it still owned.
                 if [[ "$MOUNT_RESILIENT" == "true" || "$MOUNT_RESILIENT" == "True" || "$MOUNT_RESILIENT" == "1" ]]; then
-                    RCLONE_CMD="$RCLONE_CMD --timeout 30s --contimeout 10s"
+                    RCLONE_CMD+=(--timeout 30s --contimeout 10s)
                 fi
 
                 # Bandwidth cap: rclone --bwlimit on BOTH mount commands (streaming +
@@ -1506,7 +1513,7 @@ final class SyncSetupService {
                 # rendered mount command carries it; the sync/bisync path applies the same
                 # cap at the shared append point below (guarded so mount never doubles it).
                 if [[ -n "$BANDWIDTH_LIMIT" ]]; then
-                    RCLONE_CMD="$RCLONE_CMD --bwlimit \\"$BANDWIDTH_LIMIT\\""
+                    RCLONE_CMD+=(--bwlimit "$BANDWIDTH_LIMIT")
                 fi
 
                 # DRY-RUN TEST SEAM
@@ -1520,7 +1527,11 @@ final class SyncSetupService {
                 # mounting anything.
                 if [[ "$SYNCTRAY_DRY_RUN" == "1" ]]; then
                     echo "SYNCTRAY_DRY_RUN_MODE=$MOUNT_MODE"
-                    echo "SYNCTRAY_DRY_RUN_CMD=$RCLONE_CMD"
+                    echo "SYNCTRAY_DRY_RUN_CMD=${RCLONE_CMD[*]}"
+                    # One line per argv element, exactly as rclone will receive it — lets a
+                    # self-test prove a path with shell metacharacters stays ONE inert
+                    # argument (AC-SEC1).
+                    printf 'SYNCTRAY_DRY_RUN_ARG=%s\\n' "${RCLONE_CMD[@]}"
                     echo "SYNCTRAY_DRY_RUN_ENV_OVERRIDES=$(env | grep -c '^RCLONE_CONFIG_' || true)"
                     rm -f "$LOCK_FILE"
                     trap - EXIT
@@ -1583,40 +1594,53 @@ final class SyncSetupService {
                     BOOTSTRAP_FLAGS="--resync --resync-mode newer"
                 fi
 
-                RCLONE_CMD="$RCLONE_BIN bisync \\"$REMOTE\\" \\"$LOCAL_PATH\\" --verbose --use-json-log --stats 2s --filter-from \\"$FILTER_FILE\\" --resilient --recover --conflict-resolve newer --conflict-loser num --conflict-suffix sync-conflict-{DateOnly}-"
+                RCLONE_CMD=("$RCLONE_BIN" bisync "$REMOTE" "$LOCAL_PATH" --verbose --use-json-log --stats 2s --filter-from "$FILTER_FILE" --resilient --recover --conflict-resolve newer --conflict-loser num --conflict-suffix "sync-conflict-{DateOnly}-")
 
                 if [[ -n "$BOOTSTRAP_FLAGS" ]]; then
-                    RCLONE_CMD="$RCLONE_CMD $BOOTSTRAP_FLAGS"
+                    RCLONE_CMD+=(--resync --resync-mode newer)
                 fi
             else
                 # One-way sync
                 if [[ "$SYNC_DIRECTION" == "localToRemote" ]]; then
                     # Local is source, remote is destination (backup/upload)
                     echo "$(date '+%Y-%m-%d %H:%M:%S') - Starting sync (local → remote)" >> "$LOG_FILE"
-                    RCLONE_CMD="$RCLONE_BIN sync \\"$LOCAL_PATH\\" \\"$REMOTE\\" --verbose --use-json-log --stats 2s --filter-from \\"$FILTER_FILE\\""
+                    RCLONE_CMD=("$RCLONE_BIN" sync "$LOCAL_PATH" "$REMOTE" --verbose --use-json-log --stats 2s --filter-from "$FILTER_FILE")
                 else
                     # Remote is source, local is destination (download/mirror)
                     echo "$(date '+%Y-%m-%d %H:%M:%S') - Starting sync (remote → local)" >> "$LOG_FILE"
-                    RCLONE_CMD="$RCLONE_BIN sync \\"$REMOTE\\" \\"$LOCAL_PATH\\" --verbose --use-json-log --stats 2s --filter-from \\"$FILTER_FILE\\""
+                    RCLONE_CMD=("$RCLONE_BIN" sync "$REMOTE" "$LOCAL_PATH" --verbose --use-json-log --stats 2s --filter-from "$FILTER_FILE")
                 fi
             fi
 
             if [[ -n "$NO_CHECK_CERT" ]]; then
-                RCLONE_CMD="$RCLONE_CMD $NO_CHECK_CERT"
+                RCLONE_CMD+=($NO_CHECK_CERT)
             fi
 
+            # User-supplied extra flags are split into argv with shell-like QUOTING rules
+            # (shlex) but are never evaluated: `$(...)`, backticks, `;`, `|` and friends
+            # stay literal text inside an rclone argument instead of running as commands.
             if [[ -n "$ADDITIONAL_FLAGS" ]]; then
-                RCLONE_CMD="$RCLONE_CMD $ADDITIONAL_FLAGS"
+                ADDITIONAL_ARGS=()
+                while IFS= read -r -d '' arg; do
+                    ADDITIONAL_ARGS+=("$arg")
+                done < <(python3 -c "
+            import shlex, sys
+            for a in shlex.split(sys.argv[1]):
+                sys.stdout.write(a + chr(0))
+            " "$ADDITIONAL_FLAGS")
+                RCLONE_CMD+=("${ADDITIONAL_ARGS[@]}")
             fi
 
             # Bandwidth cap for sync/bisync. The mount path adds --bwlimit before its
             # dry-run seam above, so exclude mount here to avoid a duplicate flag.
             if [[ -n "$BANDWIDTH_LIMIT" && "$SYNC_MODE" != "mount" ]]; then
-                RCLONE_CMD="$RCLONE_CMD --bwlimit \\"$BANDWIDTH_LIMIT\\""
+                RCLONE_CMD+=(--bwlimit "$BANDWIDTH_LIMIT")
             fi
 
-            # Run sync command
-            eval "$RCLONE_CMD" 2>&1 | tee -a "$LOG_FILE"
+            # Run sync command. Executed straight from the argv array — never `eval` — so a
+            # path, remote or flag value containing quotes or shell metacharacters is
+            # passed to rclone verbatim instead of being re-parsed as shell code.
+            "${RCLONE_CMD[@]}" 2>&1 | tee -a "$LOG_FILE"
 
             EXIT_CODE=${PIPESTATUS[0]}
 

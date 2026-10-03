@@ -109,6 +109,7 @@ enum ConfigSelfTest {
             testCacheSuffixPairSafety,
             testCacheSuffixEmptyDestination,
             testMountCommandQuoting,
+            testScriptNoShellEval,
             testCacheOnlyUnionConfig,
             testCacheOnlyUnionBehaviour,
             testMountModeSelection,
@@ -667,7 +668,7 @@ enum ConfigSelfTest {
         var capped = mountFixtureProfile(localPath: "\(root)/mnt", cachePath: "\(root)/cache")
         capped.bandwidthLimit = "5M"
         let cappedResult = dryRunMountScript(profile: capped, rcloneConfig: "")
-        guard let cappedCmd = cappedResult.cmd, cappedCmd.contains("--bwlimit \"5M\"") else {
+        guard let cappedCmd = cappedResult.cmd, cappedCmd.contains("--bwlimit 5M") else {
             return report(name, slug, false, "(mount command missing --bwlimit: \(cappedResult.cmd ?? "nil"))")
         }
         // ...and is absent when empty.
@@ -2627,6 +2628,9 @@ enum ConfigSelfTest {
         /// runtime decisions (e.g. "using fallback: X") that never surface in `cmd` for a
         /// mode (like Cache Only) whose rendered command doesn't reference the remote name.
         let log: String
+        /// The command's argv, one element per `SYNCTRAY_DRY_RUN_ARG=` line — exactly what
+        /// rclone receives from the script's `"${RCLONE_CMD[@]}"` expansion.
+        var args: [String] = []
     }
 
     /// Render the shared script + this profile's derived config into a fresh temp dir, then
@@ -2699,12 +2703,14 @@ enum ConfigSelfTest {
         let data = pipe.fileHandleForReading.readDataToEndOfFile()
         let output = String(data: data, encoding: .utf8) ?? ""
 
-        var mode: String?, cmd: String?, envOverrides: Int?
+        var mode: String?, cmd: String?, envOverrides: Int?, args: [String] = []
         for line in output.split(separator: "\n", omittingEmptySubsequences: false) {
             if line.hasPrefix("SYNCTRAY_DRY_RUN_MODE=") {
                 mode = String(line.dropFirst("SYNCTRAY_DRY_RUN_MODE=".count))
             } else if line.hasPrefix("SYNCTRAY_DRY_RUN_CMD=") {
                 cmd = String(line.dropFirst("SYNCTRAY_DRY_RUN_CMD=".count))
+            } else if line.hasPrefix("SYNCTRAY_DRY_RUN_ARG=") {
+                args.append(String(line.dropFirst("SYNCTRAY_DRY_RUN_ARG=".count)))
             } else if line.hasPrefix("SYNCTRAY_DRY_RUN_ENV_OVERRIDES=") {
                 envOverrides = Int(line.dropFirst("SYNCTRAY_DRY_RUN_ENV_OVERRIDES=".count))
             }
@@ -2712,7 +2718,7 @@ enum ConfigSelfTest {
         let logContent = (try? String(contentsOfFile: profile.logPath, encoding: .utf8)) ?? ""
         return DryRunResult(
             mode: mode, cmd: cmd, envOverrides: envOverrides, output: output,
-            exitCode: proc.terminationStatus, scriptPath: scriptPath, log: logContent)
+            exitCode: proc.terminationStatus, scriptPath: scriptPath, log: logContent, args: args)
     }
 
     /// A minimal rclone config defining `name` as an `alias` remote rooted at `path` — the
@@ -3019,24 +3025,6 @@ enum ConfigSelfTest {
 
     // MARK: - AC-CK4 — mount command keeps a spaced path as ONE argument
 
-    /// Word-split `cmd` exactly the way the script's `eval "$RCLONE_CMD"` does, returning the
-    /// resulting argv. A path whose quotes were consumed at assignment time (a bare `"`
-    /// rendered into the script instead of `\"`) splits into several words here — the same
-    /// split rclone would receive.
-    private static func evalArgv(_ cmd: String) -> [String] {
-        let proc = Process()
-        proc.executableURL = URL(fileURLWithPath: "/bin/bash")
-        proc.arguments = ["-c", "eval \"set -- $1\"; printf '%s\\0' \"$@\"", "_", cmd]
-        let pipe = Pipe()
-        proc.standardOutput = pipe
-        do { try proc.run() } catch { return [] }
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        proc.waitUntilExit()
-        return (String(data: data, encoding: .utf8) ?? "")
-            .split(separator: "\0", omittingEmptySubsequences: false)
-            .dropLast().map(String.init)
-    }
-
     private static func argFollowing(_ flag: String, in argv: [String]) -> String? {
         guard let i = argv.firstIndex(of: flag), i + 1 < argv.count else { return nil }
         return argv[i + 1]
@@ -3056,11 +3044,11 @@ enum ConfigSelfTest {
         defer { try? fm.removeItem(atPath: streaming.cacheOnlyConfigPath) }
         let s = dryRunMountScript(
             profile: streaming, rcloneConfig: aliasRcloneConfig(name: "synology", path: target))
-        guard s.mode == MountMode.streaming.rawValue, let sCmd = s.cmd else {
+        guard s.mode == MountMode.streaming.rawValue, s.cmd != nil else {
             return report("AC-CK4", "mount-command-quoting", false,
                           "(streaming fixture did not dry-run streaming: \(s.output) log=\(s.log))")
         }
-        let sArgv = evalArgv(sCmd)
+        let sArgv = s.args
         guard sArgv.contains(local),
               argFollowing("--cache-dir", in: sArgv) == cache,
               argFollowing("--volname", in: sArgv) == "My Mount"
@@ -3073,11 +3061,11 @@ enum ConfigSelfTest {
         let cacheOnly = mountFixtureProfile(localPath: local, cachePath: cache, streamCacheOnly: true)
         defer { try? fm.removeItem(atPath: cacheOnly.cacheOnlyConfigPath) }
         let c = dryRunMountScript(profile: cacheOnly, rcloneConfig: "")
-        guard c.mode == MountMode.cacheOnlyManual.rawValue, let cCmd = c.cmd else {
+        guard c.mode == MountMode.cacheOnlyManual.rawValue, c.cmd != nil else {
             return report("AC-CK4", "mount-command-quoting", false,
                           "(cache-only fixture did not dry-run cache-only: \(c.output) log=\(c.log))")
         }
-        let cArgv = evalArgv(cCmd)
+        let cArgv = c.args
         guard cArgv.contains(local),
               argFollowing("--cache-dir", in: cArgv) == cacheOnly.cacheOnlyCachePath,
               argFollowing("--exclude-from", in: cArgv) == cacheOnly.cacheOnlyExcludePath,
@@ -3088,6 +3076,43 @@ enum ConfigSelfTest {
                           "(cache-only command splits a spaced path: \(cArgv))")
         }
         return report("AC-CK4", "mount-command-quoting", true)
+    }
+
+    // MARK: - AC-SEC1 — the generated script never re-parses a value as shell code
+
+    /// A path containing shell metacharacters must reach rclone as ONE literal argument and
+    /// never execute. The script used to build a string and `eval` it, so a folder named
+    /// `$(touch x)` ran `touch x`. Asserts on the argv the script actually hands rclone, plus
+    /// a static check that no `eval` of the rclone command survives in the script.
+    private static func testScriptNoShellEval() -> Bool {
+        let name = "AC-SEC1", slug = "script-no-shell-eval"
+        let fm = FileManager.default
+        let root = "\(selfTestRoot)/sec1-\(UUID().uuidString)"
+        let marker = "\(root)/injected"
+        let local = "\(root)/a \"quoted\" $(touch \(marker)) `touch \(marker)` ;x"
+        let cache = "\(root)/cache"
+        let target = "\(root)/remote-target"
+        for dir in [local, cache, target] {
+            try? fm.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        }
+        let profile = mountFixtureProfile(localPath: local, cachePath: cache)
+        defer { try? fm.removeItem(atPath: profile.cacheOnlyConfigPath) }
+        let result = dryRunMountScript(
+            profile: profile, rcloneConfig: aliasRcloneConfig(name: "synology", path: target))
+        guard result.mode == MountMode.streaming.rawValue else {
+            return report(name, slug, false, "(fixture did not dry-run streaming: \(result.output) log=\(result.log))")
+        }
+        guard result.args.contains(local) else {
+            return report(name, slug, false, "(metacharacter path was not passed as one argument: \(result.args))")
+        }
+        guard !fm.fileExists(atPath: marker) else {
+            return report(name, slug, false, "(a path value was executed as shell code)")
+        }
+        let script = SyncSetupService.shared.generateSyncScript()
+        guard !script.contains("eval \"$RCLONE_CMD\""), script.contains("\"${RCLONE_CMD[@]}\"") else {
+            return report(name, slug, false, "(script still evals the rclone command string)")
+        }
+        return report(name, slug, true)
     }
 
     // MARK: - AC-CO1 — Cache Only union config + command composition
@@ -3116,7 +3141,7 @@ enum ConfigSelfTest {
         else {
             return report("AC-CO1", "cache-only-union-config", false, "(command missing expected flags: \(cmd))")
         }
-        guard !cmd.contains("--cache-dir \"\(cache)\"") else {
+        guard argFollowing("--cache-dir", in: result.args) != cache else {
             return report("AC-CO1", "cache-only-union-config", false, "(cache-only mount reused the streaming --cache-dir)")
         }
         // Cache Only must use the same long dir-cache-time as streaming (1000h): its union
