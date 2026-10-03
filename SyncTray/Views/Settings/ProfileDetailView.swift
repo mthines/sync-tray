@@ -329,9 +329,7 @@ struct ProfileDetailView: View {
                             profileStore: profileStore,
                             syncManager: syncManager,
                             syncMode: syncMode,
-                            syncDirection: syncDirection,
-                            rcloneRemote: rcloneRemote,
-                            remotePath: remotePath
+                            syncDirection: syncDirection
                         )
                     }
 
@@ -4399,12 +4397,10 @@ struct SyncOnlyFoldersSection: View {
     let profile: SyncProfile
     @ObservedObject var profileStore: ProfileStore
     @ObservedObject var syncManager: SyncManager
-    /// The form's current mode/direction/remote (may be unsaved), so the caption and picker
-    /// match what the user is looking at.
+    /// The form's current mode/direction (may be unsaved), so the caption matches what the
+    /// user is looking at. The picker itself roots at `liveProfile` — see the `.sheet` below.
     let syncMode: SyncMode
     let syncDirection: SyncDirection
-    let rcloneRemote: String
-    let remotePath: String
 
     @State private var folders: [String] = []
     @State private var showingBrowser = false
