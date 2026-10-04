@@ -3,6 +3,110 @@ import AppKit
 import Combine
 import ServiceManagement
 
+/// Who is launching an exclusive run — every recovery/resync entry point names
+/// itself so a token can be told apart in diagnostics.
+enum ExclusiveRunSource: String {
+    case installResync = "install_resync"
+    case resync
+    case smartFix = "smart_fix"
+    case unlockAndResync = "unlock_resync"
+    case forceSync = "force_sync"
+    case autoFix = "auto_fix"
+}
+
+/// Proof that a caller holds the exclusive run slot for `profileId`. Only the
+/// exact token `begin` handed out can `end` it — a superseded or foreign token
+/// (e.g. a very late callback from a run that was already dropped by the
+/// stale-grace self-heal) is rejected by `ExclusiveRunRegistry.end`, so it can
+/// never release a newer run out from under it.
+struct ExclusiveRunToken: Hashable {
+    let profileId: UUID
+    let id: UUID
+    let source: ExclusiveRunSource
+    /// The `/tmp` run-lock placeholder token this run acquired with (the app's own
+    /// PID, per D4) — callers use this (plus any later child-PID swap) to build the
+    /// `ownTokens` set `SyncRunLock.releaseIfOwned`/`replaceIfOwned` need.
+    let placeholder: String
+    let startedAt: Date
+}
+
+/// Pure in-memory registry enforcing "one exclusive run per profile at a time".
+/// Replaces the old in-flight `Set<UUID>` (D1): a bare set cannot tell
+/// whose run is ending, so a late `end` from a superseded run could release a
+/// newer one, and it was being cleared by `.syncCompleted`/`.syncFailed` log
+/// events from processes that were never its owner. A token makes `end`
+/// idempotent and owner-checked, and the struct is self-testable without
+/// constructing `SyncManager`.
+struct ExclusiveRunRegistry {
+    enum Decision: Equatable {
+        case granted(ExclusiveRunToken)
+        case blocked(BlockReason)
+    }
+
+    enum BlockReason: Equatable {
+        case inFlight
+        case runLockLive
+        case sessionLockLive
+    }
+
+    /// An entry older than this with a dead run lock is treated as abandoned
+    /// (R9) — the self-heal backstop for a missed `endExclusiveRun` call, since
+    /// every normal exit path releases its own token well under a minute.
+    static let staleGrace: TimeInterval = 60
+
+    private var active: [UUID: ExclusiveRunToken] = [:]
+
+    /// Decide whether `profileId` may start an exclusive run right now. Checks,
+    /// in order: an existing registry entry (dropped first if it is older than
+    /// `staleGrace` AND its run lock is no longer live — R9's self-heal), then
+    /// the `/tmp` run lock's liveness, then the bisync session `.lck` holder's
+    /// liveness. Granting creates and stores a fresh token. Pure (liveness is
+    /// injected via `isAlive`).
+    mutating func begin(
+        profileId: UUID,
+        source: ExclusiveRunSource,
+        runLock: SyncRunLock.Holder,
+        sessionLock: SyncRunLock.Holder,
+        isAlive: (Int32) -> Bool,
+        now: Date,
+        placeholder: String
+    ) -> Decision {
+        if let existing = active[profileId] {
+            let runLockLive = SyncRunLock.isLive(runLock, isAlive: isAlive)
+            let abandoned = now.timeIntervalSince(existing.startedAt) > Self.staleGrace && !runLockLive
+            if !abandoned {
+                return .blocked(.inFlight)
+            }
+            active.removeValue(forKey: profileId)
+        }
+
+        if SyncRunLock.isLive(runLock, isAlive: isAlive) {
+            return .blocked(.runLockLive)
+        }
+        if SyncRunLock.isLive(sessionLock, isAlive: isAlive) {
+            return .blocked(.sessionLockLive)
+        }
+
+        let token = ExclusiveRunToken(profileId: profileId, id: UUID(), source: source, placeholder: placeholder, startedAt: now)
+        active[profileId] = token
+        return .granted(token)
+    }
+
+    /// Release `token`'s slot iff it is still the stored token for its profile —
+    /// a superseded or foreign token is rejected (returns `false`) and leaves the
+    /// newer run active, untouched.
+    @discardableResult
+    mutating func end(_ token: ExclusiveRunToken) -> Bool {
+        guard active[token.profileId] == token else { return false }
+        active.removeValue(forKey: token.profileId)
+        return true
+    }
+
+    func isActive(_ profileId: UUID) -> Bool {
+        active[profileId] != nil
+    }
+}
+
 @MainActor
 final class SyncManager: ObservableObject {
     @Published private(set) var currentState: SyncState = .idle
@@ -254,9 +358,22 @@ final class SyncManager: ObservableObject {
     /// Reset when the profile completes a successful sync.
     private var autoFixSuppressed: Set<UUID> = []
 
-    /// Profiles where an auto-fix resync is currently in-flight.
-    /// Prevents a second Task from being dispatched before the first completes.
-    private var autoFixInFlight: Set<UUID> = []
+    /// Single-run guard (CLAUDE.md "One Run Per Profile"): enforces one exclusive
+    /// run per profile across every launch path (reinstall resync, Resync, Smart
+    /// Fix, Unlock & Resync, Force Sync, auto-fix). Replaces the old
+    /// in-flight `Set<UUID>` — see `ExclusiveRunRegistry`'s doc comment.
+    private var exclusiveRunRegistry = ExclusiveRunRegistry()
+
+    /// An external `.profile.json` edit's `.reinstall` reconcile, deferred because the
+    /// profile's run was live at edit time (review finding: this used to be dropped with
+    /// only a debug log and never retried — the next edit diffed against the already-
+    /// persisted profile, found nothing to reconcile, and the agent kept running the
+    /// stale script forever). `old` is the profile as it was actually installed (captured
+    /// BEFORE this edit persisted), so a later retry still tears down what is really
+    /// running; `new` is replaced by each subsequent deferred edit while one run keeps
+    /// blocking. Retried from `processLogEvent` whenever this profile's run is observed
+    /// to end (`retryPendingExternalReinstallIfNeeded`).
+    private var pendingExternalReinstalls: [UUID: (old: SyncProfile, new: SyncProfile)] = [:]
 
     /// The time window (seconds) within which consecutive auto-fix failures trigger backoff suppression.
     private let autoFixBackoffWindow: TimeInterval = 5 * 60  // 5 minutes
@@ -845,6 +962,27 @@ final class SyncManager: ObservableObject {
             }
 
         case .reinstall:
+            // Refuse while the profile's run is live (review finding): an external edit
+            // reaches `uninstallForReinstall` without going through `beginExclusiveRun`,
+            // so without this check a config edit that lands mid-run would unload the
+            // agent, delete the profile's own live locks, then immediately reload the
+            // agent (RunAtLoad=true) — a second bisync next to the one still running.
+            // `uninstallForReinstall` itself refuses too (defense in depth, shared with
+            // the CLI's `reinstall`/`profile set`); skipping `install` here as well means
+            // this edit is never half-applied (config persisted above, agent left as-is).
+            guard !isRunLive(for: currentProfile) else {
+                // Remember it instead of dropping it (review finding): keep the ORIGINAL
+                // `old` from the first deferral if one is already pending, since that is
+                // what is actually installed — only `new` advances to this latest edit.
+                let effectiveOld = pendingExternalReinstalls[currentProfile.id]?.old ?? currentProfile
+                pendingExternalReinstalls[currentProfile.id] = (old: effectiveOld, new: updatedProfile)
+                SyncTraySettings.debugLog(
+                    "[ConfigFileWatcher] Deferred reinstall for '\(currentProfile.name)': a sync is currently running; will retry once it ends")
+                TelemetryService.shared.recordDeferredReinstall(
+                    profileId: currentProfile.id, profileName: currentProfile.name, outcome: "deferred")
+                break
+            }
+            pendingExternalReinstalls[currentProfile.id] = nil
             do {
                 // Keeps the bisync listings while they still apply, so a settings edit
                 // never forces a full --resync (see `uninstallForReinstall`).
@@ -1032,6 +1170,173 @@ final class SyncManager: ObservableObject {
         monitoringExternalSyncs.contains(profileId)
     }
 
+    // MARK: - Single-Run Guard
+
+    /// Decide whether a profile is live right now, for `isRunLive`. Pure static so
+    /// it is self-testable without constructing `SyncManager` (AC-SR7). Mount
+    /// (Stream) profiles hold their `/tmp` run lock for the whole life of the
+    /// mount daemon (R7) — if lock liveness counted for them, Pause/Uninstall/
+    /// Reinstall would stay disabled forever (see the comment in
+    /// `detectAndResumeRunningSyncs`), so a mount profile's liveness comes from
+    /// the registry alone.
+    nonisolated static func runLiveness(
+        isMount: Bool,
+        registryActive: Bool,
+        runLock: SyncRunLock.Holder,
+        sessionLock: SyncRunLock.Holder,
+        isAlive: (Int32) -> Bool
+    ) -> Bool {
+        if isMount {
+            return registryActive
+        }
+        return registryActive
+            || SyncRunLock.isLive(runLock, isAlive: isAlive)
+            || SyncRunLock.isLive(sessionLock, isAlive: isAlive)
+    }
+
+    /// Read a profile's two lock holders fresh from disk: the `/tmp` run lock and
+    /// the bisync session `.lck`. Shared by every method below so the parse logic
+    /// lives in one place.
+    private func lockHolders(for profile: SyncProfile) -> (runLock: SyncRunLock.Holder, sessionLock: SyncRunLock.Holder) {
+        let runLock = SyncRunLock.parseHolder(try? String(contentsOfFile: profile.lockFilePath, encoding: .utf8))
+        let sessionLockPath = SyncRunLock.sessionLockPath(for: profile)
+        let sessionLock = SyncRunLock.parseHolder(try? String(contentsOfFile: sessionLockPath, encoding: .utf8))
+        return (runLock, sessionLock)
+    }
+
+    /// Begin an exclusive run for `profile`, atomically acquiring the `/tmp` run
+    /// lock with the app's own PID as a live placeholder (D4) once the registry
+    /// grants the slot. Every launch path that actually starts rclone (reinstall
+    /// resync, Resync, Smart Fix, Unlock & Resync, Force Sync, auto-fix) calls this
+    /// before doing anything else. Returns `nil` when blocked — the caller must not
+    /// mutate state, clear errors, or launch a process.
+    func beginExclusiveRun(for profile: SyncProfile, source: ExclusiveRunSource) -> ExclusiveRunToken? {
+        let (runLock, sessionLock) = lockHolders(for: profile)
+        let placeholder = String(getpid())
+        let decision = exclusiveRunRegistry.begin(
+            profileId: profile.id,
+            source: source,
+            runLock: runLock,
+            sessionLock: sessionLock,
+            isAlive: SyncRunLock.processIsAlive,
+            now: Date(),
+            placeholder: placeholder
+        )
+        guard case .granted(let token) = decision else { return nil }
+
+        let acquireResult = SyncRunLock.acquire(path: profile.lockFilePath, token: placeholder, isAlive: SyncRunLock.processIsAlive)
+        guard acquireResult == .acquired else {
+            exclusiveRunRegistry.end(token)
+            return nil
+        }
+        return token
+    }
+
+    /// Release `token`'s registry slot. Does NOT touch the lock file on disk —
+    /// callers release that separately via `SyncRunLock.releaseIfOwned` once the
+    /// process has actually exited, so the lock stays held for the run's whole
+    /// lifetime even though the registry entry and the file are independent.
+    func endExclusiveRun(_ token: ExclusiveRunToken) {
+        exclusiveRunRegistry.end(token)
+    }
+
+    /// Check-only variant for script-driven recovery (Unlock & Retry, Unlock, Sync
+    /// Now — D6): the sync script takes its own atomic `noclobber` lock, so these
+    /// paths only need to know whether it is safe to proceed, not a token to hold.
+    func canStartRun(for profile: SyncProfile) -> Bool {
+        guard !exclusiveRunRegistry.isActive(profile.id) else { return false }
+        let (runLock, sessionLock) = lockHolders(for: profile)
+        if SyncRunLock.isLive(runLock, isAlive: SyncRunLock.processIsAlive) { return false }
+        if SyncRunLock.isLive(sessionLock, isAlive: SyncRunLock.processIsAlive) { return false }
+        return true
+    }
+
+    /// Whether a profile currently has a live run, for UI gating (`isSyncRunningForProfile`,
+    /// the error banner) and for suppressing a rejected-concurrent-run failure from
+    /// being treated as a profile failure (R3).
+    func isRunLive(for profile: SyncProfile) -> Bool {
+        let (runLock, sessionLock) = lockHolders(for: profile)
+        return Self.runLiveness(
+            isMount: profile.isMountMode,
+            registryActive: exclusiveRunRegistry.isActive(profile.id),
+            runLock: runLock,
+            sessionLock: sessionLock,
+            isAlive: SyncRunLock.processIsAlive
+        )
+    }
+
+    /// Applies a reinstall that `applyExternalProfileEdit` deferred because the
+    /// profile's run was live at edit time (review finding: a deferred reinstall was
+    /// otherwise never retried). Called from `processLogEvent` whenever a log event
+    /// observes this profile's run ending — safe to call unconditionally; a no-op when
+    /// nothing is pending.
+    ///
+    /// Reinstalls the CURRENT profile from `profileStore`, never the `pending.new`
+    /// snapshot captured at defer time (review finding): any edit that lands while the
+    /// run was still live — including a `.none`-action edit like a changed "Don't Sync"
+    /// pattern, or an enable/disable — updates the store but never touches the pending
+    /// snapshot, so installing the stale copy would silently drop it.
+    private func retryPendingExternalReinstallIfNeeded(for profileId: UUID) {
+        guard let pending = pendingExternalReinstalls[profileId] else { return }
+        // The profile may have been deleted, or disabled, while the reinstall was
+        // deferred (review finding): neither clears the pending entry, and falling
+        // back to the stale `pending.new` snapshot on a delete — or reinstalling a
+        // profile the user explicitly disabled — would bring back a launchd agent
+        // with no UI to stop it. Drop the pending entry instead; both delete and
+        // disable already ran their own `uninstall` through the normal reconcile
+        // path, so there is nothing left to reinstall.
+        guard let latest = profileStore.profile(for: profileId), latest.isEnabled else {
+            pendingExternalReinstalls[profileId] = nil
+            TelemetryService.shared.recordDeferredReinstall(
+                profileId: profileId, profileName: pending.new.name, outcome: "dropped")
+            return
+        }
+        guard !isRunLive(for: latest) else {
+            // The "run ended" log line and the run actually being over are not atomic:
+            // an app-started run's terminationHandler writes "Bisync completed/failed"
+            // BEFORE releasing the lock, and the launchd sync script's own log line
+            // precedes its EXIT trap removing the session lock (review finding). Either
+            // way `isRunLive` can still read true for a moment after this log event — a
+            // short delayed re-check catches that window instead of waiting for some
+            // unrelated later run to end.
+            scheduleRetryPendingExternalReinstallCheck(for: profileId)
+            return
+        }
+        pendingReinstallRetryScheduled.remove(profileId)
+        pendingExternalReinstalls[profileId] = nil
+        do {
+            try setupService.uninstallForReinstall(from: pending.old, to: latest)
+        } catch {
+            // Ignore uninstall errors, matching the original deferred path.
+        }
+        do {
+            try setupService.install(profile: latest)
+            startWatching(profile: latest)
+            SyncTraySettings.debugLog(
+                "[ConfigFileWatcher] Applied deferred reinstall for '\(latest.name)' now that its run has ended")
+            TelemetryService.shared.recordDeferredReinstall(
+                profileId: profileId, profileName: latest.name, outcome: "applied")
+        } catch {
+            print("Failed to reinstall externally-edited profile after deferred retry: \(error)")
+            TelemetryService.shared.recordDeferredReinstall(
+                profileId: profileId, profileName: latest.name, outcome: "failed")
+        }
+    }
+
+    /// At most one in-flight delayed re-check per profile, so repeated log events while
+    /// a run is winding down don't stack up timers (see `retryPendingExternalReinstallIfNeeded`).
+    private var pendingReinstallRetryScheduled: Set<UUID> = []
+
+    private func scheduleRetryPendingExternalReinstallCheck(for profileId: UUID) {
+        guard !pendingReinstallRetryScheduled.contains(profileId) else { return }
+        pendingReinstallRetryScheduled.insert(profileId)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
+            guard let self else { return }
+            self.pendingReinstallRetryScheduled.remove(profileId)
+            self.retryPendingExternalReinstallIfNeeded(for: profileId)
+        }
+    }
+
     // MARK: - Auto-Fix
 
     /// Attempt an automatic --resync recovery for the given profile.
@@ -1080,9 +1385,18 @@ final class SyncManager: ObservableObject {
             return
         }
 
-        // Skip if a resync is already in-flight for this profile
-        guard !autoFixInFlight.contains(profileId) else {
-            SyncTraySettings.debugLog("Auto-fix skipped: resync already in-flight for '\(profile.name)'")
+        // Skip if a resync is already in-flight for this profile, or if another
+        // process holds the run/session lock (D8): checked here, in the same
+        // position the old in-flight-set check occupied, before the backoff
+        // bookkeeping below. Blocked is telemetry-visible now, where the old
+        // in-flight skip was silent.
+        guard let token = beginExclusiveRun(for: profile, source: .autoFix) else {
+            SyncTraySettings.debugLog("Auto-fix skipped: a run is already in progress for '\(profile.name)'")
+            TelemetryService.shared.recordAutoFixTriggered(
+                profileId: profileId,
+                profileName: profile.name,
+                result: "blocked_already_running"
+            )
             return
         }
 
@@ -1090,6 +1404,8 @@ final class SyncManager: ObservableObject {
         // transition notification so the user is not spammed on every subsequent syncFailed event.
         guard !autoFixSuppressed.contains(profileId) else {
             SyncTraySettings.debugLog("Auto-fix suppressed (backoff) for '\(profile.name)'")
+            SyncRunLock.releaseIfOwned(path: profile.lockFilePath, ownTokens: [token.placeholder])
+            endExclusiveRun(token)
             return
         }
 
@@ -1112,6 +1428,8 @@ final class SyncManager: ObservableObject {
             )
             SyncTraySettings.debugLog("Auto-fix giving up (backoff) for '\(profile.name)' after \(attempts.count) attempts")
             notificationService.notifyAutoFixSuppressed(profileId: profileId, profileName: profile.name)
+            SyncRunLock.releaseIfOwned(path: profile.lockFilePath, ownTokens: [token.placeholder])
+            endExclusiveRun(token)
             return
         }
 
@@ -1133,11 +1451,8 @@ final class SyncManager: ObservableObject {
         // upcoming "Starting bisync" / "Bisync completed" markers promptly.
         logWatchers[profileId]?.setActivelySyncing(true)
 
-        // Mark in-flight before dispatching
-        autoFixInFlight.insert(profileId)
-
         Task {
-            await performResync(for: profile)
+            await performResync(for: profile, token: token)
         }
     }
 
@@ -1183,9 +1498,12 @@ final class SyncManager: ObservableObject {
     }
 
     /// Run `rclone bisync --resync` for a profile directly (no UI output panel).
-    /// Called by `triggerAutoFix`. On completion, state is updated via the existing
-    /// log-watcher pipeline (same as scheduled syncs).
-    private func performResync(for profile: SyncProfile) async {
+    /// Called by `triggerAutoFix`, which has already acquired `token` via
+    /// `beginExclusiveRun` — this function never sweeps `.lck` files, never writes
+    /// a `"pending"` sentinel, and only ever touches `token`'s own lock through the
+    /// owner-checked `SyncRunLock` primitives. On completion, state is updated via
+    /// the existing log-watcher pipeline (same as scheduled syncs).
+    private func performResync(for profile: SyncProfile, token: ExclusiveRunToken) async {
         let profileId = profile.id
 
         // Capture all values from the main actor before going to the background
@@ -1201,18 +1519,7 @@ final class SyncManager: ObservableObject {
         let fallbackTransport = profileTransports[profileId] ?? .unknown
         let fallbackRemote = profile.fallbackRemote
         let (effectiveRemotePath, extraEnv) = resolveActiveRemote(for: profile)
-        let bisyncDir = "\(NSHomeDirectory())/Library/Caches/rclone/bisync"
-
-        // Pre-flight: if a live lock already exists for a running process, skip.
-        if let existingPidStr = try? String(contentsOfFile: lockPath, encoding: .utf8)
-                .trimmingCharacters(in: .whitespacesAndNewlines),
-           let existingPid = Int32(existingPidStr),
-           kill(existingPid, 0) == 0 {
-            SyncTraySettings.debugLog("Resync already in progress for '\(profile.name)', skipping auto-fix")
-            autoFixInFlight.remove(profileId)
-            setSyncing(for: profileId, isSyncing: false)
-            return
-        }
+        let placeholder = token.placeholder
 
         // Re-check the external drive right before launching — it may have been unplugged in
         // the window between triggerAutoFix's guard and now (a resync can be queued behind an
@@ -1221,21 +1528,10 @@ final class SyncManager: ObservableObject {
         if !drivePathToMonitor.isEmpty,
            !FileManager.default.fileExists(atPath: drivePathToMonitor) {
             SyncTraySettings.debugLog("Auto-fix aborted: external drive unmounted before resync for '\(profile.name)'")
-            autoFixInFlight.remove(profileId)
+            SyncRunLock.releaseIfOwned(path: lockPath, ownTokens: [placeholder])
+            endExclusiveRun(token)
             profileStates[profileId] = .driveNotMounted
             updateAggregateState()
-            return
-        }
-
-        // Write a sentinel lock file NOW — before process.run() — so launchd cannot
-        // spawn a concurrent rclone bisync against the same remote/path in the gap
-        // between process creation and PID availability.
-        let lockURL = URL(fileURLWithPath: lockPath)
-        let sentinelWritten = (try? Data("pending".utf8).write(to: lockURL)) != nil
-        if !sentinelWritten {
-            SyncTraySettings.debugLog("Could not write sentinel lock for '\(profile.name)' — aborting auto-fix")
-            autoFixInFlight.remove(profileId)
-            setSyncing(for: profileId, isSyncing: false)
             return
         }
 
@@ -1244,16 +1540,9 @@ final class SyncManager: ObservableObject {
                 DispatchQueue.global(qos: .userInitiated).async {
                     let fileManager = FileManager.default
 
-                    // Remove stale bisync .lck files before resync (same as runResync in the view)
-                    if let files = try? fileManager.contentsOfDirectory(atPath: bisyncDir) {
-                        for file in files where file.hasSuffix(".lck") {
-                            try? fileManager.removeItem(atPath: "\(bisyncDir)/\(file)")
-                        }
-                    }
-
                     // Locate rclone binary
                     guard let rclonePath = RcloneLocator.resolve() else {
-                        try? fileManager.removeItem(atPath: lockPath)
+                        SyncRunLock.releaseIfOwned(path: lockPath, ownTokens: [placeholder])
                         continuation.resume(throwing: NSError(
                             domain: "SyncManager",
                             code: 1,
@@ -1329,7 +1618,7 @@ final class SyncManager: ObservableObject {
                     }
 
                     guard let processLog = FileHandle(forWritingAtPath: logPath) else {
-                        try? fileManager.removeItem(atPath: lockPath)
+                        SyncRunLock.releaseIfOwned(path: lockPath, ownTokens: [placeholder])
                         continuation.resume(throwing: NSError(
                             domain: "SyncManager",
                             code: 2,
@@ -1343,39 +1632,45 @@ final class SyncManager: ObservableObject {
 
                     appendLog("Starting bisync (auto-fix --resync)")
 
+                    // Child PID becomes known only after `process.run()`; captured here so the
+                    // termination handler can release the lock whichever token it still holds
+                    // (placeholder, if the swap below never landed, or the real child PID).
+                    var childPIDToken = placeholder
+
                     process.terminationHandler = { proc in
                         try? processLog.close()
                         let exit = proc.terminationStatus
                         appendLog(exit == 0
                             ? "Bisync completed successfully"
                             : "Bisync failed with exit code \(exit)")
-                        try? fileManager.removeItem(atPath: lockPath)
+                        SyncRunLock.releaseIfOwned(path: lockPath, ownTokens: [placeholder, childPIDToken])
                         continuation.resume()
                     }
 
                     do {
                         try process.run()
-                        // Overwrite sentinel with the real PID now that we have it
-                        try? "\(process.processIdentifier)".write(
-                            toFile: lockPath, atomically: true, encoding: .utf8)
+                        // Swap the placeholder for the real child PID now that it's known —
+                        // only if the lock still holds the placeholder (owner-checked).
+                        childPIDToken = "\(process.processIdentifier)"
+                        SyncRunLock.replaceIfOwned(path: lockPath, expected: placeholder, with: childPIDToken)
                     } catch {
                         try? processLog.close()
                         appendLog("Auto-fix failed to launch rclone: \(error.localizedDescription)")
-                        try? fileManager.removeItem(atPath: lockPath)
+                        SyncRunLock.releaseIfOwned(path: lockPath, ownTokens: [placeholder])
                         continuation.resume(throwing: error)
                     }
                 }
             }
         } catch {
             SyncTraySettings.debugLog("Auto-fix process error for '\(profile.name)': \(error)")
-            autoFixInFlight.remove(profileId)
+            endExclusiveRun(token)
             setSyncing(for: profileId, isSyncing: false)
             return
         }
 
-        // Clear in-flight on clean exit. State after completion (idle / error) is set by
-        // the log-watcher pipeline via .syncCompleted / .syncFailed.
-        autoFixInFlight.remove(profileId)
+        // Clear the registry slot on clean exit. State after completion (idle / error)
+        // is set by the log-watcher pipeline via .syncCompleted / .syncFailed.
+        endExclusiveRun(token)
     }
 
     // MARK: - Notification Muting
@@ -1629,14 +1924,14 @@ final class SyncManager: ObservableObject {
     /// Check if a sync is currently running for this profile via lock file
     /// Returns the PID if found, nil otherwise
     private func detectRunningSyncPID(for profile: SyncProfile) -> Int32? {
-        let lockPath = profile.lockFilePath
-        guard FileManager.default.fileExists(atPath: lockPath),
-              let pidStr = try? String(contentsOfFile: lockPath, encoding: .utf8)
-                  .trimmingCharacters(in: .whitespacesAndNewlines),
-              let pid = Int32(pidStr),
-              kill(pid, 0) == 0 else {
-            return nil
-        }
+        let holder = SyncRunLock.parseHolder(try? String(contentsOfFile: profile.lockFilePath, encoding: .utf8))
+        guard case .pid(let pid) = holder, SyncRunLock.processIsAlive(pid) else { return nil }
+        // The `/tmp` lock briefly holds the app's own PID as a launch-gap placeholder
+        // (D4, `beginExclusiveRun`) before it is swapped for the real rclone child PID.
+        // Treating that window as "a sync process is running at this PID" would hand
+        // SyncTray's own PID to `terminateRunningSync`'s `kill(-pid, SIGTERM)` — Pause
+        // would SIGTERM the app itself (review finding). No running sync to detect yet.
+        guard pid != getpid() else { return nil }
         return pid
     }
 
@@ -2182,10 +2477,13 @@ final class SyncManager: ObservableObject {
             profileProgress[profileId] = nil  // Clear progress when sync completes
             logWatchers[profileId]?.setActivelySyncing(false)  // Reduce polling frequency
             lastSyncTime = event.timestamp
-            // Successful sync clears backoff suppression and in-flight state for this profile
+            // Successful sync clears backoff suppression for this profile. The
+            // exclusive-run registry is NOT touched here (D1): it is owned and
+            // ended only by the run that `beginExclusiveRun`'d it, never by a log
+            // event — a log event can come from any process writing this profile's
+            // shared log file, not necessarily the run that holds the token.
             autoFixSuppressed.remove(profileId)
             autoFixAttempts[profileId] = nil
-            autoFixInFlight.remove(profileId)
             let changesCount = currentSyncChanges[profileId]?.count ?? 0
             // Report telemetry for successful sync
             let completedDuration = syncStartTimes[profileId].map { Date().timeIntervalSince($0) } ?? 0
@@ -2209,10 +2507,36 @@ final class SyncManager: ObservableObject {
                 notificationService.clearPendingChanges(for: profileId)
             }
             currentSyncChanges[profileId] = nil
+            // The run just ended — apply any reinstall an external edit deferred while
+            // it was live (review finding).
+            retryPendingExternalReinstallIfNeeded(for: profileId)
 
         case .syncFailed(let exitCode, let message):
             // Check if the error message (or the last seen error) is a transient one
             let errorToCheck = message ?? lastSeenErrorMessage[profileId]
+
+            // A rejected CONCURRENT run's own failure (R3): another live process
+            // holds this profile's bisync session lock, so this `.syncFailed` is
+            // not a genuine profile failure — state stays whatever the still-live
+            // run left it at, no error is stored, and auto-fix never fires.
+            // Session-lock liveness ONLY (D5), never the in-flight registry: a
+            // rejected run that IS the in-flight app run itself, failing against
+            // its own dead stale lock, must still surface normally.
+            if let currentProfile = profile {
+                let sessionHolderLive = SyncRunLock.isLive(
+                    lockHolders(for: currentProfile).sessionLock, isAlive: SyncRunLock.processIsAlive)
+                if SyncRunLock.isRejectedConcurrentRun(message: errorToCheck, sessionHolderLive: sessionHolderLive) {
+                    SyncTraySettings.debugLog(
+                        "Ignoring prior-lock-file syncFailed for '\(currentProfile.name)': a live process holds the session lock")
+                    // Observable in Dash0 (review finding): this is the exact incident
+                    // shape this guard exists to catch — without a signal here nobody
+                    // can tell whether a double-bisync race is still happening.
+                    TelemetryService.shared.recordRejectedConcurrentRun(
+                        profileId: profileId, profileName: currentProfile.name, site: "sync_failed")
+                    break
+                }
+            }
+
             if let msg = errorToCheck, SyncLogPatterns.isTransientAllFilesChangedError(msg) {
                 // Transient "all files were changed" - just clear state, don't show error
                 profileProgress[profileId] = nil
@@ -2222,6 +2546,8 @@ final class SyncManager: ObservableObject {
                 currentSyncChanges[profileId] = nil  // Only clear this profile's changes
                 // Reset to idle since this isn't a real error
                 profileStates[profileId] = .idle
+                // The run just ended (cosmetic non-error) — apply any deferred reinstall.
+                retryPendingExternalReinstallIfNeeded(for: profileId)
                 break
             }
 
@@ -2255,10 +2581,9 @@ final class SyncManager: ObservableObject {
             }
             currentSyncChanges[profileId] = nil
 
-            // Clear in-flight sentinel so the backoff state can accept the next attempt.
             // The backoff counter (autoFixAttempts) and suppression (autoFixSuppressed) still
-            // apply — this only unblocks the in-flight guard.
-            autoFixInFlight.remove(profileId)
+            // apply unchanged. The exclusive-run registry is not touched here (D1) — only the
+            // run's own owner ends its token, via `performResync`/`endExclusiveRun`.
 
             // Auto-fix: if the stored error is an out-of-sync error and the setting is on,
             // trigger an automatic --resync recovery.
@@ -2267,6 +2592,9 @@ final class SyncManager: ObservableObject {
                let currentProfile = profile {
                 triggerAutoFix(for: currentProfile)
             }
+            // The run just ended (failed, but ended) — apply any reinstall an external
+            // edit deferred while it was live (review finding).
+            retryPendingExternalReinstallIfNeeded(for: profileId)
 
         case .transportChanged(let transport):
             profileTransports[profileId] = transport
@@ -2277,6 +2605,37 @@ final class SyncManager: ObservableObject {
             )
 
         case .errorMessage(let message):
+            // A rejected CONCURRENT run's own "prior lock file found" message (R3):
+            // another live process holds this profile's bisync session lock, so
+            // this is not this profile's error. Session-lock liveness ONLY (D5) —
+            // never the in-flight registry — so a rejected run that is the
+            // in-flight app run itself, failing against its own dead stale lock,
+            // still surfaces normally.
+            //
+            // Still record it into `lastSeenErrorMessage` before suppressing (review
+            // finding): the script's eventual plain-text "Bisync failed with exit
+            // code N" line parses to `.syncFailed(message: nil)`, so without this the
+            // `.syncFailed` handler's own `isRejectedConcurrentRun` re-check below has
+            // no message to test and the rejected run's failure leaks through as a
+            // genuine profile failure. `lastSeenErrorMessage` is "last seen" by
+            // design — a later REAL error message overwrites this one before
+            // `.syncFailed` arrives, so it is never mistakenly suppressed by a
+            // rejected run's stale message.
+            if let currentProfile = profile {
+                let sessionHolderLive = SyncRunLock.isLive(
+                    lockHolders(for: currentProfile).sessionLock, isAlive: SyncRunLock.processIsAlive)
+                if SyncRunLock.isRejectedConcurrentRun(message: message, sessionHolderLive: sessionHolderLive) {
+                    lastSeenErrorMessage[profileId] = message
+                    SyncTraySettings.debugLog(
+                        "Ignoring prior-lock-file errorMessage for '\(currentProfile.name)': a live process holds the session lock")
+                    // Observable in Dash0 (review finding) — same signal as the
+                    // `.syncFailed` suppression above, from the other log line shape.
+                    TelemetryService.shared.recordRejectedConcurrentRun(
+                        profileId: profileId, profileName: currentProfile.name, site: "error_message")
+                    break
+                }
+            }
+
             // Track all error messages so we can correlate with syncFailed events
             lastSeenErrorMessage[profileId] = message
 

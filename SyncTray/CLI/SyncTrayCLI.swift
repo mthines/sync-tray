@@ -1168,11 +1168,18 @@ enum SyncTrayCLI {
             env.stderr("error: \"\(profile.name)\" is incomplete (name/remote/paths); fix it with 'synctray profile set' first\n")
             return 1
         }
-        // Uninstall is cleanup — a failure here is non-fatal (mirrors delete),
-        // since the following install regenerates every file anyway. The
-        // reinstall teardown keeps the bisync listings (same profile in and out).
+        // `uninstallForReinstall` refuses while the profile's run is live (review
+        // finding, post-merge of the single-run guard): falling through to install
+        // regardless — as this used to do, on the reasoning that install regenerates
+        // every file anyway — would reload the agent (RunAtLoad=true) right next to a
+        // still-running sync, the second-bisync incident this guard exists to prevent.
+        // Stop here on ANY uninstall failure rather than only the live case; the CLI
+        // has no cheaper way to tell them apart, and treating a failed teardown as
+        // safe to install over was the same optimistic assumption that let the
+        // original incident through.
         if let err = env.uninstallForReinstall(profile, profile) {
-            env.stderr("warning: uninstall reported: \(err)\n")
+            env.stderr("error: reinstall refused: \(err)\n")
+            return 1
         }
         if let err = env.installProfile(profile) {
             env.stderr("error: reinstall failed: \(err)\n")
@@ -1367,13 +1374,33 @@ enum SyncTrayCLI {
             }
         }
 
+        let action = SyncManager.reconcileAction(from: original, to: updated)
+
+        // Refuse BEFORE persisting when the reconcile would reinstall (review finding):
+        // `uninstallForReinstall` itself throws while the profile's run is live, but that
+        // check used to run only AFTER `writeProfile` already persisted the edit — so a
+        // refused `profile set` left the edit stuck unapplied with no automatic retry;
+        // the only way out was `synctray reinstall`. Pre-flighting it here means a
+        // refusal touches no state, matching `ProfileDetailView.saveProfile`'s fix for
+        // the same race in the app.
+        if case .reinstall = action, let err = env.uninstallForReinstall(original, updated) {
+            env.stderr("error: \(err)\n")
+            return 1
+        }
+
         guard env.writeProfile(updated) else {
             env.stderr("error: failed to write profile file\n")
             return 1
         }
 
-        let action = SyncManager.reconcileAction(from: original, to: updated)
-        if let err = applyLaunchdReconcile(action, current: original, updated: updated, env: env) {
+        // For `.reinstall`, the teardown already ran above — only install remains.
+        let reconcileErr: String?
+        if case .reinstall = action {
+            reconcileErr = env.installProfile(updated)
+        } else {
+            reconcileErr = applyLaunchdReconcile(action, current: original, updated: updated, env: env)
+        }
+        if let err = reconcileErr {
             env.stderr("updated \(original.shortId) but launchd step failed: \(err)\n")
             return 1
         }

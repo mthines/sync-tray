@@ -106,6 +106,8 @@ final class TelemetryService {
     private var fileOperationCounter: LongCounterSdk?
     private var remoteConfigCounter: LongCounterSdk?
     private var syncContentionCounter: LongCounterSdk?
+    private var rejectedConcurrentRunCounter: LongCounterSdk?
+    private var deferredReinstallCounter: LongCounterSdk?
     private var logWatcherRecoveryCounter: LongCounterSdk?
     private var staleLockCleanupCounter: LongCounterSdk?
     private var syncCheckPhaseHistogram: DoubleHistogramMeterSdk?
@@ -345,6 +347,22 @@ final class TelemetryService {
         syncContentionCounter = meter
             .counterBuilder(name: "synctray.sync.contention")
             .setDescription("Number of times a sync was skipped because another was already running")
+            .setUnit("1")
+            .build()
+
+        rejectedConcurrentRunCounter = meter
+            .counterBuilder(name: "synctray.sync.rejected_concurrent_run")
+            .setDescription(
+                "Number of times a rejected concurrent run's own \"prior lock file found\" "
+                    + "failure was suppressed because the real holder is still live")
+            .setUnit("1")
+            .build()
+
+        deferredReinstallCounter = meter
+            .counterBuilder(name: "synctray.config.deferred_reinstall")
+            .setDescription(
+                "External profile edits whose reinstall was deferred because the profile's "
+                    + "run was live, by outcome (deferred, applied, failed, dropped)")
             .setUnit("1")
             .build()
 
@@ -1320,6 +1338,39 @@ final class TelemetryService {
         )
     }
 
+    /// Record when a rejected concurrent run's own "prior lock file found" failure is
+    /// suppressed rather than surfaced as this profile's failure (the single-run guard's
+    /// R3 behaviour — see CLAUDE.md "One Run Per Profile"). Without this signal there is
+    /// no way to see in Dash0 whether the double-bisync race this guard was built to stop
+    /// is still happening (review finding).
+    /// - Parameters:
+    ///   - site: which log-event shape triggered the suppression — `"sync_failed"`
+    ///           (the script's own `syncFailed` line) or `"error_message"` (an
+    ///           intermediate `errorMessage` line, before `syncFailed` arrives).
+    func recordRejectedConcurrentRun(
+        profileId: UUID,
+        profileName: String,
+        site: String
+    ) {
+        guard SyncTraySettings.telemetryEnabled else { return }
+        ensureSetup()
+
+        rejectedConcurrentRunCounter?.add(value: 1, attribute: [
+            "synctray.profile.name": .string(profileName),
+            "rejected_concurrent_run.site": .string(site),
+        ])
+
+        emitLog(
+            severity: .info,
+            body: "Rejected concurrent run suppressed",
+            attributes: [
+                "synctray.profile.id": .string(profileId.uuidString),
+                "synctray.profile.name": .string(profileName),
+                "rejected_concurrent_run.site": .string(site),
+            ]
+        )
+    }
+
     // MARK: - Auto-Fix
 
     /// Record an automatic --resync recovery attempt.
@@ -1328,11 +1379,15 @@ final class TelemetryService {
     ///   - profileName: Display name of the affected profile.
     ///   - result:      `"triggered"` when the resync starts; `"gave_up_backoff"` when
     ///                  backoff suppresses the retry after repeated triggers;
-    ///                  `"skipped_drive_not_mounted"` when the external drive is absent.
+    ///                  `"skipped_drive_not_mounted"` when the external drive is absent;
+    ///                  `"blocked_already_running"` when the single-run guard refused
+    ///                  because another run already holds the profile's lock (CLAUDE.md
+    ///                  "One Run Per Profile").
     func recordAutoFixTriggered(
         profileId: UUID,
         profileName: String,
-        result: String     // "triggered" | "gave_up_backoff" | "skipped_drive_not_mounted"
+        // "triggered" | "gave_up_backoff" | "skipped_drive_not_mounted" | "blocked_already_running"
+        result: String
     ) {
         guard SyncTraySettings.telemetryEnabled else { return }
         ensureSetup()
@@ -1342,13 +1397,15 @@ final class TelemetryService {
             "result": .string(result),
         ])
 
-        let severity: Severity = result == "gave_up_backoff" ? .warn : .info
+        let severity: Severity = (result == "gave_up_backoff" || result == "blocked_already_running") ? .warn : .info
         let body: String
         switch result {
         case "gave_up_backoff":
             body = "Auto-fix suppressed by backoff for \(profileName)"
         case "skipped_drive_not_mounted":
             body = "Auto-fix skipped: external drive not mounted for \(profileName)"
+        case "blocked_already_running":
+            body = "Auto-fix blocked: a sync is already running for \(profileName)"
         default:
             body = "Auto-resyncing \(profileName) after sync conflict"
         }
@@ -1441,10 +1498,14 @@ final class TelemetryService {
 
     /// Record a user-initiated sync recovery action (distinct from the automatic --resync).
     /// Signals how often users hit errors bad enough to intervene, and which action they pick.
+    /// `result` is `"started"` unless the single-run guard refused the action because
+    /// another run already holds the profile's lock (`"blocked_already_running"` — see
+    /// CLAUDE.md "One Run Per Profile"), in which case severity is `.warn`.
     func recordUserRecoveryAction(
         profileId: UUID,
         profileName: String,
-        action: String   // force_sync | resync | retry
+        action: String,              // force_sync | resync | retry | …
+        result: String = "started"   // started | blocked_already_running
     ) {
         guard SyncTraySettings.telemetryEnabled else { return }
         ensureSetup()
@@ -1452,15 +1513,17 @@ final class TelemetryService {
         userRecoveryActionCounter?.add(value: 1, attribute: [
             "synctray.profile.name": .string(profileName),
             "recovery.action": .string(action),
+            "recovery.result": .string(result),
         ])
 
         emitLog(
-            severity: .info,
+            severity: result == "blocked_already_running" ? .warn : .info,
             body: "User recovery action",
             attributes: [
                 "synctray.profile.id": .string(profileId.uuidString),
                 "synctray.profile.name": .string(profileName),
                 "recovery.action": .string(action),
+                "recovery.result": .string(result),
             ]
         )
     }
@@ -1504,6 +1567,30 @@ final class TelemetryService {
         ]
         externalConfigEditCounter?.add(value: 1, attribute: attrs)
         emitLog(severity: .info, body: "External config edit applied", attributes: attrs)
+    }
+
+    /// Record a deferred external-edit reinstall's lifecycle (review finding: previously
+    /// only a debugLog/print, so Dash0 could not show an edit that never got applied).
+    /// - Parameter outcome: `"deferred"` (a sync was live at edit time), `"applied"` (the
+    ///   retry succeeded once the run ended), `"failed"` (the retry's install call itself
+    ///   threw), or `"dropped"` (the profile was deleted or disabled while the reinstall
+    ///   was deferred, so the retry discarded it rather than reinstall a profile that no
+    ///   longer exists or that the user explicitly turned off).
+    func recordDeferredReinstall(profileId: UUID, profileName: String, outcome: String) {
+        guard SyncTraySettings.telemetryEnabled else { return }
+        ensureSetup()
+
+        let attrs: [String: AttributeValue] = [
+            "synctray.profile.name": .string(profileName),
+            "deferred_reinstall.outcome": .string(outcome),
+        ]
+        deferredReinstallCounter?.add(value: 1, attribute: attrs)
+
+        emitLog(
+            severity: outcome == "failed" ? .warn : .info,
+            body: "Deferred external-edit reinstall",
+            attributes: attrs.merging(["synctray.profile.id": .string(profileId.uuidString)]) { _, new in new }
+        )
     }
 
     // MARK: - Headless CLI

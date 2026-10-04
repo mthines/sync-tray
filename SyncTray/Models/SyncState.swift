@@ -439,6 +439,17 @@ enum SyncLogPatterns {
         message.contains("cannot find prior listing")
     }
 
+    /// Matches rclone's "prior lock file found" failure, which fires when a rejected
+    /// concurrent bisync run tries to start while another run already holds the
+    /// profile's session `.lck`. ANSI color codes (e.g. `\u{1b}[31m`, `\u{1b}[93m`)
+    /// wrap the phrase but never split it, so a lowercased substring match is
+    /// sufficient. Single source for this match — see `SyncRunLock.isRejectedConcurrentRun`,
+    /// which combines it with session-lock liveness to decide whether the failure is
+    /// a rejected concurrent run (suppressed) or a genuine stale-lock failure (surfaced).
+    static func isPriorLockFileError(_ message: String) -> Bool {
+        message.lowercased().contains("prior lock file found")
+    }
+
     // MARK: - Error Categorization
 
     /// Transient "all files changed" error that should be ignored.

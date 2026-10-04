@@ -312,6 +312,30 @@ final class SyncSetupService {
     /// pair's are stale, and any already under the new pair's name come from an earlier
     /// configuration, not from a sync this profile ran.
     func uninstallForReinstall(from old: SyncProfile, to new: SyncProfile) throws {
+        // Refuse while `old`'s run is live (review finding, post-merge of the single-run
+        // guard): Save, an external-edit reinstall, and the CLI's `reinstall`/`profile set`
+        // all reach this function directly — none of them go through
+        // `SyncManager.beginExclusiveRun`, so without this check they would unload the
+        // agent and unconditionally delete the profile's own live `/tmp` lock
+        // (`uninstall`, below) and live session `.lck` (`removeBisyncLock`), then
+        // `installSync` immediately reloads the agent with `RunAtLoad=true` — starting a
+        // second bisync right next to the one still running. That is the exact incident
+        // this guard exists to prevent, reached through reinstall instead of an explicit
+        // recovery button. Mount mode is exempt (R7): its `/tmp` lock is held for the
+        // mount daemon's entire life, and a Stream profile's folder/remote change
+        // legitimately needs to detach-and-remount through this same path.
+        if !old.isMountMode {
+            let runLock = SyncRunLock.parseHolder(try? String(contentsOfFile: old.lockFilePath, encoding: .utf8))
+            let sessionLock = SyncRunLock.parseHolder(
+                try? String(contentsOfFile: SyncRunLock.sessionLockPath(for: old), encoding: .utf8))
+            if SyncRunLock.isLive(runLock, isAlive: SyncRunLock.processIsAlive)
+                || SyncRunLock.isLive(sessionLock, isAlive: SyncRunLock.processIsAlive) {
+                throw NSError(domain: "SyncSetupService", code: 3, userInfo: [
+                    NSLocalizedDescriptionKey:
+                        "A sync is currently running for \(old.name); try again once it finishes."
+                ])
+            }
+        }
         try uninstall(profile: old, keepingSyncState: true)
         if Self.reinstallKeepsBisyncListings(from: old, to: new) {
             // The agent was just unloaded, so a bisync lock left behind belongs to a run that
@@ -428,7 +452,191 @@ final class SyncSetupService {
         _ = runCommand("/bin/launchctl", arguments: ["unload", profile.plistPath])
         _ = runCommand("/bin/launchctl", arguments: ["load", profile.plistPath])
     }
+}
 
+/// Pure core + thin shell for the single-run guard: one rclone bisync process per
+/// profile at a time (see CLAUDE.md "One Run Per Profile"). Parses the two lock
+/// files that can hold a profile's run state — the `/tmp` run lock SyncTray writes
+/// and rclone's own bisync session `.lck` — decides liveness, and performs
+/// atomic/owner-checked acquire, release, and stale-only removal. Non-isolated: it
+/// is called from both `@MainActor` (`SyncManager`) and background closures (the
+/// view's resync launchers), and from `ConfigSelfTest`'s synchronous fixtures.
+enum SyncRunLock {
+    /// What a lock file's content tells us about who (if anyone) holds it.
+    enum Holder: Equatable {
+        case none
+        case pid(Int32)
+        case pending
+        case unreadable
+    }
+
+    /// Parse a lock file's raw content into a `Holder`. Accepts a bare numeric PID
+    /// (the sync script's and the app's own placeholder/child-PID format), the
+    /// legacy `"pending"` sentinel (still treated as live — requirement R1 — and
+    /// cleaned up at startup because it is unparseable as a PID), and rclone's own
+    /// bisync lock JSON (`{"PID":"123"}` string or `{"PID":123}` number — observed:
+    /// `{"Session":"…","PID":"62932","TimeRenewed":"…","TimeExpires":"…"}`). Pure.
+    static func parseHolder(_ contents: String?) -> Holder {
+        guard let raw = contents?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty else {
+            return .none
+        }
+        if raw == "pending" { return .pending }
+        if let pid = Int32(raw) { return .pid(pid) }
+        if let data = raw.data(using: .utf8),
+           let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let pidField = json["PID"] {
+            if let pidNumber = pidField as? NSNumber {
+                return .pid(pidNumber.int32Value)
+            }
+            if let pidString = pidField as? String, let pid = Int32(pidString) {
+                return .pid(pid)
+            }
+        }
+        return .unreadable
+    }
+
+    /// `kill(pid, 0) == 0` means the process exists and is ours; `errno == EPERM`
+    /// means it exists but is owned by another user — both count as alive. Any
+    /// other errno (typically `ESRCH`) means the process does not exist. Pure
+    /// (callers inject this as the `isAlive` closure so decisions stay testable).
+    static func processIsAlive(_ pid: Int32) -> Bool {
+        if kill(pid, 0) == 0 { return true }
+        return errno == EPERM
+    }
+
+    /// Whether `holder` should be treated as a live run. `.pending` is always live —
+    /// it is the launch-gap placeholder the sync script's own `ps -p` check already
+    /// honours (D4). `.none`/`.unreadable` are never live, so they are reclaimable.
+    static func isLive(_ holder: Holder, isAlive: (Int32) -> Bool) -> Bool {
+        switch holder {
+        case .pid(let pid): return isAlive(pid)
+        case .pending: return true
+        case .none, .unreadable: return false
+        }
+    }
+
+    /// The bisync session `.lck` filename for a profile: `bisyncSessionName(for:) + ".lck"`.
+    static func sessionLockFileName(for profile: SyncProfile) -> String {
+        SyncSetupService.bisyncSessionName(for: profile) + ".lck"
+    }
+
+    /// Full path to a profile's bisync session `.lck` file.
+    /// - Parameter workDir: defaults to `bisyncWorkDir`; `ConfigSelfTest` passes a temp dir.
+    static func sessionLockPath(for profile: SyncProfile, workDir: String = SyncSetupService.bisyncWorkDir) -> String {
+        (workDir as NSString).appendingPathComponent(sessionLockFileName(for: profile))
+    }
+
+    enum UnlockDecision: Equatable {
+        case allow
+        case refuseRunLockLive
+        case refuseSessionLockLive
+    }
+
+    /// Whether an unlock (removing a profile's own stale lock files) may proceed.
+    /// Refuses when either the `/tmp` run lock or the bisync session `.lck` holder
+    /// is live — in that order, so the reported reason names whichever lock is
+    /// actually blocking. Pure.
+    static func unlockDecision(runLock: Holder, sessionLock: Holder, isAlive: (Int32) -> Bool) -> UnlockDecision {
+        if isLive(runLock, isAlive: isAlive) { return .refuseRunLockLive }
+        if isLive(sessionLock, isAlive: isAlive) { return .refuseSessionLockLive }
+        return .allow
+    }
+
+    /// Whether a lock file's trimmed `contents` is one of `ownTokens` — the test
+    /// `releaseIfOwned` uses to decide whether a run may remove a lock it once held
+    /// (its placeholder, or the real child PID it later swapped in). Pure.
+    static func shouldRelease(contents: String?, ownTokens: Set<String>) -> Bool {
+        guard let raw = contents?.trimmingCharacters(in: .whitespacesAndNewlines) else { return false }
+        return ownTokens.contains(raw)
+    }
+
+    /// Whether a `prior lock file found` failure (`SyncLogPatterns.isPriorLockFileError`)
+    /// is a rejected CONCURRENT run — another live process holds the session lock —
+    /// rather than a genuine failure against a stale lock. A dead holder means the
+    /// lock really was stale, so the error must surface normally (D5): the rejected
+    /// run might be the in-flight app run itself, failing against its own dead stale
+    /// lock, and that failure still needs to offer Unlock & Retry. Pure.
+    static func isRejectedConcurrentRun(message: String?, sessionHolderLive: Bool) -> Bool {
+        guard let message, SyncLogPatterns.isPriorLockFileError(message) else { return false }
+        return sessionHolderLive
+    }
+
+    enum AcquireResult: Equatable {
+        case acquired
+        case heldLive
+        case failed
+    }
+
+    /// Atomically acquire a lock file at `path`, writing `token`. Uses
+    /// `O_CREAT|O_EXCL` so two processes racing to create the file can never both
+    /// succeed. If the file already exists: a live holder refuses (`.heldLive`,
+    /// content left untouched); a dead/unreadable holder is reclaimed by removing
+    /// the stale file and retrying the exclusive create exactly once.
+    static func acquire(path: String, token: String, isAlive: (Int32) -> Bool) -> AcquireResult {
+        if tryExclusiveCreate(path: path, token: token) { return .acquired }
+
+        let existing = parseHolder(try? String(contentsOfFile: path, encoding: .utf8))
+        if isLive(existing, isAlive: isAlive) { return .heldLive }
+
+        // Stale — reclaim once.
+        try? FileManager.default.removeItem(atPath: path)
+        if tryExclusiveCreate(path: path, token: token) { return .acquired }
+        return .failed
+    }
+
+    private static func tryExclusiveCreate(path: String, token: String) -> Bool {
+        let fd = open(path, O_CREAT | O_EXCL | O_WRONLY, 0o644)
+        guard fd >= 0 else { return false }
+        defer { close(fd) }
+        let bytes = Array(token.utf8)
+        let written = bytes.withUnsafeBufferPointer { buffer -> Int in
+            guard let base = buffer.baseAddress else { return 0 }
+            return write(fd, base, buffer.count)
+        }
+        return written == bytes.count
+    }
+
+    /// Remove the lock at `path` iff its content is one of `ownTokens` — never a
+    /// foreign holder's. Returns whether the file was removed.
+    @discardableResult
+    static func releaseIfOwned(path: String, ownTokens: Set<String>) -> Bool {
+        guard let contents = try? String(contentsOfFile: path, encoding: .utf8),
+              shouldRelease(contents: contents, ownTokens: ownTokens) else { return false }
+        try? FileManager.default.removeItem(atPath: path)
+        return true
+    }
+
+    /// Swap `path`'s content from `expected` to `newToken` only if it still holds
+    /// `expected` — guards the placeholder-to-child-PID swap against a lock that
+    /// was reclaimed or released out from under the caller between acquire and the
+    /// point the child PID becomes known.
+    @discardableResult
+    static func replaceIfOwned(path: String, expected: String, with newToken: String) -> Bool {
+        guard let contents = try? String(contentsOfFile: path, encoding: .utf8)
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+              contents == expected else { return false }
+        try? newToken.write(toFile: path, atomically: true, encoding: .utf8)
+        return true
+    }
+
+    /// Stale-only unlock: when both the `/tmp` run lock and the session `.lck`
+    /// holder are dead, remove the run lock and ONLY this profile's session
+    /// `.lck` — never anything else in the bisync work directory (so a sibling
+    /// profile's `.lck`, or this profile's own `<session>.old.lck`, is untouched).
+    /// Files are left exactly as they were when the decision is a refusal.
+    @discardableResult
+    static func removeStaleLocks(runLockPath: String, sessionLockPath: String, isAlive: (Int32) -> Bool) -> UnlockDecision {
+        let runLock = parseHolder(try? String(contentsOfFile: runLockPath, encoding: .utf8))
+        let sessionLock = parseHolder(try? String(contentsOfFile: sessionLockPath, encoding: .utf8))
+        let decision = unlockDecision(runLock: runLock, sessionLock: sessionLock, isAlive: isAlive)
+        guard decision == .allow else { return decision }
+        try? FileManager.default.removeItem(atPath: runLockPath)
+        try? FileManager.default.removeItem(atPath: sessionLockPath)
+        return decision
+    }
+}
+
+extension SyncSetupService {
     /// Update just the profile config (without reinstalling the script)
     func updateConfig(for profile: SyncProfile) throws {
         let config = generateProfileConfig(for: profile)

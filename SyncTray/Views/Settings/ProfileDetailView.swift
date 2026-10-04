@@ -152,6 +152,12 @@ struct ProfileDetailView: View {
         // Local resync started by this view
         if isRunningResync { return true }
 
+        // Real liveness: an exclusive-run registry token, a live /tmp run lock, or
+        // a live bisync session lock (R3) — not just the cosmetic `.syncing` state,
+        // which a rejected concurrent run's own failure used to flip to `.error`
+        // while the real run kept going.
+        if syncManager.isRunLive(for: profile) { return true }
+
         // SyncManager detected sync (includes external monitoring via lock file)
         if syncManager.state(for: profile.id) == .syncing { return true }
 
@@ -1251,8 +1257,11 @@ struct ProfileDetailView: View {
                 SyncProgressDetailView(progress: progress)
             }
 
-            // Last sync error from rclone (hide during active resync operations)
-            if isInstalled, !isRunningResync, let lastError = syncManager.lastError(for: profile.id) {
+            // Last sync error from rclone (hide while a run is genuinely live — R3 —
+            // not merely while this view's own resync is in flight, so a scheduled
+            // run's rejected-concurrent failure never flashes a stale banner either).
+            if isInstalled, !isRunningResync, !syncManager.isRunLive(for: profile),
+               let lastError = syncManager.lastError(for: profile.id) {
                 VStack(alignment: .leading, spacing: 8) {
                     Label("Last sync error:", systemImage: "exclamationmark.triangle.fill")
                         .font(.caption.weight(.medium))
@@ -1441,11 +1450,11 @@ struct ProfileDetailView: View {
                         if syncManager.isPaused(for: profile.id) {
                             return
                         }
-                        // Clean up stale lock file if exists but process not running
-                        let lockPath = profile.lockFilePath
-                        if FileManager.default.fileExists(atPath: lockPath) {
-                            try? FileManager.default.removeItem(atPath: lockPath)
-                        }
+                        // No lock cleanup here (D6): the sync script's own atomic
+                        // noclobber acquire already reclaims a stale lock itself —
+                        // an unconditional delete here could drop a LIVE winner's
+                        // lock out from under it (the exact incident this guard
+                        // closes).
                         TelemetryService.shared.recordProfileLifecycleOperation(
                             profileId: profile.id, profileName: profile.name,
                             operation: "sync_now", syncMode: profile.syncMode.rawValue, result: "started"
@@ -2343,6 +2352,23 @@ struct ProfileDetailView: View {
         let needsReinstall = isInstalled
             && SyncManager.reconcileAction(from: currentProfile, to: updatedProfile) == .reinstall
 
+        // Refuse BEFORE persisting when the edit needs a reinstall and the profile's
+        // run is live (review finding): `reinstallSync` already refuses this case, but
+        // only after `profileStore.update` below had already stored the edit — leaving
+        // the running agent on the OLD config while the form reloads from the NEW one,
+        // so `hasChanges` goes false and Save becomes unavailable to retry. Checking
+        // here instead means the edit is never persisted at all until it can actually
+        // take effect: the form stays dirty and Save works again once the run ends.
+        if needsReinstall, syncManager.isRunLive(for: currentProfile) {
+            showingSyncInProgressAlert = true
+            TelemetryService.shared.recordProfileLifecycleOperation(
+                profileId: currentProfile.id, profileName: currentProfile.name,
+                operation: "reinstall", syncMode: currentProfile.syncMode.rawValue,
+                result: "blocked_already_running"
+            )
+            return
+        }
+
         profileStore.update(updatedProfile)
 
         // Clear any cached error since config changed
@@ -2689,7 +2715,7 @@ struct ProfileDetailView: View {
                     // 4. NOW load the agent (after LogWatcher is watching)
                     if needsResync {
                         // runResync will handle clearing isInstalling state and load agent on completion
-                        runResync(loadAgentOnCompletion: true)
+                        runResync(loadAgentOnCompletion: true, source: .installResync)
                     } else if currentProfile.isMountMode {
                         // See `runResync`'s mount branch for why this isn't `loadAgent`.
                         isInstalling = false
@@ -3102,19 +3128,54 @@ struct ProfileDetailView: View {
             operation: "reinstall", syncMode: currentProfile.syncMode.rawValue, result: "started"
         )
 
+        let targetProfile = previous ?? currentProfile
+
+        // Refuse up front while the profile's run is live (review finding): Save, the
+        // Reinstall button, and a cache-path finalize all reach this function without
+        // going through `beginExclusiveRun`. Falling through to `installSync` while a
+        // run is live would reload the agent (RunAtLoad=true) right next to the
+        // still-running process — the second-bisync incident this guard exists to
+        // prevent, reached through reinstall instead of an explicit recovery button.
+        // `uninstallForReinstall` itself refuses too (defense in depth, and the path
+        // the CLI/external-edit reinstall share), but checking here first means the
+        // user sees the alert instead of a silently-skipped reinstall.
+        guard !syncManager.isRunLive(for: targetProfile) else {
+            showingSyncInProgressAlert = true
+            TelemetryService.shared.recordProfileLifecycleOperation(
+                profileId: currentProfile.id, profileName: currentProfile.name,
+                operation: "reinstall", syncMode: currentProfile.syncMode.rawValue,
+                result: "blocked_already_running"
+            )
+            return
+        }
+
         do {
             // Keeps the exclude filter and, while they still apply, the bisync listings —
             // so `installSync` finds them and runs no `--resync` after a settings change.
             try setupService.uninstallForReinstall(
-                from: previous ?? currentProfile, to: overrideProfile ?? currentProfile)
+                from: targetProfile, to: overrideProfile ?? currentProfile)
         } catch {
             // Ignore uninstall errors
         }
         installSync(using: overrideProfile)
     }
 
-    private func runResync(loadAgentOnCompletion: Bool = false) {
-        // For mount mode, skip initial sync entirely - just load the agent
+    /// - Parameters:
+    ///   - source: who is launching this run — used only when `holding` is `nil`
+    ///     (this function must acquire its own token); ignored when a caller
+    ///     already holds one.
+    ///   - holding: when non-nil, the caller (`runSmartFix`) already acquired this
+    ///     token via `beginExclusiveRun` and this function must use it as-is
+    ///     rather than begin a second one (Smart Fix begins once; see D1/the plan's
+    ///     "Smart Fix" edge case).
+    private func runResync(
+        loadAgentOnCompletion: Bool = false,
+        source: ExclusiveRunSource = .resync,
+        holding token: ExclusiveRunToken? = nil
+    ) {
+        // For mount mode, skip initial sync entirely - just load the agent. Mount
+        // mode has no --resync concept and never begins an exclusive run (R7's
+        // edge case: `isRunLive` ignores lock files for it anyway).
         if syncMode == .mount {
             isInstalling = false
             resyncOutputLines = ["Mount mode - starting mount service..."]
@@ -3127,6 +3188,36 @@ struct ProfileDetailView: View {
                 // (RunAtLoad off) actually mounts after a reinstall.
                 syncManager.mountProfile(profileStore.profile(for: profile.id) ?? profile)
             }
+            return
+        }
+
+        // Acquire the exclusive run slot before touching any state (R1). A caller
+        // that already holds a token (Smart Fix) passes it through `holding:`
+        // instead of a second `beginExclusiveRun` call.
+        let runToken: ExclusiveRunToken
+        if let token {
+            runToken = token
+        } else if let acquired = syncManager.beginExclusiveRun(for: profile, source: source) {
+            runToken = acquired
+        } else {
+            showingSyncInProgressAlert = true
+            // Blocked before `runResync` ever reaches its own `isInstalling = false`
+            // below (review finding): `installSync`'s caller left `isInstalling` true
+            // expecting this function to clear it, so a blocked reinstall resync must
+            // still clear it here or the Install/Reinstall button stays disabled with
+            // a spinner forever.
+            isInstalling = false
+            // D7: the install itself already succeeded, and the scheduled script
+            // self-bootstraps --resync when listings are missing — only the agent
+            // load still needs to happen here so the live run can hand off to it.
+            if loadAgentOnCompletion {
+                setupService.loadAgent(for: profile)
+            }
+            TelemetryService.shared.recordProfileLifecycleOperation(
+                profileId: profile.id, profileName: profile.name,
+                operation: loadAgentOnCompletion ? "install" : "resync",
+                syncMode: profile.syncMode.rawValue, result: "blocked_already_running"
+            )
             return
         }
 
@@ -3152,7 +3243,7 @@ struct ProfileDetailView: View {
         let capturedAdditionalFlags = additionalRcloneFlags
         let capturedFilterPath = profile.filterFilePath  // Exclude filter file
         let capturedLockPath = profile.lockFilePath  // Lock file to prevent concurrent scheduled syncs
-        let bisyncDir = "\(NSHomeDirectory())/Library/Caches/rclone/bisync"
+        let placeholder = runToken.placeholder
         let capturedMaxLines = maxOutputLines
         let syncLogPath = profile.logPath  // Use main log file (same as scheduled syncs)
         let capturedSyncMode = syncMode
@@ -3186,20 +3277,6 @@ struct ProfileDetailView: View {
             let maxLogSize: Int64 = 10_000_000  // ~10MB (increased to reduce truncation frequency)
             let truncateInterval: TimeInterval = 30
 
-            // Remove any existing lock files first (prevents "prior lock file found" errors)
-            if let files = try? fileManager.contentsOfDirectory(atPath: bisyncDir) {
-                for file in files where file.hasSuffix(".lck") {
-                    let fullPath = "\(bisyncDir)/\(file)"
-                    if (try? fileManager.removeItem(atPath: fullPath)) != nil {
-                        let msg = "Removed lock file: \(file)"
-                        writeToLog(msg)
-                        DispatchQueue.main.async {
-                            self.appendOutputLine(msg)
-                        }
-                    }
-                }
-            }
-
             let process = Process()
             let pipe = Pipe()
             let errorPipe = Pipe()
@@ -3210,7 +3287,9 @@ struct ProfileDetailView: View {
             guard let path = rclonePath else {
                 let errMsg = "Error: rclone not found. Install with: brew install rclone"
                 writeToLog(errMsg)
+                SyncRunLock.releaseIfOwned(path: capturedLockPath, ownTokens: [placeholder])
                 DispatchQueue.main.async {
+                    self.syncManager.endExclusiveRun(runToken)
                     self.isRunningResync = false
                     self.resyncOutputLines = [errMsg]
                     self.syncManager.setSyncing(for: currentProfile.id, isSyncing: false)
@@ -3268,9 +3347,10 @@ struct ProfileDetailView: View {
             do {
                 try process.run()
 
-                // Create lock file with process PID to prevent concurrent scheduled syncs
+                // Swap the placeholder for the real child PID now that it's known —
+                // only if the lock still holds the placeholder (owner-checked).
                 let pid = process.processIdentifier
-                try? "\(pid)".write(toFile: capturedLockPath, atomically: true, encoding: .utf8)
+                SyncRunLock.replaceIfOwned(path: capturedLockPath, expected: placeholder, with: "\(pid)")
 
                 // Read output in batches to reduce UI updates and lag
                 let outputHandle = pipe.fileHandleForReading
@@ -3350,8 +3430,9 @@ struct ProfileDetailView: View {
 
                 process.waitUntilExit()
 
-                // Remove lock file now that process has finished
-                try? fileManager.removeItem(atPath: capturedLockPath)
+                // Remove the lock now that the process has finished — only if it's
+                // still one of our own tokens (placeholder, or the child PID above).
+                SyncRunLock.releaseIfOwned(path: capturedLockPath, ownTokens: [placeholder, "\(pid)"])
 
                 outputHandle.readabilityHandler = nil
                 errorHandle.readabilityHandler = nil
@@ -3412,12 +3493,15 @@ struct ProfileDetailView: View {
                         self.syncManager.setSyncing(for: currentProfile.id, isSyncing: false)
                     }
 
+                    self.syncManager.endExclusiveRun(runToken)
                     self.isRunningResync = false
                 }
             } catch {
                 let errMsg = "Error running rclone: \(error.localizedDescription)"
                 writeToLog(errMsg)
+                SyncRunLock.releaseIfOwned(path: capturedLockPath, ownTokens: [placeholder])
                 DispatchQueue.main.async {
+                    self.syncManager.endExclusiveRun(runToken)
                     self.appendOutputLine(errMsg)
                     self.syncManager.setSyncing(for: currentProfile.id, isSyncing: false)
                     self.isRunningResync = false
@@ -3679,7 +3763,7 @@ struct ProfileDetailView: View {
         // These errors typically require: unlock → check files → resync
 
         // Lock file error - just remove lock and retry (no resync needed)
-        if error.contains("lock file found") || error.contains("prior lock file") {
+        if error.contains("lock file found") || SyncLogPatterns.isPriorLockFileError(error) {
             return .unlockAndRetry
         }
 
@@ -3727,10 +3811,24 @@ struct ProfileDetailView: View {
     }
 
     private func handleErrorAction(_ action: ErrorAction) {
+        // Defense in depth: the buttons that call this already gate on
+        // `isSyncRunningForProfile`, but check liveness again here so every path
+        // into a recovery action — not just the button tap — is covered (R1).
+        guard !syncManager.isRunLive(for: profile) else {
+            TelemetryService.shared.recordUserRecoveryAction(
+                profileId: profile.id,
+                profileName: profile.name,
+                action: action.telemetryName,
+                result: "blocked_already_running"
+            )
+            showingSyncInProgressAlert = true
+            return
+        }
         TelemetryService.shared.recordUserRecoveryAction(
             profileId: profile.id,
             profileName: profile.name,
-            action: action.telemetryName
+            action: action.telemetryName,
+            result: "started"
         )
         switch action {
         case .smartFix:
@@ -3795,37 +3893,35 @@ struct ProfileDetailView: View {
         }
     }
 
+    /// Stale-only unlock (D6, R2): checks liveness first (`canStartRun`) so a live
+    /// run shows the alert instead of being swept, then removes only this
+    /// profile's own `/tmp` run lock and bisync session `.lck` — never a directory
+    /// sweep, which used to delete a sibling profile's or a still-live winner's lock.
     private func removeLockFile() {
-        let bisyncDir = "\(NSHomeDirectory())/Library/Caches/rclone/bisync"
-
-        // Remove all matching lock files
-        if let files = try? FileManager.default.contentsOfDirectory(atPath: bisyncDir) {
-            for file in files where file.hasSuffix(".lck") {
-                let fullPath = "\(bisyncDir)/\(file)"
-                try? FileManager.default.removeItem(atPath: fullPath)
-            }
+        guard syncManager.canStartRun(for: profile) else {
+            showingSyncInProgressAlert = true
+            return
         }
+        SyncRunLock.removeStaleLocks(
+            runLockPath: profile.lockFilePath,
+            sessionLockPath: SyncRunLock.sessionLockPath(for: profile),
+            isAlive: SyncRunLock.processIsAlive
+        )
     }
 
-    /// Remove lock files and retry normal sync (no resync needed)
-    /// This is used when a previous sync was interrupted and left a stale lock file
+    /// Remove this profile's own stale lock files and retry normal sync (no resync
+    /// needed). Used when a previous sync was interrupted and left a stale lock
+    /// file. Stale-only and scoped to this profile (D6, R2) — see `removeLockFile`.
     private func unlockAndRetrySync() {
-        let fm = FileManager.default
-
-        // Remove SyncTray lock file
-        let tmpLockPath = profile.lockFilePath
-        if fm.fileExists(atPath: tmpLockPath) {
-            try? fm.removeItem(atPath: tmpLockPath)
+        guard syncManager.canStartRun(for: profile) else {
+            showingSyncInProgressAlert = true
+            return
         }
-
-        // Remove rclone bisync lock files
-        let bisyncDir = "\(NSHomeDirectory())/Library/Caches/rclone/bisync"
-        if let files = try? fm.contentsOfDirectory(atPath: bisyncDir) {
-            for file in files where file.hasSuffix(".lck") {
-                let fullPath = "\(bisyncDir)/\(file)"
-                try? fm.removeItem(atPath: fullPath)
-            }
-        }
+        SyncRunLock.removeStaleLocks(
+            runLockPath: profile.lockFilePath,
+            sessionLockPath: SyncRunLock.sessionLockPath(for: profile),
+            isAlive: SyncRunLock.processIsAlive
+        )
 
         // Clear the error and trigger normal sync
         syncManager.clearError(for: profile.id)
@@ -3835,6 +3931,18 @@ struct ProfileDetailView: View {
     /// Run sync with --force flag to override "too many deletes" safety limit
     /// This is used when more than 50% of files would be deleted in a single sync
     private func runForceSync() {
+        // Acquire the exclusive run slot before touching any state (R1, R8). Force
+        // Sync took no lock at all before this guard existed.
+        guard let runToken = syncManager.beginExclusiveRun(for: profile, source: .forceSync) else {
+            showingSyncInProgressAlert = true
+            TelemetryService.shared.recordProfileLifecycleOperation(
+                profileId: profile.id, profileName: profile.name,
+                operation: "force_sync", syncMode: profile.syncMode.rawValue,
+                result: "blocked_already_running"
+            )
+            return
+        }
+
         isRunningResync = true
         resyncOutputLines = []
         showResyncOutput = true
@@ -3850,6 +3958,8 @@ struct ProfileDetailView: View {
         let capturedLocalSyncPath = localSyncPath
         let capturedAdditionalFlags = additionalRcloneFlags
         let capturedFilterPath = profile.filterFilePath
+        let capturedLockPath = profile.lockFilePath
+        let placeholder = runToken.placeholder
         let syncLogPath = profile.logPath
         let capturedMaxLines = maxOutputLines
 
@@ -3888,7 +3998,9 @@ struct ProfileDetailView: View {
             guard let path = rclonePath else {
                 let errMsg = "Error: rclone not found. Install with: brew install rclone"
                 writeToLog(errMsg)
+                SyncRunLock.releaseIfOwned(path: capturedLockPath, ownTokens: [placeholder])
                 DispatchQueue.main.async {
+                    self.syncManager.endExclusiveRun(runToken)
                     self.isRunningResync = false
                     self.resyncOutputLines = [errMsg]
                     self.syncManager.setSyncing(for: currentProfile.id, isSyncing: false)
@@ -3974,12 +4086,17 @@ struct ProfileDetailView: View {
                 }
             }
 
+            var childPIDToken = placeholder
             do {
                 try process.run()
+                // Swap the placeholder for the real child PID now that it's known.
+                childPIDToken = "\(process.processIdentifier)"
+                SyncRunLock.replaceIfOwned(path: capturedLockPath, expected: placeholder, with: childPIDToken)
                 process.waitUntilExit()
             } catch {
                 let errMsg = "Failed to run rclone: \(error.localizedDescription)"
                 writeToLog(errMsg)
+                SyncRunLock.releaseIfOwned(path: capturedLockPath, ownTokens: [placeholder])
                 DispatchQueue.main.async {
                     self.appendOutputLine(errMsg)
                 }
@@ -3989,6 +4106,9 @@ struct ProfileDetailView: View {
             pipe.fileHandleForReading.readabilityHandler = nil
             errorPipe.fileHandleForReading.readabilityHandler = nil
 
+            // Release the lock whichever of our own tokens it still holds.
+            SyncRunLock.releaseIfOwned(path: capturedLockPath, ownTokens: [placeholder, childPIDToken])
+
             let exitCode = process.terminationStatus
             let completionMsg = exitCode == 0
                 ? "✅ Force sync completed successfully"
@@ -3996,6 +4116,7 @@ struct ProfileDetailView: View {
             writeToLog(completionMsg)
 
             DispatchQueue.main.async {
+                self.syncManager.endExclusiveRun(runToken)
                 self.appendOutputLine("")
                 self.appendOutputLine(completionMsg)
                 self.isRunningResync = false
@@ -4010,6 +4131,18 @@ struct ProfileDetailView: View {
 
     /// Unified smart fix that orchestrates: unlock → verify check files → resync
     private func runSmartFix() {
+        // Begin up front (D1); the session .lck cleanup below and the final
+        // `runResync` reuse this SAME token — no second begin.
+        guard let runToken = syncManager.beginExclusiveRun(for: profile, source: .smartFix) else {
+            showingSyncInProgressAlert = true
+            TelemetryService.shared.recordProfileLifecycleOperation(
+                profileId: profile.id, profileName: profile.name,
+                operation: "smart_fix", syncMode: profile.syncMode.rawValue,
+                result: "blocked_already_running"
+            )
+            return
+        }
+
         isRunningResync = true
         resyncOutputLines = []  // Clear previous output
         showResyncOutput = true
@@ -4019,50 +4152,23 @@ struct ProfileDetailView: View {
         syncManager.setSyncing(for: profile.id, isSyncing: true)
 
         // Capture values from main thread before going to background (CLAUDE.md rule 1)
-        let lockFilePath = profile.lockFilePath
-        let bisyncDir = "\(NSHomeDirectory())/Library/Caches/rclone/bisync"
+        let captureProfile = self.profile
 
         appendOutputLine("🔧 Smart Fix: Resolving sync issues...")
         appendOutputLine("")
 
         DispatchQueue.global(qos: .userInitiated).async {
-            let fileManager = FileManager.default
-
-            // Step 1: Remove ALL lock files (both /tmp script lock and rclone bisync .lck files)
+            // Step 1: remove ONLY this profile's own bisync session lock — never a
+            // directory sweep (R2). `beginExclusiveRun` above already proved this
+            // profile's session lock was dead (or absent) at acquire time, so this
+            // is cleaning up what IS stale, not guessing; the run lock itself is
+            // untouched (this run now legitimately owns it).
             DispatchQueue.main.async {
                 self.appendOutputLine("Step 1/3: Removing lock files...")
             }
-
-            var locksRemoved = 0
-
-            // First, remove /tmp script lock file
-            let tmpLockPath = lockFilePath
-            if fileManager.fileExists(atPath: tmpLockPath) {
-                if (try? fileManager.removeItem(atPath: tmpLockPath)) != nil {
-                    locksRemoved += 1
-                    DispatchQueue.main.async {
-                        self.appendOutputLine("  ✓ Removed: synctray lock file")
-                    }
-                }
-            }
-
-            // Then remove rclone bisync .lck files
-            if let files = try? fileManager.contentsOfDirectory(atPath: bisyncDir) {
-                for file in files where file.hasSuffix(".lck") {
-                    let fullPath = "\(bisyncDir)/\(file)"
-                    if (try? fileManager.removeItem(atPath: fullPath)) != nil {
-                        locksRemoved += 1
-                        DispatchQueue.main.async {
-                            self.appendOutputLine("  ✓ Removed: \(file)")
-                        }
-                    }
-                }
-            }
-
+            setupService.removeBisyncLock(for: captureProfile)
             DispatchQueue.main.async {
-                if locksRemoved == 0 {
-                    self.appendOutputLine("  ✓ No lock files found")
-                }
+                self.appendOutputLine("  ✓ Removed stale session lock (if any)")
                 self.appendOutputLine("")
             }
 
@@ -4072,7 +4178,6 @@ struct ProfileDetailView: View {
                 self.appendOutputLine("Step 2/3: Removing legacy check files...")
             }
 
-            let captureProfile = self.profile
             setupService.cleanupLegacyCheckFiles(for: captureProfile)
             DispatchQueue.main.async {
                 self.appendOutputLine("  ✓ Removed any leftover .synctray-check files")
@@ -4087,16 +4192,28 @@ struct ProfileDetailView: View {
             // Small delay to let UI update
             Thread.sleep(forTimeInterval: 0.3)
 
-            // Step 3: Run resync on main thread (uses the existing runResync function)
+            // Step 3: Run resync on main thread, holding the SAME token acquired above.
             DispatchQueue.main.async {
                 // Reset the running flag so runResync can set it again
                 self.isRunningResync = false
-                self.runResync()
+                self.runResync(source: .smartFix, holding: runToken)
             }
         }
     }
 
     private func unlockAndResync() {
+        // Begin up front (D1); the session .lck cleanup below and the final
+        // `runResync` reuse this SAME token — no second begin.
+        guard let runToken = syncManager.beginExclusiveRun(for: profile, source: .unlockAndResync) else {
+            showingSyncInProgressAlert = true
+            TelemetryService.shared.recordProfileLifecycleOperation(
+                profileId: profile.id, profileName: profile.name,
+                operation: "unlock_resync", syncMode: profile.syncMode.rawValue,
+                result: "blocked_already_running"
+            )
+            return
+        }
+
         isRunningResync = true
         resyncOutputLines = ["Removing lock files..."]
         showResyncOutput = true
@@ -4105,25 +4222,20 @@ struct ProfileDetailView: View {
         syncManager.clearError(for: profile.id)
         syncManager.setSyncing(for: profile.id, isSyncing: true)
 
-        // Remove lock files first
-        let bisyncDir = "\(NSHomeDirectory())/Library/Caches/rclone/bisync"
-        if let files = try? FileManager.default.contentsOfDirectory(atPath: bisyncDir) {
-            for file in files where file.hasSuffix(".lck") {
-                let fullPath = "\(bisyncDir)/\(file)"
-                if (try? FileManager.default.removeItem(atPath: fullPath)) != nil {
-                    appendOutputLine("Removed: \(file)")
-                }
-            }
-        }
+        // Remove ONLY this profile's own stale bisync session lock — never a
+        // directory sweep (R2); see `runSmartFix`'s Step 1 for why the run lock
+        // itself is left alone.
+        setupService.removeBisyncLock(for: profile)
+        appendOutputLine("Removed stale session lock (if any)")
 
         appendOutputLine("")
         appendOutputLine("Starting resync...")
         appendOutputLine("")
 
-        // Small delay then run resync
+        // Small delay then run resync, holding the SAME token acquired above.
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
             self.isRunningResync = false
-            self.runResync()
+            self.runResync(source: .unlockAndResync, holding: runToken)
         }
     }
 
@@ -4234,14 +4346,8 @@ struct ProfileDetailView: View {
 
     /// Check if sync is running via lock file (can be called from background)
     private func checkSyncRunningViaLockFile(at lockPath: String) -> Bool {
-        guard FileManager.default.fileExists(atPath: lockPath),
-              let pidStr = try? String(contentsOfFile: lockPath, encoding: .utf8)
-                  .trimmingCharacters(in: .whitespacesAndNewlines),
-              let pid = Int32(pidStr) else {
-            return false
-        }
-        // Check if process is still running
-        return kill(pid, 0) == 0
+        let holder = SyncRunLock.parseHolder(try? String(contentsOfFile: lockPath, encoding: .utf8))
+        return SyncRunLock.isLive(holder, isAlive: SyncRunLock.processIsAlive)
     }
 
     /// Handle completion of a resumed sync

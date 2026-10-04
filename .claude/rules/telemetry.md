@@ -209,6 +209,8 @@ rollout. No event is emitted on a fresh install.
 | `synctray.sync.file_operations` | Counter | File operations by type + extension |
 | `synctray.remote.config_operations` | Counter | Remote config operations (create/update/delete/connection_test) by provider type + result |
 | `synctray.sync.contention` | Counter | Syncs skipped because another was already running (lock file contention) |
+| `synctray.sync.rejected_concurrent_run` | Counter | A rejected concurrent run's own "prior lock file found" failure suppressed rather than surfaced as this profile's failure (the single-run guard's R3 behaviour — CLAUDE.md "One Run Per Profile"), by `rejected_concurrent_run.site`: `sync_failed` or `error_message` |
+| `synctray.config.deferred_reinstall` | Counter | External profile edits whose reinstall was deferred because the profile's run was live, by `deferred_reinstall.outcome`: `deferred` (a sync was live at edit time), `applied` (the retry succeeded once the run ended), `failed` (the retry's install call itself threw), `dropped` (the profile was deleted or disabled while the reinstall was deferred, so the retry discarded it) |
 | `synctray.logwatcher.recovery` | Counter | LogWatcher recovery events (file_replaced, missed_bytes, polling_error) |
 | `synctray.startup.stale_locks_cleaned` | Counter | Stale lock files cleaned on startup (synctray or rclone_bisync) |
 | `synctray.sync.check_phase_duration` | Histogram | Duration of bisync listing/check phase (seconds) — main bottleneck for large repos |
@@ -216,11 +218,11 @@ rollout. No event is emitted on a fresh install.
 | `synctray.directory_watch.filtered` | Counter | Directory watch events filtered out (out_of_scope, phantom, metadata) |
 | `synctray.sync.resumed_external` | Counter | Externally-started syncs detected and resumed at app startup |
 | `synctray.app.settings_opened` | Counter | Settings window opens |
-| `synctray.sync.auto_fix_triggered` | Counter | Automatic --resync recovery attempts (`result`: `triggered` or `gave_up_backoff`) |
+| `synctray.sync.auto_fix_triggered` | Counter | Automatic --resync recovery attempts (`result`: `triggered`, `gave_up_backoff`, `skipped_drive_not_mounted`, or `blocked_already_running` — the single-run guard refused because another run already held the profile's lock) |
 | `synctray.offline.pin_operations` | Counter | Offline pin/unpin operations from Finder or in-app UI (`action`: `pin` or `unpin`) |
 | `synctray.wizard.step` | Counter | Onboarding funnel events (`wizard.outcome`: started/provider_selected/remote_ready/folder_chosen/created/abandoned; `wizard.abandoned_at_step`, `provider.type`) |
 | `synctray.remote.oauth` | Counter | OAuth auth outcomes during remote setup (`result`: success/failure/cancelled; `provider.type`) |
-| `synctray.recovery.user_action` | Counter | User-initiated sync recovery actions (`recovery.action`: force_sync/resync/retry/…) — distinct from automatic auto-fix |
+| `synctray.recovery.user_action` | Counter | User-initiated sync recovery actions (`recovery.action`: force_sync/resync/retry/…; `recovery.result`: `started` or `blocked_already_running` — the single-run guard refused because another run already held the profile's lock) — distinct from automatic auto-fix |
 | `synctray.setting.changed` | Counter | App-wide preference changes (`setting.name`: auto_fix/launch_at_login/debug_logging/telemetry; `setting.enabled`) |
 | `synctray.offline.extension_setup` | Counter | Finder-extension enable funnel (`offline.extension_action`: prompt_shown/open_settings/rechecked/enabled) |
 | `synctray.offline.cache_clear` | Counter | Cache-clear operations (`offline.preserve_pinned`: whether pinned folders were kept) |
@@ -276,6 +278,12 @@ All key lifecycle events are emitted as structured OTel logs:
 - Configuration summary (profile count breakdown by mode)
 - Remote config operations: create/update/delete/connection_test (with provider type and categorized error type)
 - Sync contention: sync skipped because another was already running (bottleneck detection)
+- Rejected concurrent run suppressed: a rejected concurrent run's own "prior lock file found"
+  failure was ignored rather than surfaced as this profile's failure (`rejected_concurrent_run.site`:
+  `sync_failed`/`error_message`) — the signal that the double-bisync race the single-run guard
+  closes is (or isn't) still happening
+- Deferred external-edit reinstall: `deferred_reinstall.outcome` (`deferred`/`applied`/`failed`/`dropped`) —
+  info except `failed`, which logs at warn
 - LogWatcher recovery: file replaced, missed bytes, polling errors (monitoring health) — **coalesced into episodes**: the first event of a run emits `LogWatcher recovery: <reason>` immediately, further events within a 60s quiet window are folded into a single `LogWatcher recovery episode ended: <reason>` carrying `logwatcher.recovery_count`, `logwatcher.missed_bytes`, and `logwatcher.episode_duration_seconds`. The `synctray.logwatcher.recovery` counter still records **every** event, so the true rate is unaffected. A single-event episode emits no summary.
 - Stale lock cleanup: count and type of stale locks cleaned at startup (crash detection)
 - Check phase duration: bisync listing/comparison phase timing (bottleneck analysis)
@@ -284,11 +292,11 @@ All key lifecycle events are emitted as structured OTel logs:
 - Sync precondition failures: script_not_found, config_not_found (setup issue detection)
 - Resumed external syncs: syncs detected running at startup (launchd overlap detection)
 - App upgraded: `service.version` changed since the previous launch (deployment markers)
-- Auto-fix: automatic --resync triggered (`triggered`), suppressed by backoff (`gave_up_backoff`), or skipped because the external drive is not mounted (`skipped_drive_not_mounted`)
+- Auto-fix: automatic --resync triggered (`triggered`), suppressed by backoff (`gave_up_backoff`), skipped because the external drive is not mounted (`skipped_drive_not_mounted`), or blocked because the single-run guard found another run already holding the profile's lock (`blocked_already_running` — CLAUDE.md "One Run Per Profile")
 - Offline pin operations: directory pinned or unpinned via Finder right-click or in-app UI (`offline.action`, `offline.path_count`)
 - Wizard step: onboarding funnel events (`wizard.outcome`, `wizard.abandoned_at_step`, `provider.type`) — new-profile flow only, not edit mode
 - OAuth outcome: OAuth auth result during remote setup (`result`, `provider.type`)
-- User recovery action: user-initiated recovery from the error banner (`recovery.action`) — distinct from automatic auto-fix
+- User recovery action: user-initiated recovery from the error banner (`recovery.action`, `recovery.result`: `started` or `blocked_already_running` when the single-run guard refused) — distinct from automatic auto-fix
 - Setting changed: app-wide preference toggled (`setting.name`, `setting.enabled`); the telemetry opt-out is recorded just before telemetry disables
 - Offline extension setup: Finder-extension enable-funnel steps (`offline.extension_action`)
 - Offline cache clear: cache cleared, with whether pinned folders were preserved (`offline.preserve_pinned`)
