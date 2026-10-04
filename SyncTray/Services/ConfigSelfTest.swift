@@ -5125,6 +5125,23 @@ enum ConfigSelfTest {
             return report(name, slug, false, "(retry after a failed marker write did not write both the filter and a fresh marker)")
         }
 
+        // ORDER: the filter is written BEFORE the marker. A filter write that fails (its
+        // directory doesn't exist) must leave no marker behind — marker-first would have
+        // written one already, letting a sync consume it under the old rules.
+        let orderMarker = "\(dir)/order.resync-pending"
+        var orderProfile = bisync
+        orderProfile.syncIncludeFolders = ["Keep"]
+        var filterWriteThrew = false
+        do {
+            try SyncSetupService.shared.writeExcludeFilter(
+                for: orderProfile, at: "\(dir)/no-such-dir/exclude.txt", resyncMarkerAt: orderMarker)
+        } catch {
+            filterWriteThrew = true
+        }
+        guard filterWriteThrew, !fm.fileExists(atPath: orderMarker) else {
+            return report(name, slug, false, "(marker written before the filter — a failed filter write left a resync marker behind)")
+        }
+
         // The marker path the script derives from FILTER_FILE must equal the profile's real
         // `resyncPendingPath` — both are built from the same `{configDirectory}/{shortId}`.
         let prodFilter = bisync.filterFilePath
