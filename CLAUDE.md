@@ -13,7 +13,7 @@ SyncTray is a macOS menu bar application that provides Google Drive-style backgr
 - **Live progress tracking**: Parses rclone JSON logs for real-time transfer progress
 - **macOS notifications**: Batch notifications for file changes with "Open Directory" action
 - **Fallback remote**: Automatic failover to an alternative remote when the primary is unreachable
-- **Auto-fix sync issues**: Automatically runs `--resync` recovery when bisync detects an out-of-sync state (app-wide setting, default ON). Skipped when the profile's external drive is unmounted — a `--resync` against a missing/empty local path can't safely fix anything, so the profile is left in `.driveNotMounted` and resumes normally once the drive reconnects.
+- **Auto-fix sync issues**: Automatically runs `--resync` recovery when bisync detects an out-of-sync state (app-wide setting, default ON). Skipped when the profile's external drive is unmounted — a `--resync` against a missing/empty local path can't safely fix anything, so the profile is left in `.driveNotMounted` and resumes normally once the drive reconnects. Gated by the single-run guard (Critical Rule 8) — it never fires while another run already holds the profile's lock.
 
 ### Sync Modes
 
@@ -1375,6 +1375,47 @@ and overwrites the losing side of every file that differs. So:
 - **Every resync SyncTray starts uses `SyncSetupService.resyncArguments`** (`--resync-mode
   newer`), never a bare `--resync`, which means `--resync-mode path1` — remote wins.
 Covered by `ConfigSelfTest` AC-RI1–AC-RI6.
+
+### 8. One Run Per Profile — Single-Run Guard, Stale-Only Unlock
+On 2026-10-04 two `rclone bisync --resync` processes ran in parallel for the same profile: a
+rejected concurrent run's cleanup deleted the winner's `/tmp` lock, a scheduled run's own
+`prior lock file found` failure was mistaken for the profile's failure, the recovery banner
+re-enabled, and a manual recovery action swept every `.lck` and launched a second resync.
+This is now structurally prevented:
+- **Every resync and manual-recovery launch path — reinstall resync, Resync, Smart Fix, Unlock
+  & Resync, Force Sync, and auto-fix — goes through `SyncManager.beginExclusiveRun(for:source:)`**
+  before touching any state. It refuses (returns `nil`) when: a registry token is already active
+  for the profile, the `/tmp` run lock's holder is live (a legacy `"pending"` sentinel counts as
+  live), or the profile's rclone bisync session lock (`SyncSetupService.bisyncSessionName(for:
+  profile) + ".lck"`) holder is live. A blocked launch sets `showingSyncInProgressAlert`, records
+  `blocked_already_running` telemetry, and starts no process — state, errors, and the output
+  panel are left untouched. The caller releases its token via `SyncManager.endExclusiveRun(_:)`
+  on every exit path (success, failure, or thrown error) — a token whose owner never calls this
+  self-heals after `ExclusiveRunRegistry.staleGrace` (60s) once its run lock is no longer live,
+  so a missed release can never wedge a profile forever.
+- **Every unlock action is stale-only and scoped to one profile's own locks.** `SyncRunLock`
+  (`SyncSetupService.swift`) is the single pure core for lock liveness and unlock decisions:
+  `SyncRunLock.removeStaleLocks` (used by `canStartRun`-gated recovery — Unlock & Retry, Unlock)
+  refuses outright if either lock is live, and otherwise removes ONLY the `/tmp` run lock and
+  this profile's own `<session>.lck` — never a directory-wide sweep of
+  `~/Library/Caches/rclone/bisync/*.lck`, which used to delete a still-live winner's lock or a
+  sibling profile's lock. A run releases its `/tmp` lock on exit only if the file still holds one
+  of its own tokens (`SyncRunLock.releaseIfOwned`), and swaps its launch-time placeholder for the
+  real child PID only if the lock still holds that placeholder (`SyncRunLock.replaceIfOwned`).
+- **"Running" comes from real liveness, not the cosmetic `.syncing` state.** `isSyncRunningForProfile`
+  and the "Last sync error" banner consult `SyncManager.isRunLive(for:)`, which is registry-token
+  OR run-lock OR session-lock liveness (mount-mode profiles consult the registry only — R7: a
+  Stream profile's `/tmp` lock is held for the mount daemon's entire life, so lock liveness alone
+  would disable Pause/Uninstall/Reinstall forever). A `prior lock file found` failure
+  (`SyncLogPatterns.isPriorLockFileError`) seen while the session lock's holder is still live
+  (`SyncRunLock.isRejectedConcurrentRun`) is a rejected CONCURRENT run's own failure, not this
+  profile's — it is ignored (no state change, no stored error, no auto-fix), so the real,
+  still-running process is never mistaken for a failure.
+- **Mount mode is unaffected** (R7, above) and **a reinstall that's blocked still loads the
+  launchd agent** — the install itself already succeeded, and the scheduled script
+  self-bootstraps `--resync` when listings are missing, so the live run can hand off to it.
+Covered by `ConfigSelfTest` AC-SR1–AC-SR16 (each negative assertion shown to fail once by a
+temporary mutation before being fixed — see the plan's Progress Log).
 
 ## Debugging
 

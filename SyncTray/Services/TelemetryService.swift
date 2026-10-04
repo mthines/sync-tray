@@ -1325,11 +1325,15 @@ final class TelemetryService {
     ///   - profileName: Display name of the affected profile.
     ///   - result:      `"triggered"` when the resync starts; `"gave_up_backoff"` when
     ///                  backoff suppresses the retry after repeated triggers;
-    ///                  `"skipped_drive_not_mounted"` when the external drive is absent.
+    ///                  `"skipped_drive_not_mounted"` when the external drive is absent;
+    ///                  `"blocked_already_running"` when the single-run guard refused
+    ///                  because another run already holds the profile's lock (CLAUDE.md
+    ///                  "One Run Per Profile").
     func recordAutoFixTriggered(
         profileId: UUID,
         profileName: String,
-        result: String     // "triggered" | "gave_up_backoff" | "skipped_drive_not_mounted"
+        // "triggered" | "gave_up_backoff" | "skipped_drive_not_mounted" | "blocked_already_running"
+        result: String
     ) {
         guard SyncTraySettings.telemetryEnabled else { return }
         ensureSetup()
@@ -1339,13 +1343,15 @@ final class TelemetryService {
             "result": .string(result),
         ])
 
-        let severity: Severity = result == "gave_up_backoff" ? .warn : .info
+        let severity: Severity = (result == "gave_up_backoff" || result == "blocked_already_running") ? .warn : .info
         let body: String
         switch result {
         case "gave_up_backoff":
             body = "Auto-fix suppressed by backoff for \(profileName)"
         case "skipped_drive_not_mounted":
             body = "Auto-fix skipped: external drive not mounted for \(profileName)"
+        case "blocked_already_running":
+            body = "Auto-fix blocked: a sync is already running for \(profileName)"
         default:
             body = "Auto-resyncing \(profileName) after sync conflict"
         }
@@ -1438,10 +1444,14 @@ final class TelemetryService {
 
     /// Record a user-initiated sync recovery action (distinct from the automatic --resync).
     /// Signals how often users hit errors bad enough to intervene, and which action they pick.
+    /// `result` is `"started"` unless the single-run guard refused the action because
+    /// another run already holds the profile's lock (`"blocked_already_running"` — see
+    /// CLAUDE.md "One Run Per Profile"), in which case severity is `.warn`.
     func recordUserRecoveryAction(
         profileId: UUID,
         profileName: String,
-        action: String   // force_sync | resync | retry
+        action: String,              // force_sync | resync | retry | …
+        result: String = "started"   // started | blocked_already_running
     ) {
         guard SyncTraySettings.telemetryEnabled else { return }
         ensureSetup()
@@ -1449,15 +1459,17 @@ final class TelemetryService {
         userRecoveryActionCounter?.add(value: 1, attribute: [
             "synctray.profile.name": .string(profileName),
             "recovery.action": .string(action),
+            "recovery.result": .string(result),
         ])
 
         emitLog(
-            severity: .info,
+            severity: result == "blocked_already_running" ? .warn : .info,
             body: "User recovery action",
             attributes: [
                 "synctray.profile.id": .string(profileId.uuidString),
                 "synctray.profile.name": .string(profileName),
                 "recovery.action": .string(action),
+                "recovery.result": .string(result),
             ]
         )
     }

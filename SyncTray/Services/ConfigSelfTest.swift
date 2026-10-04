@@ -136,6 +136,15 @@ enum ConfigSelfTest {
             testSyncExcludeFilterWrite,
             testSyncFilterReconcileTrigger,
             testSyncExcludePatternsRoundTripAndCLI,
+            testExclusiveRunRegistryInFlight,
+            testSyncRunLockLiveness,
+            testSyncRunLockUnlockDecision,
+            testSyncRunLockReleaseAndReplace,
+            testSyncRunLockSessionNameAndParse,
+            testPriorLockFileRejectedRun,
+            testRunLivenessMountMode,
+            testExclusiveRunRegistryStaleGrace,
+            testSyncRunLockAcquire,
         ]
 
         for check in checks {
@@ -6094,6 +6103,389 @@ enum ConfigSelfTest {
             }
         }
         return report("AC-RI6", "script-session-name-parity", true)
+    }
+
+    // MARK: - AC-SR1 — single-run guard: begin/end are owner-checked and per-profile
+
+    private static func testExclusiveRunRegistryInFlight() -> Bool {
+        var registry = ExclusiveRunRegistry()
+        let profileA = UUID()
+        let profileB = UUID()
+        let now = Date()
+        let alwaysDead: (Int32) -> Bool = { _ in false }
+
+        guard case .granted(let tokenA1) = registry.begin(
+            profileId: profileA, source: .resync, runLock: .none, sessionLock: .none,
+            isAlive: alwaysDead, now: now, placeholder: "111"
+        ) else {
+            return report("AC-SR1", "exclusive-run-registry-in-flight", false, "(first begin for profileA was not granted)")
+        }
+
+        // A second begin for the SAME profile while the first is still active is blocked.
+        guard case .blocked(.inFlight) = registry.begin(
+            profileId: profileA, source: .resync, runLock: .none, sessionLock: .none,
+            isAlive: alwaysDead, now: now, placeholder: "222"
+        ) else {
+            return report("AC-SR1", "exclusive-run-registry-in-flight", false,
+                           "(second begin for the same in-flight profile was not blocked(.inFlight))")
+        }
+
+        // A DIFFERENT profile is unaffected.
+        guard case .granted = registry.begin(
+            profileId: profileB, source: .resync, runLock: .none, sessionLock: .none,
+            isAlive: alwaysDead, now: now, placeholder: "333"
+        ) else {
+            return report("AC-SR1", "exclusive-run-registry-in-flight", false,
+                           "(a different profile was blocked by profileA's in-flight run)")
+        }
+
+        // A foreign/superseded token cannot end the active run — it stays active.
+        let foreignToken = ExclusiveRunToken(profileId: profileA, id: UUID(), source: .resync, placeholder: "999", startedAt: now)
+        guard registry.end(foreignToken) == false else {
+            return report("AC-SR1", "exclusive-run-registry-in-flight", false, "(a foreign token was able to end another run's slot)")
+        }
+        guard registry.isActive(profileA) else {
+            return report("AC-SR1", "exclusive-run-registry-in-flight", false, "(the real run was ended by a foreign token)")
+        }
+
+        // After the real owner ends, a new begin is granted.
+        guard registry.end(tokenA1) else {
+            return report("AC-SR1", "exclusive-run-registry-in-flight", false, "(the real owner's end was rejected)")
+        }
+        guard case .granted = registry.begin(
+            profileId: profileA, source: .resync, runLock: .none, sessionLock: .none,
+            isAlive: alwaysDead, now: now, placeholder: "444"
+        ) else {
+            return report("AC-SR1", "exclusive-run-registry-in-flight", false, "(a new begin after end was not granted)")
+        }
+
+        return report("AC-SR1", "exclusive-run-registry-in-flight", true)
+    }
+
+    // MARK: - AC-SR2 — begin refuses on a live run lock, pending, or a live session lock
+
+    private static func testSyncRunLockLiveness() -> Bool {
+        let now = Date()
+        let isAlive: (Int32) -> Bool = { $0 == 111 }  // only PID 111 is "alive"
+
+        var registry = ExclusiveRunRegistry()
+        guard case .blocked(.runLockLive) = registry.begin(
+            profileId: UUID(), source: .resync, runLock: .pid(111), sessionLock: .none,
+            isAlive: isAlive, now: now, placeholder: "p"
+        ) else {
+            return report("AC-SR2", "sync-run-lock-liveness", false, "(a live run lock did not block)")
+        }
+
+        registry = ExclusiveRunRegistry()
+        guard case .blocked(.runLockLive) = registry.begin(
+            profileId: UUID(), source: .resync, runLock: .pending, sessionLock: .none,
+            isAlive: isAlive, now: now, placeholder: "p"
+        ) else {
+            return report("AC-SR2", "sync-run-lock-liveness", false, "(a pending run lock did not block)")
+        }
+
+        // A DEAD run lock but a LIVE session lock blocks on the session lock.
+        registry = ExclusiveRunRegistry()
+        guard case .blocked(.sessionLockLive) = registry.begin(
+            profileId: UUID(), source: .resync, runLock: .pid(222), sessionLock: .pid(111),
+            isAlive: isAlive, now: now, placeholder: "p"
+        ) else {
+            return report("AC-SR2", "sync-run-lock-liveness", false,
+                           "(a live session lock did not block when the run lock was dead)")
+        }
+
+        // Absent, dead, or unreadable — granted.
+        let grantedCases: [(SyncRunLock.Holder, SyncRunLock.Holder)] = [
+            (.none, .none),
+            (.pid(222), .pid(333)),
+            (.unreadable, .unreadable),
+        ]
+        for (runLock, sessionLock) in grantedCases {
+            registry = ExclusiveRunRegistry()
+            guard case .granted = registry.begin(
+                profileId: UUID(), source: .resync, runLock: runLock, sessionLock: sessionLock,
+                isAlive: isAlive, now: now, placeholder: "p"
+            ) else {
+                return report("AC-SR2", "sync-run-lock-liveness", false,
+                               "(a dead/absent/unreadable holder pair was not granted)")
+            }
+        }
+
+        return report("AC-SR2", "sync-run-lock-liveness", true)
+    }
+
+    // MARK: - AC-SR3 — stale-only unlock refuses on a live holder, never sweeps
+
+    private static func testSyncRunLockUnlockDecision() -> Bool {
+        let dir = "\(selfTestRoot)/ac-sr3-unlock"
+        try? FileManager.default.removeItem(atPath: dir)
+        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+
+        let runLockPath = "\(dir)/run.lock"
+        let sessionLockPath = "\(dir)/session.lck"
+        let siblingLockPath = "\(dir)/session.old.lck"   // this profile's own sibling — must survive
+        let otherProfileLockPath = "\(dir)/other.lck"    // a different profile's lock — must survive
+
+        let isAlive: (Int32) -> Bool = { $0 == 999 }  // only PID 999 is alive
+
+        // Case 1: a LIVE run lock refuses and leaves every file untouched.
+        try? "999".write(toFile: runLockPath, atomically: true, encoding: .utf8)
+        try? "888".write(toFile: sessionLockPath, atomically: true, encoding: .utf8)
+        try? "should-survive".write(toFile: siblingLockPath, atomically: true, encoding: .utf8)
+        try? "should-survive".write(toFile: otherProfileLockPath, atomically: true, encoding: .utf8)
+
+        let decision1 = SyncRunLock.removeStaleLocks(runLockPath: runLockPath, sessionLockPath: sessionLockPath, isAlive: isAlive)
+        guard decision1 == .refuseRunLockLive,
+              FileManager.default.fileExists(atPath: runLockPath),
+              FileManager.default.fileExists(atPath: sessionLockPath) else {
+            return report("AC-SR3", "sync-run-lock-unlock-decision", false,
+                           "(a live run lock did not refuse and leave files on disk)")
+        }
+
+        // Case 2: a DEAD run lock but a LIVE session lock also refuses, untouched.
+        try? "777".write(toFile: runLockPath, atomically: true, encoding: .utf8)
+        try? "999".write(toFile: sessionLockPath, atomically: true, encoding: .utf8)
+        let decision2 = SyncRunLock.removeStaleLocks(runLockPath: runLockPath, sessionLockPath: sessionLockPath, isAlive: isAlive)
+        guard decision2 == .refuseSessionLockLive,
+              FileManager.default.fileExists(atPath: runLockPath),
+              FileManager.default.fileExists(atPath: sessionLockPath) else {
+            return report("AC-SR3", "sync-run-lock-unlock-decision", false,
+                           "(a live session lock did not refuse and leave files on disk)")
+        }
+
+        // Case 3: both dead — remove only the /tmp lock and THIS session .lck.
+        try? "777".write(toFile: runLockPath, atomically: true, encoding: .utf8)
+        try? "888".write(toFile: sessionLockPath, atomically: true, encoding: .utf8)
+        let decision3 = SyncRunLock.removeStaleLocks(runLockPath: runLockPath, sessionLockPath: sessionLockPath, isAlive: isAlive)
+        guard decision3 == .allow,
+              !FileManager.default.fileExists(atPath: runLockPath),
+              !FileManager.default.fileExists(atPath: sessionLockPath),
+              FileManager.default.fileExists(atPath: siblingLockPath),
+              FileManager.default.fileExists(atPath: otherProfileLockPath) else {
+            return report("AC-SR3", "sync-run-lock-unlock-decision", false,
+                           "(stale-only removal touched a sibling or a different profile's lock, or left its own locks behind)")
+        }
+
+        return report("AC-SR3", "sync-run-lock-unlock-decision", true)
+    }
+
+    // MARK: - AC-SR4 — release/replace are owner-checked
+
+    private static func testSyncRunLockReleaseAndReplace() -> Bool {
+        let dir = "\(selfTestRoot)/ac-sr4-release"
+        try? FileManager.default.removeItem(atPath: dir)
+        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        let path = "\(dir)/run.lock"
+
+        // releaseIfOwned: owned content is removed.
+        try? "12345".write(toFile: path, atomically: true, encoding: .utf8)
+        guard SyncRunLock.releaseIfOwned(path: path, ownTokens: ["12345", "67890"]),
+              !FileManager.default.fileExists(atPath: path) else {
+            return report("AC-SR4", "sync-run-lock-release-replace", false, "(releaseIfOwned did not remove an owned lock)")
+        }
+
+        // releaseIfOwned: a FOREIGN holder is kept.
+        try? "99999".write(toFile: path, atomically: true, encoding: .utf8)
+        guard !SyncRunLock.releaseIfOwned(path: path, ownTokens: ["12345", "67890"]),
+              FileManager.default.fileExists(atPath: path) else {
+            return report("AC-SR4", "sync-run-lock-release-replace", false, "(releaseIfOwned removed a foreign holder's lock)")
+        }
+        try? FileManager.default.removeItem(atPath: path)
+
+        // replaceIfOwned: swaps only when the lock still holds `expected`.
+        try? "placeholder-token".write(toFile: path, atomically: true, encoding: .utf8)
+        guard SyncRunLock.replaceIfOwned(path: path, expected: "placeholder-token", with: "54321") else {
+            return report("AC-SR4", "sync-run-lock-release-replace", false, "(replaceIfOwned refused a matching placeholder)")
+        }
+        let afterSwap = (try? String(contentsOfFile: path, encoding: .utf8))?.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard afterSwap == "54321" else {
+            return report("AC-SR4", "sync-run-lock-release-replace", false, "(replaceIfOwned did not write the new token)")
+        }
+
+        // replaceIfOwned: refuses when the lock no longer holds `expected`.
+        guard !SyncRunLock.replaceIfOwned(path: path, expected: "placeholder-token", with: "99999") else {
+            return report("AC-SR4", "sync-run-lock-release-replace", false,
+                           "(replaceIfOwned swapped a lock that no longer held the expected placeholder)")
+        }
+        let unchanged = (try? String(contentsOfFile: path, encoding: .utf8))?.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard unchanged == "54321" else {
+            return report("AC-SR4", "sync-run-lock-release-replace", false, "(replaceIfOwned mutated content despite refusing)")
+        }
+
+        return report("AC-SR4", "sync-run-lock-release-replace", true)
+    }
+
+    // MARK: - AC-SR5 — the real session lock filename, and both PID encodings
+
+    private static func testSyncRunLockSessionNameAndParse() -> Bool {
+        var profile = sampleProfile()
+        profile.rcloneRemote = "synology-sftp"
+        profile.remotePath = "Kaiju/KAIJU/Reaper"
+        profile.localSyncPath = "/Volumes/SeagateHD/KaijuSync"
+
+        let expectedName = "synology-sftp_Kaiju_KAIJU_Reaper..Volumes_SeagateHD_KaijuSync.lck"
+        let gotName = SyncRunLock.sessionLockFileName(for: profile)
+        guard gotName == expectedName else {
+            return report("AC-SR5", "sync-run-lock-session-name-parse", false,
+                           "(session lock filename was \(gotName), expected \(expectedName))")
+        }
+
+        let observedJSON = #"{"Session":"synology-sftp_Kaiju_KAIJU_Reaper..Volumes_SeagateHD_KaijuSync","PID":"62932","TimeRenewed":"2026-10-04T20:11:48Z","TimeExpires":"2226-08-17T20:11:48Z"}"#
+        guard SyncRunLock.parseHolder(observedJSON) == .pid(62932) else {
+            return report("AC-SR5", "sync-run-lock-session-name-parse", false, "(observed rclone JSON did not parse to .pid(62932))")
+        }
+        guard SyncRunLock.parseHolder("12345") == .pid(12345) else {
+            return report("AC-SR5", "sync-run-lock-session-name-parse", false, "(a bare PID did not parse to .pid(12345))")
+        }
+        guard SyncRunLock.parseHolder("pending") == .pending else {
+            return report("AC-SR5", "sync-run-lock-session-name-parse", false, "(\"pending\" did not parse to .pending)")
+        }
+
+        return report("AC-SR5", "sync-run-lock-session-name-parse", true)
+    }
+
+    // MARK: - AC-SR6 — a rejected concurrent run is distinguished from a genuine failure
+
+    private static func testPriorLockFileRejectedRun() -> Bool {
+        let observed = "Failed to bisync: \u{1b}[31mprior lock file found: \u{1b}[93m/Users/me/.cache/rclone/bisync/x.lck\u{1b}[0m"
+        guard SyncLogPatterns.isPriorLockFileError(observed) else {
+            return report("AC-SR6", "prior-lock-file-rejected-run", false,
+                           "(isPriorLockFileError did not match the observed ANSI-wrapped message)")
+        }
+        guard SyncRunLock.isRejectedConcurrentRun(message: observed, sessionHolderLive: true) else {
+            return report("AC-SR6", "prior-lock-file-rejected-run", false,
+                           "(isRejectedConcurrentRun was false for a matching message with a live holder)")
+        }
+        guard !SyncRunLock.isRejectedConcurrentRun(message: observed, sessionHolderLive: false) else {
+            return report("AC-SR6", "prior-lock-file-rejected-run", false,
+                           "(isRejectedConcurrentRun was true for a matching message with a dead holder)")
+        }
+        let unrelated = "cannot find prior listings"
+        guard !SyncRunLock.isRejectedConcurrentRun(message: unrelated, sessionHolderLive: true) else {
+            return report("AC-SR6", "prior-lock-file-rejected-run", false,
+                           "(isRejectedConcurrentRun was true for an unrelated message)")
+        }
+        return report("AC-SR6", "prior-lock-file-rejected-run", true)
+    }
+
+    // MARK: - AC-SR7 — mount-mode liveness ignores lock files, registry only
+
+    private static func testRunLivenessMountMode() -> Bool {
+        let alwaysAlive: (Int32) -> Bool = { _ in true }
+
+        // Mount mode with a live /tmp lock but NO registry token — not running
+        // (otherwise Pause/Uninstall/Reinstall would stay disabled forever).
+        guard SyncManager.runLiveness(
+            isMount: true, registryActive: false, runLock: .pid(123), sessionLock: .none, isAlive: alwaysAlive
+        ) == false else {
+            return report("AC-SR7", "run-liveness-mount-mode", false,
+                           "(mount mode counted a live lock file as running with no registry token)")
+        }
+
+        // Mount mode WITH a registry token — running, regardless of lock state.
+        guard SyncManager.runLiveness(
+            isMount: true, registryActive: true, runLock: .none, sessionLock: .none, isAlive: alwaysAlive
+        ) == true else {
+            return report("AC-SR7", "run-liveness-mount-mode", false,
+                           "(mount mode with an active registry token was not reported as running)")
+        }
+
+        // Non-mount: a live lock file DOES count, even with no registry token.
+        guard SyncManager.runLiveness(
+            isMount: false, registryActive: false, runLock: .pid(123), sessionLock: .none, isAlive: alwaysAlive
+        ) == true else {
+            return report("AC-SR7", "run-liveness-mount-mode", false, "(non-mount mode ignored a live run lock)")
+        }
+
+        return report("AC-SR7", "run-liveness-mount-mode", true)
+    }
+
+    // MARK: - AC-SR8 — a missed endExclusiveRun self-heals after the stale grace
+
+    private static func testExclusiveRunRegistryStaleGrace() -> Bool {
+        var registry = ExclusiveRunRegistry()
+        let profileId = UUID()
+        let start = Date()
+        let alwaysDead: (Int32) -> Bool = { _ in false }
+
+        guard case .granted = registry.begin(
+            profileId: profileId, source: .resync, runLock: .none, sessionLock: .none,
+            isAlive: alwaysDead, now: start, placeholder: "p1"
+        ) else {
+            return report("AC-SR8", "exclusive-run-registry-stale-grace", false, "(initial begin was not granted)")
+        }
+
+        // Within the grace period — still blocked, even with a dead run lock.
+        let withinGrace = start.addingTimeInterval(ExclusiveRunRegistry.staleGrace - 1)
+        guard case .blocked(.inFlight) = registry.begin(
+            profileId: profileId, source: .resync, runLock: .none, sessionLock: .none,
+            isAlive: alwaysDead, now: withinGrace, placeholder: "p2"
+        ) else {
+            return report("AC-SR8", "exclusive-run-registry-stale-grace", false, "(an entry within the grace period was dropped)")
+        }
+
+        // Past the grace period but the run lock IS live — still blocked (not abandoned).
+        let pastGraceLiveLock = start.addingTimeInterval(ExclusiveRunRegistry.staleGrace + 1)
+        let aliveOne: (Int32) -> Bool = { $0 == 1 }
+        guard case .blocked = registry.begin(
+            profileId: profileId, source: .resync, runLock: .pid(1), sessionLock: .none,
+            isAlive: aliveOne, now: pastGraceLiveLock, placeholder: "p3"
+        ) else {
+            return report("AC-SR8", "exclusive-run-registry-stale-grace", false, "(an entry past grace with a live run lock was dropped)")
+        }
+
+        // Past the grace period AND the run lock is dead — dropped, granted.
+        guard case .granted = registry.begin(
+            profileId: profileId, source: .resync, runLock: .none, sessionLock: .none,
+            isAlive: alwaysDead, now: pastGraceLiveLock, placeholder: "p4"
+        ) else {
+            return report("AC-SR8", "exclusive-run-registry-stale-grace", false,
+                           "(an abandoned entry past grace with a dead run lock was not dropped and granted)")
+        }
+
+        return report("AC-SR8", "exclusive-run-registry-stale-grace", true)
+    }
+
+    // MARK: - AC-SR16 — atomic acquire: heldLive / reclaim / create
+
+    private static func testSyncRunLockAcquire() -> Bool {
+        let dir = "\(selfTestRoot)/ac-sr16-acquire"
+        try? FileManager.default.removeItem(atPath: dir)
+        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        let path = "\(dir)/run.lock"
+        let isAlive: (Int32) -> Bool = { $0 == 999 }
+
+        // Live-PID lock: heldLive, content unchanged.
+        try? "999".write(toFile: path, atomically: true, encoding: .utf8)
+        guard SyncRunLock.acquire(path: path, token: "newtoken", isAlive: isAlive) == .heldLive else {
+            return report("AC-SR16", "sync-run-lock-acquire", false, "(acquire against a live-PID lock did not return .heldLive)")
+        }
+        let stillLive = (try? String(contentsOfFile: path, encoding: .utf8))?.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard stillLive == "999" else {
+            return report("AC-SR16", "sync-run-lock-acquire", false, "(acquire mutated a live-PID lock's content)")
+        }
+
+        // Dead-PID lock: reclaimed.
+        try? "111".write(toFile: path, atomically: true, encoding: .utf8)
+        guard SyncRunLock.acquire(path: path, token: "newtoken", isAlive: isAlive) == .acquired else {
+            return report("AC-SR16", "sync-run-lock-acquire", false, "(acquire against a dead-PID lock did not reclaim)")
+        }
+        let reclaimed = (try? String(contentsOfFile: path, encoding: .utf8))?.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard reclaimed == "newtoken" else {
+            return report("AC-SR16", "sync-run-lock-acquire", false, "(reclaimed lock did not hold the new token)")
+        }
+        try? FileManager.default.removeItem(atPath: path)
+
+        // Absent: created exclusively.
+        guard SyncRunLock.acquire(path: path, token: "freshtoken", isAlive: isAlive) == .acquired else {
+            return report("AC-SR16", "sync-run-lock-acquire", false, "(acquire against an absent lock did not create it)")
+        }
+        let fresh = (try? String(contentsOfFile: path, encoding: .utf8))?.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard fresh == "freshtoken" else {
+            return report("AC-SR16", "sync-run-lock-acquire", false, "(freshly created lock did not hold the token)")
+        }
+
+        return report("AC-SR16", "sync-run-lock-acquire", true)
     }
 }
 
