@@ -2339,6 +2339,23 @@ struct ProfileDetailView: View {
         let needsReinstall = isInstalled
             && SyncManager.reconcileAction(from: currentProfile, to: updatedProfile) == .reinstall
 
+        // Refuse BEFORE persisting when the edit needs a reinstall and the profile's
+        // run is live (review finding): `reinstallSync` already refuses this case, but
+        // only after `profileStore.update` below had already stored the edit — leaving
+        // the running agent on the OLD config while the form reloads from the NEW one,
+        // so `hasChanges` goes false and Save becomes unavailable to retry. Checking
+        // here instead means the edit is never persisted at all until it can actually
+        // take effect: the form stays dirty and Save works again once the run ends.
+        if needsReinstall, syncManager.isRunLive(for: currentProfile) {
+            showingSyncInProgressAlert = true
+            TelemetryService.shared.recordProfileLifecycleOperation(
+                profileId: currentProfile.id, profileName: currentProfile.name,
+                operation: "reinstall", syncMode: currentProfile.syncMode.rawValue,
+                result: "blocked_already_running"
+            )
+            return
+        }
+
         profileStore.update(updatedProfile)
 
         // Clear any cached error since config changed
