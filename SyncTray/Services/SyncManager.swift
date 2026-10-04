@@ -1012,12 +1012,15 @@ final class SyncManager: ObservableObject {
             self?.applyWarmReconcile(for: id, trigger: "external_edit")
         }
 
-        // "Don't Sync" patterns, also ORTHOGONAL to `action`: a changed
-        // `syncExcludePatterns` yields `action == .none` (the script re-reads the
-        // filter file every run), so rewrite the file here, with the same gate and the
-        // same outcome recording as the in-app editor (`updateSyncExcludePatterns`). A
-        // failed write goes to `syncFilterErrors`, not `profileErrors`: every sync run
-        // clears `profileErrors`, which would make the patterns look applied again.
+        // "Don't Sync" patterns AND "Sync Only These Folders" selective folders, also
+        // ORTHOGONAL to `action`: a changed `syncExcludePatterns`/`syncIncludeFolders` yields
+        // `action == .none` (the script re-reads the filter file every run), so rewrite the
+        // file here, with the same gate and the same outcome recording as the in-app editors
+        // (`updateSyncExcludePatterns` / `updateSyncIncludeFolders`). A failed write goes to
+        // `syncFilterErrors`, not `profileErrors`: every sync run clears `profileErrors`,
+        // which would make the patterns look applied again. A bisync profile whose compiled
+        // include rules actually change picks up its own resync-pending marker inside the
+        // write — never a reinstall.
         applySyncFilterReconcile(from: currentProfile, to: updatedProfile)
 
         updateAggregateState()
