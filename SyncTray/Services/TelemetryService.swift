@@ -107,6 +107,7 @@ final class TelemetryService {
     private var remoteConfigCounter: LongCounterSdk?
     private var syncContentionCounter: LongCounterSdk?
     private var rejectedConcurrentRunCounter: LongCounterSdk?
+    private var deferredReinstallCounter: LongCounterSdk?
     private var logWatcherRecoveryCounter: LongCounterSdk?
     private var staleLockCleanupCounter: LongCounterSdk?
     private var syncCheckPhaseHistogram: DoubleHistogramMeterSdk?
@@ -354,6 +355,14 @@ final class TelemetryService {
             .setDescription(
                 "Number of times a rejected concurrent run's own \"prior lock file found\" "
                     + "failure was suppressed because the real holder is still live")
+            .setUnit("1")
+            .build()
+
+        deferredReinstallCounter = meter
+            .counterBuilder(name: "synctray.config.deferred_reinstall")
+            .setDescription(
+                "External profile edits whose reinstall was deferred because the profile's "
+                    + "run was live, by outcome (deferred, applied, failed)")
             .setUnit("1")
             .build()
 
@@ -1555,6 +1564,28 @@ final class TelemetryService {
         ]
         externalConfigEditCounter?.add(value: 1, attribute: attrs)
         emitLog(severity: .info, body: "External config edit applied", attributes: attrs)
+    }
+
+    /// Record a deferred external-edit reinstall's lifecycle (review finding: previously
+    /// only a debugLog/print, so Dash0 could not show an edit that never got applied).
+    /// - Parameter outcome: `"deferred"` (a sync was live at edit time), `"applied"` (the
+    ///   retry succeeded once the run ended), or `"failed"` (the retry's install call
+    ///   itself threw).
+    func recordDeferredReinstall(profileId: UUID, profileName: String, outcome: String) {
+        guard SyncTraySettings.telemetryEnabled else { return }
+        ensureSetup()
+
+        let attrs: [String: AttributeValue] = [
+            "synctray.profile.name": .string(profileName),
+            "deferred_reinstall.outcome": .string(outcome),
+        ]
+        deferredReinstallCounter?.add(value: 1, attribute: attrs)
+
+        emitLog(
+            severity: outcome == "failed" ? .warn : .info,
+            body: "Deferred external-edit reinstall",
+            attributes: attrs.merging(["synctray.profile.id": .string(profileId.uuidString)]) { _, new in new }
+        )
     }
 
     // MARK: - Headless CLI
