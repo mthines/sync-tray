@@ -4857,7 +4857,10 @@ enum ConfigSelfTest {
         profile.syncMode = .bisync
         profile.syncIncludeFolders = ["Keep", "Deep/Nested"]
         do {
-            try SyncSetupService.shared.writeExcludeFilter(for: profile, at: filterPath)
+            // A bisync include change also writes the resync marker — keep it in the sandbox,
+            // or it defaults to the real ~/.config/synctray/profiles/{shortId}.resync-pending.
+            try SyncSetupService.shared.writeExcludeFilter(
+                for: profile, at: filterPath, resyncMarkerAt: "\(dir).resync-pending")
         } catch {
             return report(name, slug, false, "(writeExcludeFilter threw: \(error))")
         }
