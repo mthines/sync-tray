@@ -106,6 +106,7 @@ final class TelemetryService {
     private var fileOperationCounter: LongCounterSdk?
     private var remoteConfigCounter: LongCounterSdk?
     private var syncContentionCounter: LongCounterSdk?
+    private var rejectedConcurrentRunCounter: LongCounterSdk?
     private var logWatcherRecoveryCounter: LongCounterSdk?
     private var staleLockCleanupCounter: LongCounterSdk?
     private var syncCheckPhaseHistogram: DoubleHistogramMeterSdk?
@@ -345,6 +346,14 @@ final class TelemetryService {
         syncContentionCounter = meter
             .counterBuilder(name: "synctray.sync.contention")
             .setDescription("Number of times a sync was skipped because another was already running")
+            .setUnit("1")
+            .build()
+
+        rejectedConcurrentRunCounter = meter
+            .counterBuilder(name: "synctray.sync.rejected_concurrent_run")
+            .setDescription(
+                "Number of times a rejected concurrent run's own \"prior lock file found\" "
+                    + "failure was suppressed because the real holder is still live")
             .setUnit("1")
             .build()
 
@@ -1313,6 +1322,39 @@ final class TelemetryService {
             attributes: [
                 "synctray.profile.id": .string(profileId.uuidString),
                 "synctray.profile.name": .string(profileName),
+            ]
+        )
+    }
+
+    /// Record when a rejected concurrent run's own "prior lock file found" failure is
+    /// suppressed rather than surfaced as this profile's failure (the single-run guard's
+    /// R3 behaviour — see CLAUDE.md "One Run Per Profile"). Without this signal there is
+    /// no way to see in Dash0 whether the double-bisync race this guard was built to stop
+    /// is still happening (review finding).
+    /// - Parameters:
+    ///   - site: which log-event shape triggered the suppression — `"sync_failed"`
+    ///           (the script's own `syncFailed` line) or `"error_message"` (an
+    ///           intermediate `errorMessage` line, before `syncFailed` arrives).
+    func recordRejectedConcurrentRun(
+        profileId: UUID,
+        profileName: String,
+        site: String
+    ) {
+        guard SyncTraySettings.telemetryEnabled else { return }
+        ensureSetup()
+
+        rejectedConcurrentRunCounter?.add(value: 1, attribute: [
+            "synctray.profile.name": .string(profileName),
+            "rejected_concurrent_run.site": .string(site),
+        ])
+
+        emitLog(
+            severity: .info,
+            body: "Rejected concurrent run suppressed",
+            attributes: [
+                "synctray.profile.id": .string(profileId.uuidString),
+                "synctray.profile.name": .string(profileName),
+                "rejected_concurrent_run.site": .string(site),
             ]
         )
     }

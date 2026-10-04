@@ -209,6 +209,7 @@ rollout. No event is emitted on a fresh install.
 | `synctray.sync.file_operations` | Counter | File operations by type + extension |
 | `synctray.remote.config_operations` | Counter | Remote config operations (create/update/delete/connection_test) by provider type + result |
 | `synctray.sync.contention` | Counter | Syncs skipped because another was already running (lock file contention) |
+| `synctray.sync.rejected_concurrent_run` | Counter | A rejected concurrent run's own "prior lock file found" failure suppressed rather than surfaced as this profile's failure (the single-run guard's R3 behaviour — CLAUDE.md "One Run Per Profile"), by `rejected_concurrent_run.site`: `sync_failed` or `error_message` |
 | `synctray.logwatcher.recovery` | Counter | LogWatcher recovery events (file_replaced, missed_bytes, polling_error) |
 | `synctray.startup.stale_locks_cleaned` | Counter | Stale lock files cleaned on startup (synctray or rclone_bisync) |
 | `synctray.sync.check_phase_duration` | Histogram | Duration of bisync listing/check phase (seconds) — main bottleneck for large repos |
@@ -276,6 +277,10 @@ All key lifecycle events are emitted as structured OTel logs:
 - Configuration summary (profile count breakdown by mode)
 - Remote config operations: create/update/delete/connection_test (with provider type and categorized error type)
 - Sync contention: sync skipped because another was already running (bottleneck detection)
+- Rejected concurrent run suppressed: a rejected concurrent run's own "prior lock file found"
+  failure was ignored rather than surfaced as this profile's failure (`rejected_concurrent_run.site`:
+  `sync_failed`/`error_message`) — the signal that the double-bisync race the single-run guard
+  closes is (or isn't) still happening
 - LogWatcher recovery: file replaced, missed bytes, polling errors (monitoring health) — **coalesced into episodes**: the first event of a run emits `LogWatcher recovery: <reason>` immediately, further events within a 60s quiet window are folded into a single `LogWatcher recovery episode ended: <reason>` carrying `logwatcher.recovery_count`, `logwatcher.missed_bytes`, and `logwatcher.episode_duration_seconds`. The `synctray.logwatcher.recovery` counter still records **every** event, so the true rate is unaffected. A single-event episode emits no summary.
 - Stale lock cleanup: count and type of stale locks cleaned at startup (crash detection)
 - Check phase duration: bisync listing/comparison phase timing (bottleneck analysis)

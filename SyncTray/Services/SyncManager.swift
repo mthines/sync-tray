@@ -2476,6 +2476,11 @@ final class SyncManager: ObservableObject {
                 if SyncRunLock.isRejectedConcurrentRun(message: errorToCheck, sessionHolderLive: sessionHolderLive) {
                     SyncTraySettings.debugLog(
                         "Ignoring prior-lock-file syncFailed for '\(currentProfile.name)': a live process holds the session lock")
+                    // Observable in Dash0 (review finding): this is the exact incident
+                    // shape this guard exists to catch — without a signal here nobody
+                    // can tell whether a double-bisync race is still happening.
+                    TelemetryService.shared.recordRejectedConcurrentRun(
+                        profileId: profileId, profileName: currentProfile.name, site: "sync_failed")
                     break
                 }
             }
@@ -2571,6 +2576,10 @@ final class SyncManager: ObservableObject {
                     lastSeenErrorMessage[profileId] = message
                     SyncTraySettings.debugLog(
                         "Ignoring prior-lock-file errorMessage for '\(currentProfile.name)': a live process holds the session lock")
+                    // Observable in Dash0 (review finding) — same signal as the
+                    // `.syncFailed` suppression above, from the other log line shape.
+                    TelemetryService.shared.recordRejectedConcurrentRun(
+                        profileId: profileId, profileName: currentProfile.name, site: "error_message")
                     break
                 }
             }
