@@ -3150,6 +3150,12 @@ struct ProfileDetailView: View {
             runToken = acquired
         } else {
             showingSyncInProgressAlert = true
+            // Blocked before `runResync` ever reaches its own `isInstalling = false`
+            // below (review finding): `installSync`'s caller left `isInstalling` true
+            // expecting this function to clear it, so a blocked reinstall resync must
+            // still clear it here or the Install/Reinstall button stays disabled with
+            // a spinner forever.
+            isInstalling = false
             // D7: the install itself already succeeded, and the scheduled script
             // self-bootstraps --resync when listings are missing — only the agent
             // load still needs to happen here so the live run can hand off to it.
