@@ -988,7 +988,13 @@ delete files that are suddenly out of scope. Rather than discard the
 listings (forbidden by Critical Rule 7, above), `writeExcludeFilter` detects
 an include-rule CHANGE (comparing the compiled include block before/after,
 so an exclude-only edit never triggers this) on a `.bisync` profile and writes
-a fresh UUID token to `{shortId}.resync-pending`. The generated sync script
+a fresh UUID token to `{shortId}.resync-pending` — right AFTER the filter file,
+rolling the filter back if the marker write fails (so the next write retries
+both instead of short-circuiting on an already-updated filter and losing the
+resync). Filter-first is deliberate: a sync that starts between the two writes
+costs at most one aborted run before the marker lands, whereas marker-first
+could let that run consume the marker under the OLD rules and leave the
+profile stuck on `--max-delete` aborts (covered by AC-SI6). The generated sync script
 checks this marker before building its bootstrap args: a present token makes
 it run `--resync --resync-mode newer` (the newer copy wins on conflict, matching every
 other SyncTray-initiated resync) instead of a plain bisync, logging "sync
