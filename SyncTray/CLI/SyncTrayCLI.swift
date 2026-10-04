@@ -1371,13 +1371,33 @@ enum SyncTrayCLI {
             }
         }
 
+        let action = SyncManager.reconcileAction(from: original, to: updated)
+
+        // Refuse BEFORE persisting when the reconcile would reinstall (review finding):
+        // `uninstallForReinstall` itself throws while the profile's run is live, but that
+        // check used to run only AFTER `writeProfile` already persisted the edit — so a
+        // refused `profile set` left the edit stuck unapplied with no automatic retry;
+        // the only way out was `synctray reinstall`. Pre-flighting it here means a
+        // refusal touches no state, matching `ProfileDetailView.saveProfile`'s fix for
+        // the same race in the app.
+        if case .reinstall = action, let err = env.uninstallForReinstall(original, updated) {
+            env.stderr("error: \(err)\n")
+            return 1
+        }
+
         guard env.writeProfile(updated) else {
             env.stderr("error: failed to write profile file\n")
             return 1
         }
 
-        let action = SyncManager.reconcileAction(from: original, to: updated)
-        if let err = applyLaunchdReconcile(action, current: original, updated: updated, env: env) {
+        // For `.reinstall`, the teardown already ran above — only install remains.
+        let reconcileErr: String?
+        if case .reinstall = action {
+            reconcileErr = env.installProfile(updated)
+        } else {
+            reconcileErr = applyLaunchdReconcile(action, current: original, updated: updated, env: env)
+        }
+        if let err = reconcileErr {
             env.stderr("updated \(original.shortId) but launchd step failed: \(err)\n")
             return 1
         }

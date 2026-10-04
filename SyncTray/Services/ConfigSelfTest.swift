@@ -145,6 +145,8 @@ enum ConfigSelfTest {
             testRunLivenessMountMode,
             testExclusiveRunRegistryStaleGrace,
             testSyncRunLockAcquire,
+            testProfileSetRefusesBeforePersist,
+            testReviewBranchGuardsPinned,
         ]
 
         for check in checks {
@@ -6486,6 +6488,73 @@ enum ConfigSelfTest {
         }
 
         return report("AC-SR16", "sync-run-lock-acquire", true)
+    }
+
+    // MARK: - AC-SR17 — `profile set` never persists a reinstall it refused
+
+    /// Review finding: `runProfileSet` wrote the `.profile.json` BEFORE calling
+    /// `uninstallForReinstall`, so a refusal (a sync currently running) left the edit
+    /// persisted but unapplied — rerunning the command then printed "no changes" with no
+    /// way to retry except `synctray reinstall`. Pins the fix: the reinstall teardown
+    /// call now runs before `writeProfile`, so a refusal touches no disk state.
+    private static func testProfileSetRefusesBeforePersist() -> Bool {
+        let enabled = sampleProfile(id: UUID(), name: "Enabled", isEnabled: true)
+        var writeCalls = 0
+        let env = fakeCLIEnvironment(
+            readProfiles: { [enabled] },
+            writeProfile: { _ in writeCalls += 1; return true },
+            uninstallForReinstall: { _, _ in "A sync is currently running for Enabled; try again once it finishes." }
+        )
+        let exitCode = SyncTrayCLI.execute(["profile", "set", enabled.shortId, "syncIntervalMinutes", "42"], env: env)
+        guard exitCode != 0 else {
+            return report("AC-SR17", "profile-set-refuses-before-persist", false,
+                "(profile set did not exit non-zero when the reinstall teardown refused)")
+        }
+        guard writeCalls == 0 else {
+            return report("AC-SR17", "profile-set-refuses-before-persist", false,
+                "(profile set wrote the profile file despite the reinstall teardown refusing)")
+        }
+        return report("AC-SR17", "profile-set-refuses-before-persist", true)
+    }
+
+    // MARK: - AC-SR18 — review-branch guards are pinned by source-text assertions
+
+    /// Review finding: the `getpid()` guard (so Pause can't SIGTERM the app itself), the
+    /// `uninstallForReinstall` refusal while a run is live, and the external-edit
+    /// deferred-reinstall retry (AC-SR17's sibling fix, above) all close real
+    /// regressions `review-branch` found during this change's own review — but none was
+    /// pinned by a test, so a revert of any one stays green. Pins all three by reading
+    /// the live source, the same style `testReinstallTeardownRouting` (AC-RI5) uses.
+    private static func testReviewBranchGuardsPinned() -> Bool {
+        guard let managerSource = readSourceFile("Services/SyncManager.swift"),
+              let setupSource = readSourceFile("Services/SyncSetupService.swift") else {
+            return report("AC-SR18", "review-branch-guards-pinned", false, "(could not read source files)")
+        }
+
+        guard let detectPID = extractFunctionBody(startingAt: "private func detectRunningSyncPID(", in: managerSource),
+              detectPID.contains("pid != getpid()") else {
+            return report("AC-SR18", "review-branch-guards-pinned", false,
+                "(detectRunningSyncPID no longer excludes the app's own PID)")
+        }
+
+        guard let uninstallForReinstall = extractFunctionBody(startingAt: "func uninstallForReinstall(", in: setupSource),
+              uninstallForReinstall.contains("try again once it finishes") else {
+            return report("AC-SR18", "review-branch-guards-pinned", false,
+                "(uninstallForReinstall no longer refuses while the profile's run is live)")
+        }
+
+        guard let externalEdit = extractFunctionBody(startingAt: "func applyExternalProfileEdit(", in: managerSource),
+              externalEdit.contains("pendingExternalReinstalls[currentProfile.id]") else {
+            return report("AC-SR18", "review-branch-guards-pinned", false,
+                "(applyExternalProfileEdit no longer tracks a deferred reinstall for later retry)")
+        }
+
+        guard managerSource.contains("retryPendingExternalReinstallIfNeeded(for: profileId)") else {
+            return report("AC-SR18", "review-branch-guards-pinned", false,
+                "(a deferred reinstall is no longer retried when the profile's run ends)")
+        }
+
+        return report("AC-SR18", "review-branch-guards-pinned", true)
     }
 }
 

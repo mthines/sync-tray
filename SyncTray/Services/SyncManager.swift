@@ -364,6 +364,17 @@ final class SyncManager: ObservableObject {
     /// in-flight `Set<UUID>` — see `ExclusiveRunRegistry`'s doc comment.
     private var exclusiveRunRegistry = ExclusiveRunRegistry()
 
+    /// An external `.profile.json` edit's `.reinstall` reconcile, deferred because the
+    /// profile's run was live at edit time (review finding: this used to be dropped with
+    /// only a debug log and never retried — the next edit diffed against the already-
+    /// persisted profile, found nothing to reconcile, and the agent kept running the
+    /// stale script forever). `old` is the profile as it was actually installed (captured
+    /// BEFORE this edit persisted), so a later retry still tears down what is really
+    /// running; `new` is replaced by each subsequent deferred edit while one run keeps
+    /// blocking. Retried from `processLogEvent` whenever this profile's run is observed
+    /// to end (`retryPendingExternalReinstallIfNeeded`).
+    private var pendingExternalReinstalls: [UUID: (old: SyncProfile, new: SyncProfile)] = [:]
+
     /// The time window (seconds) within which consecutive auto-fix failures trigger backoff suppression.
     private let autoFixBackoffWindow: TimeInterval = 5 * 60  // 5 minutes
 
@@ -960,10 +971,16 @@ final class SyncManager: ObservableObject {
             // the CLI's `reinstall`/`profile set`); skipping `install` here as well means
             // this edit is never half-applied (config persisted above, agent left as-is).
             guard !isRunLive(for: currentProfile) else {
+                // Remember it instead of dropping it (review finding): keep the ORIGINAL
+                // `old` from the first deferral if one is already pending, since that is
+                // what is actually installed — only `new` advances to this latest edit.
+                let effectiveOld = pendingExternalReinstalls[currentProfile.id]?.old ?? currentProfile
+                pendingExternalReinstalls[currentProfile.id] = (old: effectiveOld, new: updatedProfile)
                 SyncTraySettings.debugLog(
-                    "[ConfigFileWatcher] Deferred reinstall for '\(currentProfile.name)': a sync is currently running")
+                    "[ConfigFileWatcher] Deferred reinstall for '\(currentProfile.name)': a sync is currently running; will retry once it ends")
                 break
             }
+            pendingExternalReinstalls[currentProfile.id] = nil
             do {
                 // Keeps the bisync listings while they still apply, so a settings edit
                 // never forces a full --resync (see `uninstallForReinstall`).
@@ -1241,6 +1258,31 @@ final class SyncManager: ObservableObject {
             sessionLock: sessionLock,
             isAlive: SyncRunLock.processIsAlive
         )
+    }
+
+    /// Applies a reinstall that `applyExternalProfileEdit` deferred because the
+    /// profile's run was live at edit time (review finding: a deferred reinstall was
+    /// otherwise never retried). Called from `processLogEvent` whenever a log event
+    /// observes this profile's run ending — safe to call unconditionally; a no-op when
+    /// nothing is pending or the profile is still live (another concurrent run, or a
+    /// log event that isn't actually this profile's own run ending).
+    private func retryPendingExternalReinstallIfNeeded(for profileId: UUID) {
+        guard let pending = pendingExternalReinstalls[profileId] else { return }
+        guard !isRunLive(for: pending.new) else { return }
+        pendingExternalReinstalls[profileId] = nil
+        do {
+            try setupService.uninstallForReinstall(from: pending.old, to: pending.new)
+        } catch {
+            // Ignore uninstall errors, matching the original deferred path.
+        }
+        do {
+            try setupService.install(profile: pending.new)
+            startWatching(profile: pending.new)
+            SyncTraySettings.debugLog(
+                "[ConfigFileWatcher] Applied deferred reinstall for '\(pending.new.name)' now that its run has ended")
+        } catch {
+            print("Failed to reinstall externally-edited profile after deferred retry: \(error)")
+        }
     }
 
     // MARK: - Auto-Fix
@@ -2413,6 +2455,9 @@ final class SyncManager: ObservableObject {
                 notificationService.clearPendingChanges(for: profileId)
             }
             currentSyncChanges[profileId] = nil
+            // The run just ended — apply any reinstall an external edit deferred while
+            // it was live (review finding).
+            retryPendingExternalReinstallIfNeeded(for: profileId)
 
         case .syncFailed(let exitCode, let message):
             // Check if the error message (or the last seen error) is a transient one
@@ -2444,6 +2489,8 @@ final class SyncManager: ObservableObject {
                 currentSyncChanges[profileId] = nil  // Only clear this profile's changes
                 // Reset to idle since this isn't a real error
                 profileStates[profileId] = .idle
+                // The run just ended (cosmetic non-error) — apply any deferred reinstall.
+                retryPendingExternalReinstallIfNeeded(for: profileId)
                 break
             }
 
@@ -2488,6 +2535,9 @@ final class SyncManager: ObservableObject {
                let currentProfile = profile {
                 triggerAutoFix(for: currentProfile)
             }
+            // The run just ended (failed, but ended) — apply any reinstall an external
+            // edit deferred while it was live (review finding).
+            retryPendingExternalReinstallIfNeeded(for: profileId)
 
         case .transportChanged(let transport):
             profileTransports[profileId] = transport
