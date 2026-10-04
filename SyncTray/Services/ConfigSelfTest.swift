@@ -6554,6 +6554,17 @@ enum ConfigSelfTest {
                 "(a deferred reinstall is no longer retried when the profile's run ends)")
         }
 
+        // Review finding (round 2): the retry must install the CURRENT profile, never the
+        // stale snapshot captured at defer time, and must re-check shortly when the "run
+        // ended" log line beat the lock's actual release.
+        guard let retryFn = extractFunctionBody(
+            startingAt: "private func retryPendingExternalReinstallIfNeeded(", in: managerSource),
+              retryFn.contains("profileStore.profile(for: profileId) ?? pending.new"),
+              retryFn.contains("scheduleRetryPendingExternalReinstallCheck(for: profileId)") else {
+            return report("AC-SR18", "review-branch-guards-pinned", false,
+                "(deferred-reinstall retry no longer re-fetches the current profile or no longer re-checks shortly)")
+        }
+
         return report("AC-SR18", "review-branch-guards-pinned", true)
     }
 }

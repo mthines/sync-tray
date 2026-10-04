@@ -978,6 +978,8 @@ final class SyncManager: ObservableObject {
                 pendingExternalReinstalls[currentProfile.id] = (old: effectiveOld, new: updatedProfile)
                 SyncTraySettings.debugLog(
                     "[ConfigFileWatcher] Deferred reinstall for '\(currentProfile.name)': a sync is currently running; will retry once it ends")
+                TelemetryService.shared.recordDeferredReinstall(
+                    profileId: currentProfile.id, profileName: currentProfile.name, outcome: "deferred")
                 break
             }
             pendingExternalReinstalls[currentProfile.id] = nil
@@ -1264,24 +1266,59 @@ final class SyncManager: ObservableObject {
     /// profile's run was live at edit time (review finding: a deferred reinstall was
     /// otherwise never retried). Called from `processLogEvent` whenever a log event
     /// observes this profile's run ending — safe to call unconditionally; a no-op when
-    /// nothing is pending or the profile is still live (another concurrent run, or a
-    /// log event that isn't actually this profile's own run ending).
+    /// nothing is pending.
+    ///
+    /// Reinstalls the CURRENT profile from `profileStore`, never the `pending.new`
+    /// snapshot captured at defer time (review finding): any edit that lands while the
+    /// run was still live — including a `.none`-action edit like a changed "Don't Sync"
+    /// pattern, or an enable/disable — updates the store but never touches the pending
+    /// snapshot, so installing the stale copy would silently drop it.
     private func retryPendingExternalReinstallIfNeeded(for profileId: UUID) {
         guard let pending = pendingExternalReinstalls[profileId] else { return }
-        guard !isRunLive(for: pending.new) else { return }
+        let latest = profileStore.profile(for: profileId) ?? pending.new
+        guard !isRunLive(for: latest) else {
+            // The "run ended" log line and the run actually being over are not atomic:
+            // an app-started run's terminationHandler writes "Bisync completed/failed"
+            // BEFORE releasing the lock, and the launchd sync script's own log line
+            // precedes its EXIT trap removing the session lock (review finding). Either
+            // way `isRunLive` can still read true for a moment after this log event — a
+            // short delayed re-check catches that window instead of waiting for some
+            // unrelated later run to end.
+            scheduleRetryPendingExternalReinstallCheck(for: profileId)
+            return
+        }
+        pendingReinstallRetryScheduled.remove(profileId)
         pendingExternalReinstalls[profileId] = nil
         do {
-            try setupService.uninstallForReinstall(from: pending.old, to: pending.new)
+            try setupService.uninstallForReinstall(from: pending.old, to: latest)
         } catch {
             // Ignore uninstall errors, matching the original deferred path.
         }
         do {
-            try setupService.install(profile: pending.new)
-            startWatching(profile: pending.new)
+            try setupService.install(profile: latest)
+            startWatching(profile: latest)
             SyncTraySettings.debugLog(
-                "[ConfigFileWatcher] Applied deferred reinstall for '\(pending.new.name)' now that its run has ended")
+                "[ConfigFileWatcher] Applied deferred reinstall for '\(latest.name)' now that its run has ended")
+            TelemetryService.shared.recordDeferredReinstall(
+                profileId: profileId, profileName: latest.name, outcome: "applied")
         } catch {
             print("Failed to reinstall externally-edited profile after deferred retry: \(error)")
+            TelemetryService.shared.recordDeferredReinstall(
+                profileId: profileId, profileName: latest.name, outcome: "failed")
+        }
+    }
+
+    /// At most one in-flight delayed re-check per profile, so repeated log events while
+    /// a run is winding down don't stack up timers (see `retryPendingExternalReinstallIfNeeded`).
+    private var pendingReinstallRetryScheduled: Set<UUID> = []
+
+    private func scheduleRetryPendingExternalReinstallCheck(for profileId: UUID) {
+        guard !pendingReinstallRetryScheduled.contains(profileId) else { return }
+        pendingReinstallRetryScheduled.insert(profileId)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
+            guard let self else { return }
+            self.pendingReinstallRetryScheduled.remove(profileId)
+            self.retryPendingExternalReinstallIfNeeded(for: profileId)
         }
     }
 
