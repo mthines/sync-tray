@@ -3098,11 +3098,32 @@ struct ProfileDetailView: View {
             operation: "reinstall", syncMode: currentProfile.syncMode.rawValue, result: "started"
         )
 
+        let targetProfile = previous ?? currentProfile
+
+        // Refuse up front while the profile's run is live (review finding): Save, the
+        // Reinstall button, and a cache-path finalize all reach this function without
+        // going through `beginExclusiveRun`. Falling through to `installSync` while a
+        // run is live would reload the agent (RunAtLoad=true) right next to the
+        // still-running process — the second-bisync incident this guard exists to
+        // prevent, reached through reinstall instead of an explicit recovery button.
+        // `uninstallForReinstall` itself refuses too (defense in depth, and the path
+        // the CLI/external-edit reinstall share), but checking here first means the
+        // user sees the alert instead of a silently-skipped reinstall.
+        guard !syncManager.isRunLive(for: targetProfile) else {
+            showingSyncInProgressAlert = true
+            TelemetryService.shared.recordProfileLifecycleOperation(
+                profileId: currentProfile.id, profileName: currentProfile.name,
+                operation: "reinstall", syncMode: currentProfile.syncMode.rawValue,
+                result: "blocked_already_running"
+            )
+            return
+        }
+
         do {
             // Keeps the exclude filter and, while they still apply, the bisync listings —
             // so `installSync` finds them and runs no `--resync` after a settings change.
             try setupService.uninstallForReinstall(
-                from: previous ?? currentProfile, to: overrideProfile ?? currentProfile)
+                from: targetProfile, to: overrideProfile ?? currentProfile)
         } catch {
             // Ignore uninstall errors
         }

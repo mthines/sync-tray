@@ -305,6 +305,30 @@ final class SyncSetupService {
     /// pair's are stale, and any already under the new pair's name come from an earlier
     /// configuration, not from a sync this profile ran.
     func uninstallForReinstall(from old: SyncProfile, to new: SyncProfile) throws {
+        // Refuse while `old`'s run is live (review finding, post-merge of the single-run
+        // guard): Save, an external-edit reinstall, and the CLI's `reinstall`/`profile set`
+        // all reach this function directly — none of them go through
+        // `SyncManager.beginExclusiveRun`, so without this check they would unload the
+        // agent and unconditionally delete the profile's own live `/tmp` lock
+        // (`uninstall`, below) and live session `.lck` (`removeBisyncLock`), then
+        // `installSync` immediately reloads the agent with `RunAtLoad=true` — starting a
+        // second bisync right next to the one still running. That is the exact incident
+        // this guard exists to prevent, reached through reinstall instead of an explicit
+        // recovery button. Mount mode is exempt (R7): its `/tmp` lock is held for the
+        // mount daemon's entire life, and a Stream profile's folder/remote change
+        // legitimately needs to detach-and-remount through this same path.
+        if !old.isMountMode {
+            let runLock = SyncRunLock.parseHolder(try? String(contentsOfFile: old.lockFilePath, encoding: .utf8))
+            let sessionLock = SyncRunLock.parseHolder(
+                try? String(contentsOfFile: SyncRunLock.sessionLockPath(for: old), encoding: .utf8))
+            if SyncRunLock.isLive(runLock, isAlive: SyncRunLock.processIsAlive)
+                || SyncRunLock.isLive(sessionLock, isAlive: SyncRunLock.processIsAlive) {
+                throw NSError(domain: "SyncSetupService", code: 3, userInfo: [
+                    NSLocalizedDescriptionKey:
+                        "A sync is currently running for \(old.name); try again once it finishes."
+                ])
+            }
+        }
         try uninstall(profile: old, keepingSyncState: true)
         if Self.reinstallKeepsBisyncListings(from: old, to: new) {
             // The agent was just unloaded, so a bisync lock left behind belongs to a run that

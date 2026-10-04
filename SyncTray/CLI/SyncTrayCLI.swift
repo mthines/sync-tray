@@ -1165,11 +1165,18 @@ enum SyncTrayCLI {
             env.stderr("error: \"\(profile.name)\" is incomplete (name/remote/paths); fix it with 'synctray profile set' first\n")
             return 1
         }
-        // Uninstall is cleanup — a failure here is non-fatal (mirrors delete),
-        // since the following install regenerates every file anyway. The
-        // reinstall teardown keeps the bisync listings (same profile in and out).
+        // `uninstallForReinstall` refuses while the profile's run is live (review
+        // finding, post-merge of the single-run guard): falling through to install
+        // regardless — as this used to do, on the reasoning that install regenerates
+        // every file anyway — would reload the agent (RunAtLoad=true) right next to a
+        // still-running sync, the second-bisync incident this guard exists to prevent.
+        // Stop here on ANY uninstall failure rather than only the live case; the CLI
+        // has no cheaper way to tell them apart, and treating a failed teardown as
+        // safe to install over was the same optimistic assumption that let the
+        // original incident through.
         if let err = env.uninstallForReinstall(profile, profile) {
-            env.stderr("warning: uninstall reported: \(err)\n")
+            env.stderr("error: reinstall refused: \(err)\n")
+            return 1
         }
         if let err = env.installProfile(profile) {
             env.stderr("error: reinstall failed: \(err)\n")

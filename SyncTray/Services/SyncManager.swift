@@ -951,6 +951,19 @@ final class SyncManager: ObservableObject {
             }
 
         case .reinstall:
+            // Refuse while the profile's run is live (review finding): an external edit
+            // reaches `uninstallForReinstall` without going through `beginExclusiveRun`,
+            // so without this check a config edit that lands mid-run would unload the
+            // agent, delete the profile's own live locks, then immediately reload the
+            // agent (RunAtLoad=true) — a second bisync next to the one still running.
+            // `uninstallForReinstall` itself refuses too (defense in depth, shared with
+            // the CLI's `reinstall`/`profile set`); skipping `install` here as well means
+            // this edit is never half-applied (config persisted above, agent left as-is).
+            guard !isRunLive(for: currentProfile) else {
+                SyncTraySettings.debugLog(
+                    "[ConfigFileWatcher] Deferred reinstall for '\(currentProfile.name)': a sync is currently running")
+                break
+            }
             do {
                 // Keeps the bisync listings while they still apply, so a settings edit
                 // never forces a full --resync (see `uninstallForReinstall`).
