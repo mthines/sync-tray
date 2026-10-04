@@ -362,7 +362,7 @@ final class TelemetryService {
             .counterBuilder(name: "synctray.config.deferred_reinstall")
             .setDescription(
                 "External profile edits whose reinstall was deferred because the profile's "
-                    + "run was live, by outcome (deferred, applied, failed)")
+                    + "run was live, by outcome (deferred, applied, failed, dropped)")
             .setUnit("1")
             .build()
 
@@ -1569,8 +1569,10 @@ final class TelemetryService {
     /// Record a deferred external-edit reinstall's lifecycle (review finding: previously
     /// only a debugLog/print, so Dash0 could not show an edit that never got applied).
     /// - Parameter outcome: `"deferred"` (a sync was live at edit time), `"applied"` (the
-    ///   retry succeeded once the run ended), or `"failed"` (the retry's install call
-    ///   itself threw).
+    ///   retry succeeded once the run ended), `"failed"` (the retry's install call itself
+    ///   threw), or `"dropped"` (the profile was deleted or disabled while the reinstall
+    ///   was deferred, so the retry discarded it rather than reinstall a profile that no
+    ///   longer exists or that the user explicitly turned off).
     func recordDeferredReinstall(profileId: UUID, profileName: String, outcome: String) {
         guard SyncTraySettings.telemetryEnabled else { return }
         ensureSetup()

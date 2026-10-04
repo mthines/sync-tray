@@ -1275,7 +1275,19 @@ final class SyncManager: ObservableObject {
     /// snapshot, so installing the stale copy would silently drop it.
     private func retryPendingExternalReinstallIfNeeded(for profileId: UUID) {
         guard let pending = pendingExternalReinstalls[profileId] else { return }
-        let latest = profileStore.profile(for: profileId) ?? pending.new
+        // The profile may have been deleted, or disabled, while the reinstall was
+        // deferred (review finding): neither clears the pending entry, and falling
+        // back to the stale `pending.new` snapshot on a delete — or reinstalling a
+        // profile the user explicitly disabled — would bring back a launchd agent
+        // with no UI to stop it. Drop the pending entry instead; both delete and
+        // disable already ran their own `uninstall` through the normal reconcile
+        // path, so there is nothing left to reinstall.
+        guard let latest = profileStore.profile(for: profileId), latest.isEnabled else {
+            pendingExternalReinstalls[profileId] = nil
+            TelemetryService.shared.recordDeferredReinstall(
+                profileId: profileId, profileName: pending.new.name, outcome: "dropped")
+            return
+        }
         guard !isRunLive(for: latest) else {
             // The "run ended" log line and the run actually being over are not atomic:
             // an app-started run's terminationHandler writes "Bisync completed/failed"
