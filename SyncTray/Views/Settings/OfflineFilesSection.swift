@@ -946,6 +946,10 @@ struct ExcludePatternListEditor: View {
     let caption: String
     let emptyText: String
     var placeholder: String = "Pattern (e.g., *.bak or **/BACKUP/**)"
+    /// SF Symbol shown beside each row. Defaults to the "excluded" glyph the "Don't Sync" /
+    /// "Don't Download" lists use; `SyncOnlyFoldersSection` passes `"folder"` since its rows
+    /// are included folders, not excluded patterns.
+    var rowIcon: String = "nosign"
     let patterns: [String]
     let onChange: ([String]) -> Void
 
@@ -974,7 +978,7 @@ struct ExcludePatternListEditor: View {
             } else {
                 ForEach(patterns, id: \.self) { pattern in
                     HStack(spacing: 8) {
-                        Image(systemName: "nosign")
+                        Image(systemName: rowIcon)
                             .foregroundStyle(.secondary)
                             .font(.caption2)
                             .accessibilityHidden(true)

@@ -59,6 +59,17 @@ struct SyncProfile: Identifiable, Codable, Equatable {
     /// block at the top of the profile's exclude filter file, so matching files stop syncing in
     /// both directions. Nothing is deleted on either side. Ignored in mount mode.
     var syncExcludePatterns: [String]
+    /// Selective folders (Option A) for Two-Way and One-Way profiles — when non-empty, ONLY
+    /// these folders (paths relative to the profile's root pair: `remotePath` on the remote
+    /// side, `localSyncPath` on the local side) are synced; an empty list keeps today's
+    /// "sync everything" behaviour byte-for-byte. Entries are literal folder paths (no
+    /// globs — wildcards belong in `syncExcludePatterns`), normalized at every boundary
+    /// (trimmed, leading/trailing `/` stripped, `.`/`..` segments and blank entries dropped,
+    /// de-duplicated keeping order). Compiled into a managed TAIL block of the exclude
+    /// filter file by `SyncExcludeFilter` (after the "Don't Sync" head block), so every
+    /// exclude still wins first-match. Ignored in mount mode. Not emitted into the derived
+    /// `{shortId}.json` — the script reads it only via the compiled filter file.
+    var syncIncludeFolders: [String]
     var rcPort: Int                     // Port for rclone RC (remote control) API (mount mode)
     /// Number of files rclone downloads in parallel — drives the mount's `--transfers`
     /// AND the app-side offline-warm concurrency (`VFSCacheService`), kept in lockstep.
@@ -166,6 +177,29 @@ struct SyncProfile: Identifiable, Codable, Equatable {
     /// Profile-specific exclude filter file
     var filterFilePath: String {
         "\(Self.configDirectory)/\(shortId)-exclude.txt"
+    }
+
+    /// Script-consumed token marker: when present, the sync script's bisync branch runs
+    /// `--resync --resync-mode newer` (newer copy wins) instead of its usual incremental
+    /// sync, then removes the marker on exit 0 ONLY if its content still matches the token
+    /// it read at start (so an edit landing mid-run re-arms rather than being swallowed).
+    /// Written by `SyncSetupService.writeExcludeFilter` right AFTER the filter file, only when
+    /// a bisync profile's compiled include rules change (see CLAUDE.md "Critical Rule 7" —
+    /// this is the resync-safe alternative to deleting bisync listings). If the marker write
+    /// fails the filter is rolled back, so the next write retries both and a scheduled resync
+    /// is never lost. Removed by a plain `uninstall` (disable/delete) alongside the filter
+    /// file. Never emitted into the derived `{shortId}.json` — the script derives this same
+    /// path on its own.
+    var resyncPendingPath: String {
+        "\(Self.configDirectory)/\(shortId).resync-pending"
+    }
+
+    /// Per-session consumption record for `resyncPendingPath` — written by the sync script
+    /// next to the marker so a primary/fallback pair with distinct full-remote-swap sessions
+    /// (see "Fallback Remote Pipeline" in CLAUDE.md) each get their own one-time resync before
+    /// the marker is cleared. Removed alongside the marker by a plain `uninstall`.
+    var resyncConsumedPath: String {
+        "\(resyncPendingPath).consumed"
     }
 
     var launchdLabel: String {
@@ -318,6 +352,7 @@ struct SyncProfile: Identifiable, Codable, Equatable {
         pinnedDirectories: [String] = [],
         warmExcludePatterns: [String] = [],
         syncExcludePatterns: [String] = [],
+        syncIncludeFolders: [String] = [],
         rcPort: Int = 0,
         downloadConnections: Int = 2,
         bandwidthLimit: String = "",
@@ -349,6 +384,7 @@ struct SyncProfile: Identifiable, Codable, Equatable {
         self.pinnedDirectories = pinnedDirectories
         self.warmExcludePatterns = warmExcludePatterns
         self.syncExcludePatterns = syncExcludePatterns
+        self.syncIncludeFolders = SyncProfile.normalizedSyncIncludeFolders(syncIncludeFolders)
         self.rcPort = rcPort > 0 ? rcPort : SyncProfile.defaultRCPort(for: id)
         self.downloadConnections = min(16, max(1, downloadConnections))
         self.bandwidthLimit = SyncProfile.normalizedBandwidthLimit(bandwidthLimit)
@@ -373,6 +409,43 @@ struct SyncProfile: Identifiable, Codable, Equatable {
         let rate = "(?:off|[0-9]+(?:\\.[0-9]+)?[bBkKmMgGtTpP]?i?)"
         let pattern = "^\(rate)(?::\(rate))?$"
         return value.range(of: pattern, options: .regularExpression) != nil
+    }
+
+    /// Normalizes a raw `syncIncludeFolders` list: trims whitespace, strips leading/trailing
+    /// `/`, drops any entry that's empty, `/`, or fails `isValidSyncIncludeFolder` (contains a
+    /// `.`/`..` path segment, an empty segment, or a line break), then de-duplicates while
+    /// keeping first-seen order. Used by the memberwise init and the decoder so every entry
+    /// point produces the same, script-safe list.
+    static func normalizedSyncIncludeFolders(_ raw: [String]) -> [String] {
+        var seen = Set<String>()
+        var result: [String] = []
+        for entry in raw {
+            var trimmed = entry.trimmingCharacters(in: .whitespacesAndNewlines)
+            while trimmed.hasPrefix("/") { trimmed.removeFirst() }
+            while trimmed.hasSuffix("/") { trimmed.removeLast() }
+            guard isValidSyncIncludeFolder(trimmed), seen.insert(trimmed).inserted else { continue }
+            result.append(trimmed)
+        }
+        return result
+    }
+
+    /// True for a literal, relative folder path safe to compile into an rclone filter rule:
+    /// non-empty, no line breaks, and no `.`/`..`/empty path segment (which would otherwise
+    /// let an entry escape the profile's root pair or match unintentionally broadly).
+    /// Wildcards are deliberately NOT validated here — include folders are literal paths;
+    /// globs belong in `syncExcludePatterns`.
+    static func isValidSyncIncludeFolder(_ value: String) -> Bool {
+        var trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        while trimmed.hasPrefix("/") { trimmed.removeFirst() }
+        while trimmed.hasSuffix("/") { trimmed.removeLast() }
+        guard !trimmed.isEmpty else { return false }
+        guard !trimmed.contains("\n"), !trimmed.contains("\r") else { return false }
+        let segments = trimmed.split(separator: "/", omittingEmptySubsequences: false)
+        guard !segments.isEmpty else { return false }
+        for segment in segments {
+            if segment.isEmpty || segment == "." || segment == ".." { return false }
+        }
+        return true
     }
 
     /// Generate a deterministic RC port from the profile UUID (range: 5800-5899)
@@ -404,7 +477,7 @@ extension SyncProfile {
         case vfsCacheMode, vfsCacheMaxSize, vfsCacheMaxAge, vfsCachePath, allowNonEmptyMount
         case mountAtStartup
         case streamCacheOnly
-        case pinnedDirectories, warmExcludePatterns, syncExcludePatterns, rcPort
+        case pinnedDirectories, warmExcludePatterns, syncExcludePatterns, syncIncludeFolders, rcPort
         case downloadConnections
         case bandwidthLimit
         case mountResilient
@@ -466,6 +539,10 @@ extension SyncProfile {
         warmExcludePatterns = try container.decodeIfPresent([String].self, forKey: .warmExcludePatterns) ?? []
         // Backwards compatibility: default to empty array if not present
         syncExcludePatterns = try container.decodeIfPresent([String].self, forKey: .syncExcludePatterns) ?? []
+        // Backwards compatibility: default to empty array if not present. Normalized so a
+        // hand-edited profile file can never inject a `.`/`..` escape or a blank entry.
+        let decodedIncludeFolders = try container.decodeIfPresent([String].self, forKey: .syncIncludeFolders) ?? []
+        syncIncludeFolders = SyncProfile.normalizedSyncIncludeFolders(decodedIncludeFolders)
         // Backwards compatibility: generate default RC port if not present
         let decodedRCPort = try container.decodeIfPresent(Int.self, forKey: .rcPort) ?? 0
         rcPort = decodedRCPort > 0 ? decodedRCPort : SyncProfile.defaultRCPort(for: id)
