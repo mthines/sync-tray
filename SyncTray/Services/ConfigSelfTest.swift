@@ -5100,6 +5100,31 @@ enum ConfigSelfTest {
             return report(name, slug, false, "(one-way profile wrongly got a resync-pending marker)")
         }
 
+        // A marker-write failure rolls the filter back and throws, so the next write retries
+        // BOTH. Left updated, the retry would hit the `updated == existing` guard and never
+        // write the marker — the scheduled resync silently lost. (The unwritable marker path
+        // sits in a directory that doesn't exist; atomic writes never create parents.)
+        let filterBeforeFailure = try? String(contentsOfFile: filterPath, encoding: .utf8)
+        bisync.syncIncludeFolders = ["Keep", "Deep/Nested", "Other"]
+        let unwritableMarker = "\(dir)/no-such-dir/x.resync-pending"
+        var markerWriteThrew = false
+        do {
+            try SyncSetupService.shared.writeExcludeFilter(for: bisync, at: filterPath, resyncMarkerAt: unwritableMarker)
+        } catch {
+            markerWriteThrew = true
+        }
+        guard markerWriteThrew else {
+            return report(name, slug, false, "(a failed marker write did not throw)")
+        }
+        guard (try? String(contentsOfFile: filterPath, encoding: .utf8)) == filterBeforeFailure else {
+            return report(name, slug, false, "(filter not rolled back after the marker write failed)")
+        }
+        try? SyncSetupService.shared.writeExcludeFilter(for: bisync, at: filterPath, resyncMarkerAt: markerPath)
+        guard let token3 = try? String(contentsOfFile: markerPath, encoding: .utf8), token3 != token2,
+              (try? String(contentsOfFile: filterPath, encoding: .utf8))?.contains("+ /Other/**") == true else {
+            return report(name, slug, false, "(retry after a failed marker write did not write both the filter and a fresh marker)")
+        }
+
         // The marker path the script derives from FILTER_FILE must equal the profile's real
         // `resyncPendingPath` — both are built from the same `{configDirectory}/{shortId}`.
         let prodFilter = bisync.filterFilePath

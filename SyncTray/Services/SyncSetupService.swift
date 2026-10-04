@@ -2053,10 +2053,11 @@ final class SyncSetupService {
     /// the next sync with no reinstall, and without stopping a sync in progress.
     ///
     /// When the write actually changes the compiled include rules on an ENABLED bisync
-    /// profile, a fresh token is written to the resync-pending marker right BEFORE the filter
+    /// profile, a fresh token is written to the resync-pending marker right AFTER the filter
     /// file — the script-consumed signal (see CLAUDE.md "Critical Rule 7") that the next
     /// bisync run should `--resync --resync-mode newer` instead of its usual incremental sync.
-    /// (Marker-before-filter, not after: see the comment at the write site for why.)
+    /// (Filter-then-marker, with the filter rolled back if the marker write fails: see the
+    /// comment at the write site for why.)
     /// One-way profiles, and a filter write that doesn't change the include rules, never touch
     /// the marker.
     /// - Parameters:
@@ -2084,21 +2085,28 @@ final class SyncSetupService {
         )
         guard updated != existing else { return }
 
-        // Marker before filter, deliberately: once the filter write below lands, a later
-        // call recomputes `updated` against the now-current file and can equal `existing`
-        // again, hitting the guard above and returning before ever reaching the marker —
-        // silently losing a resync schedule and eventually tripping bisync's --max-delete
-        // abort. Writing the marker first means a mid-write failure here still leaves the
-        // filter unwritten, so the NEXT call re-enters this same branch and retries both;
-        // the only failure direction that survives a retry gap is an extra, harmless
-        // resync (never a missed one).
+        // Filter first, then marker — and roll the filter back if the marker write fails.
+        // - Marker-first would let a sync that starts between the two writes see the marker,
+        //   resync with the OLD rules and clear it; the next run then narrows with no resync,
+        //   trips bisync's --max-delete abort, and every later run aborts too (stuck).
+        //   Filter-first's equivalent race costs at most ONE aborted run (nothing deleted)
+        //   before the marker lands and the following run resyncs — it heals on its own.
+        // - The rollback keeps a marker-write failure retryable: with the filter left
+        //   updated, the next call would compute `updated == existing`, return at the guard
+        //   above, and never write the marker — silently losing the scheduled resync.
         let includeRulesChanged = previousIncludeRules != SyncExcludeFilter.includeRules(in: updated)
-        if includeRulesChanged, profile.syncMode == .bisync {
-            let resolvedMarkerPath = markerPath ?? profile.resyncPendingPath
-            try UUID().uuidString.write(toFile: resolvedMarkerPath, atomically: true, encoding: .utf8)
-        }
-
         try updated.write(toFile: filterPath, atomically: true, encoding: .utf8)
+        guard includeRulesChanged, profile.syncMode == .bisync else { return }
+        do {
+            try UUID().uuidString.write(toFile: markerPath ?? profile.resyncPendingPath, atomically: true, encoding: .utf8)
+        } catch {
+            if let existing {
+                try? existing.write(toFile: filterPath, atomically: true, encoding: .utf8)
+            } else {
+                try? FileManager.default.removeItem(atPath: filterPath)
+            }
+            throw error
+        }
     }
 
     private func runCommand(_ command: String, arguments: [String]) -> (
