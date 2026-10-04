@@ -1414,8 +1414,10 @@ This is now structurally prevented:
 - **Mount mode is unaffected** (R7, above) and **a reinstall that's blocked still loads the
   launchd agent** — the install itself already succeeded, and the scheduled script
   self-bootstraps `--resync` when listings are missing, so the live run can hand off to it.
-Covered by `ConfigSelfTest` AC-SR1–AC-SR16 (each negative assertion shown to fail once by a
-temporary mutation before being fixed — see the plan's Progress Log).
+Covered by `ConfigSelfTest` AC-SR1–AC-SR8, AC-SR16–AC-SR18 (9 original cases plus 2 added by
+review — the `profile set` persist-before-refuse ordering and a source-text pin on the
+`getpid()`/`uninstallForReinstall`/deferred-reinstall-retry guards); each negative assertion
+was independently shown to fail once by a temporary mutation before being fixed.
 
 ## Debugging
 
