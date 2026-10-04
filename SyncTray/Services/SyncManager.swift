@@ -2491,10 +2491,21 @@ final class SyncManager: ObservableObject {
             // never the in-flight registry — so a rejected run that is the
             // in-flight app run itself, failing against its own dead stale lock,
             // still surfaces normally.
+            //
+            // Still record it into `lastSeenErrorMessage` before suppressing (review
+            // finding): the script's eventual plain-text "Bisync failed with exit
+            // code N" line parses to `.syncFailed(message: nil)`, so without this the
+            // `.syncFailed` handler's own `isRejectedConcurrentRun` re-check below has
+            // no message to test and the rejected run's failure leaks through as a
+            // genuine profile failure. `lastSeenErrorMessage` is "last seen" by
+            // design — a later REAL error message overwrites this one before
+            // `.syncFailed` arrives, so it is never mistakenly suppressed by a
+            // rejected run's stale message.
             if let currentProfile = profile {
                 let sessionHolderLive = SyncRunLock.isLive(
                     lockHolders(for: currentProfile).sessionLock, isAlive: SyncRunLock.processIsAlive)
                 if SyncRunLock.isRejectedConcurrentRun(message: message, sessionHolderLive: sessionHolderLive) {
+                    lastSeenErrorMessage[profileId] = message
                     SyncTraySettings.debugLog(
                         "Ignoring prior-lock-file errorMessage for '\(currentProfile.name)': a live process holds the session lock")
                     break
