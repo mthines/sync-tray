@@ -1819,6 +1819,12 @@ final class SyncManager: ObservableObject {
     private func detectRunningSyncPID(for profile: SyncProfile) -> Int32? {
         let holder = SyncRunLock.parseHolder(try? String(contentsOfFile: profile.lockFilePath, encoding: .utf8))
         guard case .pid(let pid) = holder, SyncRunLock.processIsAlive(pid) else { return nil }
+        // The `/tmp` lock briefly holds the app's own PID as a launch-gap placeholder
+        // (D4, `beginExclusiveRun`) before it is swapped for the real rclone child PID.
+        // Treating that window as "a sync process is running at this PID" would hand
+        // SyncTray's own PID to `terminateRunningSync`'s `kill(-pid, SIGTERM)` — Pause
+        // would SIGTERM the app itself (review finding). No running sync to detect yet.
+        guard pid != getpid() else { return nil }
         return pid
     }
 
