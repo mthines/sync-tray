@@ -151,6 +151,22 @@ final class RcloneConfigService {
         try fileManager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: configPath)
     }
 
+    /// Tighten an rclone.conf that an earlier SyncTray wizard created world-readable
+    /// (0644). Runs once per launch; only a regular file owned by this user with group
+    /// or other bits set is changed, and nothing is ever created. `attributesOfItem`
+    /// does not follow a final symlink, so a symlinked rclone.conf is left alone.
+    func tightenConfigPermissionsIfLoose() {
+        let fileManager = FileManager.default
+        guard let attrs = try? fileManager.attributesOfItem(atPath: configPath),
+              attrs[.type] as? FileAttributeType == .typeRegular,
+              (attrs[.ownerAccountID] as? NSNumber)?.uint32Value == getuid(),
+              let mode = attrs[.posixPermissions] as? Int,
+              mode & 0o077 != 0 else { return }
+
+        // Keep the owner bits as they are and drop only group/other.
+        try? fileManager.setAttributes([.posixPermissions: mode & 0o700], ofItemAtPath: configPath)
+    }
+
     /// Read configuration for an existing remote from rclone.conf
     /// Returns a RemoteConfiguration pre-populated with the remote's current settings.
     func readRemoteConfig(name: String) -> RemoteConfiguration? {
