@@ -32,6 +32,9 @@ struct SyncTrayApp: App {
         // Run any pending data migrations before loading profiles
         MigrationRunner.runPendingMigrations()
 
+        // Earlier wizards wrote rclone.conf 0644; tighten it now instead of waiting for the next remote edit.
+        RcloneConfigService.shared.tightenConfigPermissionsIfLoose()
+
         // Initialize telemetry (no-op if disabled)
         TelemetryService.shared.configure()
 

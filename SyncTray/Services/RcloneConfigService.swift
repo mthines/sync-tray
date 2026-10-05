@@ -92,13 +92,6 @@ final class RcloneConfigService {
 
     /// Add a new remote to rclone config
     func addRemote(_ config: RemoteConfiguration) throws {
-        // Ensure config directory exists
-        let configDir = (configPath as NSString).deletingLastPathComponent
-        try FileManager.default.createDirectory(
-            atPath: configDir,
-            withIntermediateDirectories: true
-        )
-
         // Read existing config
         var existingConfig = ""
         if FileManager.default.fileExists(atPath: configPath) {
@@ -122,7 +115,56 @@ final class RcloneConfigService {
             ? newSection
             : "\(existingConfig)\n\n\(newSection)"
 
-        try newConfig.write(toFile: configPath, atomically: true, encoding: .utf8)
+        try writeConfig(newConfig)
+    }
+
+    /// Write rclone.conf readable by the owner only (0600). The file holds OAuth tokens
+    /// and passwords that `rclone reveal` turns back into plain text, and rclone keeps a
+    /// file's existing mode when it saves, so the mode set here is the one it keeps.
+    private func writeConfig(_ contents: String) throws {
+        let fileManager = FileManager.default
+
+        // 0700 applies only to directories created here; an existing one is left alone.
+        let configDir = (configPath as NSString).deletingLastPathComponent
+        try fileManager.createDirectory(
+            atPath: configDir,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700]
+        )
+
+        // A new file is created 0600 before anything is written to it, and an existing
+        // looser file is tightened first; the atomic write keeps the existing file's mode.
+        if !fileManager.fileExists(atPath: configPath) {
+            guard fileManager.createFile(
+                atPath: configPath,
+                contents: nil,
+                attributes: [.posixPermissions: 0o600]
+            ) else {
+                throw ConfigError.configWriteFailed
+            }
+        }
+        try fileManager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: configPath)
+
+        try contents.write(toFile: configPath, atomically: true, encoding: .utf8)
+
+        // Enforce 0600 on the file the atomic write left behind.
+        try fileManager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: configPath)
+    }
+
+    /// Tighten an rclone.conf that an earlier SyncTray wizard created world-readable
+    /// (0644). Runs once per launch; only a regular file owned by this user with group
+    /// or other bits set is changed, and nothing is ever created. `attributesOfItem`
+    /// does not follow a final symlink, so a symlinked rclone.conf is left alone.
+    func tightenConfigPermissionsIfLoose() {
+        let fileManager = FileManager.default
+        guard let attrs = try? fileManager.attributesOfItem(atPath: configPath),
+              attrs[.type] as? FileAttributeType == .typeRegular,
+              (attrs[.ownerAccountID] as? NSNumber)?.uint32Value == getuid(),
+              let mode = attrs[.posixPermissions] as? Int,
+              mode & 0o077 != 0 else { return }
+
+        // Keep the owner bits as they are and drop only group/other.
+        try? fileManager.setAttributes([.posixPermissions: mode & 0o700], ofItemAtPath: configPath)
     }
 
     /// Read configuration for an existing remote from rclone.conf
@@ -234,13 +276,6 @@ final class RcloneConfigService {
         // Delete the existing remote first
         try deleteRemote(config.name)
 
-        // Ensure config directory exists
-        let configDir = (configPath as NSString).deletingLastPathComponent
-        try FileManager.default.createDirectory(
-            atPath: configDir,
-            withIntermediateDirectories: true
-        )
-
         // Read existing config (after deletion)
         var existingConfig = ""
         if FileManager.default.fileExists(atPath: configPath) {
@@ -259,7 +294,7 @@ final class RcloneConfigService {
             ? newSection
             : "\(existingConfig)\n\n\(newSection)"
 
-        try newConfig.write(toFile: configPath, atomically: true, encoding: .utf8)
+        try writeConfig(newConfig)
     }
 
     /// Delete a remote from rclone config
