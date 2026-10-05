@@ -116,6 +116,7 @@ enum ConfigSelfTest {
             testAdditionalFlagsSplitting,
             testRCAPIAuthenticated,
             testShimQuotesExecutablePath,
+            testMountModeFileNotInSharedTmp,
             testCacheOnlyUnionConfig,
             testCacheOnlyUnionBehaviour,
             testMountModeSelection,
@@ -3414,6 +3415,46 @@ enum ConfigSelfTest {
         }
         guard !fm.fileExists(atPath: marker) else {
             return report(name, slug, false, "(the executable path was executed as shell code)")
+        }
+        return report(name, slug, true)
+    }
+
+    // MARK: - AC-SEC4 — the mount-mode file never lives in the shared /tmp
+
+    /// The sync script writes the mode token with a plain `echo > "$MOUNT_MODE_PATH"`, which
+    /// follows a symlink. In the world-writable `/tmp`, another local user could plant one at
+    /// the predictable `synctray-mount-{shortId}.mode` name and have this user overwrite any
+    /// file they can write. Asserts the path is in this user's own 0700 temp dir, never
+    /// `/tmp`, and that an upgraded install's derived config naming the old `/tmp` path is
+    /// flagged for the launch-time rewrite (and a current or pre-Cache-Only one is not).
+    private static func testMountModeFileNotInSharedTmp() -> Bool {
+        let name = "AC-SEC4", slug = "mount-mode-file-not-in-shared-tmp"
+        let profile = sampleProfile()
+        let path = profile.mountModePath
+        guard !path.hasPrefix("/tmp/"), !path.hasPrefix("/private/tmp/") else {
+            return report(name, slug, false, "(mode file is in shared /tmp: \(path))")
+        }
+        let tempDir = SyncProfile.privateTempDirectory
+        let dirPrefix = tempDir.hasSuffix("/") ? tempDir : "\(tempDir)/"
+        guard path == "\(dirPrefix)synctray-mount-\(profile.shortId).mode" else {
+            return report(name, slug, false, "(mode file not in the per-user temp dir \(tempDir): \(path))")
+        }
+        guard let attrs = try? FileManager.default.attributesOfItem(atPath: tempDir),
+              (attrs[.ownerAccountID] as? NSNumber)?.uint32Value == getuid(),
+              let perms = attrs[.posixPermissions] as? Int, perms & 0o077 == 0 else {
+            return report(name, slug, false, "(per-user temp dir \(tempDir) is not owned by this user with mode 0700)")
+        }
+        func config(_ value: String?) -> Data? {
+            var dict: [String: Any] = ["profileId": profile.id.uuidString]
+            if let value { dict["mountModePath"] = value }
+            return try? JSONSerialization.data(withJSONObject: dict)
+        }
+        let legacy = "/tmp/synctray-mount-\(profile.shortId).mode"
+        guard SyncSetupService.derivedConfigHasStaleMountModePath(config(legacy), expected: path),
+              !SyncSetupService.derivedConfigHasStaleMountModePath(config(path), expected: path),
+              !SyncSetupService.derivedConfigHasStaleMountModePath(config(nil), expected: path),
+              !SyncSetupService.derivedConfigHasStaleMountModePath(nil, expected: path) else {
+            return report(name, slug, false, "(stale-derived-config detection wrong)")
         }
         return report(name, slug, true)
     }

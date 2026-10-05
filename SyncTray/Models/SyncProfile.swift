@@ -262,11 +262,26 @@ struct SyncProfile: Identifiable, Codable, Equatable {
     }
 
     /// Per-boot mode-signalling file the sync script writes right before starting rclone
-    /// — one of `MountMode`'s raw values. Lives in `/tmp` (like the lock file), never
-    /// under `~/.config/synctray`, which `MigrationRunner` walks as profile/settings JSON.
+    /// — one of `MountMode`'s raw values. Lives in the per-user Darwin temp dir
+    /// (`privateTempDirectory`), never under `~/.config/synctray`, which `MigrationRunner`
+    /// walks as profile/settings JSON — and never in the world-writable `/tmp`: there
+    /// another local user could plant a symlink at this predictable name, and the
+    /// script's `echo > path` would follow it and overwrite any file this user can write
+    /// (CWE-59). Covered by `ConfigSelfTest` AC-SEC4.
     var mountModePath: String {
-        "/tmp/synctray-mount-\(shortId).mode"
+        (Self.privateTempDirectory as NSString).appendingPathComponent("synctray-mount-\(shortId).mode")
     }
+
+    /// This user's own temp directory (`/var/folders/…/T/`): owned by the user, mode
+    /// 0700, created on demand by `confstr`, and cleared at boot like `/tmp`. Read via
+    /// `confstr` rather than `$TMPDIR` so the app (launched by launchd) and the CLI
+    /// (launched from a shell that may override `TMPDIR`) always agree on the path.
+    static let privateTempDirectory: String = {
+        var buffer = [CChar](repeating: 0, count: Int(PATH_MAX))
+        let length = confstr(_CS_DARWIN_USER_TEMP_DIR, &buffer, buffer.count)
+        guard length > 0, length <= buffer.count else { return NSTemporaryDirectory() }
+        return String(cString: buffer)
+    }()
 
     // MARK: - Full Remote Path
 

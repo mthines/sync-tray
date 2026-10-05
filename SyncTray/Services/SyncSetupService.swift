@@ -91,6 +91,35 @@ final class SyncSetupService {
         }
     }
 
+    /// Rewrite an installed profile's derived config when its `mountModePath` is not the
+    /// current one — i.e. it still names the old shared `/tmp/synctray-mount-{shortId}.mode`
+    /// (see `SyncProfile.mountModePath`, CWE-59). The derived config is otherwise only
+    /// rewritten on install/save, so without this an upgraded install would keep the script
+    /// writing the old `/tmp` path while the app reads the new one. A config without the key
+    /// (predating Cache Only) is left as it is. Called once at app startup.
+    func refreshMountModePathIfChanged(profiles: [SyncProfile]) {
+        for profile in profiles {
+            guard Self.derivedConfigHasStaleMountModePath(
+                FileManager.default.contents(atPath: profile.configPath),
+                expected: profile.mountModePath) else { continue }
+            do {
+                try updateConfig(for: profile)
+                SyncTraySettings.debugLog("Refreshed derived config for \(profile.shortId) (mount-mode file moved)")
+            } catch {
+                print("Failed to refresh derived config for \(profile.shortId): \(error)")
+            }
+        }
+    }
+
+    /// Pure decision for `refreshMountModePathIfChanged`: true only when the derived config
+    /// carries a `mountModePath` that differs from `expected`.
+    static func derivedConfigHasStaleMountModePath(_ configData: Data?, expected: String) -> Bool {
+        guard let configData,
+              let config = (try? JSONSerialization.jsonObject(with: configData)) as? [String: Any],
+              let onDisk = config["mountModePath"] as? String else { return false }
+        return onDisk != expected
+    }
+
     /// Generate and install the sync script and launchd plist for a profile
     /// - Parameters:
     ///   - profile: The sync profile to install
