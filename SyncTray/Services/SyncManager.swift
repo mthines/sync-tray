@@ -386,6 +386,7 @@ final class SyncManager: ObservableObject {
         setupProfileObserver()
         cleanupStaleLockFiles()
         setupService.refreshSharedScriptIfChanged()  // Propagate script template updates
+        setupService.refreshMountModePathIfChanged(profiles: self.profileStore.profiles)  // Mode file moved out of /tmp
         setupService.cleanupStaleMounts(mountProfiles: self.profileStore.profiles)  // Clean up stale mounts on startup
         detectAndResumeRunningSyncs()  // After cleanup, detect external syncs
         checkInitialState()
