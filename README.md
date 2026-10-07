@@ -179,6 +179,7 @@ For Two-Way and One-Way profiles, the inverse of **Don't Sync**: instead of excl
 ### One-Click Actions
 
 - **Sync Now**: Trigger immediate sync for all enabled profiles
+- **Abort**: While a Two-Way or One-Way profile is syncing, its Pause button becomes **Abort** — stop the sync, change its settings, and start it again with **Sync Now**. A two-way sync first wraps up the files in flight and saves its sync history, which can take up to about a minute and a half; the same button then becomes **Force Stop** if you'd rather not wait. Files already transferred stay where they are, and the profile's schedule keeps running.
 - **Open Directory**: Jump to your local sync folder
 - **View Log**: Open the sync log for troubleshooting
 

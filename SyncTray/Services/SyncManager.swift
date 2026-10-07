@@ -162,6 +162,23 @@ final class SyncManager: ObservableObject {
     /// Paused profiles (session-only, not persisted - resets on app restart)
     @Published private(set) var pausedProfiles: Set<UUID> = []
 
+    // MARK: Abort state (see `abortSync`)
+
+    /// Profiles with an abort in flight, and how far it has escalated. Published so the
+    /// profile card can swap Abort for Force Stop and show "Stopping…".
+    @Published private(set) var abortPhases: [UUID: SyncAbort.Phase] = [:]
+    /// Profiles whose user pressed Force Stop while their abort was still graceful.
+    private var abortForceRequested: Set<UUID> = []
+    /// The task driving each in-flight abort.
+    private var abortTasks: [UUID: Task<Void, Never>] = [:]
+    /// Until when a finished abort's trailing log lines still belong to the aborted run
+    /// (`SyncAbort.trailingSuppression`). Cleared by the next genuine run.
+    private var abortSuppressUntil: [UUID: Date] = [:]
+    /// Profiles whose initial sync was aborted before its launchd agent was loaded. Loading
+    /// it then would have restarted the sync at once (`RunAtLoad`), so the load waits for
+    /// the next run the app starts (`runSyncScript`).
+    private var agentLoadDeferredByAbort: Set<UUID> = []
+
     /// Live progress of offline-file warming per profile (session-only). Drives the
     /// "Available Offline" progress row in `OfflineFilesSection`. Set by
     /// `warmPinnedDirectories`, which every warm entry point routes through.
@@ -1838,6 +1855,226 @@ final class SyncManager: ObservableObject {
         }
     }
 
+    // MARK: - Abort
+
+    /// Whether an abort is in flight for a profile.
+    func isAborting(for profileId: UUID) -> Bool {
+        abortPhases[profileId] != nil
+    }
+
+    /// Whether the profile's most recent run was stopped by `abortSync` — true while the
+    /// abort is in flight and for `SyncAbort.trailingSuppression` after it finished. Run
+    /// launchers read it to report "aborted" instead of "failed".
+    func wasRunAborted(for profileId: UUID) -> Bool {
+        SyncAbort.suppressesRunEnd(
+            abortInFlight: isAborting(for: profileId),
+            suppressUntil: abortSuppressUntil[profileId],
+            now: Date()
+        )
+    }
+
+    /// Keep an aborted initial sync's launchd agent unloaded until the next run the app
+    /// starts for the profile — loading it now would restart the sync at once (`RunAtLoad`).
+    func deferAgentLoadAfterAbort(for profileId: UUID) {
+        agentLoadDeferredByAbort.insert(profileId)
+    }
+
+    /// Stop a profile's in-flight run so its settings can be changed and the sync restarted
+    /// (CLAUDE.md "Aborting a running sync"). Works for every run shape: a scheduled or
+    /// Sync Now run of the sync script, and an app-launched rclone (initial sync, Fix /
+    /// Force / Restore, auto-fix).
+    ///
+    /// The first call shuts rclone down gracefully (SIGINT, so bisync saves its state); a
+    /// second call while that is still in progress force-stops the run (SIGTERM, then
+    /// SIGKILL). Unlike Pause, the profile stays active: the launchd agent stays loaded
+    /// and Sync Now is available again as soon as the run has exited. No lock is touched
+    /// while any process of the run is alive (Critical Rule 8); leftover locks are removed
+    /// stale-only once it has exited.
+    func abortSync(for profile: SyncProfile) {
+        // A Stream profile has no run to abort — its daemon is stopped with Unmount.
+        guard !profile.isMountMode else { return }
+
+        if isAborting(for: profile.id) {
+            abortForceRequested.insert(profile.id)
+            TelemetryService.shared.recordProfileLifecycleOperation(
+                profileId: profile.id, profileName: profile.name,
+                operation: "abort", syncMode: profile.syncMode.rawValue, result: "force_requested"
+            )
+            return
+        }
+
+        guard isRunLive(for: profile) else {
+            // Nothing is running, yet the card offered Abort: the profile is stuck showing
+            // `.syncing` for a run that already ended without a closing log line. Put it at rest.
+            if profileStates[profile.id] == .syncing {
+                profileStates[profile.id] = isPaused(for: profile.id) ? .paused : .idle
+                profileProgress[profile.id] = nil
+                logWatchers[profile.id]?.setActivelySyncing(false)
+                updateAggregateState()
+            }
+            TelemetryService.shared.recordProfileLifecycleOperation(
+                profileId: profile.id, profileName: profile.name,
+                operation: "abort", syncMode: profile.syncMode.rawValue, result: "not_running"
+            )
+            return
+        }
+
+        abortPhases[profile.id] = .graceful
+        abortForceRequested.remove(profile.id)
+        abortSuppressUntil[profile.id] = nil
+        // The startup poller for a run found already in progress would read the aborted
+        // run's failure back out of the log and show it as an error; the abort owns the
+        // run's ending from here on.
+        syncCompletionPollers[profile.id]?.cancel()
+        syncCompletionPollers.removeValue(forKey: profile.id)
+
+        SyncTraySettings.debugLog("Aborting sync for '\(profile.name)'")
+        TelemetryService.shared.recordProfileLifecycleOperation(
+            profileId: profile.id, profileName: profile.name,
+            operation: "abort", syncMode: profile.syncMode.rawValue, result: "started"
+        )
+
+        abortTasks[profile.id] = Task { [weak self] in
+            await self?.runAbort(for: profile)
+        }
+    }
+
+    /// The live PIDs an abort starts from: the `/tmp` run-lock holder (the script's bash, or
+    /// an app-launched rclone) and the bisync session-lock holder (rclone). Excludes the app
+    /// itself — the run lock's launch-gap placeholder (D4).
+    private func liveRunRoots(for profile: SyncProfile) -> [Int32] {
+        let (runLock, sessionLock) = lockHolders(for: profile)
+        var roots: [Int32] = []
+        for holder in [runLock, sessionLock] {
+            if case .pid(let pid) = holder, pid != getpid(), SyncRunLock.processIsAlive(pid) {
+                roots.append(pid)
+            }
+        }
+        return roots
+    }
+
+    /// Drive one abort to its end: signal the run, escalate on a timer or on Force Stop, and
+    /// finish once every process of the run has exited and neither lock has a live holder.
+    /// Re-reads the locks and the process table every second, so an rclone that starts after
+    /// the first scan (an app-launched run still in its launch gap, or the script moving
+    /// from its pre-flight probe to the real sync) is caught too.
+    private func runAbort(for profile: SyncProfile) async {
+        let profileId = profile.id
+        let appPID = getpid()
+        let started = Date()
+        // Generous ceiling, so a lock whose holder never goes away cannot keep the card in
+        // "Stopping…" forever.
+        let deadline = SyncAbort.gracefulTimeout + SyncAbort.terminateTimeout + 30
+        var phase: SyncAbort.Phase?
+        var phaseStarted = started
+        var signalled: [SyncAbort.Phase: Set<Int32>] = [:]
+        var tracked: Set<Int32> = []
+        var outcome = "success"
+
+        while !Task.isCancelled {
+            let roots = liveRunRoots(for: profile)
+            let table = await Task.detached(priority: .userInitiated) { SyncAbort.readProcessTable() }.value
+            let targets = SyncAbort.targets(roots: roots, appPID: appPID, table: table)
+            tracked.formUnion(targets.all)
+            tracked = tracked.filter { SyncRunLock.processIsAlive($0) }
+
+            if tracked.isEmpty && !isRunLive(for: profile) { break }
+
+            let now = Date()
+            let force = abortForceRequested.contains(profileId)
+            let current: SyncAbort.Phase
+            if let phase {
+                current = SyncAbort.nextPhase(
+                    current: phase, elapsedInPhase: now.timeIntervalSince(phaseStarted), forceRequested: force)
+            } else {
+                // A Force Stop pressed before the first scan finished still applies.
+                current = SyncAbort.nextPhase(
+                    current: SyncAbort.initialPhase(for: targets), elapsedInPhase: 0, forceRequested: force)
+            }
+            if current != phase {
+                phase = current
+                phaseStarted = now
+                abortPhases[profileId] = current
+                SyncTraySettings.debugLog("Abort '\(profile.name)': \(current)")
+            }
+            if current != .graceful { outcome = "forced" }
+
+            // Each PID gets each phase's signal once; SIGKILL repeats until the PID is gone.
+            let sig = SyncAbort.signal(for: current)
+            for pid in SyncAbort.signalTargets(for: current, in: targets)
+            where current == .killing || !(signalled[current]?.contains(pid) ?? false) {
+                kill(pid, sig)
+                signalled[current, default: []].insert(pid)
+            }
+
+            if now.timeIntervalSince(started) >= deadline {
+                outcome = "timeout"
+                break
+            }
+            try? await Task.sleep(nanoseconds: 1_000_000_000)
+        }
+
+        finishAbort(for: profile, outcome: outcome)
+    }
+
+    /// Settle a profile after its abort: remove the run's leftover locks (stale-only), put
+    /// the profile back at rest without an error, and close its telemetry span.
+    private func finishAbort(for profile: SyncProfile, outcome: String) {
+        let profileId = profile.id
+        abortTasks.removeValue(forKey: profileId)
+        abortPhases.removeValue(forKey: profileId)
+        abortForceRequested.remove(profileId)
+
+        // A run stopped by SIGKILL never reached its own cleanup: the script's EXIT trap,
+        // rclone's session-lock release. Stale-only — refuses if either holder is alive,
+        // e.g. a new run that has already started.
+        SyncRunLock.removeStaleLocks(
+            runLockPath: profile.lockFilePath,
+            sessionLockPath: SyncRunLock.sessionLockPath(for: profile),
+            isAlive: SyncRunLock.processIsAlive
+        )
+
+        TelemetryService.shared.recordProfileLifecycleOperation(
+            profileId: profileId, profileName: profile.name,
+            operation: "abort", syncMode: profile.syncMode.rawValue, result: outcome
+        )
+        SyncTraySettings.debugLog("Abort '\(profile.name)' finished: \(outcome)")
+
+        // Gave up with the run still live (a holder the abort could not identify as part
+        // of the run, or one that would not die): leave its state, errors and log lines
+        // alone rather than show a running sync as stopped. Abort can be pressed again.
+        if isRunLive(for: profile) {
+            abortSuppressUntil[profileId] = nil
+            return
+        }
+        abortSuppressUntil[profileId] = Date().addingTimeInterval(SyncAbort.trailingSuppression)
+
+        monitoringExternalSyncs.remove(profileId)
+        profileProgress[profileId] = nil
+        profileErrors[profileId] = nil
+        lastSeenErrorMessage[profileId] = nil
+        currentSyncChanges[profileId] = nil
+        syncStartTimes[profileId] = nil
+        checkPhaseStartTimes.removeValue(forKey: profileId)
+        checkPhaseReported.remove(profileId)
+        logWatchers[profileId]?.setActivelySyncing(false)
+        notificationService.clearPendingChanges(for: profileId)
+        if let state = profileStates[profileId] {
+            switch state {
+            case .syncing, .error:
+                profileStates[profileId] = isPaused(for: profileId) ? .paused : .idle
+            default:
+                break
+            }
+        }
+        updateAggregateState()
+
+        TelemetryService.shared.recordSyncSkipped(profileId: profileId, profileName: profile.name, reason: "aborted")
+
+        // The run has ended — apply any reinstall an external edit deferred while it was live.
+        retryPendingExternalReinstallIfNeeded(for: profileId)
+    }
+
     /// Read the last error message from a log file
     private func readLastErrorFromLog(_ logPath: String) -> String? {
         guard FileManager.default.fileExists(atPath: logPath),
@@ -2182,6 +2419,14 @@ final class SyncManager: ObservableObject {
             return
         }
 
+        // Skip right after an abort: the change this callback reports is most likely the
+        // aborted run's own last writes (debounced past its exit), and starting a new sync
+        // for it would undo the abort the user just asked for.
+        if wasRunAborted(for: profileId) {
+            SyncTraySettings.debugLog("DirectoryWatcher: Skipping sync for \(profileId.uuidString.prefix(8)) - run was just aborted")
+            return
+        }
+
         // Skip if drive not mounted
         if profileStates[profileId] == .driveNotMounted {
             SyncTraySettings.debugLog("DirectoryWatcher: Skipping sync for \(profileId.uuidString.prefix(8)) - drive not mounted")
@@ -2422,6 +2667,18 @@ final class SyncManager: ObservableObject {
             return
         }
 
+        // An aborted initial sync left the launchd agent unloaded, because loading it would
+        // have restarted the sync at once (`RunAtLoad`). Start this run BY loading it, so
+        // the schedule comes back together with the restart instead of staying off until
+        // the next Save. If the agent is already loaded (a Save reinstalled it meanwhile),
+        // run the script as usual.
+        if agentLoadDeferredByAbort.remove(profile.id) != nil,
+           !setupService.isLoaded(profile: profile),
+           setupService.loadAgent(for: profile) {
+            SyncTraySettings.debugLog("Restarted '\(profile.name)' by loading its launchd agent (deferred by an abort)")
+            return
+        }
+
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/bin/bash")
         process.arguments = [SyncProfile.sharedScriptPath, profile.configPath]
@@ -2449,6 +2706,16 @@ final class SyncManager: ObservableObject {
 
         switch event.type {
         case .syncStarted:
+            // A start line read while an abort is in flight, or after an aborted run has
+            // already exited, is the aborted run's own late line (the log watcher polls
+            // every few seconds) — not a new run. Treating it as one would flip the
+            // profile back to `.syncing` and let that run's failure lines surface.
+            if let currentProfile = profile, wasRunAborted(for: profileId),
+               isAborting(for: profileId) || !isRunLive(for: currentProfile) {
+                break
+            }
+            // A genuinely new run: whatever an earlier abort left suppressed no longer applies.
+            abortSuppressUntil[profileId] = nil
             profileStates[profileId] = .syncing
             profileErrors[profileId] = nil  // Clear previous error on new sync
             lastSeenErrorMessage[profileId] = nil  // Clear last seen error
@@ -2513,6 +2780,24 @@ final class SyncManager: ObservableObject {
             retryPendingExternalReinstallIfNeeded(for: profileId)
 
         case .syncFailed(let exitCode, let message):
+            // The run was stopped by `abortSync`: its non-zero exit is the abort, not a
+            // failure — no error, no notification, and above all no auto-fix `--resync`
+            // restarting what the user just stopped. `finishAbort` settles the state.
+            if wasRunAborted(for: profileId) {
+                SyncTraySettings.debugLog("Ignoring syncFailed (exit \(exitCode)) for '\(profileName)': the run was aborted")
+                profileProgress[profileId] = nil
+                lastSeenErrorMessage[profileId] = nil
+                currentSyncChanges[profileId] = nil
+                syncStartTimes[profileId] = nil
+                logWatchers[profileId]?.setActivelySyncing(false)
+                TelemetryService.shared.recordSyncSkipped(profileId: profileId, profileName: profileName, reason: "aborted")
+                if !isAborting(for: profileId), profileStates[profileId] == .syncing {
+                    profileStates[profileId] = isPaused(for: profileId) ? .paused : .idle
+                }
+                retryPendingExternalReinstallIfNeeded(for: profileId)
+                break
+            }
+
             // Check if the error message (or the last seen error) is a transient one
             let errorToCheck = message ?? lastSeenErrorMessage[profileId]
 
@@ -2606,6 +2891,12 @@ final class SyncManager: ObservableObject {
             )
 
         case .errorMessage(let message):
+            // An aborted run's errors ("context canceled", interrupted transfers, …) are
+            // the abort's own doing — never stored or shown as the profile's error.
+            if wasRunAborted(for: profileId) {
+                break
+            }
+
             // A rejected CONCURRENT run's own "prior lock file found" message (R3):
             // another live process holds this profile's bisync session lock, so
             // this is not this profile's error. Session-lock liveness ONLY (D5) —

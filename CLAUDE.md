@@ -1502,6 +1502,52 @@ review — the `profile set` persist-before-refuse ordering and a source-text pi
 `getpid()`/`uninstallForReinstall`/deferred-reinstall-retry guards); each negative assertion
 was independently shown to fail once by a temporary mutation before being fixed.
 
+### 9. Aborting a Running Sync — Graceful First, Stale-Only Cleanup
+While a Two-Way / One-Way profile's run is live, the profile card's Pause button becomes
+**Abort** (`SyncManager.abortSync(for:)`), so a user can stop a sync, change its settings and
+restart it — Save and Reinstall refuse while a run is live (Rule 8), so without Abort a long
+initial sync left nothing to do but wait. Abort is not Pause: the launchd agent stays loaded,
+the profile is never added to `pausedProfiles`, and Sync Now is available as soon as the run
+has exited.
+- **Which processes.** `SyncAbort` (`SyncSetupService.swift`, pure core next to `SyncRunLock`)
+  finds the run from the profile's two lock holders — the `/tmp` run lock (the script's bash,
+  or an app-launched rclone) and the bisync session `.lck` (rclone) — plus their descendants
+  from one `ps -A -o pid=,ppid=,comm=` read. A holder is used only if the table names it bash,
+  the sync script itself, or rclone (`SyncAbort.isRunRoot`), so a stale lock whose PID was
+  reused is never signalled — nor is anything when `ps` fails; the app's own PID (the
+  launch-gap placeholder) and PIDs ≤ 1 never are either. Every run shape is covered: the
+  scheduled/Sync Now script and the initial sync, Fix / Force / Restore, and auto-fix.
+- **Graceful first.** SIGINT goes to rclone only — bisync's graceful shutdown then drains or
+  cancels its transfers and makes a best effort to save its listings, so the next run can
+  normally carry on without a resync (one-way `rclone sync` just exits).
+  `tee` is deliberately not signalled: it would die first and rclone would SIGPIPE mid-shutdown.
+  A script still in its pre-flight checks (no rclone yet) goes straight to SIGTERM.
+- **Escalation.** After `SyncAbort.gracefulTimeout` (90 s, bisync's own graceful window), or at
+  once on **Force Stop** (the same button while the abort is in flight, behind a confirmation),
+  SIGTERM goes to every process of the run, children before the shell; SIGKILL follows 10 s
+  later. The monitor re-reads the locks and the process table every second, so an rclone that
+  appears after the first scan (an app-launched run still in its launch gap) is caught too —
+  and a run that starts while an abort is still in flight is stopped with it.
+- **Cleanup only after exit.** The abort finishes only when every tracked process is dead and
+  `isRunLive` is false; only then does it call `SyncRunLock.removeStaleLocks` (stale-only), for
+  a run SIGKILL stopped before its own EXIT trap / session-lock release. It never deletes a lock
+  itself. If it gives up (130 s) with the run still live, the state is left alone.
+- **Not a failure.** `wasRunAborted(for:)` — true while the abort is in flight and for
+  `SyncAbort.trailingSuppression` (30 s) after — makes `.syncFailed` and `.errorMessage` drop
+  the aborted run's own lines (no error banner, no notification, no auto-fix `--resync`), makes
+  a late `.syncStarted` from that run be ignored, and keeps the directory watcher from
+  restarting a sync for the aborted run's own last writes. The next genuine `.syncStarted`
+  clears it.
+- **Aborted initial sync.** `runResync` loads the launchd agent when an install's initial sync
+  ends — but the agent is `RunAtLoad`, so loading it after an abort would restart the sync at
+  once. The load is deferred (`deferAgentLoadAfterAbort`) and done by the next app-started run
+  (`runSyncScript`) instead — Sync Now restarts the sync AND brings back its schedule; a Save
+  reinstalls it anyway.
+Covered by `ConfigSelfTest` AC-AB1 (process targets, incl. reused-PID and no-table refusals),
+AC-AB2 (escalation and signals), AC-AB3 (run-end suppression) and AC-AB4 (source pins: no
+pause/agent unload/direct lock delete in `abortSync`, stale-only cleanup, the `.syncFailed`
+abort branch ahead of auto-fix, and the card's Pause → Abort swap).
+
 ## Debugging
 
 ### Enable Debug Logging
