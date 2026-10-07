@@ -1512,41 +1512,57 @@ has exited.
 - **Which processes.** `SyncAbort` (`SyncSetupService.swift`, pure core next to `SyncRunLock`)
   finds the run from the profile's two lock holders — the `/tmp` run lock (the script's bash,
   or an app-launched rclone) and the bisync session `.lck` (rclone) — plus their descendants
-  from one `ps -A -o pid=,ppid=,comm=` read. A holder is used only if the table names it bash,
-  the sync script itself, or rclone (`SyncAbort.isRunRoot`), so a stale lock whose PID was
-  reused is never signalled — nor is anything when `ps` fails; the app's own PID (the
+  from one `ps -A -ww -o pid=,ppid=,comm=` read. A holder is used only when
+  `SyncAbort.isRunRoot` identifies it as this profile's run: the script must be `bash` (or the
+  script's own file name) AND its command line must name this profile's `configPath` (launchd
+  and the app both start it as `synctray-sync.sh <configPath>`); an rclone holder must be a
+  direct child of the app (an app-launched run — a script run's rclone is reached as bash's
+  descendant). A stale lock whose PID was reused, another profile's rclone or a mount daemon is
+  therefore never signalled — nor is anything when `ps` fails. The app's own PID (the
   launch-gap placeholder) and PIDs ≤ 1 never are either. Every run shape is covered: the
   scheduled/Sync Now script and the initial sync, Fix / Force / Restore, and auto-fix.
 - **Graceful first.** SIGINT goes to rclone only — bisync's graceful shutdown then drains or
   cancels its transfers and makes a best effort to save its listings, so the next run can
-  normally carry on without a resync (one-way `rclone sync` just exits).
-  `tee` is deliberately not signalled: it would die first and rclone would SIGPIPE mid-shutdown.
-  A script still in its pre-flight checks (no rclone yet) goes straight to SIGTERM.
+  normally carry on without a resync (one-way `rclone sync` just exits). `tee` is deliberately
+  not signalled: it would die first and rclone would SIGPIPE mid-shutdown. A script still in
+  its pre-flight checks (no rclone yet) goes straight to SIGTERM; when nothing of the run is
+  visible yet (an app-launched rclone in its launch gap), the first phase waits for it.
 - **Escalation.** After `SyncAbort.gracefulTimeout` (90 s, bisync's own graceful window), or at
-  once on **Force Stop** (the same button while the abort is in flight, behind a confirmation),
-  SIGTERM goes to every process of the run, children before the shell; SIGKILL follows 10 s
-  later. The monitor re-reads the locks and the process table every second, so an rclone that
-  appears after the first scan (an app-launched run still in its launch gap) is caught too —
-  and a run that starts while an abort is still in flight is stopped with it.
-- **Cleanup only after exit.** The abort finishes only when every tracked process is dead and
-  `isRunLive` is false; only then does it call `SyncRunLock.removeStaleLocks` (stale-only), for
-  a run SIGKILL stopped before its own EXIT trap / session-lock release. It never deletes a lock
-  itself. If it gives up (130 s) with the run still live, the state is left alone.
-- **Not a failure.** `wasRunAborted(for:)` — true while the abort is in flight and for
-  `SyncAbort.trailingSuppression` (30 s) after — makes `.syncFailed` and `.errorMessage` drop
-  the aborted run's own lines (no error banner, no notification, no auto-fix `--resync`), makes
-  a late `.syncStarted` from that run be ignored, and keeps the directory watcher from
-  restarting a sync for the aborted run's own last writes. The next genuine `.syncStarted`
-  clears it.
+  once on **Force Stop** (`forceStopAbort` — the same button while the abort is in flight,
+  behind a confirmation; a no-op once the abort has finished), SIGTERM goes to every process of
+  the run, children before the shell, plus any orphan seen in the run earlier; SIGKILL follows
+  10 s later. The monitor re-reads the locks and the process table every second.
+- **No new run meanwhile.** `beginExclusiveRun` and `runSyncScript` refuse while an abort is in
+  flight, and the card treats an in-flight abort as running (Sync Now, Uninstall, Reinstall
+  stay disabled), so the abort's monitor can never catch a run the user just started.
+- **Cleanup only after exit.** `SyncAbort.completion` finishes the abort only once no lock
+  holder is live; tracked leftovers that are not rclone (the script's timeout-watchdog `sleep`,
+  a `tee`) are released with SIGTERM, but a leftover rclone is waited for and escalated. Only
+  then does it call `SyncRunLock.removeStaleLocks` (stale-only), for a run SIGKILL stopped
+  before its own EXIT trap / session-lock release. It never deletes a lock itself. If it gives
+  up (130 s) with the run still live, the state, errors and log lines are left alone.
+- **Not a failure.** Before the abort stops counting as in flight, `finishAbort` reads the
+  log to its end (`LogWatcher.readPendingLines`), so the run's last lines are handled as the
+  abort's. `wasRunAborted(for:)` — true while the abort is in flight and for
+  `SyncAbort.trailingSuppression` (30 s) after, as a backstop — makes `.syncFailed`,
+  `.errorMessage` and `.stats` drop the aborted run's lines (no error banner, no notification,
+  no auto-fix `--resync`), makes a late `.syncStarted` from that run be ignored, and keeps the
+  directory watcher from restarting a sync for the aborted run's own last writes. The next run
+  the app starts (`runSyncScript`, `beginExclusiveRun`) or a genuine `.syncStarted` clears it.
+  The view's run launchers report "aborted" from `isAborting` (an app-launched run's abort
+  cannot finish before its token is released), so a quick genuine failure of a run restarted
+  right after an abort still reads as a failure.
 - **Aborted initial sync.** `runResync` loads the launchd agent when an install's initial sync
   ends — but the agent is `RunAtLoad`, so loading it after an abort would restart the sync at
   once. The load is deferred (`deferAgentLoadAfterAbort`) and done by the next app-started run
   (`runSyncScript`) instead — Sync Now restarts the sync AND brings back its schedule; a Save
-  reinstalls it anyway.
-Covered by `ConfigSelfTest` AC-AB1 (process targets, incl. reused-PID and no-table refusals),
-AC-AB2 (escalation and signals), AC-AB3 (run-end suppression) and AC-AB4 (source pins: no
-pause/agent unload/direct lock delete in `abortSync`, stale-only cleanup, the `.syncFailed`
-abort branch ahead of auto-fix, and the card's Pause → Abort swap).
+  reinstalls it anyway. Until then the directory watcher does not restart it. The deferral is
+  in memory only: after an app restart the agent comes back at the next login or Save.
+Covered by `ConfigSelfTest` AC-AB1 (process targets and run-root identity, incl. reused-PID and
+no-table refusals), AC-AB2 (escalation, signals, orphans, completion), AC-AB3 (run-end
+suppression) and AC-AB4 (source pins: no pause/agent unload/direct lock delete in `abortSync`,
+stale-only cleanup, completion-gated finish with the log read first, no new run while
+aborting, the `.syncFailed` abort branch ahead of auto-fix, and the card's Pause → Abort swap).
 
 ## Debugging
 

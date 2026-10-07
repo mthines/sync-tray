@@ -155,6 +155,10 @@ struct ProfileDetailView: View {
         // Local resync started by this view
         if isRunningResync { return true }
 
+        // An abort is still stopping the run: keep Sync Now, Uninstall and Reinstall off and
+        // Force Stop on until it has finished, even if the run's own state already went idle.
+        if syncManager.isAborting(for: profile.id) { return true }
+
         // Real liveness: an exclusive-run registry token, a live /tmp run lock, or
         // a live bisync session lock (R3) — not just the cosmetic `.syncing` state,
         // which a rejected concurrent run's own failure used to flip to `.error`
@@ -417,7 +421,7 @@ struct ProfileDetailView: View {
         }
         .alert("Force Stop This Sync?", isPresented: $showingForceStopConfirm) {
             Button("Keep Waiting", role: .cancel) {}
-            Button("Force Stop", role: .destructive) { syncManager.abortSync(for: profile) }
+            Button("Force Stop", role: .destructive) { syncManager.forceStopAbort(for: profile) }
         } message: {
             Text("rclone is still finishing the files it was transferring, and stops on its own within about a minute and a half. Stopping now cuts those transfers off, and a Two-Way profile's next sync may take longer while it recovers.")
         }
@@ -3517,7 +3521,11 @@ struct ProfileDetailView: View {
                         self.syncManager.clearError(for: currentProfile.id)
                         self.syncManager.setSyncing(for: currentProfile.id, isSyncing: false)
                         self.syncManager.refreshSettings()
-                    } else if self.syncManager.wasRunAborted(for: currentProfile.id) {
+                    } else if self.syncManager.isAborting(for: currentProfile.id) {
+                        // `isAborting`, not the time-based `wasRunAborted`: this run's exclusive
+                        // token is still held here, so an abort of THIS run cannot have finished
+                        // yet — while a quick genuine failure of a run restarted soon after an
+                        // abort must still read as a failure.
                         self.appendOutputLine("")
                         self.appendOutputLine("■ Sync aborted.")
 
@@ -4167,7 +4175,9 @@ struct ProfileDetailView: View {
             DispatchQueue.main.async {
                 self.syncManager.endExclusiveRun(runToken)
                 self.appendOutputLine("")
-                let aborted = exitCode != 0 && self.syncManager.wasRunAborted(for: currentProfile.id)
+                // `isAborting`: this run's abort cannot finish before its token is released
+                // (just above, in this same main-actor block).
+                let aborted = exitCode != 0 && self.syncManager.isAborting(for: currentProfile.id)
                 self.appendOutputLine(aborted ? "■ Force sync aborted" : completionMsg)
                 self.isRunningResync = false
                 self.syncManager.setSyncing(for: currentProfile.id, isSyncing: false)

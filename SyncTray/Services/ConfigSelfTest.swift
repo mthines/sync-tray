@@ -7248,22 +7248,30 @@ enum ConfigSelfTest {
             garbage line
               x     y z
             """
-        let table = SyncAbort.parseProcessTable(psOutput)
-        guard table.count == 8 else {
-            return report("AC-AB1", "abort-process-targets", false, "(parsed \(table.count) rows, expected 8)")
+        let parsed = SyncAbort.parseProcessTable(psOutput)
+        guard parsed.count == 8 else {
+            return report("AC-AB1", "abort-process-targets", false, "(parsed \(parsed.count) rows, expected 8)")
         }
-        guard table.contains(SyncAbort.ProcessEntry(
+        guard parsed.contains(SyncAbort.ProcessEntry(
             pid: 703, ppid: 701, name: "/Applications/Some App.app/Contents/MacOS/helper with spaces")) else {
             return report("AC-AB1", "abort-process-targets", false, "(a path with spaces was not kept whole)")
         }
 
+        // The profile's derived config, as the script's command line carries it.
+        let configPath = "/Users/me/.config/synctray/profiles/c6169dcc.json"
+        let scriptArgs = "/bin/bash /Users/me/.local/bin/synctray-sync.sh \(configPath)"
+        func targets(_ roots: [Int32], _ arguments: [Int32: String] = [:], table: [SyncAbort.ProcessEntry]? = nil) -> SyncAbort.Targets {
+            SyncAbort.targets(roots: roots, appPID: 500, table: table ?? parsed,
+                              rootArguments: arguments, configPath: configPath)
+        }
+
         // Script run: bash 700 holds the run lock, rclone 701 the session lock.
-        let script = SyncAbort.targets(roots: [700, 701], appPID: 500, table: table)
+        let script = targets([700, 701], [700: scriptArgs, 701: "/opt/homebrew/bin/rclone bisync remote: /Users/me/Sync"])
         guard Set(script.all) == [700, 701, 702, 703] else {
             return report("AC-AB1", "abort-process-targets", false, "(script run targets were \(script.all))")
         }
-        guard script.all.last == 700 || script.all.firstIndex(of: 700)! > script.all.firstIndex(of: 701)! else {
-            return report("AC-AB1", "abort-process-targets", false, "(the shell was ordered before its rclone child)")
+        guard script.all.last == 700 else {
+            return report("AC-AB1", "abort-process-targets", false, "(the shell was not ordered after its children)")
         }
         guard script.rclone == [701] else {
             return report("AC-AB1", "abort-process-targets", false, "(graceful targets were \(script.rclone), expected [701] — never tee)")
@@ -7277,41 +7285,43 @@ enum ConfigSelfTest {
             return report("AC-AB1", "abort-process-targets", false, "(an unrelated rclone was targeted)")
         }
 
-        // App-launched run: the run lock holds rclone 800, a child of SyncTray itself.
-        let appRun = SyncAbort.targets(roots: [800], appPID: 500, table: table)
+        // App-launched run: the run lock holds rclone 800, a direct child of SyncTray itself.
+        let appRun = targets([800])
         guard appRun.all == [800], appRun.rclone == [800] else {
             return report("AC-AB1", "abort-process-targets", false, "(app-launched run targets were \(appRun.all))")
         }
 
         // The launch-gap placeholder (the app's own PID) and launchd are never targets.
-        let placeholder = SyncAbort.targets(roots: [500, 1, 0], appPID: 500, table: table)
-        guard placeholder.all.isEmpty, SyncAbort.initialPhase(for: placeholder) == .terminating else {
+        let placeholder = targets([500, 1, 0])
+        guard placeholder.all.isEmpty else {
             return report("AC-AB1", "abort-process-targets", false, "(the app or launchd was targeted: \(placeholder.all))")
         }
 
         // A root that already exited (not in the table) is skipped.
-        guard SyncAbort.targets(roots: [4242], appPID: 500, table: table).all.isEmpty else {
+        guard targets([4242]).all.isEmpty else {
             return report("AC-AB1", "abort-process-targets", false, "(an exited root was targeted)")
         }
 
-        // A stale lock whose PID now names an unrelated process is never signalled, nor are
-        // its children — the abort cannot identify it as part of the run.
-        guard SyncAbort.targets(roots: [703], appPID: 500, table: table).all.isEmpty else {
-            return report("AC-AB1", "abort-process-targets", false, "(a reused PID that is neither bash nor rclone was targeted)")
+        // Stale locks whose PID was reused are never signalled, nor are their children: a
+        // process that is neither bash nor rclone; a bash running something other than this
+        // profile's script, or whose command line is unknown; an rclone that is not the app's
+        // own child (another profile's run, a mount daemon).
+        guard targets([703]).all.isEmpty,
+              targets([700], [700: "/bin/bash /Users/me/bin/backup.sh"]).all.isEmpty,
+              targets([700]).all.isEmpty,
+              targets([900], [900: "/opt/homebrew/bin/rclone sync a: b"]).all.isEmpty else {
+            return report("AC-AB1", "abort-process-targets", false, "(a process not identified as this profile's run was targeted)")
         }
-
-        // Run roots: the script under either name `ps` may report for it, and rclone — never
-        // an interactive login shell (`-bash`) or another program.
-        guard SyncAbort.isRunRoot("/bin/bash"),
-              SyncAbort.isRunRoot("/Users/me/.local/bin/synctray-sync.sh"),
-              SyncAbort.isRunRoot("/usr/local/bin/rclone-v1.68"),
-              !SyncAbort.isRunRoot("-bash"),
-              !SyncAbort.isRunRoot("/usr/bin/vim") else {
+        // ...while the script is still recognised when `ps` reports it by its file name.
+        let byScriptName = SyncAbort.ProcessEntry(pid: 700, ppid: 1, name: "/Users/me/.local/bin/synctray-sync.sh")
+        guard SyncAbort.isRunRoot(byScriptName, arguments: scriptArgs, appPID: 500, configPath: configPath),
+              !SyncAbort.isRunRoot(SyncAbort.ProcessEntry(pid: 700, ppid: 1, name: "-bash"),
+                                   arguments: scriptArgs, appPID: 500, configPath: configPath) else {
             return report("AC-AB1", "abort-process-targets", false, "(run-root name matching was wrong)")
         }
 
-        // No process table to check names against: nothing is signalled.
-        guard SyncAbort.targets(roots: [700, 701], appPID: 500, table: []).all.isEmpty else {
+        // No process table to check identities against: nothing is signalled.
+        guard targets([700, 701], [700: scriptArgs], table: []).all.isEmpty else {
             return report("AC-AB1", "abort-process-targets", false, "(roots were signalled without a process table)")
         }
 
@@ -7351,6 +7361,21 @@ enum ConfigSelfTest {
         guard SyncAbort.gracefulTimeout >= 90 else {
             return report("AC-AB2", "abort-escalation", false, "(graceful timeout shorter than bisync's own graceful window)")
         }
+
+        // Orphans (seen in the run, shell since gone) are escalated too, but never SIGINTed.
+        guard SyncAbort.signalTargets(for: .graceful, in: withRclone, orphans: [42]) == [701],
+              SyncAbort.signalTargets(for: .terminating, in: withRclone, orphans: [42, 700]) == [700, 701, 42] else {
+            return report("AC-AB2", "abort-escalation", false, "(orphans were signalled in the wrong phase)")
+        }
+
+        // Done only once no lock holder is live; leftover non-rclone orphans (a watchdog
+        // `sleep`) are released, but a leftover rclone is waited for.
+        guard SyncAbort.completion(runLive: true, liveTracked: [:]) == .waiting,
+              SyncAbort.completion(runLive: false, liveTracked: [:]) == .finished(releasing: []),
+              SyncAbort.completion(runLive: false, liveTracked: [9: "/bin/sleep", 3: "/usr/bin/tee"]) == .finished(releasing: [3, 9]),
+              SyncAbort.completion(runLive: false, liveTracked: [9: "/bin/sleep", 7: "/opt/homebrew/bin/rclone"]) == .waiting else {
+            return report("AC-AB2", "abort-escalation", false, "(abort completion decision was wrong)")
+        }
         return report("AC-AB2", "abort-escalation", true)
     }
 
@@ -7376,8 +7401,10 @@ enum ConfigSelfTest {
     /// The orchestration lives in MainActor `SyncManager` and SwiftUI state this suite has no
     /// seam into, so pin the properties that matter by reading the live source (the AC-SR18
     /// style): Abort never pauses the profile or unloads its agent (the user restarts right
-    /// after), lock cleanup is stale-only, an aborted run's failure returns before auto-fix
-    /// can start a `--resync`, and the card swaps Pause for Abort while a run is live.
+    /// after), lock cleanup is stale-only, the abort finishes only once the run has ended
+    /// and reads the run's last log lines first, no new run starts while an abort is in
+    /// flight, an aborted run's failure returns before auto-fix can start a `--resync`, and
+    /// the card swaps Pause for Abort while a run is live.
     private static func testAbortWiringPinned() -> Bool {
         guard let managerSource = readSourceFile("Services/SyncManager.swift"),
               let viewSource = readSourceFile("Views/Settings/ProfileDetailView.swift") else {
@@ -7396,9 +7423,23 @@ enum ConfigSelfTest {
             return report("AC-AB4", "abort-wiring-pinned", false, "(finishAbort no longer cleans locks stale-only)")
         }
         guard let runFn = extractFunctionBody(startingAt: "private func runAbort(", in: managerSource),
-              runFn.contains("tracked.isEmpty && !isRunLive(for: profile)") else {
+              runFn.contains("if case .finished(let leftovers) = SyncAbort.completion(\n                runLive: isRunLive(for: profile), liveTracked: tracked) {") else {
             return report("AC-AB4", "abort-wiring-pinned", false,
-                "(runAbort can finish while a process of the run or a lock holder is still alive)")
+                "(runAbort can finish without the run having ended)")
+        }
+        guard let beginFn = extractFunctionBody(startingAt: "func beginExclusiveRun(for profile: SyncProfile", in: managerSource),
+              beginFn.contains("guard !isAborting(for: profile.id) else { return nil }"),
+              let scriptFn = extractFunctionBody(startingAt: "private func runSyncScript(", in: managerSource),
+              scriptFn.contains("if isAborting(for: profile.id) {") else {
+            return report("AC-AB4", "abort-wiring-pinned", false,
+                "(a new run can start while an abort is still stopping the last one)")
+        }
+        guard let finishRead = extractFunctionBody(startingAt: "private func finishAbort(", in: managerSource),
+              let flush = finishRead.range(of: "logWatchers[profileId]?.readPendingLines()"),
+              let clear = finishRead.range(of: "abortPhases.removeValue(forKey: profileId)"),
+              flush.lowerBound < clear.lowerBound else {
+            return report("AC-AB4", "abort-wiring-pinned", false,
+                "(finishAbort no longer reads the run's last log lines before the abort stops counting as in flight)")
         }
         guard let failedRange = managerSource.range(of: "case .syncFailed(let exitCode, let message):"),
               let autoFixRange = managerSource.range(of: "triggerAutoFix(for: currentProfile)", range: failedRange.upperBound..<managerSource.endIndex),
