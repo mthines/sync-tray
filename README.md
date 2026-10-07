@@ -5,7 +5,7 @@
 <h1 align="center">SyncTray</h1>
 
 <p align="center">
-  <strong>Google Drive-style sync for any storage you own — NAS, S3, SFTP, Google Drive, and 70+ more.</strong><br>
+  <strong>Google Drive-style sync for any storage — your NAS, S3, SFTP, Google Drive, and 70+ more.</strong><br>
   A native macOS menu bar app for two-way sync, one-way backup, and on-demand streaming, built on <a href="https://rclone.org">rclone</a>.<br>
   Set it up in the app, or hand the whole setup to your AI agent.
 </p>
@@ -90,11 +90,11 @@ What makes this safe to hand to an agent:
 
 ## Three ways to sync
 
-| Mode               | Best for                             | What happens                                                    |
-| ------------------ | ------------------------------------ | --------------------------------------------------------------- |
-| **Two-Way Sync**   | Files you edit on more than one Mac  | Changes on either side reach the other, on a schedule you pick  |
-| **One-Way Sync**   | Backups and mirrors                  | One side is the source; the other always matches it             |
-| **Stream (Mount)** | Big libraries that don't fit on disk | Every file shows up in Finder and downloads when you open it    |
+| Mode               | Best for                                   | What happens                                                   |
+| ------------------ | ------------------------------------------ | -------------------------------------------------------------- |
+| **Two-Way Sync**   | Files you work on from more than one place | Changes on either side reach the other, on a schedule you pick |
+| **One-Way Sync**   | Backups and mirrors                        | One side is the source; the other always matches it            |
+| **Stream (Mount)** | Big libraries that don't fit on disk       | Every file shows up in Finder and downloads when you open it   |
 
 ### Stream, with offline folders
 
@@ -102,7 +102,7 @@ A Stream profile mounts your remote as a folder.
 Files download the first time you open them and stay cached for as long as you choose (7 days by default).
 
 - **Available Offline.** Right-click any folder in Finder to keep it fully downloaded, with live progress in the menu bar.
-- **Cache Only.** One click — or automatically, when the remote can't be reached as the mount starts — switches the mount to serve only what's cached. You can keep creating and editing files; they upload when you resume, and a file that changed on the remote meanwhile is saved as a conflict copy instead of overwriting it.
+- **Cache Only.** One click — or automatically, when the remote can't be reached as the mount starts — switches the mount to serve only what's cached. You can keep creating and editing files, and they upload when you resume. If the same file changed on the remote meanwhile, yours uploads as a separate conflict copy — nothing gets overwritten.
 - **Resilient by default.** A stalled server returns an error within about 30 seconds instead of freezing Finder.
 
 ### Home and away
@@ -145,8 +145,10 @@ brew install --cask mthines/synctray/synctray
 ```bash
 git clone https://github.com/mthines/sync-tray.git
 cd sync-tray
-xcodebuild -scheme SyncTray -configuration Release build
+xcodebuild -scheme SyncTray -configuration Release CODE_SIGNING_ALLOWED=NO build
 ```
+
+An unsigned build runs, but the Finder extension only loads in a signed one — [DEVELOPMENT.md](DEVELOPMENT.md) covers local signing.
 
 SyncTray finds rclone from Homebrew, `/usr/local/bin`, `/usr/bin`, and nix installs without extra configuration.
 
@@ -156,7 +158,7 @@ SyncTray finds rclone from Homebrew, `/usr/local/bin`, `/usr/bin`, and nix insta
 2. **Open Settings → +** to start the setup wizard.
 3. **Pick or connect a remote.** The wizard can connect Google Drive, Dropbox, OneDrive, Synology, SMB, WebDAV, and SFTP for you, or reuse any remote you already set up with `rclone config`.
 4. **Choose the folders, the mode, and how often to sync** (every 1 minute to 1 hour; 5 minutes by default).
-5. **Install.** SyncTray creates the local folder, runs the first sync, and schedules the rest.
+5. **Install.** SyncTray creates the local folder, runs the first sync (or mounts the remote), and schedules the rest.
 
 <p align="center">
   <img src="docs/assets/new-profile-wizard-providers.png" alt="Choosing a storage provider in the setup wizard" height="420">

@@ -1,6 +1,6 @@
 # Set up SyncTray with an AI agent
 
-SyncTray is built to be configured by an agent as easily as by a person.
+SyncTray is built to be configured by an agent, not only by a person clicking through Settings.
 Every profile is a JSON file with a published schema, and the `synctray` CLI covers creating, checking, changing, and running profiles — with machine-readable output.
 This guide walks through a full setup, from an empty Mac to a running sync, the way an agent like Claude Code, Codex, or Cursor would do it.
 
