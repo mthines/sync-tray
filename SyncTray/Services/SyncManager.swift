@@ -3015,6 +3015,12 @@ final class SyncManager: ObservableObject {
             }
 
         case .stats(let stats):
+            // A late stats line from a run whose abort already finished would put a stale
+            // progress bar back on a profile that is at rest.
+            if let currentProfile = profile, wasRunAborted(for: profileId), !isAborting(for: profileId),
+               !isRunLive(for: currentProfile) {
+                break
+            }
             if let bytes = stats.bytes, let totalBytes = stats.totalBytes, totalBytes > 0 {
                 let checksDone = stats.checks ?? 0
                 let totalChecks = stats.totalChecks ?? 0
