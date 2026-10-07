@@ -164,8 +164,11 @@ final class SyncManager: ObservableObject {
 
     // MARK: Abort state (see `abortSync`)
 
-    /// Profiles with an abort in flight, and how far it has escalated. Published so the
-    /// profile card can swap Abort for Force Stop and show "Stopping…".
+    /// Profiles with an abort in flight. Published so the profile card can swap Abort for
+    /// Force Stop and show "Stopping…".
+    @Published private(set) var abortingProfiles: Set<UUID> = []
+    /// How far each in-flight abort has escalated — absent until its first phase is chosen
+    /// (nothing of the run visible yet), so the card never claims "finishing files" early.
     @Published private(set) var abortPhases: [UUID: SyncAbort.Phase] = [:]
     /// Profiles whose user pressed Force Stop while their abort was still graceful.
     private var abortForceRequested: Set<UUID> = []
@@ -1864,7 +1867,7 @@ final class SyncManager: ObservableObject {
 
     /// Whether an abort is in flight for a profile.
     func isAborting(for profileId: UUID) -> Bool {
-        abortPhases[profileId] != nil
+        abortingProfiles.contains(profileId)
     }
 
     /// Whether the profile's most recent run was stopped by `abortSync` — true while the
@@ -1915,7 +1918,7 @@ final class SyncManager: ObservableObject {
             return
         }
 
-        abortPhases[profile.id] = .graceful
+        abortingProfiles.insert(profile.id)
         abortForceRequested.remove(profile.id)
         abortSuppressUntil[profile.id] = nil
         // The startup poller for a run found already in progress would read the aborted
@@ -1970,6 +1973,7 @@ final class SyncManager: ObservableObject {
         let profileId = profile.id
         let appPID = getpid()
         let configPath = profile.configPath
+        let localSyncPath = profile.localSyncPath
         let started = Date()
         // Generous ceiling, so a lock whose holder never goes away cannot keep the card in
         // "Stopping…" forever.
@@ -1990,16 +1994,18 @@ final class SyncManager: ObservableObject {
             }
 
             let roots = liveRunRoots(for: profile)
-            let (table, rootArguments) = await Task.detached(priority: .userInitiated) {
+            let (table, arguments) = await Task.detached(priority: .userInitiated) {
                 () -> ([SyncAbort.ProcessEntry], [Int32: String]) in
+                let table = SyncAbort.readProcessTable()
                 var arguments: [Int32: String] = [:]
-                for root in roots {
-                    if let line = SyncAbort.readArguments(of: root) { arguments[root] = line }
+                for pid in SyncAbort.pidsNeedingArguments(roots: roots, table: table) {
+                    if let line = SyncAbort.readArguments(of: pid) { arguments[pid] = line }
                 }
-                return (SyncAbort.readProcessTable(), arguments)
+                return (table, arguments)
             }.value
             let targets = SyncAbort.targets(
-                roots: roots, appPID: appPID, table: table, rootArguments: rootArguments, configPath: configPath)
+                roots: roots, appPID: appPID, table: table, arguments: arguments,
+                configPath: configPath, localSyncPath: localSyncPath)
 
             // Keep a tracked PID only while the table still shows it under the same name, so a
             // PID reused by an unrelated process after the run's own one exited is dropped.
@@ -2066,6 +2072,7 @@ final class SyncManager: ObservableObject {
         // abort's own — not left for the next file event to report as a failure.
         logWatchers[profileId]?.readPendingLines()
         abortTasks.removeValue(forKey: profileId)
+        abortingProfiles.remove(profileId)
         abortPhases.removeValue(forKey: profileId)
         abortForceRequested.remove(profileId)
 
@@ -2671,6 +2678,13 @@ final class SyncManager: ObservableObject {
     }
 
     private func runSyncScript(for profile: SyncProfile, trigger: String = "manual") async {
+        // Never start a run while an abort is still stopping the last one — the abort's
+        // monitor would stop this run too.
+        if isAborting(for: profile.id) {
+            SyncTraySettings.debugLog("Skipping sync script while an abort is in flight: \(profile.name)")
+            return
+        }
+
         // Remember what kicked this off so the `.syncStarted` log event (parsed from the
         // sync log, decoupled from here) can attribute `sync.trigger`. A launchd/scheduled
         // run never calls this method, so an absent entry means "scheduled".
@@ -2679,13 +2693,6 @@ final class SyncManager: ObservableObject {
         // Check if profile is paused
         if isPaused(for: profile.id) {
             SyncTraySettings.debugLog("Skipping sync script for paused profile: \(profile.name)")
-            return
-        }
-
-        // Never start a run while an abort is still stopping the last one — the abort's
-        // monitor would stop this run too.
-        if isAborting(for: profile.id) {
-            SyncTraySettings.debugLog("Skipping sync script while an abort is in flight: \(profile.name)")
             return
         }
 

@@ -1184,15 +1184,17 @@ struct ProfileDetailView: View {
         VStack(alignment: .leading, spacing: 12) {
             // Status - check local resync state first, then syncManager state
             HStack {
-                if let abortPhase = syncManager.abortPhases[profile.id] {
+                if syncManager.isAborting(for: profile.id) {
                     // Abort in flight — rclone is finishing (graceful) or being stopped.
                     Label("Stopping…", systemImage: "stop.circle")
                         .foregroundColor(.orange)
-                    Text(abortPhase == .graceful
-                         ? "Finishing files in transfer"
-                         : "Force stopping")
-                        .font(.caption)
-                        .foregroundColor(.secondary)
+                    if let abortPhase = syncManager.abortPhases[profile.id] {
+                        Text(abortPhase == .graceful
+                             ? "Finishing files in transfer"
+                             : "Force stopping")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
                 } else if isRunningResync {
                     // Local resync in progress (runs directly, not via launchd)
                     Label("Syncing", systemImage: "arrow.triangle.2.circlepath")
@@ -1498,7 +1500,8 @@ struct ProfileDetailView: View {
                             Button(action: { showingForceStopConfirm = true }) {
                                 Label("Force Stop", systemImage: "xmark.octagon")
                             }
-                            // Already force-stopping once the graceful phase is over.
+                            // Only while rclone is finishing gracefully: before a phase is chosen
+                            // there is nothing to force yet, and after it the stop is already forced.
                             .disabled(syncManager.abortPhases[profile.id] != .graceful)
                             .help("Stop immediately instead of waiting for rclone to finish the files it is transferring")
                         } else {

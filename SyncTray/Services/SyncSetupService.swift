@@ -769,39 +769,72 @@ enum SyncAbort {
     /// Whether a lock holder is this profile's run, so an abort may signal it and everything
     /// under it. A lock file can outlive its run and its PID be reused by an unrelated
     /// process; the liveness guards treat that conservatively as "running", but an abort
-    /// must never signal a process it cannot identify as the run. So identity, not just name:
+    /// must never signal a process it cannot identify as the run. So identity, not just name
+    /// (`arguments` is the holder's command line; without it nothing qualifies):
     /// - the sync script — named `bash` (or, depending on how `ps` reports a `#!` script, the
     ///   script's own file name) AND started with this profile's derived config: launchd and
     ///   the app both run it as `synctray-sync.sh <configPath>`;
-    /// - an app-launched rclone — named rclone AND a direct child of the app.
+    /// - an app-launched rclone — named rclone, a direct child of the app, AND syncing this
+    ///   profile's local folder (`localSyncPath`, as stored or `~`-expanded).
     /// A script run's rclone is reached as a descendant of its bash, so it never needs to
     /// qualify as a root on its own. Pure.
-    static func isRunRoot(_ entry: ProcessEntry, arguments: String?, appPID: Int32, configPath: String) -> Bool {
+    static func isRunRoot(
+        _ entry: ProcessEntry, arguments: String?, appPID: Int32, configPath: String, localSyncPath: String
+    ) -> Bool {
+        guard let arguments else { return false }
         let executable = (entry.name as NSString).lastPathComponent
         if isRclone(executable) {
+            let expandedLocal = (localSyncPath as NSString).expandingTildeInPath
             return entry.ppid == appPID
+                && !localSyncPath.isEmpty
+                && (arguments.contains(localSyncPath) || arguments.contains(expandedLocal))
         }
         let scriptName = (SyncProfile.sharedScriptPath as NSString).lastPathComponent
-        guard executable == "bash" || executable == scriptName, let arguments else { return false }
+        guard executable == "bash" || executable == scriptName else { return false }
         return arguments.contains(configPath)
+    }
+
+    /// Whether an rclone command line is the sync script's pre-flight reachability probe
+    /// (`rclone lsjson --stat`, `remote_path_reachable`) rather than the sync itself. A probe
+    /// has nothing to shut down gracefully, and SIGINTing it would only make the script read
+    /// the remote as unreachable and switch to its fallback. Pure.
+    static func isPreflightProbe(_ arguments: String?) -> Bool {
+        guard let arguments else { return false }
+        return arguments.contains(" lsjson ")
+    }
+
+    /// The PIDs whose command lines `targets` needs: every root, and each rclone under one
+    /// (to tell the sync from a pre-flight probe). Pure.
+    static func pidsNeedingArguments(roots: [Int32], table: [ProcessEntry]) -> [Int32] {
+        let names = Dictionary(table.map { ($0.pid, $0.name) }, uniquingKeysWith: { first, _ in first })
+        var pids: [Int32] = []
+        for root in roots where !pids.contains(root) {
+            pids.append(root)
+            for pid in descendants(of: root, in: table) where isRclone(names[pid] ?? "") && !pids.contains(pid) {
+                pids.append(pid)
+            }
+        }
+        return pids
     }
 
     /// The processes belonging to a run rooted at `roots` (the live run-lock and session-lock
     /// holders). A root is used only if `table` lists it and `isRunRoot` identifies it
-    /// (`rootArguments` holds each root's command line) — one that already exited, or a
-    /// reused PID now naming something else, is skipped, and so is everything when there is
-    /// no table to check against. The app's own PID — the `/tmp` lock's launch-gap
-    /// placeholder (D4) — and PIDs ≤ 1 are never targets, so an abort can never signal
-    /// SyncTray itself or launchd. Pure.
+    /// (`arguments` holds command lines, see `pidsNeedingArguments`) — one that already
+    /// exited, or a reused PID now naming something else, is skipped, and so is everything
+    /// when there is no table to check against. The app's own PID — the `/tmp` lock's
+    /// launch-gap placeholder (D4) — and PIDs ≤ 1 are never targets, so an abort can never
+    /// signal SyncTray itself or launchd. A pre-flight probe is part of the run but not a
+    /// graceful target. Pure.
     static func targets(
         roots: [Int32], appPID: Int32, table: [ProcessEntry],
-        rootArguments: [Int32: String], configPath: String
+        arguments: [Int32: String], configPath: String, localSyncPath: String
     ) -> Targets {
         let names = Dictionary(table.map { ($0.pid, $0.name) }, uniquingKeysWith: { first, _ in first })
         let entries = Dictionary(table.map { ($0.pid, $0) }, uniquingKeysWith: { first, _ in first })
         let eligibleRoots = roots.filter { root in
             guard root > 1, root != appPID, let entry = entries[root] else { return false }
-            return isRunRoot(entry, arguments: rootArguments[root], appPID: appPID, configPath: configPath)
+            return isRunRoot(entry, arguments: arguments[root], appPID: appPID,
+                             configPath: configPath, localSyncPath: localSyncPath)
         }
         var all: [Int32] = []
         var seen: Set<Int32> = []
@@ -814,7 +847,7 @@ enum SyncAbort {
             for pid in descendants(of: root, in: table) { add(pid) }
             add(root)
         }
-        let rclone = all.filter { isRclone(names[$0] ?? "") }
+        let rclone = all.filter { isRclone(names[$0] ?? "") && !isPreflightProbe(arguments[$0]) }
         return Targets(all: all, rclone: rclone)
     }
 
