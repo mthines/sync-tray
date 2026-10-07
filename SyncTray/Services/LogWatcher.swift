@@ -153,6 +153,14 @@ final class LogWatcher {
         TelemetryService.shared.recordLogWatcherRecovery(reason: "file_replaced", profileName: profileName)
     }
 
+    /// Deliver whatever the log has gained since the last read, right now, instead of waiting
+    /// for the next file event or poll. For a caller about to change how it reads this log's
+    /// lines — an abort finishing — so every line written before that point is handled under
+    /// the old rules first. Main thread only, like the file-event handler it runs.
+    func readPendingLines() {
+        handleFileChange()
+    }
+
     /// Adjust polling frequency based on sync activity
     func setActivelySyncing(_ active: Bool) {
         guard isActivelySyncing != active else { return }

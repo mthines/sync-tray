@@ -91,6 +91,9 @@ struct ProfileDetailView: View {
     // Alert for sync already in progress
     @State private var showingSyncInProgressAlert: Bool = false
 
+    // Confirmation for Force Stop (escalating an abort that is still finishing gracefully)
+    @State private var showingForceStopConfirm: Bool = false
+
     // Setup wizard for reconfiguring the profile
     @State private var showingReconfigureWizard: Bool = false
 
@@ -151,6 +154,10 @@ struct ProfileDetailView: View {
     private var isSyncRunningForProfile: Bool {
         // Local resync started by this view
         if isRunningResync { return true }
+
+        // An abort is still stopping the run: keep Sync Now, Uninstall and Reinstall off and
+        // Force Stop on until it has finished, even if the run's own state already went idle.
+        if syncManager.isAborting(for: profile.id) { return true }
 
         // Real liveness: an exclusive-run registry token, a live /tmp run lock, or
         // a live bisync session lock (R3) — not just the cosmetic `.syncing` state,
@@ -408,7 +415,15 @@ struct ProfileDetailView: View {
         .alert("Sync Already Running", isPresented: $showingSyncInProgressAlert) {
             Button("OK", role: .cancel) {}
         } message: {
-            Text("A sync is already in progress for this profile. Please wait for it to complete before starting another sync.")
+            Text(profile.isMountMode
+                 ? "A sync is already in progress for this profile. Please wait for it to complete before starting another sync."
+                 : "A sync is already in progress for this profile. Wait for it to finish, or press Abort to stop it first.")
+        }
+        .alert("Force Stop This Sync?", isPresented: $showingForceStopConfirm) {
+            Button("Keep Waiting", role: .cancel) {}
+            Button("Force Stop", role: .destructive) { syncManager.forceStopAbort(for: profile) }
+        } message: {
+            Text("rclone is still finishing the files it was transferring, and stops on its own within about a minute and a half. Stopping now cuts those transfers off, and a Two-Way profile's next sync may take longer while it recovers.")
         }
         .sheet(isPresented: $showingReconfigureWizard) {
             SetupWizardView(profileStore: profileStore, editing: profile)
@@ -1169,7 +1184,18 @@ struct ProfileDetailView: View {
         VStack(alignment: .leading, spacing: 12) {
             // Status - check local resync state first, then syncManager state
             HStack {
-                if isRunningResync {
+                if syncManager.isAborting(for: profile.id) {
+                    // Abort in flight — rclone is finishing (graceful) or being stopped.
+                    Label("Stopping…", systemImage: "stop.circle")
+                        .foregroundColor(.orange)
+                    if let abortPhase = syncManager.abortPhases[profile.id] {
+                        Text(abortPhase == .graceful
+                             ? "Finishing files in transfer"
+                             : "Force stopping")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+                } else if isRunningResync {
                     // Local resync in progress (runs directly, not via launchd)
                     Label("Syncing", systemImage: "arrow.triangle.2.circlepath")
                         .foregroundColor(.blue)
@@ -1466,16 +1492,34 @@ struct ProfileDetailView: View {
                     .buttonStyle(.borderedProminent)
                     .disabled(isSyncRunningForProfile || syncManager.isPaused(for: profile.id))
 
-                    // Pause/Resume button
-                    Button(action: {
-                        syncManager.togglePause(for: profile.id)
-                    }) {
-                        Label(
-                            syncManager.isPaused(for: profile.id) ? "Resume" : "Pause",
-                            systemImage: syncManager.isPaused(for: profile.id) ? "play.fill" : "pause.fill"
-                        )
+                    // While a run is live, Pause becomes Abort: stop the run so the settings
+                    // can be changed and the sync restarted. A second press while the abort
+                    // is still finishing in-flight files becomes Force Stop.
+                    if isSyncRunningForProfile {
+                        if syncManager.isAborting(for: profile.id) {
+                            Button(action: { showingForceStopConfirm = true }) {
+                                Label("Force Stop", systemImage: "xmark.octagon")
+                            }
+                            // Only while rclone is finishing gracefully: before a phase is chosen
+                            // there is nothing to force yet, and after it the stop is already forced.
+                            .disabled(syncManager.abortPhases[profile.id] != .graceful)
+                            .help("Stop immediately instead of waiting for rclone to finish the files it is transferring")
+                        } else {
+                            Button(action: { syncManager.abortSync(for: profile) }) {
+                                Label("Abort", systemImage: "stop.fill")
+                            }
+                            .help("Stop this sync. Files already transferred are kept; Sync Now starts it again")
+                        }
+                    } else {
+                        Button(action: {
+                            syncManager.togglePause(for: profile.id)
+                        }) {
+                            Label(
+                                syncManager.isPaused(for: profile.id) ? "Resume" : "Pause",
+                                systemImage: syncManager.isPaused(for: profile.id) ? "play.fill" : "pause.fill"
+                            )
+                        }
                     }
-                    .disabled(isSyncRunningForProfile)
 
                     Button(action: { showingUninstallConfirm = true }) {
                         Label("Uninstall", systemImage: "trash")
@@ -3480,6 +3524,22 @@ struct ProfileDetailView: View {
                         self.syncManager.clearError(for: currentProfile.id)
                         self.syncManager.setSyncing(for: currentProfile.id, isSyncing: false)
                         self.syncManager.refreshSettings()
+                    } else if self.syncManager.isAborting(for: currentProfile.id) {
+                        // `isAborting`, not the time-based `wasRunAborted`: this run's exclusive
+                        // token is still held here, so an abort of THIS run cannot have finished
+                        // yet — while a quick genuine failure of a run restarted soon after an
+                        // abort must still read as a failure.
+                        self.appendOutputLine("")
+                        self.appendOutputLine("■ Sync aborted.")
+
+                        // Loading the agent now would start the aborted sync straight back up
+                        // (RunAtLoad). The next Sync Now loads it instead; a Save reinstalls it.
+                        if loadAgentOnCompletion {
+                            self.syncManager.deferAgentLoadAfterAbort(for: currentProfile.id)
+                            self.appendOutputLine("Scheduled sync starts again with Sync Now or Save.")
+                        }
+
+                        self.syncManager.setSyncing(for: currentProfile.id, isSyncing: false)
                     } else {
                         self.appendOutputLine("")
                         self.appendOutputLine("✗ Resync failed with exit code \(exitCode)")
@@ -4118,7 +4178,10 @@ struct ProfileDetailView: View {
             DispatchQueue.main.async {
                 self.syncManager.endExclusiveRun(runToken)
                 self.appendOutputLine("")
-                self.appendOutputLine(completionMsg)
+                // `isAborting`: this run's abort cannot finish before its token is released
+                // (just above, in this same main-actor block).
+                let aborted = exitCode != 0 && self.syncManager.isAborting(for: currentProfile.id)
+                self.appendOutputLine(aborted ? "■ Force sync aborted" : completionMsg)
                 self.isRunningResync = false
                 self.syncManager.setSyncing(for: currentProfile.id, isSyncing: false)
 
@@ -4356,7 +4419,7 @@ struct ProfileDetailView: View {
 
         // Update state
         appendOutputLine("")
-        appendOutputLine("✓ Sync completed")
+        appendOutputLine(syncManager.wasRunAborted(for: profile.id) ? "■ Sync aborted" : "✓ Sync completed")
 
         isRunningResync = false
         syncManager.setSyncing(for: profile.id, isSyncing: false)

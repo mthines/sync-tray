@@ -665,6 +665,293 @@ enum SyncRunLock {
     }
 }
 
+/// Pure core + thin shell for aborting a profile's in-flight run (CLAUDE.md "Aborting a
+/// running sync"). Decides WHICH processes belong to the run and WHICH signal each phase
+/// sends; `SyncManager.abortSync` owns the timing and the state. Non-isolated, like
+/// `SyncRunLock`, so `ConfigSelfTest` can drive it synchronously.
+///
+/// A run is one of two shapes, and both are found from the profile's two lock files:
+/// - the sync script (launchd schedule, Sync Now, directory watch): the `/tmp` run lock holds
+///   the script's bash PID and rclone runs as its child, piped into `tee`;
+/// - an app-launched rclone (initial sync after install, Fix / Force / Restore, auto-fix):
+///   the `/tmp` run lock holds rclone's own PID.
+/// A bisync run's session `.lck` additionally names the rclone PID in both shapes.
+enum SyncAbort {
+    /// One row of `ps -A -o pid=,ppid=,comm=`.
+    struct ProcessEntry: Equatable {
+        let pid: Int32
+        let ppid: Int32
+        let name: String
+    }
+
+    /// The processes an abort acts on.
+    struct Targets: Equatable {
+        /// Every live process of the run: each root's descendants (deepest first) and then the
+        /// root itself, so an escalating signal reaches children before the shell that waits
+        /// on them.
+        var all: [Int32]
+        /// The rclone processes among `all` — the only ones the graceful phase signals.
+        var rclone: [Int32]
+    }
+
+    /// How far an abort has escalated.
+    enum Phase: Hashable {
+        /// SIGINT to rclone only. rclone bisync treats SIGINT as its "graceful shutdown":
+        /// it finishes or cancels in-flight transfers and makes a best effort to save its
+        /// listings before exiting, so the next run can normally carry on without a resync.
+        /// Nothing else in the run is signalled — killing `tee` would make rclone die of
+        /// SIGPIPE mid-shutdown.
+        case graceful
+        /// SIGTERM to every process of the run (rclone exits immediately, the script's EXIT
+        /// trap releases its lock). Reached from `graceful` after `gracefulTimeout`, or at
+        /// once when the user asks to force-stop.
+        case terminating
+        /// SIGKILL to whatever is still alive `terminateTimeout` after SIGTERM.
+        case killing
+    }
+
+    /// How long the graceful phase may run before escalating on its own. rclone bisync
+    /// gives its own graceful shutdown up to ~90 s (30 s to drain transfers, then 60 s to
+    /// save state), so escalating earlier would cut it off while it writes its listings.
+    static let gracefulTimeout: TimeInterval = 90
+    /// How long SIGTERM gets before SIGKILL.
+    static let terminateTimeout: TimeInterval = 10
+    /// How long after an abort finishes its run's trailing log lines (rclone's own
+    /// "Failed to bisync", the script's "Bisync failed with exit code N") are still treated
+    /// as the aborted run's rather than a real failure. A backstop only: the abort reads the
+    /// log to its end before it finishes, and the next run the app starts clears it early.
+    static let trailingSuppression: TimeInterval = 30
+
+    /// Parse `ps -A -o pid=,ppid=,comm=` output. `comm` can be a full path containing
+    /// spaces, so only the first two fields split on whitespace. Malformed lines are
+    /// skipped. Pure.
+    static func parseProcessTable(_ output: String) -> [ProcessEntry] {
+        var entries: [ProcessEntry] = []
+        for rawLine in output.split(whereSeparator: \.isNewline) {
+            let fields = rawLine.split(maxSplits: 2, omittingEmptySubsequences: true, whereSeparator: { $0 == " " || $0 == "\t" })
+            guard fields.count == 3,
+                  let pid = Int32(fields[0]),
+                  let ppid = Int32(fields[1]) else { continue }
+            let name = String(fields[2]).trimmingCharacters(in: .whitespaces)
+            guard !name.isEmpty else { continue }
+            entries.append(ProcessEntry(pid: pid, ppid: ppid, name: name))
+        }
+        return entries
+    }
+
+    /// Whether a process name is rclone — `comm` is either the bare name or the executable's
+    /// full path (`/opt/homebrew/bin/rclone`); a versioned binary name (`rclone-v1.68`)
+    /// counts too. Pure.
+    static func isRclone(_ name: String) -> Bool {
+        (name as NSString).lastPathComponent.hasPrefix("rclone")
+    }
+
+    /// Every descendant of `root` in `table`, deepest first (a child is listed after its own
+    /// children). Cycle-safe. Does not include `root`. Pure.
+    static func descendants(of root: Int32, in table: [ProcessEntry]) -> [Int32] {
+        var childrenByParent: [Int32: [Int32]] = [:]
+        for entry in table where entry.pid != entry.ppid {
+            childrenByParent[entry.ppid, default: []].append(entry.pid)
+        }
+        var result: [Int32] = []
+        var visited: Set<Int32> = [root]
+        func visit(_ pid: Int32) {
+            for child in childrenByParent[pid] ?? [] where !visited.contains(child) {
+                visited.insert(child)
+                visit(child)
+                result.append(child)
+            }
+        }
+        visit(root)
+        return result
+    }
+
+    /// Whether a lock holder is this profile's run, so an abort may signal it and everything
+    /// under it. A lock file can outlive its run and its PID be reused by an unrelated
+    /// process; the liveness guards treat that conservatively as "running", but an abort
+    /// must never signal a process it cannot identify as the run. So identity, not just name
+    /// (`arguments` is the holder's command line; without it nothing qualifies):
+    /// - the sync script — named `bash` (or, depending on how `ps` reports a `#!` script, the
+    ///   script's own file name) AND started with this profile's derived config: launchd and
+    ///   the app both run it as `synctray-sync.sh <configPath>`;
+    /// - an app-launched rclone — named rclone, a direct child of the app, AND syncing this
+    ///   profile's local folder (`localSyncPath`, as stored or `~`-expanded).
+    /// A script run's rclone is reached as a descendant of its bash, so it never needs to
+    /// qualify as a root on its own. Pure.
+    static func isRunRoot(
+        _ entry: ProcessEntry, arguments: String?, appPID: Int32, configPath: String, localSyncPath: String
+    ) -> Bool {
+        guard let arguments else { return false }
+        let executable = (entry.name as NSString).lastPathComponent
+        if isRclone(executable) {
+            let expandedLocal = (localSyncPath as NSString).expandingTildeInPath
+            return entry.ppid == appPID
+                && !localSyncPath.isEmpty
+                && (arguments.contains(localSyncPath) || arguments.contains(expandedLocal))
+        }
+        let scriptName = (SyncProfile.sharedScriptPath as NSString).lastPathComponent
+        guard executable == "bash" || executable == scriptName else { return false }
+        return arguments.contains(configPath)
+    }
+
+    /// Whether an rclone command line is the sync script's pre-flight reachability probe
+    /// (`rclone lsjson --stat`, `remote_path_reachable`) rather than the sync itself. A probe
+    /// has nothing to shut down gracefully, and SIGINTing it would only make the script read
+    /// the remote as unreachable and switch to its fallback. Pure.
+    static func isPreflightProbe(_ arguments: String?) -> Bool {
+        guard let arguments else { return false }
+        return arguments.contains(" lsjson ")
+    }
+
+    /// The PIDs whose command lines `targets` needs: every root, and each rclone under one
+    /// (to tell the sync from a pre-flight probe). Pure.
+    static func pidsNeedingArguments(roots: [Int32], table: [ProcessEntry]) -> [Int32] {
+        let names = Dictionary(table.map { ($0.pid, $0.name) }, uniquingKeysWith: { first, _ in first })
+        var pids: [Int32] = []
+        for root in roots where !pids.contains(root) {
+            pids.append(root)
+            for pid in descendants(of: root, in: table) where isRclone(names[pid] ?? "") && !pids.contains(pid) {
+                pids.append(pid)
+            }
+        }
+        return pids
+    }
+
+    /// The processes belonging to a run rooted at `roots` (the live run-lock and session-lock
+    /// holders). A root is used only if `table` lists it and `isRunRoot` identifies it
+    /// (`arguments` holds command lines, see `pidsNeedingArguments`) — one that already
+    /// exited, or a reused PID now naming something else, is skipped, and so is everything
+    /// when there is no table to check against. The app's own PID — the `/tmp` lock's
+    /// launch-gap placeholder (D4) — and PIDs ≤ 1 are never targets, so an abort can never
+    /// signal SyncTray itself or launchd. A pre-flight probe is part of the run but not a
+    /// graceful target. Pure.
+    static func targets(
+        roots: [Int32], appPID: Int32, table: [ProcessEntry],
+        arguments: [Int32: String], configPath: String, localSyncPath: String
+    ) -> Targets {
+        let names = Dictionary(table.map { ($0.pid, $0.name) }, uniquingKeysWith: { first, _ in first })
+        let entries = Dictionary(table.map { ($0.pid, $0) }, uniquingKeysWith: { first, _ in first })
+        let eligibleRoots = roots.filter { root in
+            guard root > 1, root != appPID, let entry = entries[root] else { return false }
+            return isRunRoot(entry, arguments: arguments[root], appPID: appPID,
+                             configPath: configPath, localSyncPath: localSyncPath)
+        }
+        var all: [Int32] = []
+        var seen: Set<Int32> = []
+        func add(_ pid: Int32) {
+            guard pid > 1, pid != appPID, names[pid] != nil, !seen.contains(pid) else { return }
+            seen.insert(pid)
+            all.append(pid)
+        }
+        for root in eligibleRoots {
+            for pid in descendants(of: root, in: table) { add(pid) }
+            add(root)
+        }
+        let rclone = all.filter { isRclone(names[$0] ?? "") && !isPreflightProbe(arguments[$0]) }
+        return Targets(all: all, rclone: rclone)
+    }
+
+    /// Where an abort starts: graceful when there is an rclone to shut down, otherwise
+    /// straight to SIGTERM — a script still in its pre-flight checks has nothing to save. Pure.
+    static func initialPhase(for targets: Targets) -> Phase {
+        targets.rclone.isEmpty ? .terminating : .graceful
+    }
+
+    /// The next phase given how long the current one has run and whether the user asked to
+    /// force-stop. Never de-escalates. Pure.
+    static func nextPhase(current: Phase, elapsedInPhase: TimeInterval, forceRequested: Bool) -> Phase {
+        switch current {
+        case .graceful:
+            return (forceRequested || elapsedInPhase >= gracefulTimeout) ? .terminating : .graceful
+        case .terminating:
+            return elapsedInPhase >= terminateTimeout ? .killing : .terminating
+        case .killing:
+            return .killing
+        }
+    }
+
+    /// The signal a phase sends. Pure.
+    static func signal(for phase: Phase) -> Int32 {
+        switch phase {
+        case .graceful: return SIGINT
+        case .terminating: return SIGTERM
+        case .killing: return SIGKILL
+        }
+    }
+
+    /// The PIDs a phase signals: rclone only while graceful; after that every process of the
+    /// run, plus `orphans` — processes seen in the run earlier that are no longer under a
+    /// root (their shell already died), which would otherwise outlive the abort. Pure.
+    static func signalTargets(for phase: Phase, in targets: Targets, orphans: [Int32] = []) -> [Int32] {
+        guard phase != .graceful else { return targets.rclone }
+        var pids = targets.all
+        for pid in orphans where !pids.contains(pid) {
+            pids.append(pid)
+        }
+        return pids
+    }
+
+    /// Whether an abort is done.
+    enum Completion: Equatable {
+        case waiting
+        /// Done; SIGTERM these leftovers on the way out.
+        case finished(releasing: [Int32])
+    }
+
+    /// Whether an abort has finished. The run has ended once no lock holder is live
+    /// (`runLive` false). Processes still tracked after that are the run's orphans — a
+    /// timeout watchdog's `sleep`, a `tee` — that hold no lock and sync nothing, so they are
+    /// released with SIGTERM instead of being waited for. A leftover rclone still syncs: the
+    /// abort carries on (and escalates) until it is gone. `liveTracked` maps PID → name. Pure.
+    static func completion(runLive: Bool, liveTracked: [Int32: String]) -> Completion {
+        guard !runLive, !liveTracked.values.contains(where: { isRclone($0) }) else { return .waiting }
+        return .finished(releasing: liveTracked.keys.sorted())
+    }
+
+    /// Whether a run-end log event (`.syncFailed`, `.errorMessage`) belongs to an aborted run
+    /// and must not surface as a failure: an abort is still in flight, or it finished less
+    /// than `trailingSuppression` ago (`suppressUntil`). Pure.
+    static func suppressesRunEnd(abortInFlight: Bool, suppressUntil: Date?, now: Date) -> Bool {
+        if abortInFlight { return true }
+        guard let suppressUntil else { return false }
+        return now < suppressUntil
+    }
+
+    /// Read the process table — the impure shell. Blocking (it runs `ps`), so call it off
+    /// the main actor. An empty table on failure makes `targets` signal nothing.
+    static func readProcessTable() -> [ProcessEntry] {
+        parseProcessTable(runPS(["-A", "-ww", "-o", "pid=,ppid=,comm="]) ?? "")
+    }
+
+    /// One process's full command line, or nil if it is gone or `ps` failed. Blocking.
+    static func readArguments(of pid: Int32) -> String? {
+        guard let output = runPS(["-ww", "-o", "args=", "-p", String(pid)]) else { return nil }
+        let arguments = output.trimmingCharacters(in: .whitespacesAndNewlines)
+        return arguments.isEmpty ? nil : arguments
+    }
+
+    /// Run `/bin/ps` and return its stdout, or nil when it fails. Reads stdout to EOF BEFORE
+    /// waiting for exit: `ps -A` output can exceed the pipe buffer, and waiting first would
+    /// deadlock. `-ww`: never truncate to a terminal width.
+    private static func runPS(_ arguments: [String]) -> String? {
+        let process = Process()
+        let pipe = Pipe()
+        process.executableURL = URL(fileURLWithPath: "/bin/ps")
+        process.arguments = arguments
+        process.standardOutput = pipe
+        process.standardError = FileHandle.nullDevice
+        do {
+            try process.run()
+        } catch {
+            return nil
+        }
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        guard process.terminationStatus == 0 else { return nil }
+        return String(decoding: data, as: UTF8.self)
+    }
+}
+
 extension SyncSetupService {
     /// Update just the profile config (without reinstalling the script)
     func updateConfig(for profile: SyncProfile) throws {
