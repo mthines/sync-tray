@@ -189,7 +189,7 @@ auth: `curl -u synctray:$(cat ~/.local/state/synctray/rc/<rc-port>.auth) -X POST
 localhost:<rc-port>/core/stats`, same for pprof), or in Dash0 via
 `synctray.mount.cached_read.throughput` grouped by `cache.fs_type` (the heartbeat's
 read-health probe, `SyncManager.probeMountReadHealth`, AC-RH1). User-facing
-guidance lives in README → Troubleshooting → "Mount mode: Slow file access".
+guidance lives in `docs/troubleshooting.md` → "Streaming is slow for files that are already cached".
 
 The **macFUSE** backend additionally requires the official rclone binary
 (Homebrew's rclone can't mount):
@@ -1234,7 +1234,7 @@ DirectoryWatcher receives FSEvents callback
         ↓
 Filters out metadata files (.DS_Store, ._*, .tmp, etc.)
         ↓
-Debounces rapid changes (15 second window)
+Debounces rapid changes (5 second window, set in SyncManager)
         ↓
 SyncManager.triggerManualSync() called
         ↓

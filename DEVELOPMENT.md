@@ -40,11 +40,16 @@ To exercise the extension:
 
 1. In Xcode set your **Team** on both the `SyncTray` and `SyncTrayFinderSync` targets
    (Signing & Capabilities → Automatically manage signing); confirm both carry the
-   `group.com.synctray.app` App Group.
+   `7HVK85DZG7.group.com.synctray.app` App Group.
 2. Build & run (⌘R), then enable it under System Settings → General → Login Items &
    Extensions → Extensions → **SyncTray Offline**.
 3. Mount a Stream profile and right-click a folder **inside the mount** →
-   **SyncTray ▸ Available Offline**. Verify with `pluginkit -m -i com.synctray.app.findersync`.
+   **SyncTray ▸ Available Offline**. Verify with `pluginkit -m -i com.synctray.app.dev.findersync`.
+
+Debug builds use `.dev` bundle ids (`com.synctray.app.dev` and `com.synctray.app.dev.findersync`,
+via `BUNDLE_ID_SUFFIX` in `Config/Signing.xcconfig`), so a dev build never takes over the
+Finder registration of an installed release. If you enable both extensions, Finder shows two
+"SyncTray" submenus — disable one while you iterate.
 4. **After every rebuild, run `killall Finder`** so it reloads the extension.
 
 `scripts/dev.sh` (`nx run synctray:dev`) tries a signed build first (extension loads
@@ -56,14 +61,68 @@ Shipping the extension to users (Developer ID signing + notarization) is covered
 
 ```
 SyncTray/
+├── CLI/              # The headless `synctray` command and its ~/.local/bin shim
 ├── Models/           # Data models and state types
 ├── Services/         # Business logic and background services
 ├── Views/            # SwiftUI views
-├── Assets.xcassets/  # App icons and images
+├── Resources/Schemas # JSON Schemas for the files in ~/.config/synctray/
 └── SyncTrayApp.swift # App entry point and AppDelegate
+SyncTrayFinderSync/   # Finder "Available Offline" extension
+FileProviderExtension/ # Design scaffolding only — not part of the build
 ```
 
-See [CLAUDE.md](CLAUDE.md) for full architecture documentation.
+The main pieces:
+
+| Component             | Role                                                                    |
+| --------------------- | ----------------------------------------------------------------------- |
+| `SyncManager`         | Orchestrates every profile's state, watchers, mounts, and runs          |
+| `ProfileStore`        | Reads and writes the authoritative `~/.config/synctray/profiles/*.profile.json` |
+| `ConfigFileWatcher`   | Applies external edits to the config folder live                        |
+| `SyncSetupService`    | Generates the shared sync script and launchd plists; installs agents    |
+| `LogWatcher` / `LogParser` | Follow and parse each profile's rclone JSON log                    |
+| `VFSCacheService`     | Stream cache, offline-folder warming, and the rclone RC API            |
+| `OverlaySyncService`  | Uploads files created or edited in Cache Only                           |
+| `SyncTrayCLI`         | The `synctray` command                                                  |
+| `TelemetryService`    | Opt-in OpenTelemetry traces, metrics, and logs                          |
+
+See [CLAUDE.md](CLAUDE.md) for the full architecture and the rules that keep it safe.
+
+## Testing
+
+SyncTray has no XCTest target. The `#if DEBUG` self-test suite in
+`SyncTray/Services/ConfigSelfTest.swift` is the test suite, and CI runs it on every PR:
+
+```bash
+xcodebuild -scheme SyncTray -configuration Debug -destination 'platform=macOS' \
+    -derivedDataPath build CODE_SIGNING_ALLOWED=NO build
+build/Build/Products/Debug/SyncTray.app/Contents/MacOS/SyncTray --self-test
+```
+
+It exits non-zero on any failed assertion. Don't run two self-tests at once: they share a
+temporary directory and fail each other at random.
+
+`scripts/check-schema-in-sync.sh` checks that the JSON Schemas still match `SyncProfile`'s
+fields. Run it after adding or renaming a profile field; CI runs it too.
+
+## Commit convention and releases
+
+Commits and PR titles follow [Conventional Commits](https://www.conventionalcommits.org/),
+and the prefix decides the next version:
+
+| Prefix   | Version bump  | Example                        |
+| -------- | ------------- | ------------------------------ |
+| `feat:`  | Minor (0.X.0) | `feat: add dark mode support`  |
+| `fix:`   | Patch (0.0.X) | `fix: resolve crash on launch` |
+| `feat!:` | Major (X.0.0) | `feat!: redesign settings API` |
+
+Other prefixes (`docs:`, `chore:`, `ci:`, …) don't release.
+
+- **Stable releases** are published by CI: merging a `feat:` or `fix:` PR to `main` bumps the
+  version, builds, signs, notarizes, publishes the GitHub release, and updates the Homebrew
+  tap (`scripts/release-ci.sh`). A local `scripts/release.sh` run refuses, because it can't
+  notarize — see [`docs/release-signing.md`](docs/release-signing.md).
+- **Betas** are published on demand: an authorized `/beta` comment on an open PR builds and
+  publishes a beta of that PR, installable as the `synctray-beta` cask.
 
 ## OpenTelemetry (Telemetry)
 
@@ -193,39 +252,38 @@ OTEL_EXPORTER_OTLP_HEADERS=Authorization=Bearer unused
 
 ### What's Collected
 
-**No personal data is collected.** No file paths, profile names, remote names, or account info.
+The in-app **Privacy & Telemetry** sheet (`TelemetryDetailsSheet.swift`) is the user-facing
+promise, and the code must stay inside it:
 
-#### Metrics (exported every 60 seconds)
+- **Collected:** sync results and durations, error *categories* (never the raw message), sync
+  modes and settings in use, trigger counts, launches and profile counts, and the display
+  names users give their profiles.
+- **Never collected:** file or folder names, file contents, remote names, hostnames, server
+  addresses, credentials, error message text, IP addresses, or account details. File
+  operations are recorded by normalized extension only.
 
-| Metric                         | Type          | Description                         |
-| ------------------------------ | ------------- | ----------------------------------- |
-| `synctray.sync.duration`       | Histogram     | Sync operation duration (seconds)   |
-| `synctray.sync.completed`      | Counter       | Number of completed sync operations |
-| `synctray.sync.files_changed`  | Counter       | Number of files changed during sync |
-| `synctray.app.profiles.active` | UpDownCounter | Number of active sync profiles      |
-| `synctray.app.launch`          | Counter       | Number of app launches              |
+All three signals are exported over OTLP/HTTP. Metrics use delta temporality and export every
+30 seconds. There are more than 50 instruments, covering sync runs, mounts, offline warming,
+Cache Only uploads, cache moves, recovery actions, the CLI, and the setup wizard;
+`TelemetryService.swift` is the inventory, and
+[`.claude/rules/telemetry.md`](.claude/rules/telemetry.md) explains how to add more.
 
-All sync metrics include `sync.mode` (bisync/sync/mount) and `sync.result` (success/failure) attributes.
+#### Resource attributes
 
-#### Traces
+| Attribute                     | Value                                                                        |
+| ----------------------------- | ---------------------------------------------------------------------------- |
+| `service.name`                | `synctray` (`OTEL_SERVICE_NAME`)                                             |
+| `service.namespace`           | `synctray`                                                                   |
+| `service.version`             | `<marketing>+<build>.g<gitSHA>`, for example `0.34.0+1.gabc1234`             |
+| `service.instance.id`         | Random UUID per install                                                      |
+| `enduser.id`                  | HMAC-SHA256 of the hardware UUID — stable across reinstalls, not reversible  |
+| `deployment.environment.name` | `development` (Debug) or `production` (Release); overridable                 |
+| `vcs.repository.url.full`     | The `origin` URL the binary was built from, credentials stripped            |
+| `vcs.ref.head.revision`       | The full commit SHA the binary was built from                                |
+| `host.arch`                   | `arm64` or `amd64`                                                           |
+| `os.type` / `os.version`      | `darwin` and the macOS version                                               |
 
-| Span           | Kind     | Attributes                                       |
-| -------------- | -------- | ------------------------------------------------ |
-| `sync.execute` | INTERNAL | `sync.mode`, `sync.result`, `sync.files_changed` |
-
-#### Resource Attributes
-
-Every signal includes these resource attributes (overridable via `OTEL_RESOURCE_ATTRIBUTES`):
-
-| Attribute                     | Default              | Source                             |
-| ----------------------------- | -------------------- | ---------------------------------- |
-| `service.name`                | `synctray`           | `OTEL_SERVICE_NAME` env var        |
-| `service.namespace`           | `synctray`           | Hardcoded                          |
-| `service.version`             | App bundle version   | `CFBundleShortVersionString`       |
-| `service.instance.id`         | Random UUID          | Generated on first opt-in          |
-| `deployment.environment.name` | —                    | `OTEL_RESOURCE_ATTRIBUTES` env var |
-| `os.type`                     | `darwin`             | Hardcoded                          |
-| `os.version`                  | macOS version string | `ProcessInfo`                      |
+Any of these can be overridden or extended with `OTEL_RESOURCE_ATTRIBUTES`.
 
 ### Dependencies
 
@@ -240,12 +298,15 @@ The telemetry feature uses [opentelemetry-swift](https://github.com/open-telemet
 | File                                     | Role                                                                         |
 | ---------------------------------------- | ---------------------------------------------------------------------------- |
 | `Services/TelemetryService.swift`        | Singleton that configures OTel SDK, creates instruments, and records signals |
-| `Models/Settings.swift`                  | `telemetryEnabled` and `installationId` in UserDefaults                      |
+| `Models/Settings.swift`                  | `telemetryEnabled`, `installationId`, and `anonymousUserId`                  |
 | `SyncTrayApp.swift`                      | Calls `configure()` at launch, `shutdown()` at termination                   |
-| `Services/SyncManager.swift`             | Records sync completions and profile counts                                  |
-| `Views/Settings/ProfileDetailView.swift` | UI toggle for opting in/out                                                  |
+| `Services/SyncManager.swift`             | Records most sync, mount, and recovery events                                |
+| `Views/AppSettingsView.swift`            | The **Share usage data** toggle                                              |
+| `Views/Settings/TelemetryOptInBanner.swift`, `TelemetryDetailsSheet.swift` | Opt-in banner and the privacy disclosure     |
 
 ## Debugging
+
+Start with `synctray doctor` and `synctray status` — see [docs/cli.md](docs/cli.md).
 
 ### Enable Debug Logging
 
