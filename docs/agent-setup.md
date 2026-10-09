@@ -14,7 +14,7 @@ This guide walks through a full setup, from an empty Mac to a running sync, the 
    ```
 
 2. **Launch SyncTray once.** That writes the `synctray` CLI to `~/.local/bin/` and the JSON Schemas to `~/.config/synctray/schema/`.
-3. **Put `~/.local/bin` on your `PATH`** so the agent can run `synctray`:
+3. **Optional: put `~/.local/bin` on your `PATH`**, so you and your agent can type `synctray` instead of the full path:
 
    ```bash
    echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc
@@ -24,7 +24,25 @@ After that, the menu bar app doesn't need to be open — the CLI works on its ow
 
 ## Hand it to your agent
 
-Paste this, with your own goal filled in:
+A short request is enough:
+
+```text
+Set up SyncTray to two-way sync ~/Projects with the Projects folder on my NAS.
+Use rclone and the synctray CLI (in ~/.local/bin), and show me the profile before you turn it on.
+```
+
+The agent finds the commands with `synctray help`, connects the remote in rclone if it's missing, writes the profile, and enables it once you approve.
+
+Some other requests to try:
+
+- "Back up `~/Pictures/Export` to my `b2` bucket every hour, one way."
+- "Stream my NAS `Media` share to `~/NAS/Media` and keep the `Current Projects` folder available offline."
+- "My `Projects` sync keeps failing — find out why and fix it."
+- "Stop syncing `node_modules` folders in every profile."
+
+### A step-by-step prompt, for more control
+
+This version pins down every step the agent takes, including where credentials go:
 
 ```text
 Set up SyncTray for me using its `synctray` CLI (in ~/.local/bin).
@@ -32,21 +50,15 @@ Set up SyncTray for me using its `synctray` CLI (in ~/.local/bin).
 Goal: <two-way sync /Users/me/Projects with the "Projects" folder on my "nas" rclone remote>
 
 - Start with `synctray help`, `synctray doctor`, and `rclone listremotes`.
-- If the remote I need doesn't exist yet, walk me through `rclone config`.
-  Credentials only ever live in rclone's config, never in SyncTray's files.
+- If the remote I need doesn't exist yet, set it up with rclone and ask me for
+  anything only I can provide. Credentials only ever live in rclone's config,
+  never in SyncTray's files.
 - Write the profile against ~/.config/synctray/schema/profile.schema.json,
   with a fresh `uuidgen` id, absolute paths, and "isEnabled": false.
 - Create it with `synctray profile create --from <file>`, show me
   `synctray profile show <name>`, and wait for my OK.
 - Then run `synctray profile enable <name>` and confirm with `synctray status <name>`.
 ```
-
-Some goals to try:
-
-- "Back up `~/Pictures/Export` to my `b2` bucket every hour, one way."
-- "Stream my NAS `Media` share to `~/NAS/Media` and keep the `Current Projects` folder available offline."
-- "My `Projects` sync keeps failing — find out why and fix it."
-- "Stop syncing `node_modules` folders in every profile."
 
 ## What the agent does, step by step
 
@@ -65,7 +77,14 @@ rclone listremotes     # which remotes exist
 ### 2. Make sure the remote exists
 
 SyncTray syncs through rclone remotes; it doesn't store credentials itself.
-If the remote is missing, create it with `rclone config` — interactively, or with `rclone config create` for a scripted setup.
+If the remote is missing, the agent can create it with `rclone config create`, for example an SFTP remote that signs in with your SSH key:
+
+```bash
+rclone config create nas sftp host=nas.local user=me key_file=~/.ssh/id_ed25519
+```
+
+For Google Drive, Dropbox, and OneDrive, rclone signs you in through your browser.
+If you'd rather not hand a password to the agent, run `rclone config` yourself and let the agent take it from there.
 See [rclone's docs](https://rclone.org/docs/) for each provider's options.
 
 Then confirm rclone can reach the folder:

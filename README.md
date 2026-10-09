@@ -44,49 +44,18 @@ SyncTray turns it into the Mac sync client you'd expect, pointed at storage you 
 
 ## Let your agent set it up
 
-SyncTray's whole configuration is a folder of JSON files, and the app's actions have CLI commands.
-That means Claude Code, Codex, Cursor, or any agent with a terminal can create, check, and fix your sync setup for you 🤖
-
-Launch SyncTray once (that installs the `synctray` CLI and the config schema), add `~/.local/bin` to your `PATH`, then paste this into your agent:
+Claude Code, Codex, Cursor — any agent with a terminal can set up rclone and SyncTray for you 🤖
+Install SyncTray, launch it once, and ask:
 
 ```text
-Set up SyncTray for me using its `synctray` CLI (in ~/.local/bin).
-
-Goal: <two-way sync /Users/me/Projects with the "Projects" folder on my "nas" rclone remote>
-
-- Start with `synctray help`, `synctray doctor`, and `rclone listremotes`.
-- If the remote I need doesn't exist yet, walk me through `rclone config`.
-  Credentials only ever live in rclone's config, never in SyncTray's files.
-- Write the profile against ~/.config/synctray/schema/profile.schema.json,
-  with a fresh `uuidgen` id, absolute paths, and "isEnabled": false.
-- Create it with `synctray profile create --from <file>`, show me
-  `synctray profile show <name>`, and wait for my OK.
-- Then run `synctray profile enable <name>` and confirm with `synctray status <name>`.
+Set up SyncTray to two-way sync ~/Projects with the Projects folder on my NAS.
+Use rclone and the synctray CLI (in ~/.local/bin), and show me the profile before you turn it on.
 ```
 
-Here's what that looks like from the terminal:
+If the NAS isn't connected in rclone yet, the agent does that too.
+You step in only to sign in, type a password, or approve the profile.
 
-```console
-$ synctray profile create --from projects.profile.json
-created Projects (6f1c2b9e) — not installed (disabled or incomplete)
-
-$ synctray profile enable Projects
-enabled Projects (6f1c2b9e)
-
-$ synctray status Projects
-Projects  6f1c2b9e  enabled=true  agent=loaded  running=true  last=started  state=syncing
-```
-
-What makes this safe to hand to an agent:
-
-- **Live-applied files.** Edit or drop a `*.profile.json` in `~/.config/synctray/profiles/` and the running app applies it within about a second — no restart, no UI.
-- **Five required keys.** `id`, `name`, `rcloneRemote`, `remotePath`, and `localSyncPath`. Everything else has a default.
-- **Stage, then enable.** A profile created with `"isEnabled": false` is saved but not scheduled, so you can review it before anything syncs.
-- **Machine-readable answers.** `status --json`, `offline status --json`, `profile show`, and a one-word `state=` field to branch on. Bad input exits `65` with the decode error and writes nothing.
-- **No credentials in the config.** Secrets stay in rclone's own config file.
-- **Headless.** The CLI works whether or not the menu bar app is running.
-
-→ [Agent setup guide](docs/agent-setup.md) · [CLI reference](docs/cli.md) · [Configuration files](docs/configuration.md)
+→ [Agent setup guide](docs/agent-setup.md): what the agent does step by step, a more detailed prompt, and rules to give it.
 
 ## Three ways to sync
 
