@@ -15,7 +15,8 @@ synctray help
 ```
 
 The shim runs the CLI built into `SyncTray.app`, so it stays in step with the installed app version.
-The CLI never opens a window or starts background work, and every command runs whether or not the menu bar app is open.
+The CLI never opens a window or starts the app's own watchers and timers — the syncs and mounts it installs run under launchd.
+Every command runs whether or not the menu bar app is open.
 
 ## Targeting a profile
 
