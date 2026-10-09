@@ -316,6 +316,8 @@ enum SyncTrayCLI {
     /// `telemetry` itself. Defaults to No; Ctrl-C leaves it unanswered.
     static func promptForTelemetryIfNeeded(_ argv: [String], env: CLIEnvironment) {
         guard let first = argv.first, !["help", "-h", "--help", "telemetry"].contains(first) else { return }
+        // A command that doesn't parse only prints a usage error — no point asking.
+        guard case .success = parse(argv) else { return }
         let state = env.telemetryConsent()
         guard !state.enabled, !state.answered, env.isInteractiveTerminal() else { return }
 

@@ -3550,6 +3550,7 @@ enum ConfigSelfTest {
             (["status"], TelemetryConsentState(enabled: true, answered: true), true),   // already on
             (["help"], unanswered, true),
             (["telemetry", "on"], unanswered, true),
+            (["stauts"], unanswered, true),                                     // typo: usage error only
         ]
         for (argv, state, interactive) in silent {
             let r = prompt(argv, state: state, interactive: interactive, answer: "y")
