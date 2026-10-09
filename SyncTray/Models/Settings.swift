@@ -84,6 +84,10 @@ struct SyncTraySettings {
         return uuid
     }
 
+    /// The one-line description of what telemetry shares, shown by the app's opt-in
+    /// banner and the CLI's first-run question, so the two always say the same thing.
+    static let telemetryConsentSummary = "Usage data — sync results, error types, feature usage, profile names. No file names, remote names, or credentials."
+
     /// The current consent banner version. Bump this to re-show the banner to all users,
     /// even those who previously dismissed it. Independent of the app version.
     static let currentTelemetryConsentVersion = 1

@@ -1,4 +1,5 @@
 import Foundation
+import ServiceManagement
 
 /// Where `profile create` reads the profile JSON from.
 enum CreateSource: Equatable {
@@ -20,6 +21,19 @@ struct StatusWait: Equatable {
     let timeout: TimeInterval
 }
 
+/// The shared telemetry opt-in as the CLI sees it: `answered` is true once the user
+/// has said yes or no in the app (banner, wizard) or the CLI, for the current
+/// consent version.
+struct TelemetryConsentState: Equatable {
+    let enabled: Bool
+    let answered: Bool
+}
+
+enum TelemetryAction: Equatable {
+    case status(json: Bool)
+    case set(enabled: Bool)
+}
+
 /// Parsed CLI subcommand — the pure, testable result of `SyncTrayCLI.parse`.
 enum CLICommand: Equatable {
     case doctor
@@ -27,6 +41,7 @@ enum CLICommand: Equatable {
     case logs(target: String, follow: Bool)
     case listRemotes
     case remoteFolders(target: String, json: Bool)
+    case telemetry(TelemetryAction)
     case profiles
     case status(target: String?, json: Bool, wait: StatusWait?)
     case offlineStatus(target: String?, json: Bool)
@@ -162,6 +177,17 @@ struct CLIEnvironment {
     /// Whether rclone.conf sets `no_check_certificate = true` for this remote,
     /// so `remote folders` lists with the same flags the app's folder chooser uses.
     var remoteSkipsCertCheck: (_ remoteName: String) -> Bool
+    /// The shared telemetry opt-in (`SyncTraySettings`, the same store the app reads).
+    var telemetryConsent: () -> TelemetryConsentState
+    /// Record the user's telemetry answer in every place the app reads it — the
+    /// setting, the consent version (so the app's banner doesn't ask again) and
+    /// `settings.json` (so a running app applies it live).
+    var setTelemetryEnabled: (Bool) -> Void
+    /// Whether a person is at the keyboard: stdin and stderr are terminals and `CI`
+    /// is unset. The first-run telemetry question is only ever asked then.
+    var isInteractiveTerminal: () -> Bool
+    /// Read one line of the user's answer. `nil` on end of input.
+    var readLine: () -> String?
     /// Pause between polls in `status --wait` / `mount`. Injected so the
     /// self-test's wait loops run instantly.
     var sleep: (TimeInterval) -> Void
@@ -202,6 +228,8 @@ enum SyncTrayCLI {
       listremotes                  List configured rclone remotes
       remote folders <remote>[:path] [--json]
                                    List the folders the app's folder chooser shows for a remote
+      telemetry [status|on|off] [--json]
+                                   Show or change usage-data sharing (shared with the app)
 
     Configure:
       profile create --from <file> Create a profile from a .profile.json file
@@ -259,6 +287,7 @@ enum SyncTrayCLI {
             return nil                                          // other flags → GUI/self-test path
         }
         // `-`-prefixed `-h`/`--help`, or any bare token, IS a subcommand.
+        TelemetryService.processKind = "cli"
         return runMeasured(argv, env: .production())
     }
 
@@ -268,6 +297,7 @@ enum SyncTrayCLI {
     /// touches `TelemetryService`. Telemetry is gated on the user's opt-in, so
     /// this is a no-op — no setup, no network, no stdout — when disabled.
     private static func runMeasured(_ argv: [String], env: CLIEnvironment) -> Int32 {
+        promptForTelemetryIfNeeded(argv, env: env)
         let start = env.now()
         let code = execute(argv, env: env)
         let elapsed = env.now().timeIntervalSince(start)
@@ -278,6 +308,29 @@ enum SyncTrayCLI {
         )
         TelemetryService.shared.flushForExit()
         return code
+    }
+
+    /// The CLI's first-run telemetry question — the same consent the app's banner
+    /// asks for, recorded in the same place. Asked at most once (until the consent
+    /// version is bumped), only when a person is at a terminal, never for `help` or
+    /// `telemetry` itself. Defaults to No; Ctrl-C leaves it unanswered.
+    static func promptForTelemetryIfNeeded(_ argv: [String], env: CLIEnvironment) {
+        guard let first = argv.first, !["help", "-h", "--help", "telemetry"].contains(first) else { return }
+        let state = env.telemetryConsent()
+        guard !state.enabled, !state.answered, env.isInteractiveTerminal() else { return }
+
+        env.stderr("""
+        Help improve SyncTray by sharing usage data?
+          \(SyncTraySettings.telemetryConsentSummary)
+          The SyncTray app uses the same setting. Change it any time: synctray telemetry on|off
+
+        """ + "Share usage data? [y/N] ")
+        let answer = env.readLine()?.trimmingCharacters(in: .whitespaces).lowercased()
+        let enabled = answer == "y" || answer == "yes"
+        env.setTelemetryEnabled(enabled)
+        env.stderr(enabled
+            ? "Usage data is on. Thank you!\n\n"
+            : "\(answer == nil ? "\n" : "")Usage data stays off.\n\n")
     }
 
     /// Map an argv to a BOUNDED command verb for telemetry — never args, paths,
@@ -298,6 +351,10 @@ enum SyncTrayCLI {
         if first == "cache" {
             let sub = argv.dropFirst().first(where: { !$0.hasPrefix("-") }) ?? ""
             return sub == "move" ? "cache-move" : "(other)"
+        }
+        if first == "telemetry" {
+            let sub = argv.dropFirst().first(where: { !$0.hasPrefix("-") }) ?? "status"
+            return ["status", "on", "off"].contains(sub) ? "telemetry-\(sub)" : "(other)"
         }
         if first == "remote" {
             let sub = argv.dropFirst().first(where: { !$0.hasPrefix("-") }) ?? ""
@@ -337,6 +394,21 @@ enum SyncTrayCLI {
 
         case "listremotes":
             return .success(.listRemotes)
+
+        case "telemetry":
+            let flags = parseFlags(rest, valueFlags: [])
+            switch flags.positionals.first {
+            case nil, "status":
+                guard flags.positionals.count <= 1 else { break }
+                return .success(.telemetry(.status(json: rest.contains("--json"))))
+            case "on" where flags.positionals.count == 1:
+                return .success(.telemetry(.set(enabled: true)))
+            case "off" where flags.positionals.count == 1:
+                return .success(.telemetry(.set(enabled: false)))
+            default:
+                break
+            }
+            return .failure(CLIUsageError(message: "usage: synctray telemetry [status|on|off] [--json]"))
 
         case "remote":
             let flags = parseFlags(rest, valueFlags: [])
@@ -561,6 +633,8 @@ enum SyncTrayCLI {
             return runListRemotes(env: env)
         case .remoteFolders(let target, let json):
             return runRemoteFolders(target, json: json, env: env)
+        case .telemetry(let action):
+            return runTelemetry(action, env: env)
         case .profiles:
             return runProfiles(env: env)
         case .status(let target, let json, let wait):
@@ -774,6 +848,26 @@ enum SyncTrayCLI {
             env.stdout(String(decoding: data, as: UTF8.self) + "\n")
         } else {
             for folder in folders { env.stdout(folder + "\n") }
+        }
+        return 0
+    }
+
+    // MARK: - telemetry
+
+    private static func runTelemetry(_ action: TelemetryAction, env: CLIEnvironment) -> Int32 {
+        switch action {
+        case .status(let json):
+            let state = env.telemetryConsent()
+            if json {
+                env.stdout("{\"asked\":\(state.answered),\"enabled\":\(state.enabled)}\n")
+            } else if state.enabled {
+                env.stdout("Usage data: on. Turn it off with: synctray telemetry off\n")
+            } else {
+                env.stdout("Usage data: off\(state.answered ? "" : " (not asked yet)"). Turn it on with: synctray telemetry on\n")
+            }
+        case .set(let enabled):
+            env.setTelemetryEnabled(enabled)
+            env.stdout("Usage data: \(enabled ? "on" : "off"). The SyncTray app uses the same setting.\n")
         }
         return 0
     }
@@ -1719,11 +1813,43 @@ extension CLIEnvironment {
             remoteSkipsCertCheck: { name in
                 RcloneConfigService.shared.readRemoteConfig(name: name)?.values["no_check_certificate"] == "true"
             },
+            telemetryConsent: {
+                TelemetryConsentState(
+                    enabled: SyncTraySettings.telemetryEnabled,
+                    answered: SyncTraySettings.telemetryBannerDismissed
+                )
+            },
+            setTelemetryEnabled: { enabled in CLIEnvironment.setTelemetryEnabledProcess(enabled) },
+            isInteractiveTerminal: {
+                isatty(STDIN_FILENO) == 1 && isatty(STDERR_FILENO) == 1
+                    && (ProcessInfo.processInfo.environment["CI"] ?? "").isEmpty
+            },
+            readLine: { Swift.readLine() },
             sleep: { Thread.sleep(forTimeInterval: $0) },
             stdout: { FileHandle.standardOutput.write(Data($0.utf8)) },
             stderr: { FileHandle.standardError.write(Data($0.utf8)) },
             now: { Date() }
         )
+    }
+
+    /// Real implementation of `setTelemetryEnabled`: the same writes the app's
+    /// toggle and banner make, plus `settings.json` so a running app applies it live.
+    /// The opt-out event is sent before telemetry goes off, as the app does.
+    fileprivate static func setTelemetryEnabledProcess(_ enabled: Bool) {
+        if !enabled, SyncTraySettings.telemetryEnabled {
+            TelemetryService.shared.recordSettingChanged(name: "telemetry", enabled: false)
+            TelemetryService.shared.flushForExit()
+        }
+        let changed = SyncTraySettings.telemetryEnabled != enabled
+        SyncTraySettings.telemetryEnabled = enabled
+        SyncTraySettings.telemetryBannerDismissedVersion = SyncTraySettings.currentTelemetryConsentVersion
+        AppSettingsFileStore.updateSettingsFile(
+            .telemetryEnabled, to: enabled,
+            isLoginItemEnabled: SMAppService.mainApp.status == .enabled
+        )
+        if enabled, changed {
+            TelemetryService.shared.recordSettingChanged(name: "telemetry", enabled: true)
+        }
     }
 
     /// Real implementation of `probeMount`. The process check matches `ps` output

@@ -119,6 +119,7 @@ enum ConfigSelfTest {
             testMountModeFileNotInSharedTmp,
             testRemoteFolderListingKeepsSpaces,
             testCLIRemoteFolders,
+            testCLITelemetryConsent,
             testCacheOnlyUnionConfig,
             testCacheOnlyUnionBehaviour,
             testMountModeSelection,
@@ -1479,6 +1480,10 @@ enum ConfigSelfTest {
             VFSCacheService.WarmEstimate(files: 0, bytes: 0, cachedFiles: 0, cachedBytes: 0)
         },
         remoteSkipsCertCheck: @escaping (String) -> Bool = { _ in false },
+        telemetryConsent: @escaping () -> TelemetryConsentState = { TelemetryConsentState(enabled: false, answered: true) },
+        setTelemetryEnabled: @escaping (Bool) -> Void = { _ in },
+        isInteractiveTerminal: @escaping () -> Bool = { false },
+        readLine: @escaping () -> String? = { nil },
         sleep: @escaping (TimeInterval) -> Void = { _ in },
         stdout: @escaping (String) -> Void = { _ in },
         stderr: @escaping (String) -> Void = { _ in },
@@ -1509,6 +1514,10 @@ enum ConfigSelfTest {
             probeMount: probeMount,
             warmEstimate: warmEstimate,
             remoteSkipsCertCheck: remoteSkipsCertCheck,
+            telemetryConsent: telemetryConsent,
+            setTelemetryEnabled: setTelemetryEnabled,
+            isInteractiveTerminal: isInteractiveTerminal,
+            readLine: readLine,
             sleep: sleep,
             stdout: stdout,
             stderr: stderr,
@@ -3496,6 +3505,108 @@ enum ConfigSelfTest {
         guard SyncTrayCLI.run(.remoteFolders(target: "nope", json: false), env: failing) == 1,
               err.contains("didn't find section") else {
             return report(name, slug, false, "(rclone failure not surfaced: \(err.debugDescription))")
+        }
+        return report(name, slug, true)
+    }
+
+    // MARK: - AC-CLI13 — the CLI asks for the app's telemetry consent once, shares it
+
+    /// The CLI's first-run question must only appear for a person at a terminal who
+    /// hasn't answered in the app or the CLI, default to No, and record the answer
+    /// through the shared setter; `telemetry on|off|status` must use the same state;
+    /// a CLI write to settings.json must not touch the other keys (a running app
+    /// would apply a flipped `launchAtLogin`); and CLI telemetry must carry
+    /// `synctray.process.kind`.
+    private static func testCLITelemetryConsent() -> Bool {
+        let name = "AC-CLI13", slug = "cli-telemetry-consent"
+        let unanswered = TelemetryConsentState(enabled: false, answered: false)
+
+        func prompt(_ argv: [String], state: TelemetryConsentState, interactive: Bool, answer: String?) -> (asked: Bool, set: Bool?, err: String) {
+            var asked = false, set: Bool? = nil, err = ""
+            let env = fakeCLIEnvironment(
+                telemetryConsent: { state },
+                setTelemetryEnabled: { set = $0 },
+                isInteractiveTerminal: { interactive },
+                readLine: { asked = true; return answer },
+                stderr: { err += $0 }
+            )
+            SyncTrayCLI.promptForTelemetryIfNeeded(argv, env: env)
+            return (asked, set, err)
+        }
+
+        let yes = prompt(["status"], state: unanswered, interactive: true, answer: " Y ")
+        guard yes.asked, yes.set == true, yes.err.contains(SyncTraySettings.telemetryConsentSummary), yes.err.contains("[y/N]") else {
+            return report(name, slug, false, "(yes answer not recorded or copy differs: \(yes))")
+        }
+        for answer in ["", "n", "maybe", nil] as [String?] {
+            let no = prompt(["status"], state: unanswered, interactive: true, answer: answer)
+            guard no.asked, no.set == false else {
+                return report(name, slug, false, "(answer \(answer.debugDescription) did not default to No: \(no))")
+            }
+        }
+        let silent: [([String], TelemetryConsentState, Bool)] = [
+            (["status"], unanswered, false),                                   // piped / agent / CI
+            (["status"], TelemetryConsentState(enabled: false, answered: true), true),  // said no in the app
+            (["status"], TelemetryConsentState(enabled: true, answered: true), true),   // already on
+            (["help"], unanswered, true),
+            (["telemetry", "on"], unanswered, true),
+        ]
+        for (argv, state, interactive) in silent {
+            let r = prompt(argv, state: state, interactive: interactive, answer: "y")
+            guard !r.asked, r.set == nil, r.err.isEmpty else {
+                return report(name, slug, false, "(prompted when it must not: \(argv) \(state) interactive=\(interactive))")
+            }
+        }
+
+        guard case .success(.telemetry(.status(json: false))) = SyncTrayCLI.parse(["telemetry"]),
+              case .success(.telemetry(.status(json: true))) = SyncTrayCLI.parse(["telemetry", "status", "--json"]),
+              case .success(.telemetry(.set(enabled: true))) = SyncTrayCLI.parse(["telemetry", "on"]),
+              case .success(.telemetry(.set(enabled: false))) = SyncTrayCLI.parse(["telemetry", "off"]),
+              case .failure = SyncTrayCLI.parse(["telemetry", "maybe"]),
+              SyncTrayCLI.telemetryVerb(for: ["telemetry"]) == "telemetry-status",
+              SyncTrayCLI.telemetryVerb(for: ["telemetry", "off"]) == "telemetry-off" else {
+            return report(name, slug, false, "(telemetry parse or verb wrong)")
+        }
+        var set: Bool? = nil, out = ""
+        let env = fakeCLIEnvironment(
+            telemetryConsent: { TelemetryConsentState(enabled: true, answered: true) },
+            setTelemetryEnabled: { set = $0 },
+            stdout: { out += $0 }
+        )
+        guard SyncTrayCLI.run(.telemetry(.set(enabled: false)), env: env) == 0, set == false else {
+            return report(name, slug, false, "(telemetry off did not use the shared setter)")
+        }
+        out = ""
+        guard SyncTrayCLI.run(.telemetry(.status(json: true)), env: env) == 0,
+              let data = out.data(using: .utf8),
+              let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Bool],
+              json == ["asked": true, "enabled": true] else {
+            return report(name, slug, false, "(status --json wrong: \(out.debugDescription))")
+        }
+
+        let dir = "\(selfTestRoot)/cli-telemetry-settings"
+        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        let seed = #"{"autoFixSyncIssues":false,"debugLoggingEnabled":true,"launchAtLogin":true,"telemetryEnabled":false}"#
+        FileManager.default.createFile(atPath: "\(dir)/settings.json", contents: Data(seed.utf8))
+        guard AppSettingsFileStore.updateSettingsFile(.telemetryEnabled, to: true, isLoginItemEnabled: false, directory: dir),
+              let written = FileManager.default.contents(atPath: "\(dir)/settings.json"),
+              let settings = (try? JSONSerialization.jsonObject(with: written)) as? [String: Bool],
+              settings == ["autoFixSyncIssues": false, "debugLoggingEnabled": true, "launchAtLogin": true, "telemetryEnabled": true] else {
+            return report(name, slug, false, "(settings.json update changed other keys)")
+        }
+
+        guard let cliSource = readSourceFile("CLI/SyncTrayCLI.swift"),
+              let measured = extractFunctionBody(startingAt: "private static func runMeasured(", in: cliSource),
+              let promptAt = measured.range(of: "promptForTelemetryIfNeeded("),
+              let executeAt = measured.range(of: "execute(argv"),
+              promptAt.lowerBound < executeAt.lowerBound,
+              let dispatch = extractFunctionBody(startingAt: "static func dispatch(arguments:", in: cliSource),
+              dispatch.contains("TelemetryService.processKind = \"cli\""),
+              let telemetrySource = readSourceFile("Services/TelemetryService.swift"),
+              telemetrySource.contains("\"synctray.process.kind\": .string(Self.processKind)"),
+              let banner = readSourceFile("Views/Settings/TelemetryOptInBanner.swift"),
+              banner.contains("SyncTraySettings.telemetryConsentSummary") else {
+            return report(name, slug, false, "(prompt not before execute, process kind unset, or banner copy not shared)")
         }
         return report(name, slug, true)
     }
