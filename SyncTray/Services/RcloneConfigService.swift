@@ -545,6 +545,21 @@ final class RcloneConfigService {
         ["lsf", target, "--dirs-only"] + (skipCertCheck ? ["--no-check-certificate"] : [])
     }
 
+    /// Reads a child's stdout and stderr to EOF at the same time. Reading one pipe
+    /// to EOF before the other deadlocks once the child fills the unread pipe's
+    /// ~64 KB buffer: it blocks writing, so the pipe being read never closes.
+    /// Call before `waitUntilExit()`.
+    static func drainPipes(stdout: Pipe, stderr: Pipe) -> (out: Data, err: Data) {
+        var err = Data()
+        let errGroup = DispatchGroup()
+        DispatchQueue.global(qos: .utility).async(group: errGroup) {
+            err = stderr.fileHandleForReading.readDataToEndOfFile()
+        }
+        let out = stdout.fileHandleForReading.readDataToEndOfFile()
+        errGroup.wait()
+        return (out, err)
+    }
+
     func listFolders(remote: String) async -> Result<[String], ConfigError> {
         guard let rclonePath = findRclonePath() else {
             return .failure(.rcloneNotFound)
@@ -566,9 +581,7 @@ final class RcloneConfigService {
 
                 do {
                     try process.run()
-                    // Read before waiting: a large listing would otherwise fill the pipe and block rclone.
-                    let data = pipe.fileHandleForReading.readDataToEndOfFile()
-                    let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
+                    let (data, errData) = Self.drainPipes(stdout: pipe, stderr: errPipe)
                     process.waitUntilExit()
 
                     if process.terminationStatus == 0 {

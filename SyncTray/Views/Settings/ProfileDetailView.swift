@@ -2646,9 +2646,7 @@ struct ProfileDetailView: View {
 
             do {
                 try process.run()
-                // Read before waiting: a large listing would otherwise fill the pipe and block rclone.
-                let data = pipe.fileHandleForReading.readDataToEndOfFile()
-                let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
+                let (data, errData) = RcloneConfigService.drainPipes(stdout: pipe, stderr: errPipe)
                 process.waitUntilExit()
 
                 guard process.terminationStatus == 0 else {
@@ -4870,10 +4868,7 @@ struct RemoteFolderBrowserSheet: View {
             proc.standardOutput = pipe; proc.standardError = errPipe
             do {
                 try proc.run()
-                // Drain both pipes before waiting: a listing larger than the pipe
-                // buffer would otherwise block rclone and never exit.
-                let outData = pipe.fileHandleForReading.readDataToEndOfFile()
-                let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
+                let (outData, errData) = RcloneConfigService.drainPipes(stdout: pipe, stderr: errPipe)
                 proc.waitUntilExit()
                 let out = String(decoding: outData, as: UTF8.self)
                 if proc.terminationStatus != 0 {

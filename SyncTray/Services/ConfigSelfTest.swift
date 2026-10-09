@@ -3462,7 +3462,50 @@ enum ConfigSelfTest {
                 return report(name, slug, false, "(\(site) does not list with lsf + parseDirectoryListing)")
             }
         }
+        guard let browser = extractFunctionBody(startingAt: "private func loadFolders()", in: detailSource) else {
+            return report(name, slug, false, "(could not read RemoteFolderBrowserSheet.loadFolders)")
+        }
+        for (site, body) in [("loadRemoteFolders", chooser), ("listFolders", wizard), ("RemoteFolderBrowserSheet.loadFolders", browser)] {
+            guard body.contains("drainPipes(") else {
+                return report(name, slug, false, "(\(site) does not drain rclone's pipes concurrently)")
+            }
+        }
+        if let failure = drainPipesFailure() {
+            return report(name, slug, false, "(\(failure))")
+        }
         return report(name, slug, true)
+    }
+
+    /// Runs a child that writes 300 KB to stderr and then 300 KB to stdout — far past
+    /// the ~64 KB pipe buffer — and checks `drainPipes` returns both intact. A drain
+    /// that reads one pipe to EOF first never returns; the 10 s wait turns that hang
+    /// into a failure. Returns nil on success.
+    private static func drainPipesFailure() -> String? {
+        let size = 300_000
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/bin/sh")
+        proc.arguments = ["-c", "head -c \(size) /dev/zero | tr '\\0' e >&2; head -c \(size) /dev/zero | tr '\\0' o"]
+        let outPipe = Pipe(), errPipe = Pipe()
+        proc.standardOutput = outPipe
+        proc.standardError = errPipe
+        do { try proc.run() } catch { return "could not start /bin/sh: \(error)" }
+
+        var drained: (out: Data, err: Data)?
+        let done = DispatchSemaphore(value: 0)
+        DispatchQueue.global(qos: .userInitiated).async {
+            drained = RcloneConfigService.drainPipes(stdout: outPipe, stderr: errPipe)
+            done.signal()
+        }
+        guard done.wait(timeout: .now() + 10) == .success, let result = drained else {
+            proc.terminate()
+            return "drainPipes hung on a child writing >64 KB to both pipes"
+        }
+        proc.waitUntilExit()
+        guard result.out == Data(repeating: UInt8(ascii: "o"), count: size),
+              result.err == Data(repeating: UInt8(ascii: "e"), count: size) else {
+            return "drainPipes lost data (stdout \(result.out.count) B, stderr \(result.err.count) B)"
+        }
+        return nil
     }
 
     // MARK: - AC-CLI12 — `remote folders` prints what the folder chooser shows
