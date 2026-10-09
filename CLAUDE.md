@@ -1177,7 +1177,8 @@ counter + `CLI invoked` structured log (bounded command verb + `ok`/`error` +
 exit code + duration — never args, paths, profile names, or remotes) and flushes
 before exit (`runMeasured` → `TelemetryService.recordCLIInvocation` +
 `flushForExit`). It is gated on the user's telemetry opt-in, so a disabled CLI
-does no setup, no network, and prints nothing extra. The self-test path
+does no setup and no network; its only extra output is the one-time consent
+question on an interactive terminal (see "Privacy and consent" below). The self-test path
 (`execute` with a fake `CLIEnvironment`) never touches telemetry.
 
 **Pure core / impure shell.** `SyncTrayCLI.parse`/`execute`/`run`/`doctorChecks`
