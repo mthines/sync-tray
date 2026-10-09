@@ -527,6 +527,18 @@ final class RcloneConfigService {
     // MARK: - List Remote Contents
 
     /// List folders at the root of a remote
+    /// Folder names from `rclone lsf --dirs-only` output: one name per line, each ending in `/`.
+    /// Uses `lsf` rather than `lsd` because `lsd` prints names in a whitespace-padded column,
+    /// and splitting that on whitespace turned "My Folder" into "Folder". Names are kept
+    /// verbatim, so leading and trailing spaces survive.
+    static func parseDirectoryListing(_ output: String) -> [String] {
+        output.components(separatedBy: "\n")
+            .map { $0.hasSuffix("\r") ? String($0.dropLast()) : $0 }
+            .filter { $0.hasSuffix("/") && $0.count > 1 }
+            .map { String($0.dropLast()) }
+            .sorted()
+    }
+
     func listFolders(remote: String) async -> Result<[String], ConfigError> {
         guard let rclonePath = findRclonePath() else {
             return .failure(.rcloneNotFound)
@@ -536,49 +548,32 @@ final class RcloneConfigService {
             DispatchQueue.global(qos: .userInitiated).async {
                 let process = Process()
                 let pipe = Pipe()
+                let errPipe = Pipe()
 
                 process.executableURL = URL(fileURLWithPath: rclonePath)
                 let remotePath = remote.hasSuffix(":") ? remote : "\(remote):"
                 let remoteName = remote.replacingOccurrences(of: ":", with: "")
                 let skipCert = self.readRemoteConfig(name: remoteName)?.values["no_check_certificate"] == "true"
-                var args = ["lsd", remotePath]
+                var args = ["lsf", remotePath, "--dirs-only"]
                 if skipCert {
                     args.append("--no-check-certificate")
                 }
                 process.arguments = args
                 process.standardOutput = pipe
-                process.standardError = pipe
+                process.standardError = errPipe
 
                 do {
                     try process.run()
+                    // Read before waiting: a large listing would otherwise fill the pipe and block rclone.
+                    let data = pipe.fileHandleForReading.readDataToEndOfFile()
+                    let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
                     process.waitUntilExit()
 
                     if process.terminationStatus == 0 {
-                        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-                        if let output = String(data: data, encoding: .utf8) {
-                            // Parse lsd output format: "     -1 2000-01-01 01:00:00        -1 FolderName"
-                            // Format: size date time count name (with variable whitespace)
-                            let folders = output.components(separatedBy: "\n")
-                                .compactMap { line -> String? in
-                                    let trimmed = line.trimmingCharacters(in: .whitespaces)
-                                    guard !trimmed.isEmpty else { return nil }
-                                    // Match: -1 YYYY-MM-DD HH:MM:SS -1 FolderName
-                                    // (size) (date) (time) (count) (name)
-                                    let pattern = #"^-?\d+\s+\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\s+-?\d+\s+(.+)$"#
-                                    if let regex = try? NSRegularExpression(pattern: pattern),
-                                       let match = regex.firstMatch(in: trimmed, range: NSRange(trimmed.startIndex..., in: trimmed)),
-                                       let folderRange = Range(match.range(at: 1), in: trimmed) {
-                                        return String(trimmed[folderRange])
-                                    }
-                                    return nil
-                                }
-                            continuation.resume(returning: .success(folders))
-                        } else {
-                            continuation.resume(returning: .success([]))
-                        }
+                        let output = String(decoding: data, as: UTF8.self)
+                        continuation.resume(returning: .success(Self.parseDirectoryListing(output)))
                     } else {
-                        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-                        let error = String(data: data, encoding: .utf8) ?? "Unknown error"
+                        let error = String(data: errData, encoding: .utf8) ?? "Unknown error"
                         continuation.resume(returning: .failure(.connectionFailed(error)))
                     }
                 } catch {

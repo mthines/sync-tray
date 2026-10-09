@@ -117,6 +117,7 @@ enum ConfigSelfTest {
             testRCAPIAuthenticated,
             testShimQuotesExecutablePath,
             testMountModeFileNotInSharedTmp,
+            testRemoteFolderListingKeepsSpaces,
             testCacheOnlyUnionConfig,
             testCacheOnlyUnionBehaviour,
             testMountModeSelection,
@@ -3419,6 +3420,35 @@ enum ConfigSelfTest {
         }
         guard !fm.fileExists(atPath: marker) else {
             return report(name, slug, false, "(the executable path was executed as shell code)")
+        }
+        return report(name, slug, true)
+    }
+
+    // MARK: - AC-RF1 — remote folder names with spaces survive the folder chooser
+
+    /// The profile editor's folder dropdown used to split `rclone lsd` output on whitespace
+    /// and keep the last token, so "My Folder" was offered as "Folder" — a different folder
+    /// when one by that name also exists. Asserts the shared `lsf --dirs-only` parser keeps
+    /// every name verbatim, and that the chooser and the wizard both list with it.
+    private static func testRemoteFolderListingKeepsSpaces() -> Bool {
+        let name = "AC-RF1", slug = "remote-folder-listing-keeps-spaces"
+        let output = "Folder/\nMy Folder/\nMy  songs/\n trailing space /\r\n\n"
+        let parsed = RcloneConfigService.parseDirectoryListing(output)
+        let expected = [" trailing space ", "Folder", "My  songs", "My Folder"]
+        guard parsed == expected else {
+            return report(name, slug, false, "(parsed \(parsed), expected \(expected))")
+        }
+        guard let detailSource = readSourceFile("Views/Settings/ProfileDetailView.swift"),
+              let configSource = readSourceFile("Services/RcloneConfigService.swift"),
+              let chooser = extractFunctionBody(startingAt: "private func loadRemoteFolders()", in: detailSource),
+              let wizard = extractFunctionBody(startingAt: "func listFolders(remote: String)", in: configSource) else {
+            return report(name, slug, false, "(could not read the folder-listing call sites)")
+        }
+        for (site, body) in [("loadRemoteFolders", chooser), ("listFolders", wizard)] {
+            guard body.contains("\"--dirs-only\""), body.contains("parseDirectoryListing("),
+                  !body.contains("\"lsd\"") else {
+                return report(name, slug, false, "(\(site) does not list with lsf + parseDirectoryListing)")
+            }
         }
         return report(name, slug, true)
     }
