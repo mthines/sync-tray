@@ -526,7 +526,6 @@ final class RcloneConfigService {
 
     // MARK: - List Remote Contents
 
-    /// List folders at the root of a remote
     /// Folder names from `rclone lsf --dirs-only` output: one name per line, each ending in `/`.
     /// Uses `lsf` rather than `lsd` because `lsd` prints names in a whitespace-padded column,
     /// and splitting that on whitespace turned "My Folder" into "Folder". Names are kept
@@ -560,6 +559,7 @@ final class RcloneConfigService {
         return (out, err)
     }
 
+    /// List folders at the root of a remote
     func listFolders(remote: String) async -> Result<[String], ConfigError> {
         guard let rclonePath = findRclonePath() else {
             return .failure(.rcloneNotFound)
