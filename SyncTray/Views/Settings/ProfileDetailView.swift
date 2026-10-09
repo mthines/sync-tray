@@ -4870,10 +4870,14 @@ struct RemoteFolderBrowserSheet: View {
             proc.standardOutput = pipe; proc.standardError = errPipe
             do {
                 try proc.run()
+                // Drain both pipes before waiting: a listing larger than the pipe
+                // buffer would otherwise block rclone and never exit.
+                let outData = pipe.fileHandleForReading.readDataToEndOfFile()
+                let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
                 proc.waitUntilExit()
-                let out = String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+                let out = String(decoding: outData, as: UTF8.self)
                 if proc.terminationStatus != 0 {
-                    let e = String(decoding: errPipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+                    let e = String(decoding: errData, as: UTF8.self)
                         .trimmingCharacters(in: .whitespacesAndNewlines)
                     DispatchQueue.main.async {
                         self.isLoading = false
