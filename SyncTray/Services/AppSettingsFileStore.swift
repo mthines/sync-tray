@@ -43,6 +43,41 @@ enum AppSettingsFileStore {
         ]
     }
 
+    /// Set one key in `settings.json`, keeping every other key as the file has it.
+    /// For a writer outside the app (the CLI): rewriting the whole file from its own
+    /// view could flip `launchAtLogin`, which the running app applies on any change.
+    /// A missing file is created from `currentSafeSettings`.
+    @discardableResult
+    static func updateSettingsFile(
+        _ key: SafeKey,
+        to value: Bool,
+        isLoginItemEnabled: Bool,
+        directory: String = AppSettingsFileStore.defaultDirectory
+    ) -> Bool {
+        let path = "\(directory)/settings.json"
+        var payload: [String: Any]
+        if let data = FileManager.default.contents(atPath: path),
+           let existing = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] {
+            payload = existing
+        } else {
+            payload = ["$schema": schemaRef]
+            for (k, v) in currentSafeSettings(isLoginItemEnabled: isLoginItemEnabled) {
+                payload[k.rawValue] = v
+            }
+        }
+        payload[key.rawValue] = value
+        guard let data = try? JSONSerialization.data(withJSONObject: payload, options: [.prettyPrinted, .sortedKeys]) else {
+            return false
+        }
+        do {
+            try FileManager.default.createDirectory(atPath: directory, withIntermediateDirectories: true)
+            try data.write(to: URL(fileURLWithPath: path), options: .atomic)
+            return true
+        } catch {
+            return false
+        }
+    }
+
     /// Write `settings.json` (safe keys + `$schema`) into `directory` (defaults
     /// to the real config directory; overridable for self-test isolation).
     /// Notes the write's content hash in `ConfigSelfWriteRegistry` so

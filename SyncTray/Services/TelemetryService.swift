@@ -35,6 +35,12 @@ import OpenTelemetryProtocolExporterHttp
 final class TelemetryService {
     static let shared = TelemetryService()
 
+    /// Which process is reporting — `app` or `cli` — emitted as the
+    /// `synctray.process.kind` resource attribute. Both share `service.name` (one
+    /// binary, one release); this keeps a CLI `cache move` or `mount` apart from the
+    /// app's own. Set by `SyncTrayCLI.dispatch` before any telemetry is set up.
+    static var processKind = "app"
+
     // MARK: - Configuration
     //
     // Lookup priority (first non-empty wins):
@@ -2128,6 +2134,7 @@ final class TelemetryService {
             ResourceAttributes.serviceVersion.rawValue: .string(version),
             "service.instance.id": .string(SyncTraySettings.installationId),
             "enduser.id": .string(SyncTraySettings.anonymousUserId),
+            "synctray.process.kind": .string(Self.processKind),
             ResourceAttributes.osType.rawValue: .string("darwin"),
             ResourceAttributes.osVersion.rawValue: .string(osVersion),
         ]
@@ -2788,7 +2795,10 @@ final class TelemetryService {
     /// Setup diagnostics go to stderr, never stdout: the headless CLI configures
     /// telemetry in-process, and a stray stdout line breaks every agent that
     /// parses `status --json` / `profile show`.
+    /// Silent in the CLI: its stderr is the user's terminal, where exporter setup noise
+    /// on every command would bury the real output.
     private static func diagnostic(_ message: String) {
+        guard processKind == "app" else { return }
         FileHandle.standardError.write(Data("[SyncTray][Telemetry] \(message)\n".utf8))
     }
 

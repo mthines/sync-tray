@@ -24,7 +24,7 @@ struct TelemetryOptInBanner: View {
                 VStack(alignment: .leading, spacing: 2) {
                     Text("Help shape SyncTray")
                         .font(.subheadline.weight(.medium))
-                    Text("Usage data — sync results, error types, feature usage, profile names. No file names, remote names, or credentials.")
+                    Text(SyncTraySettings.telemetryConsentSummary)
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)

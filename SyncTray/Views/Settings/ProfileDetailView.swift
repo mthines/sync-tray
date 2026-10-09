@@ -2625,6 +2625,7 @@ struct ProfileDetailView: View {
         DispatchQueue.global(qos: .userInitiated).async {
             let process = Process()
             let pipe = Pipe()
+            let errPipe = Pipe()
 
             let rclonePath = RcloneLocator.resolve()
 
@@ -2639,21 +2640,17 @@ struct ProfileDetailView: View {
             process.executableURL = URL(fileURLWithPath: path)
             let remoteName = rcloneRemote.replacingOccurrences(of: ":", with: "")
             let skipCert = RcloneConfigService.shared.readRemoteConfig(name: remoteName)?.values["no_check_certificate"] == "true"
-            var args = ["lsd", "\(rcloneRemote):"]
-            if skipCert {
-                args.append("--no-check-certificate")
-            }
-            process.arguments = args
+            process.arguments = RcloneConfigService.folderListingArguments("\(rcloneRemote):", skipCertCheck: skipCert)
             process.standardOutput = pipe
-            process.standardError = pipe
+            process.standardError = errPipe
 
             do {
                 try process.run()
+                let (data, errData) = RcloneConfigService.drainPipes(stdout: pipe, stderr: errPipe)
                 process.waitUntilExit()
 
                 guard process.terminationStatus == 0 else {
-                    let data = pipe.fileHandleForReading.readDataToEndOfFile()
-                    let errorOutput = String(data: data, encoding: .utf8) ?? "Unknown error"
+                    let errorOutput = String(data: errData, encoding: .utf8) ?? "Unknown error"
                     DispatchQueue.main.async {
                         isLoadingFolders = false
                         foldersError = "Failed to list folders: \(errorOutput)"
@@ -2661,20 +2658,10 @@ struct ProfileDetailView: View {
                     return
                 }
 
-                let data = pipe.fileHandleForReading.readDataToEndOfFile()
-                let output = String(data: data, encoding: .utf8) ?? ""
-
-                let folders = output
-                    .components(separatedBy: .newlines)
-                    .compactMap { line -> String? in
-                        let trimmed = line.trimmingCharacters(in: .whitespaces)
-                        guard !trimmed.isEmpty else { return nil }
-                        let components = trimmed.components(separatedBy: .whitespaces).filter { !$0.isEmpty }
-                        return components.last
-                    }
+                let folders = RcloneConfigService.parseDirectoryListing(String(decoding: data, as: UTF8.self))
 
                 DispatchQueue.main.async {
-                    availableFolders = folders.sorted()
+                    availableFolders = folders
                     isLoadingFolders = false
                     if folders.isEmpty {
                         foldersError = "No folders found on remote (or remote is empty)"
@@ -4881,10 +4868,11 @@ struct RemoteFolderBrowserSheet: View {
             proc.standardOutput = pipe; proc.standardError = errPipe
             do {
                 try proc.run()
+                let (outData, errData) = RcloneConfigService.drainPipes(stdout: pipe, stderr: errPipe)
                 proc.waitUntilExit()
-                let out = String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+                let out = String(decoding: outData, as: UTF8.self)
                 if proc.terminationStatus != 0 {
-                    let e = String(decoding: errPipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+                    let e = String(decoding: errData, as: UTF8.self)
                         .trimmingCharacters(in: .whitespacesAndNewlines)
                     DispatchQueue.main.async {
                         self.isLoading = false
@@ -4894,11 +4882,7 @@ struct RemoteFolderBrowserSheet: View {
                     }
                     return
                 }
-                let dirs = out.components(separatedBy: .newlines)
-                    .map { $0.trimmingCharacters(in: .whitespaces) }
-                    .filter { !$0.isEmpty }
-                    .map { $0.hasSuffix("/") ? String($0.dropLast()) : $0 }
-                    .sorted()
+                let dirs = RcloneConfigService.parseDirectoryListing(out)
                 DispatchQueue.main.async { self.folders = dirs; self.isLoading = false }
             } catch {
                 DispatchQueue.main.async { self.isLoading = false; self.errorMessage = error.localizedDescription }

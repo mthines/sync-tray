@@ -138,6 +138,10 @@ For operations with real duration (like syncs), use the `activeSyncSpans` patter
 - `service.name` = synctray
 - `service.namespace` = synctray
 - `service.instance.id` = random UUID per installation (changes on reinstall)
+- `synctray.process.kind` = `app` for the menu-bar app, `cli` for a headless `synctray` run
+  (`TelemetryService.processKind`, set by `SyncTrayCLI.dispatch`). Same `service.name` for
+  both — filter on this to separate CLI-originated events (a `cache move`, a `mount`) from
+  the app's
 - `enduser.id` = HMAC-SHA256 of hardware UUID (stable across reinstalls, not reversible)
 - `service.version` = deployment-precise version (see below)
 - `deployment.environment.name` = `development` for DEBUG builds, `production` for Release
@@ -230,7 +234,7 @@ rollout. No event is emitted on a fresh install.
 | `synctray.mount.reinstall_detach` | Counter | Pre-uninstall volume detach attempts for mount-mode profiles, reached on every `SyncSetupService.uninstall` (including the settings-save reinstall path) — `mount.result`: `not_mounted`/`success`/`success_forced`/`failure` |
 | `synctray.mount.reinstall_detach.duration` | Histogram | Time taken to gracefully detach a mounted volume before reinstall (seconds) — regression signal for the "settings change freezes an active Stream mount" failure mode; only recorded when the profile was actually mounted |
 | `synctray.mount.cache_only_fallback` | Counter | Cache Only was requested (`streamCacheOnly`) but the mount settled on streaming — the silent script fallback when the partial-file exclude list can't be built. The "I enabled Cache Only but it's still streaming/downloading" case; invisible without this. Emitted once at the mode-change edge by `SyncManager.reconcileMountStatesOffMain`, guarded by `resumingFromCacheOnly` so a legitimate drain-and-resume flip isn't counted |
-| `synctray.cli.invoked` | Counter | Headless `synctray` CLI invocations (`cli.command`: bounded verb — doctor/status/offline-status/profiles/logs/test-remote/listremotes/sync/mount/unmount/reinstall/install/cache-move/profile-create/profile-show/profile-set/profile-enable/profile-disable/profile-delete/profile-list/help, or `(other)`; `cli.result`: ok/error). Never carries args, paths, profile names, or remotes. Recorded once per run by `runMeasured`, then flushed via `flushForExit` before the process exits |
+| `synctray.cli.invoked` | Counter | Headless `synctray` CLI invocations (`cli.command`: bounded verb — doctor/status/offline-status/profiles/logs/test-remote/listremotes/remote-folders/telemetry-status/telemetry-on/telemetry-off/sync/mount/unmount/reinstall/install/cache-move/profile-create/profile-show/profile-set/profile-enable/profile-disable/profile-delete/profile-list/help, or `(other)`; `cli.result`: ok/error). Never carries args, paths, profile names, or remotes. Recorded once per run by `runMeasured`, then flushed via `flushForExit` before the process exits |
 | `synctray.offline.warm.duration` | Histogram | Duration of an offline-file warming run, seconds (`warm.trigger`: manual/startup/finder_pin; `warm.outcome`: completed/cancelled) |
 | `synctray.offline.warm.throughput` | Histogram | Average read throughput of a warming run, MB/s — the primary signal for slow-fallback diagnosis (the SFTP fallback caps aggregate throughput) |
 | `synctray.offline.warm.files` | Counter | Files warmed into the VFS content cache (`warm.outcome`: completed/cancelled) |

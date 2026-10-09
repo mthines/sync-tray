@@ -1,4 +1,5 @@
 import Foundation
+import ServiceManagement
 
 /// Where `profile create` reads the profile JSON from.
 enum CreateSource: Equatable {
@@ -20,12 +21,27 @@ struct StatusWait: Equatable {
     let timeout: TimeInterval
 }
 
+/// The shared telemetry opt-in as the CLI sees it: `answered` is true once the user
+/// has said yes or no in the app (banner, wizard) or the CLI, for the current
+/// consent version.
+struct TelemetryConsentState: Equatable {
+    let enabled: Bool
+    let answered: Bool
+}
+
+enum TelemetryAction: Equatable {
+    case status(json: Bool)
+    case set(enabled: Bool)
+}
+
 /// Parsed CLI subcommand — the pure, testable result of `SyncTrayCLI.parse`.
 enum CLICommand: Equatable {
     case doctor
     case testRemote(String)
     case logs(target: String, follow: Bool)
     case listRemotes
+    case remoteFolders(target: String, json: Bool)
+    case telemetry(TelemetryAction)
     case profiles
     case status(target: String?, json: Bool, wait: StatusWait?)
     case offlineStatus(target: String?, json: Bool)
@@ -158,6 +174,20 @@ struct CLIEnvironment {
     /// network. Backs `offline status`; injected so the self-test drives it with
     /// fixtures. Defaults to `VFSCacheService.shared.estimateWarmWork`.
     var warmEstimate: (_ dir: String, _ profile: SyncProfile) -> VFSCacheService.WarmEstimate
+    /// Whether rclone.conf sets `no_check_certificate = true` for this remote,
+    /// so `remote folders` lists with the same flags the app's folder chooser uses.
+    var remoteSkipsCertCheck: (_ remoteName: String) -> Bool
+    /// The shared telemetry opt-in (`SyncTraySettings`, the same store the app reads).
+    var telemetryConsent: () -> TelemetryConsentState
+    /// Record the user's telemetry answer in every place the app reads it — the
+    /// setting, the consent version (so the app's banner doesn't ask again) and
+    /// `settings.json` (so a running app applies it live).
+    var setTelemetryEnabled: (Bool) -> Void
+    /// Whether a person is at the keyboard: stdin and stderr are terminals and `CI`
+    /// is unset. The first-run telemetry question is only ever asked then.
+    var isInteractiveTerminal: () -> Bool
+    /// Read one line of the user's answer. `nil` on end of input.
+    var readLine: () -> String?
     /// Pause between polls in `status --wait` / `mount`. Injected so the
     /// self-test's wait loops run instantly.
     var sleep: (TimeInterval) -> Void
@@ -196,6 +226,10 @@ enum SyncTrayCLI {
       logs <name|id> [--follow]    Print or tail a profile's sync log
       test-remote <name|id>        Probe a profile's remote reachability
       listremotes                  List configured rclone remotes
+      remote folders <remote>[:path] [--json]
+                                   List the folders the app's folder chooser shows for a remote
+      telemetry [status|on|off] [--json]
+                                   Show or change usage-data sharing (shared with the app)
 
     Configure:
       profile create --from <file> Create a profile from a .profile.json file
@@ -253,6 +287,7 @@ enum SyncTrayCLI {
             return nil                                          // other flags → GUI/self-test path
         }
         // `-`-prefixed `-h`/`--help`, or any bare token, IS a subcommand.
+        TelemetryService.processKind = "cli"
         return runMeasured(argv, env: .production())
     }
 
@@ -262,6 +297,7 @@ enum SyncTrayCLI {
     /// touches `TelemetryService`. Telemetry is gated on the user's opt-in, so
     /// this is a no-op — no setup, no network, no stdout — when disabled.
     private static func runMeasured(_ argv: [String], env: CLIEnvironment) -> Int32 {
+        promptForTelemetryIfNeeded(argv, env: env)
         let start = env.now()
         let code = execute(argv, env: env)
         let elapsed = env.now().timeIntervalSince(start)
@@ -272,6 +308,31 @@ enum SyncTrayCLI {
         )
         TelemetryService.shared.flushForExit()
         return code
+    }
+
+    /// The CLI's first-run telemetry question — the same consent the app's banner
+    /// asks for, recorded in the same place. Asked at most once (until the consent
+    /// version is bumped), only when a person is at a terminal, never for `help` or
+    /// `telemetry` itself. Defaults to No; Ctrl-C leaves it unanswered.
+    static func promptForTelemetryIfNeeded(_ argv: [String], env: CLIEnvironment) {
+        guard let first = argv.first, !["help", "-h", "--help", "telemetry"].contains(first) else { return }
+        // A command that doesn't parse only prints a usage error — no point asking.
+        guard case .success = parse(argv) else { return }
+        let state = env.telemetryConsent()
+        guard !state.enabled, !state.answered, env.isInteractiveTerminal() else { return }
+
+        env.stderr("""
+        Help improve SyncTray by sharing usage data?
+          \(SyncTraySettings.telemetryConsentSummary)
+          The SyncTray app uses the same setting. Change it any time: synctray telemetry on|off
+
+        """ + "Share usage data? [y/N] ")
+        let answer = env.readLine()?.trimmingCharacters(in: .whitespaces).lowercased()
+        let enabled = answer == "y" || answer == "yes"
+        env.setTelemetryEnabled(enabled)
+        env.stderr(enabled
+            ? "Usage data is on. Thank you!\n\n"
+            : "\(answer == nil ? "\n" : "")Usage data stays off.\n\n")
     }
 
     /// Map an argv to a BOUNDED command verb for telemetry — never args, paths,
@@ -292,6 +353,14 @@ enum SyncTrayCLI {
         if first == "cache" {
             let sub = argv.dropFirst().first(where: { !$0.hasPrefix("-") }) ?? ""
             return sub == "move" ? "cache-move" : "(other)"
+        }
+        if first == "telemetry" {
+            let sub = argv.dropFirst().first(where: { !$0.hasPrefix("-") }) ?? "status"
+            return ["status", "on", "off"].contains(sub) ? "telemetry-\(sub)" : "(other)"
+        }
+        if first == "remote" {
+            let sub = argv.dropFirst().first(where: { !$0.hasPrefix("-") }) ?? ""
+            return sub == "folders" ? "remote-folders" : "(other)"
         }
         if first == "offline" {
             let sub = argv.dropFirst().first(where: { !$0.hasPrefix("-") }) ?? ""
@@ -327,6 +396,28 @@ enum SyncTrayCLI {
 
         case "listremotes":
             return .success(.listRemotes)
+
+        case "telemetry":
+            let flags = parseFlags(rest, valueFlags: [])
+            switch flags.positionals.first {
+            case nil, "status":
+                guard flags.positionals.count <= 1 else { break }
+                return .success(.telemetry(.status(json: rest.contains("--json"))))
+            case "on" where flags.positionals.count == 1:
+                return .success(.telemetry(.set(enabled: true)))
+            case "off" where flags.positionals.count == 1:
+                return .success(.telemetry(.set(enabled: false)))
+            default:
+                break
+            }
+            return .failure(CLIUsageError(message: "usage: synctray telemetry [status|on|off] [--json]"))
+
+        case "remote":
+            let flags = parseFlags(rest, valueFlags: [])
+            guard flags.positionals.first == "folders", flags.positionals.count == 2 else {
+                return .failure(CLIUsageError(message: "usage: synctray remote folders <remote>[:path] [--json]"))
+            }
+            return .success(.remoteFolders(target: flags.positionals[1], json: rest.contains("--json")))
 
         case "profiles":
             return .success(.profiles)
@@ -542,6 +633,10 @@ enum SyncTrayCLI {
             return runLogs(target, follow: follow, env: env)
         case .listRemotes:
             return runListRemotes(env: env)
+        case .remoteFolders(let target, let json):
+            return runRemoteFolders(target, json: json, env: env)
+        case .telemetry(let action):
+            return runTelemetry(action, env: env)
         case .profiles:
             return runProfiles(env: env)
         case .status(let target, let json, let wait):
@@ -727,6 +822,56 @@ enum SyncTrayCLI {
             env.stderr(err.isEmpty ? "error: rclone listremotes failed\n" : err)
             return 1
         }
+    }
+
+    // MARK: - remote folders
+
+    /// Lists a remote's folders through the same rclone arguments and parser as the
+    /// profile editor's folder chooser and the setup wizard, so what this prints is
+    /// what the app offers. Needs no profile.
+    private static func runRemoteFolders(_ target: String, json: Bool, env: CLIEnvironment) -> Int32 {
+        let remoteName = target.split(separator: ":", maxSplits: 1).first.map(String.init) ?? ""
+        guard !remoteName.isEmpty else {
+            env.stderr("usage: synctray remote folders <remote>[:path] [--json]\n")
+            return 64
+        }
+        let fullTarget = target.contains(":") ? target : "\(target):"
+        let args = RcloneConfigService.folderListingArguments(
+            fullTarget, skipCertCheck: env.remoteSkipsCertCheck(remoteName)
+        )
+        let (exit, out, err) = env.runRclone(args, 30)
+        guard exit == 0 else {
+            env.stderr(err.isEmpty ? "error: rclone exited \(exit)\n" : err)
+            return 1
+        }
+        let folders = RcloneConfigService.parseDirectoryListing(out)
+        if json {
+            let data = (try? JSONSerialization.data(withJSONObject: folders, options: [.prettyPrinted])) ?? Data("[]".utf8)
+            env.stdout(String(decoding: data, as: UTF8.self) + "\n")
+        } else {
+            for folder in folders { env.stdout(folder + "\n") }
+        }
+        return 0
+    }
+
+    // MARK: - telemetry
+
+    private static func runTelemetry(_ action: TelemetryAction, env: CLIEnvironment) -> Int32 {
+        switch action {
+        case .status(let json):
+            let state = env.telemetryConsent()
+            if json {
+                env.stdout("{\"asked\":\(state.answered),\"enabled\":\(state.enabled)}\n")
+            } else if state.enabled {
+                env.stdout("Usage data: on. Turn it off with: synctray telemetry off\n")
+            } else {
+                env.stdout("Usage data: off\(state.answered ? "" : " (not asked yet)"). Turn it on with: synctray telemetry on\n")
+            }
+        case .set(let enabled):
+            env.setTelemetryEnabled(enabled)
+            env.stdout("Usage data: \(enabled ? "on" : "off"). The SyncTray app uses the same setting.\n")
+        }
+        return 0
     }
 
     // MARK: - profiles
@@ -1667,11 +1812,46 @@ extension CLIEnvironment {
             readFile: { try? String(contentsOfFile: $0, encoding: .utf8) },
             probeMount: { profile in CLIEnvironment.probeMountProcess(profile) },
             warmEstimate: { dir, profile in VFSCacheService.shared.estimateWarmWork(dir, for: profile) },
+            remoteSkipsCertCheck: { name in
+                RcloneConfigService.shared.readRemoteConfig(name: name)?.values["no_check_certificate"] == "true"
+            },
+            telemetryConsent: {
+                TelemetryConsentState(
+                    enabled: SyncTraySettings.telemetryEnabled,
+                    answered: SyncTraySettings.telemetryBannerDismissed
+                )
+            },
+            setTelemetryEnabled: { enabled in CLIEnvironment.setTelemetryEnabledProcess(enabled) },
+            isInteractiveTerminal: {
+                isatty(STDIN_FILENO) == 1 && isatty(STDERR_FILENO) == 1
+                    && (ProcessInfo.processInfo.environment["CI"] ?? "").isEmpty
+            },
+            readLine: { Swift.readLine() },
             sleep: { Thread.sleep(forTimeInterval: $0) },
             stdout: { FileHandle.standardOutput.write(Data($0.utf8)) },
             stderr: { FileHandle.standardError.write(Data($0.utf8)) },
             now: { Date() }
         )
+    }
+
+    /// Real implementation of `setTelemetryEnabled`: the same writes the app's
+    /// toggle and banner make, plus `settings.json` so a running app applies it live.
+    /// The opt-out event is sent before telemetry goes off, as the app does.
+    fileprivate static func setTelemetryEnabledProcess(_ enabled: Bool) {
+        if !enabled, SyncTraySettings.telemetryEnabled {
+            TelemetryService.shared.recordSettingChanged(name: "telemetry", enabled: false)
+            TelemetryService.shared.flushForExit()
+        }
+        let changed = SyncTraySettings.telemetryEnabled != enabled
+        SyncTraySettings.telemetryEnabled = enabled
+        SyncTraySettings.telemetryBannerDismissedVersion = SyncTraySettings.currentTelemetryConsentVersion
+        AppSettingsFileStore.updateSettingsFile(
+            .telemetryEnabled, to: enabled,
+            isLoginItemEnabled: SMAppService.mainApp.status == .enabled
+        )
+        if enabled, changed {
+            TelemetryService.shared.recordSettingChanged(name: "telemetry", enabled: true)
+        }
     }
 
     /// Real implementation of `probeMount`. The process check matches `ps` output
@@ -1834,18 +2014,10 @@ extension CLIEnvironment {
         let watchdog = DispatchWorkItem { if proc.isRunning { proc.terminate() } }
         DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + timeout, execute: watchdog)
 
-        // Drain stdout and stderr CONCURRENTLY. Reading one to EOF before the
-        // other deadlocks when the child fills the still-unread pipe's ~64 KB
-        // buffer — exactly what an unreachable remote does to stderr, the very
-        // buffer test-remote/doctor need. (RcloneLocator sidesteps this by
-        // nulling stderr; here we need it, so we drain both at once.)
-        var errData = Data()
-        let errGroup = DispatchGroup()
-        DispatchQueue.global(qos: .utility).async(group: errGroup) {
-            errData = stderrPipe.fileHandleForReading.readDataToEndOfFile()
-        }
-        let outData = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
-        errGroup.wait()
+        // An unreachable remote fills stderr — the very output test-remote/doctor
+        // need — so both pipes are drained at once. (RcloneLocator sidesteps this
+        // by nulling stderr.)
+        let (outData, errData) = RcloneConfigService.drainPipes(stdout: stdoutPipe, stderr: stderrPipe)
         proc.waitUntilExit()
         watchdog.cancel()
 

@@ -1127,6 +1127,8 @@ Covered by `ConfigSelfTest` AC-CLI4 and AC-SEC3.
 | `synctray logs <name\|shortId> [--follow]` | Print (or `tail -f`) that profile's sync log. |
 | `synctray test-remote <name\|shortId>` | Probe one profile's remote with `rclone lsd` under a hard timeout; prints `reachable: <remote>` or the real rclone stderr. |
 | `synctray listremotes` | `rclone listremotes`, passthrough. |
+| `synctray remote folders <remote>[:path] [--json]` | List a remote's folders exactly as the profile editor's folder chooser and the setup wizard show them — same `rclone lsf --dirs-only` arguments (`RcloneConfigService.folderListingArguments`, including the remote's `no_check_certificate`) and the same parser (`parseDirectoryListing`), so names with spaces come out verbatim. Needs no profile. `--json` prints a JSON array, which makes leading/trailing spaces visible. Covered by `ConfigSelfTest` AC-CLI12 (and AC-RF1 for the parser). |
+| `synctray telemetry [status\|on\|off] [--json]` | Show or change whether usage data is shared — the same setting as the app's telemetry toggle (see "Privacy and consent" below). `status --json` prints `{"asked":…,"enabled":…}`. `on`/`off` count as answering the first-run question. |
 
 **Configure** (mutating — headless-capable, no running app required):
 
@@ -1175,7 +1177,8 @@ counter + `CLI invoked` structured log (bounded command verb + `ok`/`error` +
 exit code + duration — never args, paths, profile names, or remotes) and flushes
 before exit (`runMeasured` → `TelemetryService.recordCLIInvocation` +
 `flushForExit`). It is gated on the user's telemetry opt-in, so a disabled CLI
-does no setup, no network, and prints nothing extra. The self-test path
+does no setup and no network; its only extra output is the one-time consent
+question on an interactive terminal (see "Privacy and consent" below). The self-test path
 (`execute` with a fake `CLIEnvironment`) never touches telemetry.
 
 **Pure core / impure shell.** `SyncTrayCLI.parse`/`execute`/`run`/`doctorChecks`
@@ -1187,10 +1190,24 @@ process/filesystem/launchd touched. Every real `rclone` invocation runs through 
 hard-timeout watchdog (mirrors `RcloneLocator`'s login-shell probe), since
 SMB/WebDAV remotes can hang past their own timeouts.
 
-**Privacy.** The CLI's output goes to the invoking terminal, not telemetry —
-`test-remote`/`profiles` printing a remote name to stdout is fine; CLI mode
-never calls `TelemetryService.configure()`, so nothing from a CLI invocation
-is ever sent anywhere.
+**Privacy and consent — one setting for the app and the CLI.** The CLI's output
+goes to the invoking terminal, not telemetry — `test-remote`/`profiles` printing a
+remote name to stdout is fine. What the CLI *sends* is only the bounded
+`synctray.cli.invoked` event above (plus the ordinary events of the operations it
+drives, e.g. a `cache move`), and only when usage data is on. That is the SAME
+`telemetryEnabled` setting the app's banner and Settings toggle use — the CLI is the
+app's own binary, so it reads the same `UserDefaults`, and `synctray telemetry on|off`
+also rewrites `telemetryEnabled` in `settings.json` (`AppSettingsFileStore.updateSettingsFile`,
+which changes only that key and never `launchAtLogin`), so a running app applies it live.
+A first run that has never been answered — in the app or the CLI — asks once
+(`promptForTelemetryIfNeeded`, before the command runs, on stderr, with the banner's own
+copy `SyncTraySettings.telemetryConsentSummary`), defaulting to **No** (`[y/N]`; an empty
+line or EOF is No, Ctrl-C leaves it unanswered). It only asks when stdin AND stderr are a
+terminal and `CI` is unset, never for `help` or `telemetry` itself, so scripts and agents
+are never blocked. CLI telemetry carries the resource attribute `synctray.process.kind=cli`
+(the app sends `app`); `service.name` stays `synctray` for both, so existing queries keep
+working. Exporter diagnostics are silenced in CLI mode so they never clutter a terminal.
+Covered by `ConfigSelfTest` AC-CLI13.
 
 ## Data Flow
 
@@ -1641,7 +1658,7 @@ open ~/Library/Developer/Xcode/DerivedData/SyncTray-*/Build/Products/Debug/SyncT
 | `SettingsView.swift` | Main settings UI with profile editing |
 | `ProfileStore.swift` | File-backed profile persistence — authoritative `{shortId}.profile.json` per profile, write-only blob mirror (see "File-Backed Configuration") |
 | `ConfigFileWatcher.swift` | Live-apply watcher for `~/.config/synctray` (profiles + settings); routes an unknown-id `.profile.json` to create-via-file |
-| `SyncTrayCLI.swift` | Headless `synctray` CLI: inspect (`doctor`/`status`/`profiles`/`profile show`/`logs`/`test-remote`/`listremotes`), configure (`profile create`/`set`/`enable`/`disable`/`delete`, `install`/`reinstall`), operate (`sync`/`mount`/`unmount`/`cache move`); dispatched from `SyncTrayApp.init` (see "Agent-Editable Configuration & CLI") |
+| `SyncTrayCLI.swift` | Headless `synctray` CLI: inspect (`doctor`/`status`/`profiles`/`profile show`/`logs`/`test-remote`/`listremotes`/`remote folders`/`telemetry`), configure (`profile create`/`set`/`enable`/`disable`/`delete`, `install`/`reinstall`), operate (`sync`/`mount`/`unmount`/`cache move`); dispatched from `SyncTrayApp.init` (see "Agent-Editable Configuration & CLI") |
 | `CLIShimInstaller.swift` | Installs the `~/.local/bin/synctray` shim (`~/.local/bin` must be on `PATH`) |
 | `SyncLogPatterns` | Centralized log message pattern matching (includes `isOutOfSyncError`) |
 | `TelemetryService.swift` | OTel singleton — traces, metrics, logs via OTLP/HTTP |
