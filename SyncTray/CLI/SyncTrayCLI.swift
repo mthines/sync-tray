@@ -2014,18 +2014,10 @@ extension CLIEnvironment {
         let watchdog = DispatchWorkItem { if proc.isRunning { proc.terminate() } }
         DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + timeout, execute: watchdog)
 
-        // Drain stdout and stderr CONCURRENTLY. Reading one to EOF before the
-        // other deadlocks when the child fills the still-unread pipe's ~64 KB
-        // buffer — exactly what an unreachable remote does to stderr, the very
-        // buffer test-remote/doctor need. (RcloneLocator sidesteps this by
-        // nulling stderr; here we need it, so we drain both at once.)
-        var errData = Data()
-        let errGroup = DispatchGroup()
-        DispatchQueue.global(qos: .utility).async(group: errGroup) {
-            errData = stderrPipe.fileHandleForReading.readDataToEndOfFile()
-        }
-        let outData = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
-        errGroup.wait()
+        // An unreachable remote fills stderr — the very output test-remote/doctor
+        // need — so both pipes are drained at once. (RcloneLocator sidesteps this
+        // by nulling stderr.)
+        let (outData, errData) = RcloneConfigService.drainPipes(stdout: stdoutPipe, stderr: stderrPipe)
         proc.waitUntilExit()
         watchdog.cancel()
 
