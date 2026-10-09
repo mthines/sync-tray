@@ -118,6 +118,7 @@ enum ConfigSelfTest {
             testShimQuotesExecutablePath,
             testMountModeFileNotInSharedTmp,
             testRemoteFolderListingKeepsSpaces,
+            testCLIRemoteFolders,
             testCacheOnlyUnionConfig,
             testCacheOnlyUnionBehaviour,
             testMountModeSelection,
@@ -1477,6 +1478,7 @@ enum ConfigSelfTest {
         warmEstimate: @escaping (String, SyncProfile) -> VFSCacheService.WarmEstimate = { _, _ in
             VFSCacheService.WarmEstimate(files: 0, bytes: 0, cachedFiles: 0, cachedBytes: 0)
         },
+        remoteSkipsCertCheck: @escaping (String) -> Bool = { _ in false },
         sleep: @escaping (TimeInterval) -> Void = { _ in },
         stdout: @escaping (String) -> Void = { _ in },
         stderr: @escaping (String) -> Void = { _ in },
@@ -1506,6 +1508,7 @@ enum ConfigSelfTest {
             readFile: readFile,
             probeMount: probeMount,
             warmEstimate: warmEstimate,
+            remoteSkipsCertCheck: remoteSkipsCertCheck,
             sleep: sleep,
             stdout: stdout,
             stderr: stderr,
@@ -3445,10 +3448,54 @@ enum ConfigSelfTest {
             return report(name, slug, false, "(could not read the folder-listing call sites)")
         }
         for (site, body) in [("loadRemoteFolders", chooser), ("listFolders", wizard)] {
-            guard body.contains("\"--dirs-only\""), body.contains("parseDirectoryListing("),
+            guard body.contains("folderListingArguments("), body.contains("parseDirectoryListing("),
                   !body.contains("\"lsd\"") else {
                 return report(name, slug, false, "(\(site) does not list with lsf + parseDirectoryListing)")
             }
+        }
+        return report(name, slug, true)
+    }
+
+    // MARK: - AC-CLI12 — `remote folders` prints what the folder chooser shows
+
+    /// `synctray remote folders` must list with the chooser's own rclone arguments
+    /// (cert flag included) and parser, keep spaces in names, work with no profile,
+    /// and surface rclone's error.
+    private static func testCLIRemoteFolders() -> Bool {
+        let name = "AC-CLI12", slug = "cli-remote-folders"
+        guard case .success(.remoteFolders("nas:Music", true)) = SyncTrayCLI.parse(["remote", "folders", "nas:Music", "--json"]),
+              case .failure = SyncTrayCLI.parse(["remote", "folders"]),
+              case .failure = SyncTrayCLI.parse(["remote", "list", "nas"]),
+              SyncTrayCLI.telemetryVerb(for: ["remote", "folders", "nas"]) == "remote-folders" else {
+            return report(name, slug, false, "(parse or telemetry verb wrong)")
+        }
+
+        var seenArgs: [[String]] = []
+        var out = ""
+        let env = fakeCLIEnvironment(
+            runRclone: { args, _ in seenArgs.append(args); return (0, "Folder/\nMy Folder/\n", "") },
+            remoteSkipsCertCheck: { $0 == "nas" },
+            stdout: { out += $0 }
+        )
+        guard SyncTrayCLI.run(.remoteFolders(target: "nas", json: false), env: env) == 0,
+              seenArgs.last == ["lsf", "nas:", "--dirs-only", "--no-check-certificate"],
+              out == "Folder\nMy Folder\n" else {
+            return report(name, slug, false, "(text run: args \(seenArgs), out \(out.debugDescription))")
+        }
+        out = ""
+        guard SyncTrayCLI.run(.remoteFolders(target: "other:A/B", json: true), env: env) == 0,
+              seenArgs.last == ["lsf", "other:A/B", "--dirs-only"],
+              let data = out.data(using: .utf8),
+              (try? JSONSerialization.jsonObject(with: data)) as? [String] == ["Folder", "My Folder"] else {
+            return report(name, slug, false, "(json run: args \(seenArgs.last ?? []), out \(out.debugDescription))")
+        }
+
+        var err = ""
+        let failing = fakeCLIEnvironment(runRclone: { _, _ in (1, "", "didn't find section in config file\n") },
+                                         stderr: { err += $0 })
+        guard SyncTrayCLI.run(.remoteFolders(target: "nope", json: false), env: failing) == 1,
+              err.contains("didn't find section") else {
+            return report(name, slug, false, "(rclone failure not surfaced: \(err.debugDescription))")
         }
         return report(name, slug, true)
     }

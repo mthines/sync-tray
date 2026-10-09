@@ -26,6 +26,7 @@ enum CLICommand: Equatable {
     case testRemote(String)
     case logs(target: String, follow: Bool)
     case listRemotes
+    case remoteFolders(target: String, json: Bool)
     case profiles
     case status(target: String?, json: Bool, wait: StatusWait?)
     case offlineStatus(target: String?, json: Bool)
@@ -158,6 +159,9 @@ struct CLIEnvironment {
     /// network. Backs `offline status`; injected so the self-test drives it with
     /// fixtures. Defaults to `VFSCacheService.shared.estimateWarmWork`.
     var warmEstimate: (_ dir: String, _ profile: SyncProfile) -> VFSCacheService.WarmEstimate
+    /// Whether rclone.conf sets `no_check_certificate = true` for this remote,
+    /// so `remote folders` lists with the same flags the app's folder chooser uses.
+    var remoteSkipsCertCheck: (_ remoteName: String) -> Bool
     /// Pause between polls in `status --wait` / `mount`. Injected so the
     /// self-test's wait loops run instantly.
     var sleep: (TimeInterval) -> Void
@@ -196,6 +200,8 @@ enum SyncTrayCLI {
       logs <name|id> [--follow]    Print or tail a profile's sync log
       test-remote <name|id>        Probe a profile's remote reachability
       listremotes                  List configured rclone remotes
+      remote folders <remote>[:path] [--json]
+                                   List the folders the app's folder chooser shows for a remote
 
     Configure:
       profile create --from <file> Create a profile from a .profile.json file
@@ -293,6 +299,10 @@ enum SyncTrayCLI {
             let sub = argv.dropFirst().first(where: { !$0.hasPrefix("-") }) ?? ""
             return sub == "move" ? "cache-move" : "(other)"
         }
+        if first == "remote" {
+            let sub = argv.dropFirst().first(where: { !$0.hasPrefix("-") }) ?? ""
+            return sub == "folders" ? "remote-folders" : "(other)"
+        }
         if first == "offline" {
             let sub = argv.dropFirst().first(where: { !$0.hasPrefix("-") }) ?? ""
             return sub == "status" ? "offline-status" : "(other)"
@@ -327,6 +337,13 @@ enum SyncTrayCLI {
 
         case "listremotes":
             return .success(.listRemotes)
+
+        case "remote":
+            let flags = parseFlags(rest, valueFlags: [])
+            guard flags.positionals.first == "folders", flags.positionals.count == 2 else {
+                return .failure(CLIUsageError(message: "usage: synctray remote folders <remote>[:path] [--json]"))
+            }
+            return .success(.remoteFolders(target: flags.positionals[1], json: rest.contains("--json")))
 
         case "profiles":
             return .success(.profiles)
@@ -542,6 +559,8 @@ enum SyncTrayCLI {
             return runLogs(target, follow: follow, env: env)
         case .listRemotes:
             return runListRemotes(env: env)
+        case .remoteFolders(let target, let json):
+            return runRemoteFolders(target, json: json, env: env)
         case .profiles:
             return runProfiles(env: env)
         case .status(let target, let json, let wait):
@@ -727,6 +746,36 @@ enum SyncTrayCLI {
             env.stderr(err.isEmpty ? "error: rclone listremotes failed\n" : err)
             return 1
         }
+    }
+
+    // MARK: - remote folders
+
+    /// Lists a remote's folders through the same rclone arguments and parser as the
+    /// profile editor's folder chooser and the setup wizard, so what this prints is
+    /// what the app offers. Needs no profile.
+    private static func runRemoteFolders(_ target: String, json: Bool, env: CLIEnvironment) -> Int32 {
+        let remoteName = target.split(separator: ":", maxSplits: 1).first.map(String.init) ?? ""
+        guard !remoteName.isEmpty else {
+            env.stderr("usage: synctray remote folders <remote>[:path] [--json]\n")
+            return 64
+        }
+        let fullTarget = target.contains(":") ? target : "\(target):"
+        let args = RcloneConfigService.folderListingArguments(
+            fullTarget, skipCertCheck: env.remoteSkipsCertCheck(remoteName)
+        )
+        let (exit, out, err) = env.runRclone(args, 30)
+        guard exit == 0 else {
+            env.stderr(err.isEmpty ? "error: rclone exited \(exit)\n" : err)
+            return 1
+        }
+        let folders = RcloneConfigService.parseDirectoryListing(out)
+        if json {
+            let data = (try? JSONSerialization.data(withJSONObject: folders, options: [.prettyPrinted])) ?? Data("[]".utf8)
+            env.stdout(String(decoding: data, as: UTF8.self) + "\n")
+        } else {
+            for folder in folders { env.stdout(folder + "\n") }
+        }
+        return 0
     }
 
     // MARK: - profiles
@@ -1667,6 +1716,9 @@ extension CLIEnvironment {
             readFile: { try? String(contentsOfFile: $0, encoding: .utf8) },
             probeMount: { profile in CLIEnvironment.probeMountProcess(profile) },
             warmEstimate: { dir, profile in VFSCacheService.shared.estimateWarmWork(dir, for: profile) },
+            remoteSkipsCertCheck: { name in
+                RcloneConfigService.shared.readRemoteConfig(name: name)?.values["no_check_certificate"] == "true"
+            },
             sleep: { Thread.sleep(forTimeInterval: $0) },
             stdout: { FileHandle.standardOutput.write(Data($0.utf8)) },
             stderr: { FileHandle.standardError.write(Data($0.utf8)) },

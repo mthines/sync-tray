@@ -2640,11 +2640,7 @@ struct ProfileDetailView: View {
             process.executableURL = URL(fileURLWithPath: path)
             let remoteName = rcloneRemote.replacingOccurrences(of: ":", with: "")
             let skipCert = RcloneConfigService.shared.readRemoteConfig(name: remoteName)?.values["no_check_certificate"] == "true"
-            var args = ["lsf", "\(rcloneRemote):", "--dirs-only"]
-            if skipCert {
-                args.append("--no-check-certificate")
-            }
-            process.arguments = args
+            process.arguments = RcloneConfigService.folderListingArguments("\(rcloneRemote):", skipCertCheck: skipCert)
             process.standardOutput = pipe
             process.standardError = errPipe
 

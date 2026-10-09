@@ -539,6 +539,12 @@ final class RcloneConfigService {
             .sorted()
     }
 
+    /// The `rclone` arguments every folder listing uses — the folder chooser, the
+    /// setup wizard and `synctray remote folders` — paired with `parseDirectoryListing`.
+    static func folderListingArguments(_ target: String, skipCertCheck: Bool) -> [String] {
+        ["lsf", target, "--dirs-only"] + (skipCertCheck ? ["--no-check-certificate"] : [])
+    }
+
     func listFolders(remote: String) async -> Result<[String], ConfigError> {
         guard let rclonePath = findRclonePath() else {
             return .failure(.rcloneNotFound)
@@ -554,11 +560,7 @@ final class RcloneConfigService {
                 let remotePath = remote.hasSuffix(":") ? remote : "\(remote):"
                 let remoteName = remote.replacingOccurrences(of: ":", with: "")
                 let skipCert = self.readRemoteConfig(name: remoteName)?.values["no_check_certificate"] == "true"
-                var args = ["lsf", remotePath, "--dirs-only"]
-                if skipCert {
-                    args.append("--no-check-certificate")
-                }
-                process.arguments = args
+                process.arguments = Self.folderListingArguments(remotePath, skipCertCheck: skipCert)
                 process.standardOutput = pipe
                 process.standardError = errPipe
 
