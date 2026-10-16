@@ -1255,6 +1255,11 @@ final class SyncManager: ObservableObject {
         }
         // A new run: an earlier abort's trailing suppression must not hide its failures.
         abortSuppressUntil[profile.id] = nil
+        // Explicit setup/recovery runs also establish the next scheduled due time.
+        if !profile.isMountMode {
+            do { try SyncSetupService.recordSyncAttempt(for: profile) }
+            catch { SyncTraySettings.debugLog("Could not record sync attempt: \(error)") }
+        }
         return token
     }
 
@@ -1378,6 +1383,8 @@ final class SyncManager: ObservableObject {
     /// runs, but without UI state (the progress bar / output panel in the settings
     /// view is driven by the profile state change visible via `@Published profileStates`).
     func triggerAutoFix(for profile: SyncProfile) {
+        // Schedule-only profiles never launch automatic recovery between due times.
+        guard profile.syncOnLocalChanges else { return }
         let profileId = profile.id
 
         // Respect the global setting
@@ -2379,16 +2386,20 @@ final class SyncManager: ObservableObject {
 
     private func setupProfileObserver() {
         profileStore.$profiles
-            .sink { [weak self] _ in
-                self?.startWatchingAllProfiles()
+            .sink { [weak self] profiles in
+                // @Published emits before the store property changes: use the
+                // emitted snapshot so switching to schedule-only stops watching now.
+                self?.startWatchingAllProfiles(profiles: profiles)
                 self?.updateAggregateState()
                 self?.updateAppGroupMountPaths()
             }
             .store(in: &cancellables)
     }
 
-    private func startWatchingAllProfiles() {
-        let enabledProfileIds = Set(profileStore.enabledProfiles.map { $0.id })
+    private func startWatchingAllProfiles(profiles: [SyncProfile]? = nil) {
+        let enabledProfiles = (profiles ?? profileStore.profiles).filter { $0.isEnabled }
+        let enabledProfileIds = Set(enabledProfiles.map { $0.id })
+        let watchedProfileIds = Set(enabledProfiles.filter { $0.syncOnLocalChanges && !$0.isMountMode }.map { $0.id })
 
         // Remove watchers for profiles that are no longer enabled
         // (Don't touch watchers for profiles that are still enabled - avoids interrupting active syncs)
@@ -2396,18 +2407,18 @@ final class SyncManager: ObservableObject {
             logWatchers[id]?.stopWatching()
             logWatchers.removeValue(forKey: id)
         }
-        for id in directoryWatchers.keys where !enabledProfileIds.contains(id) {
+        for id in directoryWatchers.keys where !watchedProfileIds.contains(id) {
             directoryWatchers[id]?.stop()
             directoryWatchers.removeValue(forKey: id)
         }
 
         // Add watchers only for profiles that don't already have them
-        for profile in profileStore.enabledProfiles {
+        for profile in enabledProfiles {
             if logWatchers[profile.id] == nil {
                 startWatching(profile: profile)
             }
             // Skip directory watching for mount mode profiles (no need to watch - files stream on-demand)
-            if directoryWatchers[profile.id] == nil && !profile.isMountMode {
+            if directoryWatchers[profile.id] == nil && !profile.isMountMode && profile.syncOnLocalChanges {
                 startWatchingDirectory(for: profile)
             }
         }
@@ -2430,6 +2441,7 @@ final class SyncManager: ObservableObject {
 
     /// Start watching a profile's local sync directory for file changes
     private func startWatchingDirectory(for profile: SyncProfile) {
+        guard profile.syncOnLocalChanges, !isPaused(for: profile.id) else { return }
         guard !profile.localSyncPath.isEmpty else { return }
         guard FileManager.default.fileExists(atPath: profile.localSyncPath) else { return }
         // Skip directory watching for mount mode (files stream on-demand, no sync needed)
@@ -2496,7 +2508,7 @@ final class SyncManager: ObservableObject {
 
         // Get profile and verify it's still valid
         guard let profile = profileStore.profile(for: profileId),
-              profile.isEnabled else {
+              profile.isEnabled, profile.syncOnLocalChanges else {
             SyncTraySettings.debugLog("DirectoryWatcher: Skipping sync for \(profileId.uuidString.prefix(8)) - profile not found or disabled")
             return
         }
@@ -2746,15 +2758,19 @@ final class SyncManager: ObservableObject {
         if agentLoadDeferredByAbort.remove(profile.id) != nil, !setupService.isLoaded(profile: profile) {
             if setupService.loadAgent(for: profile) {
                 SyncTraySettings.debugLog("Restarted '\(profile.name)' by loading its launchd agent (deferred by an abort)")
-                return
+                if profile.syncOnLocalChanges { return }
+                // Schedule-only loading merely checks whether due; the explicit
+                // Sync Now still needs its manual bypass below.
+            } else {
+                // Could not load it: still run now, and try the load again next time.
+                agentLoadDeferredByAbort.insert(profile.id)
             }
-            // Could not load it: still run now, and try the load again next time.
-            agentLoadDeferredByAbort.insert(profile.id)
         }
 
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/bin/bash")
         process.arguments = [SyncProfile.sharedScriptPath, profile.configPath]
+        if trigger == "manual" { process.arguments?.append("--manual") }
 
         do {
             try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in

@@ -30,11 +30,43 @@ You can have as many as you like.
 
 Profiles are stored as files in `~/.config/synctray/profiles/`, so you can also create and edit them from a script or an AI agent — see [Agent setup](agent-setup.md).
 
+## Automatic sync and longer intervals
+
+In setup or profile settings, choose **On local changes + schedule** (the default)
+or **Schedule only**. The default also syncs about five seconds after local editing
+stops while the app is open. Schedule only leaves edits, temporary large files,
+moves and deletions alone until the interval is due. This applies to both two-way
+and one-way profiles; Stream profiles still run continuously.
+
+Choose a preset up to **2 weeks**, or **Custom…** with a whole number of minutes,
+hours, days or weeks (1 minute to 365 days). These are elapsed intervals: one week
+means seven days, rather than a specific weekday or clock time.
+
+Schedule only remembers the last attempt across app launches, login, restarts and
+settings saves. **Sync Now**, the CLI `sync` command and an initial sync during
+setup run immediately and restart the interval. Failed attempts also restart it;
+use Sync Now to retry sooner. Automatic error recovery is disabled for this mode
+so it cannot cause extra uploads between scheduled attempts.
+
+The background agent checks the saved due time locally once a minute, without
+scanning your folder or contacting the remote before it is due. If the Mac is
+asleep/off, or the configured external drive is disconnected, an overdue sync
+runs once after it is available, normally within a minute; missed intervals do
+not queue multiple runs. It never wakes the Mac. Network failures count as an
+attempt and wait until the next interval, unless you retry manually.
+
+Without usable schedule history (including when folders or direction change),
+the first automatic check starts a full interval rather than uploading at login
+or on Save. Moving the clock backwards waits until the recorded attempt plus
+the interval is due again. Changing the interval applies it to the saved attempt
+time; it does not reset that time.
+
 ## Two-way sync
 
 For files you edit in more than one place.
-SyncTray runs `rclone bisync` on your schedule, every 1 minute to 1 hour (5 minutes by default).
-While the app is open, a local change also starts a sync about 5 seconds after you stop editing.
+SyncTray runs `rclone bisync` on your schedule, from every 1 minute to every 365 days (5 minutes by default).
+
+
 
 - **Conflicts keep both copies.** When a file changed on both sides, the newer version keeps the name and the other is renamed with a `sync-conflict-<date>` suffix.
 - **Mass deletions stop.** If a run would delete more than half of the files, it stops instead. The profile shows **Delete from Remote** to go ahead, or **Restore from Remote** to bring the files back.
