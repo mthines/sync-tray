@@ -279,6 +279,15 @@ struct SyncProfile: Identifiable, Codable, Equatable {
         (Self.privateTempDirectory as NSString).appendingPathComponent("synctray-mount-\(shortId).mode")
     }
 
+    /// Mount mode only — empty marker whose modification time records when SyncTray (the app
+    /// or the CLI) last detached this profile's volume or unloaded its agent on purpose
+    /// (`SyncSetupService.noteDeliberateUnmount`). The mount-interruption telemetry reads it to
+    /// tell a requested unmount from a drop (`MountDropClassifier`). Same per-user 0700 temp
+    /// dir as `mountModePath`, for the same reason: never the shared `/tmp`.
+    var deliberateUnmountMarkerPath: String {
+        (Self.privateTempDirectory as NSString).appendingPathComponent("synctray-unmount-\(shortId).intent")
+    }
+
     /// This user's own temp directory (`/var/folders/…/T/`): owned by the user, mode
     /// 0700, created on demand by `confstr`, and cleared at boot like `/tmp`. Read via
     /// `confstr` rather than `$TMPDIR` so the app (launched by launchd) and the CLI

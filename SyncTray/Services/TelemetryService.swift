@@ -157,6 +157,8 @@ final class TelemetryService {
     private var mountListingWarmCounter: LongCounterSdk?
     private var mountListingWarmDurationHistogram: DoubleHistogramMeterSdk?
     private var mountSpotlightMarkerCounter: LongCounterSdk?
+    private var mountInterruptionsCounter: LongCounterSdk?
+    private var mountInterruptionDurationHistogram: DoubleHistogramMeterSdk?
     private var activeOverlayUploadSpans: [UUID: any Span] = [:]
 
     // MARK: - Providers (kept alive for shutdown)
@@ -596,6 +598,16 @@ final class TelemetryService {
             .counterBuilder(name: "synctray.mount.spotlight_marker")
             .setDescription("Spotlight-exclusion marker writes at a streaming Stream mount root (written, exists, failed, skipped)")
             .setUnit("1")
+            .build()
+        mountInterruptionsCounter = meter
+            .counterBuilder(name: "synctray.mount.interruptions")
+            .setDescription("Stream mount interruptions observed by the mount monitor (mount.interruption_kind: stall = the mount root stopped answering, drop = the volume left the mount table without a requested unmount)")
+            .setUnit("1")
+            .build()
+        mountInterruptionDurationHistogram = meter
+            .histogramBuilder(name: "synctray.mount.interruption.duration")
+            .setDescription("How long a Stream mount interruption lasted, from detection to recovery or unmount (seconds)")
+            .setUnit("s")
             .build()
     }
 
@@ -2587,6 +2599,77 @@ final class TelemetryService {
         ]
         mountModeChangesCounter?.add(value: 1, attribute: attrs)
         emitLog(severity: .info, body: "Mount mode changed", attributes: attrs)
+    }
+
+    // MARK: - Mount Interruptions
+
+    /// Record the leading edge of a Stream mount interruption, as seen by the mount monitor
+    /// (`SyncManager.trackMountInterruption`). `kind` is `stall` (a `statfs` on the mount root
+    /// has been outstanding for `MountStallProbe.stallThreshold`: the condition macOS reports
+    /// as "Server connections interrupted") or `drop` (the volume left the mount table while
+    /// the profile's launchd agent stayed loaded, so no unmount was requested). Emitted at
+    /// detection, not at recovery, so an interruption that never recovers is still visible.
+    /// `mode` is the mount mode token with underscores (`streaming`, `cache_only_manual`, …)
+    /// or `unknown`.
+    func recordMountInterruptionStarted(
+        profileId: UUID,
+        profileName: String,
+        kind: String,
+        backend: String,
+        mode: String
+    ) {
+        guard SyncTraySettings.telemetryEnabled else { return }
+        ensureSetup()
+        mountInterruptionsCounter?.add(value: 1, attribute: [
+            "mount.interruption_kind": .string(kind),
+            "mount.backend": .string(backend),
+        ])
+        emitLog(severity: .warn, body: "Mount interrupted", attributes: [
+            "synctray.profile.id": .string(profileId.uuidString),
+            "synctray.profile.name": .string(profileName),
+            "sync.mode": .string("mount"),
+            "mount.interruption_kind": .string(kind),
+            "mount.backend": .string(backend),
+            "mount.mode": .string(mode),
+        ])
+    }
+
+    /// Record the end of a Stream mount interruption. `outcome` is `recovered` (the mount
+    /// answered again / the volume came back), `dropped` (a stall that ended with the volume
+    /// leaving the mount table, which is then tracked as a drop of its own), or `unmounted`
+    /// (a drop the profile never came back from before it was unmounted, disabled or removed
+    /// on purpose). For a stall, `durationSeconds` runs from the start of the probe that
+    /// stalled, so it is a lower bound.
+    func recordMountInterruptionEnded(
+        profileId: UUID,
+        profileName: String,
+        kind: String,
+        outcome: String,
+        durationSeconds: Double,
+        backend: String,
+        mode: String
+    ) {
+        guard SyncTraySettings.telemetryEnabled else { return }
+        ensureSetup()
+        mountInterruptionDurationHistogram?.record(value: durationSeconds, attributes: [
+            "mount.interruption_kind": .string(kind),
+            "mount.interruption_outcome": .string(outcome),
+            "mount.backend": .string(backend),
+        ])
+        emitLog(
+            severity: outcome == "recovered" ? .info : .warn,
+            body: "Mount interruption ended",
+            attributes: [
+                "synctray.profile.id": .string(profileId.uuidString),
+                "synctray.profile.name": .string(profileName),
+                "sync.mode": .string("mount"),
+                "mount.interruption_kind": .string(kind),
+                "mount.interruption_outcome": .string(outcome),
+                "mount.interruption_duration_s": .double(durationSeconds),
+                "mount.backend": .string(backend),
+                "mount.mode": .string(mode),
+            ]
+        )
     }
 
     /// Record a whole-tree directory-*listing* warm run on a streaming Stream mount

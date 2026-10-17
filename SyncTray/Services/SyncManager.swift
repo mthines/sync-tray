@@ -205,6 +205,21 @@ final class SyncManager: ObservableObject {
     /// the app's reads doesn't thrash the warm back on and straight off again.
     static let warmAutoPauseCooldown: TimeInterval = 30
 
+    /// Mount-interruption telemetry (CLAUDE.md "Mount interruption telemetry"): the
+    /// responsiveness probe state per mounted Stream profile (`MountStallProbe`).
+    private var mountStallProbes: [UUID: MountStallProbe] = [:]
+    /// Start of a confirmed unexpected drop per profile, cleared when the volume returns
+    /// (outcome `recovered`) or the profile is unmounted, disabled or removed (`unmounted`).
+    private var mountDropStartedAt: [UUID: Date] = [:]
+    /// Profiles whose mount-table disappearance is waiting for `MountDropClassifier.confirmDelay`
+    /// before it is classified, so one disappearance schedules one check.
+    private var pendingMountDropChecks: Set<UUID> = []
+    /// Where the responsiveness probes run. Concurrent, and off the GCD global pool, because
+    /// a probe on a hung hard NFS mount blocks its thread until the server answers; the
+    /// one-outstanding-probe-per-profile rule in `MountStallProbe` bounds the threads.
+    private let mountProbeQueue = DispatchQueue(
+        label: "com.synctray.mount-responsiveness-probe", qos: .utility, attributes: .concurrent)
+
     /// In-flight warming tasks per profile, kept so a warm run can be cancelled when the
     /// cache is cleared, the profile is unmounted, or a new run supersedes it. Without this,
     /// clearing the cache mid-warm just re-downloads the files the warmer is still reading.
@@ -751,6 +766,8 @@ final class SyncManager: ObservableObject {
         // Stop any warming first — reads through a mount that's going away would hang or fail.
         cancelWarm(for: profile.id)
         autoWarmedMounts.remove(profile.id)  // re-arm auto-warm for the next mount
+        // An open drop or stall ends here, by request (outcome `unmounted`).
+        closeMountInterruptions(only: profile.id)
 
         Task {
             do {
@@ -4386,6 +4403,14 @@ final class SyncManager: ObservableObject {
                     }
 
                     let newMode = isMounted ? modes[profile.id] : nil
+                    // Stall and drop telemetry. Runs before the mode bookkeeping below so a
+                    // drop is still reported with the mode the mount was in.
+                    self.trackMountInterruption(
+                        for: profile,
+                        wasMounted: before.contains(profile.id),
+                        isMounted: isMounted,
+                        mode: newMode ?? self.profileMountModes[profile.id]
+                    )
                     if newMode != self.profileMountModes[profile.id] {
                         self.notifiedBackOnNetworkEpisodes.remove(profile.id)
                         if let newMode {
@@ -4451,6 +4476,9 @@ final class SyncManager: ObservableObject {
                 // fallback that established after the initial poll, a launchd/externally
                 // mounted profile, or one that recovered from .failed — never reaches the
                 // extension, so its right-click menu and badges silently never appear.
+                // A profile that is no longer an enabled Stream profile (disabled, deleted,
+                // switched to a sync mode) can't recover from an open drop or stall: close it.
+                self.closeMountInterruptions(keeping: Set(mountProfiles.map(\.id)))
                 let after = Set(self.profileMountStates.filter { $0.value == .mounted }.keys)
                 if before != after {
                     self.updateAppGroupMountPaths()
@@ -4460,6 +4488,157 @@ final class SyncManager: ObservableObject {
                 // that is currently warming, pause the warm (re-armed each tick; see
                 // `refreshWarmAutoPause`). Only touches profiles with a live warm.
                 self.refreshWarmAutoPause(for: mountProfiles)
+            }
+        }
+    }
+
+    // MARK: - Mount interruption telemetry
+
+    /// Telemetry label for a mount mode: the token with underscores, or `unknown`.
+    private static func mountModeLabel(_ mode: MountMode?) -> String {
+        mode.map { $0.rawValue.replacingOccurrences(of: "-", with: "_") } ?? "unknown"
+    }
+
+    /// One mount-monitor tick of stall and drop tracking for an enabled Stream profile
+    /// (CLAUDE.md "Mount interruption telemetry"). While the volume is mounted: close an
+    /// open drop, report a probe that has crossed the stall threshold, and start the next
+    /// responsiveness probe when one is due. On the mounted → gone edge: close an open stall
+    /// as `dropped` and schedule the drop classification.
+    private func trackMountInterruption(
+        for profile: SyncProfile, wasMounted: Bool, isMounted: Bool, mode: MountMode?
+    ) {
+        let now = Date()
+        let id = profile.id
+        let backend = profile.mountBackend.rawValue
+        let modeLabel = Self.mountModeLabel(mode)
+
+        if isMounted {
+            if let since = mountDropStartedAt.removeValue(forKey: id) {
+                TelemetryService.shared.recordMountInterruptionEnded(
+                    profileId: id, profileName: profile.name, kind: "drop", outcome: "recovered",
+                    durationSeconds: max(0, now.timeIntervalSince(since)), backend: backend, mode: modeLabel)
+            }
+            var probe = mountStallProbes[id] ?? MountStallProbe()
+            if case .stallStarted = probe.evaluate(now: now) {
+                TelemetryService.shared.recordMountInterruptionStarted(
+                    profileId: id, profileName: profile.name, kind: "stall", backend: backend, mode: modeLabel)
+                SyncTraySettings.debugLog(
+                    "'\(profile.name)': mount root has not answered for \(Int(MountStallProbe.stallThreshold))s (stall)")
+            }
+            if probe.shouldStartProbe(now: now) {
+                probe.probeStarted(at: now)
+                startMountResponsivenessProbe(profileId: id, mountPoint: profile.localSyncPath)
+            }
+            mountStallProbes[id] = probe
+        } else if wasMounted {
+            if var probe = mountStallProbes[id] {
+                if case let .stallEnded(duration) = probe.volumeWentAway(at: now) {
+                    TelemetryService.shared.recordMountInterruptionEnded(
+                        profileId: id, profileName: profile.name, kind: "stall", outcome: "dropped",
+                        durationSeconds: duration, backend: backend, mode: modeLabel)
+                }
+                mountStallProbes[id] = probe
+            }
+            scheduleMountDropCheck(for: profile, disappearedAt: now, modeLabel: modeLabel)
+        }
+    }
+
+    /// Run one `statfs(2)` on the mount root off the main actor and report back when it
+    /// returns. On a hung hard NFS mount the call blocks until rclone answers (or the volume
+    /// goes away), which is exactly what `MountStallProbe` measures.
+    private func startMountResponsivenessProbe(profileId: UUID, mountPoint: String) {
+        mountProbeQueue.async { [weak self] in
+            _ = Self.mountRootAnswers(mountPoint)
+            let finishedAt = Date()
+            DispatchQueue.main.async {
+                self?.finishMountResponsivenessProbe(profileId: profileId, finishedAt: finishedAt)
+            }
+        }
+    }
+
+    /// `statfs(2)` on the mount root: an FSSTAT round trip to rclone's NFS server (a statfs
+    /// call on macFUSE). Success or error both mean the filesystem answered.
+    nonisolated private static func mountRootAnswers(_ mountPoint: String) -> Bool {
+        var buffer = Darwin.statfs()
+        return Darwin.statfs(mountPoint, &buffer) == 0
+    }
+
+    private func finishMountResponsivenessProbe(profileId: UUID, finishedAt: Date) {
+        guard var probe = mountStallProbes[profileId] else { return }
+        let event = probe.probeFinished(at: finishedAt)
+        mountStallProbes[profileId] = probe
+        guard case let .stallEnded(duration) = event,
+              let profile = profileStore.profile(for: profileId) else { return }
+        TelemetryService.shared.recordMountInterruptionEnded(
+            profileId: profileId, profileName: profile.name, kind: "stall", outcome: "recovered",
+            durationSeconds: duration, backend: profile.mountBackend.rawValue,
+            mode: Self.mountModeLabel(profileMountModes[profileId]))
+    }
+
+    /// Classify a mount-table disappearance `MountDropClassifier.confirmDelay` after it was
+    /// seen, once the agent state and the deliberate-unmount marker can be trusted. An
+    /// unexpected drop is reported with its start at the disappearance; if the volume is
+    /// already back by then it is closed straight away as `recovered`.
+    private func scheduleMountDropCheck(for profile: SyncProfile, disappearedAt: Date, modeLabel: String) {
+        let id = profile.id
+        guard mountDropStartedAt[id] == nil, !pendingMountDropChecks.contains(id) else { return }
+        pendingMountDropChecks.insert(id)
+        DispatchQueue.global(qos: .utility).asyncAfter(
+            deadline: .now() + MountDropClassifier.confirmDelay
+        ) { [weak self] in
+            guard let self else { return }
+            let agentLoaded = self.setupService.isLoaded(profile: profile)
+            let marker = self.setupService.lastDeliberateUnmount(for: profile)
+            DispatchQueue.main.async {
+                self.pendingMountDropChecks.remove(id)
+                let current = self.profileStore.profile(for: id)
+                let unexpected = MountDropClassifier.isUnexpectedDrop(
+                    agentLoaded: agentLoaded,
+                    isEnabledMountProfile: current?.isEnabled == true && current?.isMountMode == true,
+                    isPaused: self.pausedProfiles.contains(id),
+                    lastDeliberateUnmount: marker,
+                    disappearedAt: disappearedAt
+                )
+                guard unexpected, let current else { return }
+                let backend = current.mountBackend.rawValue
+                TelemetryService.shared.recordMountInterruptionStarted(
+                    profileId: id, profileName: current.name, kind: "drop", backend: backend, mode: modeLabel)
+                SyncTraySettings.debugLog("'\(current.name)': volume left the mount table without an unmount (drop)")
+                if self.profileMountStates[id] == .mounted {
+                    TelemetryService.shared.recordMountInterruptionEnded(
+                        profileId: id, profileName: current.name, kind: "drop", outcome: "recovered",
+                        durationSeconds: max(0, Date().timeIntervalSince(disappearedAt)), backend: backend,
+                        mode: Self.mountModeLabel(self.profileMountModes[id]))
+                } else {
+                    self.mountDropStartedAt[id] = disappearedAt
+                }
+            }
+        }
+    }
+
+    /// Close any open drop or stall for a profile that is being unmounted on purpose, or for
+    /// every profile not in `keeping` (no longer an enabled Stream profile). Outcome
+    /// `unmounted`: the interruption ended without the mount coming back.
+    private func closeMountInterruptions(keeping: Set<UUID>? = nil, only: UUID? = nil) {
+        let now = Date()
+        let candidates = Set(mountDropStartedAt.keys).union(mountStallProbes.keys)
+        for id in candidates {
+            if let only, id != only { continue }
+            if let keeping, keeping.contains(id) { continue }
+            let profile = profileStore.profile(for: id)
+            let name = profile?.name ?? ""
+            let backend = profile?.mountBackend.rawValue ?? "unknown"
+            let mode = Self.mountModeLabel(profileMountModes[id])
+            if let since = mountDropStartedAt.removeValue(forKey: id) {
+                TelemetryService.shared.recordMountInterruptionEnded(
+                    profileId: id, profileName: name, kind: "drop", outcome: "unmounted",
+                    durationSeconds: max(0, now.timeIntervalSince(since)), backend: backend, mode: mode)
+            }
+            if var probe = mountStallProbes.removeValue(forKey: id),
+               case let .stallEnded(duration) = probe.volumeWentAway(at: now) {
+                TelemetryService.shared.recordMountInterruptionEnded(
+                    profileId: id, profileName: name, kind: "stall", outcome: "unmounted",
+                    durationSeconds: duration, backend: backend, mode: mode)
             }
         }
     }
