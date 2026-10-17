@@ -4556,11 +4556,11 @@ final class SyncManager: ObservableObject {
         }
     }
 
-    /// `statfs(2)` on the mount root: an FSSTAT round trip to rclone's NFS server (a statfs
-    /// call on macFUSE). Success or error both mean the filesystem answered.
+    /// `statfs(2)` on the mount root (what `attributesOfFileSystem` calls): an FSSTAT round
+    /// trip to rclone's NFS server, a statfs call on macFUSE. Success or error both mean the
+    /// filesystem answered; only a call that doesn't return is a stall.
     nonisolated private static func mountRootAnswers(_ mountPoint: String) -> Bool {
-        var buffer = Darwin.statfs()
-        return Darwin.statfs(mountPoint, &buffer) == 0
+        (try? FileManager.default.attributesOfFileSystem(forPath: mountPoint)) != nil
     }
 
     private func finishMountResponsivenessProbe(profileId: UUID, finishedAt: Date) {
