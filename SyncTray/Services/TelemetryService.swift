@@ -2770,11 +2770,11 @@ final class TelemetryService {
         if SyncLogPatterns.isTransientAllFilesChangedError(msg) {
             return "transient_all_files_changed"
         }
-        if msg.contains("lack of support for") && msg.contains("exclusive") {
-            // rclone raises this when a backend (observed on WebDAV) can't honor an
-            // exclusive/atomic create that bisync's conflict-safety check requires.
-            // This is a backend capability gap, not a transient or generic failure,
-            // so it gets its own bucket instead of falling into "other".
+        if SyncLogPatterns.isBenignNFSExclusiveCreateNotice(msg) {
+            // go-nfs (behind `rclone nfsmount`) logs this for every O_EXCL create on a
+            // Stream mount; macOS retries without O_EXCL and the create succeeds. LogParser
+            // no longer surfaces it as an error, so this bucket only catches it if it ever
+            // arrives through another path (e.g. a sync-failure message), instead of "other".
             return "exclusive_mode_unsupported"
         }
         if msg.contains("not found") || msg.contains("no such") {

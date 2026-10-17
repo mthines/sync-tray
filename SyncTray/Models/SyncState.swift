@@ -458,6 +458,25 @@ enum SyncLogPatterns {
         message.contains("all files were changed") || message.contains("Safety abort")
     }
 
+    /// rclone's NFS server (go-nfs, behind `rclone nfsmount`, the default Stream backend)
+    /// logs "failing create to indicate lack of support for 'exclusive' mode." at ERROR
+    /// level every time the NFS client asks for an NFSv3 EXCLUSIVE create, i.e. whenever
+    /// an app on the Mac opens a new file on the mount with `O_CREAT|O_EXCL`.
+    ///
+    /// It is not a failure. go-nfs answers NFS3ERR_NOTSUPP on purpose, and the macOS NFS
+    /// client reacts by dropping `O_EXCL` and retrying the create (`nfs3_vnop_create`), so
+    /// the file is created and the app never sees an error. Treating the line as an error
+    /// put a red "Last sync error" banner on healthy Stream profiles that nothing ever
+    /// cleared (a mount never starts or completes a sync, which is what clears it) and
+    /// emitted one "Sync error" ERROR telemetry record per create.
+    ///
+    /// Single source for this match: `LogParser` drops the line, and
+    /// `TelemetryService.categorizeError` buckets it as `exclusive_mode_unsupported`.
+    static func isBenignNFSExclusiveCreateNotice(_ message: String) -> Bool {
+        let lower = message.lowercased()
+        return lower.contains("lack of support for") && lower.contains("exclusive")
+    }
+
     /// Generic messages that don't provide useful error info
     static func isGenericAbortMessage(_ message: String) -> Bool {
         message.contains("Bisync aborted") || message.contains("Failed to bisync")
