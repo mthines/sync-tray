@@ -147,6 +147,7 @@ enum ConfigSelfTest {
             testSyncRunLockReleaseAndReplace,
             testSyncRunLockSessionNameAndParse,
             testPriorLockFileRejectedRun,
+            testNFSExclusiveCreateNoticeNotAnError,
             testRunLivenessMountMode,
             testExclusiveRunRegistryStaleGrace,
             testSyncRunLockAcquire,
@@ -7315,6 +7316,45 @@ enum ConfigSelfTest {
                            "(isRejectedConcurrentRun was true for an unrelated message)")
         }
         return report("AC-SR6", "prior-lock-file-rejected-run", true)
+    }
+
+    // MARK: - AC-NFS1 — go-nfs's exclusive-create notice is not a profile error
+
+    /// `rclone nfsmount` (go-nfs) logs "failing create to indicate lack of support for
+    /// 'exclusive' mode." at ERROR for every O_EXCL create on a Stream mount, and macOS
+    /// retries the create without O_EXCL, which succeeds. The line must not become an
+    /// `.errorMessage` (which records a "Sync error" and raises a "Last sync error" banner
+    /// that a mount never clears), while a genuine rclone error line still must.
+    private static func testNFSExclusiveCreateNoticeNotAnError() -> Bool {
+        let notice = "failing create to indicate lack of support for 'exclusive' mode."
+        guard SyncLogPatterns.isBenignNFSExclusiveCreateNotice(notice),
+              SyncLogPatterns.isBenignNFSExclusiveCreateNotice("nfs: " + notice.uppercased()) else {
+            return report("AC-NFS1", "nfs-exclusive-create-not-an-error", false,
+                          "(isBenignNFSExclusiveCreateNotice did not match go-nfs's notice)")
+        }
+        guard !SyncLogPatterns.isBenignNFSExclusiveCreateNotice("Failed to copy: permission denied") else {
+            return report("AC-NFS1", "nfs-exclusive-create-not-an-error", false,
+                          "(isBenignNFSExclusiveCreateNotice matched an unrelated error)")
+        }
+
+        let parser = LogParser()
+        let noticeLine = #"{"level":"error","msg":"failing create to indicate lack of support for 'exclusive' mode.","source":"nfs/nfs_oncreate.go:42","time":"2026-10-17T14:02:46.706+02:00"}"#
+        guard let noticeEvent = parser.parse(line: noticeLine) else {
+            return report("AC-NFS1", "nfs-exclusive-create-not-an-error", false,
+                          "(the go-nfs JSON log line did not parse)")
+        }
+        if case .errorMessage = noticeEvent.type {
+            return report("AC-NFS1", "nfs-exclusive-create-not-an-error", false,
+                          "(the go-nfs exclusive-create notice was surfaced as an errorMessage)")
+        }
+
+        let realErrorLine = #"{"level":"error","msg":"Failed to copy: permission denied","time":"2026-10-17T14:02:46.706+02:00"}"#
+        guard let realEvent = parser.parse(line: realErrorLine),
+              case .errorMessage = realEvent.type else {
+            return report("AC-NFS1", "nfs-exclusive-create-not-an-error", false,
+                          "(a genuine rclone error line was no longer surfaced as an errorMessage)")
+        }
+        return report("AC-NFS1", "nfs-exclusive-create-not-an-error", true)
     }
 
     // MARK: - AC-SR7 — mount-mode liveness ignores lock files, registry only

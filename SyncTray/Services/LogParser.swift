@@ -84,6 +84,17 @@ final class LogParser {
 
         // Capture error messages from rclone (error or critical level)
         if entry.level == "error" || entry.level == "critical" {
+            // go-nfs's exclusive-create notice is logged at ERROR but is not a failure:
+            // the macOS NFS client retries the create without O_EXCL and it succeeds.
+            // Surfacing it would raise a "Last sync error" on a healthy Stream profile.
+            if SyncLogPatterns.isBenignNFSExclusiveCreateNotice(msg) {
+                return ParsedLogEvent(
+                    timestamp: timestamp,
+                    type: .unknown,
+                    rawLine: line
+                )
+            }
+
             // Clean up error message using centralized patterns
             var errorMsg = SyncLogPatterns.cleanErrorMessage(msg)
 

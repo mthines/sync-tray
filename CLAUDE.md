@@ -176,6 +176,15 @@ from *causing* the stall, this keeps a stall from *freezing* the machine.
 which can occasionally cause an extra re-upload after a file is merely viewed in
 Finder. `--allow-non-empty` is a FUSE-only option and is ignored for the NFS backend.
 
+**`failing create to indicate lack of support for 'exclusive' mode.` is not an error.**
+go-nfs (rclone's NFS server) logs it at ERROR for every `O_CREAT|O_EXCL` create on the
+mount and answers NFS3ERR_NOTSUPP; the macOS NFS client then retries the create without
+`O_EXCL` (`nfs3_vnop_create`) and it succeeds. `LogParser` therefore drops the line
+(`SyncLogPatterns.isBenignNFSExclusiveCreateNotice`) instead of surfacing it as a "Last
+sync error" — a banner a Stream profile could never clear, since nothing but a sync
+start/complete clears it. `TelemetryService.categorizeError` keeps the
+`exclusive_mode_unsupported` bucket for the same predicate. Covered by `ConfigSelfTest` AC-NFS1.
+
 **NFS read path is sensitive to the cache disk.** NFSv3 is stateless, so rclone
 serves every 32 KB READ as a full vfs open→read→close, and each open rewrites the
 file's `vfsMeta` sidecar (`vfscache.Item._save`, found by sampling
