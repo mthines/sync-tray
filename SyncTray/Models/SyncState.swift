@@ -233,6 +233,131 @@ enum MountState: Equatable {
     }
 }
 
+// MARK: - Mount interruption tracking
+
+/// Pure state machine behind the mount STALL telemetry (CLAUDE.md "Mount interruption
+/// telemetry", AC-MI1). The mount monitor sends one `statfs(2)` at a time to a mounted
+/// Stream profile's mount root: an NFS FSSTAT round trip to rclone's local NFS server
+/// (or a FUSE statfs on macFUSE). A probe that has not returned after `stallThreshold`
+/// is a stall: filesystem calls on the mount are not being answered, which is the
+/// condition macOS reports as "Server connections interrupted" and Finder shows as a
+/// hang. The volume stays in the mount table throughout, so the mount-table check
+/// (`SyncSetupService.isMounted`) cannot see it.
+///
+/// No I/O here: the monitor supplies the clock and reports when the probe returns, so
+/// every transition is unit-testable.
+struct MountStallProbe: Equatable {
+    /// A probe still outstanding after this long counts as a stall. Long enough that a
+    /// cold FSSTAT over a slow backend doesn't trip it, short enough to catch the hangs
+    /// a user notices.
+    static let stallThreshold: TimeInterval = 15
+    /// Minimum gap between one probe returning and the next starting: one cheap
+    /// round trip every 30 s per mounted profile.
+    static let probeInterval: TimeInterval = 30
+
+    /// When the outstanding probe started, or nil when none is outstanding.
+    private(set) var inFlightSince: Date?
+    /// When the last probe returned.
+    private(set) var lastFinishedAt: Date?
+    /// The outstanding probe's stall has been reported and not yet closed.
+    private(set) var stallOpen = false
+    /// The outstanding probe may no longer report: its stall was closed by the volume
+    /// going away, or it was already outstanding when the volume went away.
+    private(set) var probeSettled = false
+
+    enum Event: Equatable {
+        case none
+        case stallStarted(since: Date)
+        case stallEnded(duration: TimeInterval)
+    }
+
+    /// Whether a new probe should start now: none outstanding (at most one blocked
+    /// thread per profile, however long the mount hangs) and the interval has passed.
+    func shouldStartProbe(now: Date) -> Bool {
+        guard inFlightSince == nil else { return false }
+        guard let last = lastFinishedAt else { return true }
+        return now.timeIntervalSince(last) >= Self.probeInterval
+    }
+
+    mutating func probeStarted(at date: Date) {
+        inFlightSince = date
+        stallOpen = false
+        probeSettled = false
+    }
+
+    /// Evaluate the outstanding probe on a monitor tick. Returns `.stallStarted` exactly
+    /// once per probe, the first time it has been outstanding for `stallThreshold`.
+    mutating func evaluate(now: Date) -> Event {
+        guard let since = inFlightSince, !stallOpen, !probeSettled,
+              now.timeIntervalSince(since) >= Self.stallThreshold else { return .none }
+        stallOpen = true
+        return .stallStarted(since: since)
+    }
+
+    /// The probe returned, with success or an error: either way the filesystem answered.
+    /// Closes an open stall; the duration runs from the probe's start, so it is a lower
+    /// bound on how long the mount was unresponsive.
+    mutating func probeFinished(at date: Date) -> Event {
+        guard let since = inFlightSince else { return .none }
+        let wasOpen = stallOpen
+        inFlightSince = nil
+        stallOpen = false
+        probeSettled = false
+        lastFinishedAt = date
+        return wasOpen ? .stallEnded(duration: max(0, date.timeIntervalSince(since))) : .none
+    }
+
+    /// The volume left the mount table. Closes an open stall (the caller reports it with
+    /// outcome `dropped`) and settles the outstanding probe so it can't report again
+    /// when its blocked call finally returns.
+    mutating func volumeWentAway(at date: Date) -> Event {
+        guard let since = inFlightSince else { return .none }
+        probeSettled = true
+        guard stallOpen else { return .none }
+        stallOpen = false
+        return .stallEnded(duration: max(0, date.timeIntervalSince(since)))
+    }
+}
+
+/// Decides which mount-table disappearances are DROPS for the mount telemetry
+/// (CLAUDE.md "Mount interruption telemetry", AC-MI2): the volume vanished and nobody
+/// asked for it. Two signals rule out a deliberate unmount:
+/// - **The deliberate-unmount marker.** Every detach SyncTray performs, from the app or
+///   the CLI, goes through `SyncSetupService` (`unmount`, `uninstall` and therefore every
+///   reinstall and Cache Only switch, `unloadAgent` for pause, the orphan cleanup), which
+///   touches `SyncProfile.deliberateUnmountMarkerPath` first. A disappearance within
+///   `deliberateWindow` of that touch is deliberate, even when the agent is loaded again by
+///   the time we look (a reinstall reloads it within seconds).
+/// - **The launchd agent is unloaded** (checked `confirmDelay` after the disappearance,
+///   since `unmount` unloads it only after detaching): someone stopped the profile.
+/// What remains is a volume that vanished under a loaded agent with no marker: rclone
+/// exited, or macOS detached it (for example the "Disconnect" button in the "Server
+/// connections interrupted" dialog).
+enum MountDropClassifier {
+    /// How long after the volume disappears to wait before reading the agent's state.
+    static let confirmDelay: TimeInterval = 10
+    /// How long a deliberate-unmount marker explains a disappearance. Covers a slow
+    /// graceful `diskutil unmount` falling back to a forced one.
+    static let deliberateWindow: TimeInterval = 120
+
+    static func isUnexpectedDrop(
+        agentLoaded: Bool,
+        isEnabledMountProfile: Bool,
+        isPaused: Bool,
+        lastDeliberateUnmount: Date?,
+        disappearedAt: Date
+    ) -> Bool {
+        guard agentLoaded, isEnabledMountProfile, !isPaused else { return false }
+        if let marker = lastDeliberateUnmount {
+            // The marker is written before the detach, so a deliberate disappearance is
+            // seen after it; 1 s of slack absorbs timestamp granularity.
+            let age = disappearedAt.timeIntervalSince(marker)
+            if age >= -1 && age <= deliberateWindow { return false }
+        }
+        return true
+    }
+}
+
 /// The actual mode a Stream (mount) profile's rclone process is running in RIGHT NOW,
 /// read from the per-boot state file (`SyncProfile.mountModePath`) the sync script
 /// writes right before starting rclone. Distinct from `SyncProfile.streamCacheOnly`,

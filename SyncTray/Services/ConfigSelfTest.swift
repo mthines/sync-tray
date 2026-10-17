@@ -57,6 +57,8 @@ enum ConfigSelfTest {
             testListingWarmOnMount,
             testListingWarmDescentPrimitives,
             testSpotlightMarkerWrite,
+            testMountStallProbe,
+            testMountDropClassifier,
             testMountPollDecision,
             testLegacyOfflineLinkCleanup,
             testWarmReconcileTrigger,
@@ -1127,6 +1129,111 @@ enum ConfigSelfTest {
             return report("AC-LW2", "listing-warm-descent", false, "(abort threshold wrong)")
         }
         return report("AC-LW2", "listing-warm-descent", true)
+    }
+
+    // MARK: - AC-MI1 — mount stall probe state machine
+
+    /// `MountStallProbe` (mount-interruption telemetry): one outstanding probe at a time,
+    /// probes spaced by `probeInterval`, a stall reported exactly once when a probe has been
+    /// outstanding for `stallThreshold`, closed with its duration when the probe returns,
+    /// and closed (then silenced) when the volume goes away mid-stall.
+    private static func testMountStallProbe() -> Bool {
+        let id = "AC-MI1", slug = "mount-stall-probe"
+        let t0 = Date(timeIntervalSince1970: 1_000_000)
+        var probe = MountStallProbe()
+
+        guard probe.shouldStartProbe(now: t0) else {
+            return report(id, slug, false, "(a fresh probe state did not want to start a probe)")
+        }
+        probe.probeStarted(at: t0)
+        guard !probe.shouldStartProbe(now: t0.addingTimeInterval(60)) else {
+            return report(id, slug, false, "(a second probe was allowed while one is outstanding)")
+        }
+        guard probe.evaluate(now: t0.addingTimeInterval(MountStallProbe.stallThreshold - 1)) == .none else {
+            return report(id, slug, false, "(a stall was reported before the threshold)")
+        }
+        guard probe.evaluate(now: t0.addingTimeInterval(MountStallProbe.stallThreshold)) == .stallStarted(since: t0) else {
+            return report(id, slug, false, "(no stall reported at the threshold)")
+        }
+        guard probe.evaluate(now: t0.addingTimeInterval(40)) == .none else {
+            return report(id, slug, false, "(the same stall was reported twice)")
+        }
+        let back = t0.addingTimeInterval(42)
+        guard probe.probeFinished(at: back) == .stallEnded(duration: 42) else {
+            return report(id, slug, false, "(the probe returning did not close the stall with its duration)")
+        }
+        guard !probe.shouldStartProbe(now: back.addingTimeInterval(MountStallProbe.probeInterval - 1)),
+              probe.shouldStartProbe(now: back.addingTimeInterval(MountStallProbe.probeInterval)) else {
+            return report(id, slug, false, "(probes were not spaced by probeInterval)")
+        }
+
+        // A quick probe never reports anything.
+        let t1 = back.addingTimeInterval(MountStallProbe.probeInterval)
+        probe.probeStarted(at: t1)
+        guard probe.probeFinished(at: t1.addingTimeInterval(0.2)) == .none else {
+            return report(id, slug, false, "(a probe that returned in time reported a stall end)")
+        }
+
+        // Volume goes away mid-stall: closed once, and the late return stays silent.
+        let t2 = t1.addingTimeInterval(MountStallProbe.probeInterval + 1)
+        probe.probeStarted(at: t2)
+        _ = probe.evaluate(now: t2.addingTimeInterval(MountStallProbe.stallThreshold))
+        guard probe.volumeWentAway(at: t2.addingTimeInterval(20)) == .stallEnded(duration: 20) else {
+            return report(id, slug, false, "(the volume going away did not close the open stall)")
+        }
+        guard probe.evaluate(now: t2.addingTimeInterval(60)) == .none,
+              probe.probeFinished(at: t2.addingTimeInterval(61)) == .none else {
+            return report(id, slug, false, "(a stall closed by the volume going away was reported again)")
+        }
+
+        // Volume goes away with a probe outstanding but no stall yet: that probe stays silent.
+        let t3 = t2.addingTimeInterval(200)
+        probe.probeStarted(at: t3)
+        guard probe.volumeWentAway(at: t3.addingTimeInterval(1)) == .none,
+              probe.evaluate(now: t3.addingTimeInterval(MountStallProbe.stallThreshold + 5)) == .none else {
+            return report(id, slug, false, "(a probe outstanding when the volume went away later reported a stall)")
+        }
+        return report(id, slug, true)
+    }
+
+    // MARK: - AC-MI2 — mount drop classification
+
+    /// `MountDropClassifier`: a disappearance is a drop only when the agent is still loaded,
+    /// the profile is an enabled, unpaused Stream profile, and no deliberate-unmount marker
+    /// explains it (written up to `deliberateWindow` before the disappearance). Also checks
+    /// that the marker lives in the per-user temp dir, never the shared /tmp.
+    private static func testMountDropClassifier() -> Bool {
+        let id = "AC-MI2", slug = "mount-drop-classifier"
+        let seen = Date(timeIntervalSince1970: 2_000_000)
+        func drop(_ loaded: Bool, _ enabled: Bool, _ paused: Bool, _ marker: Date?) -> Bool {
+            MountDropClassifier.isUnexpectedDrop(
+                agentLoaded: loaded, isEnabledMountProfile: enabled, isPaused: paused,
+                lastDeliberateUnmount: marker, disappearedAt: seen)
+        }
+        guard drop(true, true, false, nil) else {
+            return report(id, slug, false, "(a volume gone under a loaded agent with no marker was not a drop)")
+        }
+        guard !drop(false, true, false, nil) else {
+            return report(id, slug, false, "(an unloaded agent was counted as a drop)")
+        }
+        guard !drop(true, false, false, nil), !drop(true, true, true, nil) else {
+            return report(id, slug, false, "(a disabled or paused profile was counted as a drop)")
+        }
+        guard !drop(true, true, false, seen.addingTimeInterval(-3)),
+              !drop(true, true, false, seen.addingTimeInterval(-MountDropClassifier.deliberateWindow)) else {
+            return report(id, slug, false, "(a fresh deliberate-unmount marker did not rule out a drop, e.g. a reinstall)")
+        }
+        guard drop(true, true, false, seen.addingTimeInterval(-MountDropClassifier.deliberateWindow - 1)) else {
+            return report(id, slug, false, "(a stale deliberate-unmount marker still ruled out a drop)")
+        }
+        guard drop(true, true, false, seen.addingTimeInterval(30)) else {
+            return report(id, slug, false, "(a marker written well after the disappearance ruled out the drop)")
+        }
+        let marker = sampleProfile().deliberateUnmountMarkerPath
+        guard marker.hasPrefix(SyncProfile.privateTempDirectory), !marker.hasPrefix("/tmp/") else {
+            return report(id, slug, false, "(the deliberate-unmount marker is not in the per-user temp dir: \(marker))")
+        }
+        return report(id, slug, true)
     }
 
     // MARK: - AC-SM1 — Spotlight-exclusion marker write on mount
