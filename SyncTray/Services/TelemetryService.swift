@@ -2259,7 +2259,12 @@ final class TelemetryService {
     /// Record an offline-warm pause or resume. `source` is `"manual"` (the user's toggle) or
     /// `"auto"` (an app was detected reading the mount). Auto events fire only on the
     /// idle→paused edge, not every monitor tick, so the counter tracks distinct pauses.
-    func recordWarmPause(profileId: UUID, profileName: String, paused: Bool, source: String) {
+    ///
+    /// `readers` are the process names the lsof busy check found reading the mount on that
+    /// edge (`SyncManager.warmPauseReaders`). They go on the LOG only, never on the counter
+    /// (cardinality), and only as bounded labels (`warmPauseReaderSummary`): a macOS
+    /// component's own name, `shell`, or `app`. A third-party app's name is never sent.
+    func recordWarmPause(profileId: UUID, profileName: String, paused: Bool, source: String, readers: [String] = []) {
         guard SyncTraySettings.telemetryEnabled else { return }
         ensureSetup()
         let attrs: [String: AttributeValue] = [
@@ -2269,7 +2274,65 @@ final class TelemetryService {
             "warm.pause_source": .string(source),
         ]
         warmPausedCounter?.add(value: 1, attribute: attrs)
-        emitLog(severity: .info, body: paused ? "Offline warm paused" : "Offline warm resumed", attributes: attrs)
+        var logAttrs = attrs
+        if !readers.isEmpty {
+            logAttrs["warm.pause_readers"] = .string(Self.warmPauseReaderSummary(readers))
+            logAttrs["warm.pause_reader_count"] = .int(Set(readers).count)
+        }
+        emitLog(severity: .info, body: paused ? "Offline warm paused" : "Offline warm resumed", attributes: logAttrs)
+    }
+
+    /// macOS components reported BY NAME in `warm.pause_readers`: Apple system processes that
+    /// can open files on a mounted volume, plus SyncTray's own Finder extension. Their names
+    /// identify an OS component, not the user. Anything else is `shell` or `app` (see
+    /// `warmPauseReaderLabel`), the same fixed-allowlist approach as `normalizeFileExtension`.
+    static let warmPauseReaderAllowlist: Set<String> = [
+        // Finder previews and thumbnails
+        "QuickLookSatellite", "com.apple.quicklook.ThumbnailsAgent", "quicklookd", "QuickLookUIService",
+        // Icon rendering
+        "iconservicesagent", "iconservicesd",
+        // Finder copy/move operations
+        "DesktopServicesHelper",
+        // Spotlight and metadata (beyond the daemons the busy check already ignores)
+        "corespotlightd", "mdbulkimport", "mdsync", "mdwrite", "Spotlight",
+        // Versions, Time Machine, iCloud, File Provider
+        "revisiond", "backupd", "fileproviderd", "bird", "cloudd",
+        // Security scanning
+        "XprotectService", "syspolicyd",
+        // Photos and media analysis
+        "photoanalysisd", "mediaanalysisd",
+        // SyncTray's own Finder extension
+        "SyncTrayFinderSync",
+        // Already ignored by the busy check today; listed so a change there stays legible
+        "Finder", "mds", "mds_stores", "mdworker", "mdworker_shared", "fseventsd",
+    ]
+
+    /// Shells (and tmux) report as `shell`: a terminal whose working directory is inside the
+    /// mount holds it open for as long as the shell lives.
+    static let warmPauseShellNames: Set<String> = [
+        "zsh", "bash", "sh", "fish", "tcsh", "csh", "dash", "ksh", "nu", "tmux",
+    ]
+
+    /// Most distinct labels one pause reports.
+    static let warmPauseReaderSummaryLimit = 5
+
+    /// Bounded telemetry label for one reader process: its own name when it is an allowlisted
+    /// macOS component, `shell` for a shell, otherwise `app`. A leading `-` (login shell) is
+    /// ignored.
+    static func warmPauseReaderLabel(_ processName: String) -> String {
+        let name = processName.hasPrefix("-") ? String(processName.dropFirst()) : processName
+        if warmPauseReaderAllowlist.contains(name) { return name }
+        if warmPauseShellNames.contains(name) { return "shell" }
+        return "app"
+    }
+
+    /// The `warm.pause_readers` value: distinct labels, sorted, at most
+    /// `warmPauseReaderSummaryLimit`, comma-separated. Covered by AC-WV3.
+    static func warmPauseReaderSummary(_ readers: [String]) -> String {
+        Set(readers.map(warmPauseReaderLabel))
+            .sorted()
+            .prefix(warmPauseReaderSummaryLimit)
+            .joined(separator: ",")
     }
 
     /// Start a `synctray warm` span for an offline-file warming run. No-op (returns an

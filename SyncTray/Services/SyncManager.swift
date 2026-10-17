@@ -3312,21 +3312,24 @@ final class SyncManager: ObservableObject {
             .map { ($0.id, $0.name, $0.localSyncPath) }
         guard !targets.isEmpty else { return }
         DispatchQueue.global(qos: .utility).async { [weak self] in
-            let probed: [(UUID, String, Bool)] = targets.map { id, name, mount in
-                (id, name, Self.shouldAutoPauseWarm(lsofOutput: Self.runLsofBusyCheck(mountPoint: mount)))
+            let probed: [(UUID, String, [String])] = targets.map { id, name, mount in
+                (id, name, Self.warmPauseReaders(lsofOutput: Self.runLsofBusyCheck(mountPoint: mount)))
             }
             DispatchQueue.main.async {
                 guard let self else { return }
                 let now = Date()
-                for (id, name, pause) in probed where pause {
+                for (id, name, readers) in probed where !readers.isEmpty {
                     let wasPaused = self.isWarmPaused(for: id)
                     self.warmAutoPauseUntil[id] = now.addingTimeInterval(Self.warmAutoPauseCooldown)
                     // Record/log only the idle→paused edge, not every re-arm, so a long busy
-                    // stretch is one event rather than one every 5s.
+                    // stretch is one event rather than one every 5s. The readers seen on that
+                    // edge go with it: telemetry gets the bounded labels, the local debug log
+                    // the full process names.
                     if !wasPaused {
                         TelemetryService.shared.recordWarmPause(
-                            profileId: id, profileName: name, paused: true, source: "auto")
-                        SyncTraySettings.debugLog("'\(name)': offline warm auto-paused — an app is reading the mount")
+                            profileId: id, profileName: name, paused: true, source: "auto", readers: readers)
+                        SyncTraySettings.debugLog(
+                            "'\(name)': offline warm auto-paused — reading the mount: \(readers.joined(separator: ", "))")
                     }
                 }
             }
@@ -4816,8 +4819,16 @@ final class SyncManager: ObservableObject {
     /// unmounting under an open app), a missed pause only means the warm keeps running, which
     /// is the safe default — the user can always pause manually. Covered by AC-WV2.
     nonisolated static func shouldAutoPauseWarm(lsofOutput: String?) -> Bool {
-        guard let lsofOutput else { return false }
-        return !warmInteractiveReaders(lsofOutput: lsofOutput).isEmpty
+        !warmPauseReaders(lsofOutput: lsofOutput).isEmpty
+    }
+
+    /// The interactive readers behind an auto-pause decision: `warmInteractiveReaders`, or `[]`
+    /// when lsof failed (a failed check never pauses, see `shouldAutoPauseWarm`). This is what
+    /// `refreshWarmAutoPause` reports with the pause, so the telemetry says WHICH process took
+    /// the link (bounded by `TelemetryService.warmPauseReaderSummary`). Covered by AC-WV3.
+    nonisolated static func warmPauseReaders(lsofOutput: String?) -> [String] {
+        guard let lsofOutput else { return [] }
+        return warmInteractiveReaders(lsofOutput: lsofOutput)
     }
 
     /// For each mounted profile in an AUTOMATIC Cache Only mode, probe the primary (reusing

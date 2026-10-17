@@ -690,7 +690,16 @@ the warm faster (the link is the bound) but to make it **visible** and **yieldab
   covers the idle-Finder-browsing case. A failed/`nil` lsof does NOT pause (a missed pause just
   keeps warming — safe; unlike auto-resume, which fails closed). Pause state is in-memory and
   cleared when a run ends, so a later warm the user asks for starts un-paused. Telemetry:
-  `synctray.offline.warm.paused` (`warm.pause_source`: manual/auto). Covered by AC-WV1/AC-WV2.
+  `synctray.offline.warm.paused` (`warm.pause_source`: manual/auto). An auto-pause also says
+  WHICH process took the link: `refreshWarmAutoPause` passes the readers it found
+  (`SyncManager.warmPauseReaders`) to `recordWarmPause`, whose "Offline warm paused" log carries
+  `warm.pause_readers` and `warm.pause_reader_count`. The readers go on the log only (never
+  the counter, for cardinality), as bounded labels (`TelemetryService.warmPauseReaderSummary`):
+  an allowlisted macOS component by name (`QuickLookSatellite`, `iconservicesagent`,
+  `revisiond`, `SyncTrayFinderSync`, …), `shell` for a shell or tmux with its working directory
+  in the mount, and `app` for everything else, since a third-party app's name is never sent
+  (the disclosure sheet says so). The full process names go to the local debug log. Covered by
+  AC-WV1/AC-WV2/AC-WV3.
 - **Self-healing back-off on a struggling link.** `warmDirectory`'s per-file read task reports
   whether it FAILED (threw mid-read, or got zero bytes for a non-empty file — the degraded-SMB
   "fetch a few KB, stall, retry" signature) instead of swallowing the error with `try?`. After
