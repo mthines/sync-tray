@@ -766,7 +766,7 @@ final class TelemetryService {
         }
 
         // Categorize error for the error counter
-        let errorType = categorizeError(errorMessage)
+        let errorType = Self.categorizeError(errorMessage)
         syncErrorCounter?.add(value: 1, attribute: [
             "sync.mode": .string(mode.rawValue),
             "synctray.profile.name": .string(profileName),
@@ -996,7 +996,7 @@ final class TelemetryService {
         guard SyncTraySettings.telemetryEnabled else { return }
         ensureSetup()
 
-        let errorType = categorizeError(errorMessage)
+        let errorType = Self.categorizeError(errorMessage)
 
         // Emit a log correlated to the active sync span if one exists
         let spanContext = activeSyncSpans[profileId]?.context
@@ -1232,7 +1232,7 @@ final class TelemetryService {
             "profile.operation.result": .string(result),
         ]
         if let errMsg = errorMessage {
-            let errorType = categorizeError(errMsg)
+            let errorType = Self.categorizeError(errMsg)
             logAttrs["error.type"] = .string(errorType)
         }
 
@@ -2656,7 +2656,7 @@ final class TelemetryService {
         let attrs: [String: AttributeValue] = [
             "synctray.profile.id": .string(profileId.uuidString),
             "synctray.profile.name": .string(profileName),
-            "error.type": .string(categorizeError(error.localizedDescription)),
+            "error.type": .string(Self.categorizeError(error.localizedDescription)),
         ]
         emitLog(severity: .warn, body: "Cache Only list write failed", attributes: attrs)
     }
@@ -2759,7 +2759,9 @@ final class TelemetryService {
     }
 
     /// Categorize an error message into a low-cardinality type for metrics/attributes.
-    private func categorizeError(_ message: String?) -> String {
+    /// Static and internal (pure — it only consults `SyncLogPatterns`) so `ConfigSelfTest`
+    /// can assert the buckets directly.
+    static func categorizeError(_ message: String?) -> String {
         guard let msg = message else { return "unknown" }
         if SyncLogPatterns.isCriticalError(msg) {
             if msg.contains("resync") || msg.contains("out of sync") {
@@ -2776,6 +2778,18 @@ final class TelemetryService {
             // no longer surfaces it as an error, so this bucket only catches it if it ever
             // arrives through another path (e.g. a sync-failure message), instead of "other".
             return "exclusive_mode_unsupported"
+        }
+        // EPERM — on the local side, macOS privacy controls refusing a protected path (e.g. a
+        // Photos library). Checked before the generic buckets below, which its wording
+        // ("…: operation not permitted") would otherwise slip past into "other".
+        if SyncLogPatterns.isOperationNotPermitted(msg) {
+            return "permission_denied"
+        }
+        // rclone's closing "not deleting files as there were IO errors": a consequence of an
+        // earlier read error. Seen here only when the run's first error wasn't captured —
+        // `recordSyncFailed` is normally given that first error instead.
+        if SyncLogPatterns.isIOErrorsBlockedDeletes(msg) {
+            return "io_errors_blocked_deletes"
         }
         if msg.contains("not found") || msg.contains("no such") {
             return "file_not_found"

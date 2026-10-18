@@ -24,6 +24,8 @@ final class SyncSetupService {
         - .DS_Store
         - .fseventsd
 
+        \(SyncExcludeFilter.photosLibrarySection)
+
         # Windows thumbs/previews
         - Thumbs.db
         - Thumbs.db:Encryptable
@@ -2751,6 +2753,91 @@ enum SyncExcludeFilter {
     /// decided about.
     static let includeBeginMarker = "# >>> SyncTray \"Sync Only These Folders\" (managed: edit them in SyncTray's profile settings)"
     static let includeEndMarker = "# <<< SyncTray \"Sync Only These Folders\""
+
+    /// The default rule that keeps Apple Photos libraries out of every Two-Way and One-Way
+    /// sync. A `.photoslibrary` is a live database package that macOS privacy controls won't
+    /// let other apps read, so syncing a folder that holds one (typically `~/Pictures`) failed
+    /// every run with "operation not permitted" — and rclone then also refused to propagate
+    /// any deletion ("not deleting files as there were IO errors"). Copying it file by file
+    /// while Photos has it open can produce an inconsistent copy anyway.
+    ///
+    /// Written into every new filter file as part of `SyncSetupService.defaultExcludeFilter`,
+    /// and added once to existing ones by `MigrationV5PhotosLibraryExclude`
+    /// (`addingPhotosLibraryDefault(to:)`). It is ordinary user content, not a managed block:
+    /// the user can delete it to sync a library they have granted access to.
+    static let photosLibraryRule = "- *.photoslibrary/**"
+    static let photosLibrarySection = """
+        # Apple Photos libraries: a live database macOS doesn't let other apps read
+        \(photosLibraryRule)
+        """
+
+    /// `existing` with `photosLibrarySection` added at the top of the user's own rules —
+    /// right below the managed "Don't Sync" head block and above any hand-written `+`
+    /// include, since rclone applies the first rule that matches. Returns nil when nothing
+    /// should change: the file already mentions `.photoslibrary` (the default is already
+    /// there, or the user wrote their own rule for it, which is theirs to keep).
+    ///
+    /// The head block is re-emitted exactly as found, so a later `merged(existing:patterns:)`
+    /// with the same patterns returns this output unchanged.
+    static func addingPhotosLibraryDefault(to existing: String) -> String? {
+        guard !existing.lowercased().contains(".photoslibrary") else { return nil }
+
+        var headBlock = ""
+        let lines = existing.components(separatedBy: "\n")
+        if let start = lines.firstIndex(where: { $0.trimmingCharacters(in: .whitespacesAndNewlines) == beginMarker }) {
+            // Same block bounds `strippingManagedBlock` uses: up to the end marker, or — when
+            // the end marker was deleted by hand — up to the first blank line.
+            let end = lines[start...].firstIndex(where: { $0.trimmingCharacters(in: .whitespacesAndNewlines) == endMarker })
+                ?? lines[start...].firstIndex(where: { $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }).map { $0 - 1 }
+                ?? lines.count - 1
+            headBlock = lines[start...end].joined(separator: "\n")
+        }
+
+        let userContent = droppingLeadingBlankLines(strippingManagedBlock(from: existing))
+        var output = headBlock.isEmpty ? "" : headBlock + "\n\n"
+        output += photosLibrarySection
+        if userContent.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return output + "\n"
+        }
+        return output + "\n\n" + userContent
+    }
+
+    /// The "Don't Sync" pattern that excludes exactly `blockedPath` — a local path rclone
+    /// reported macOS wouldn't let it read (`SyncLogPatterns.operationNotPermittedPath`) —
+    /// from a profile synced at `localSyncPath`: anchored to the sync folder's root with a
+    /// leading `/`, and, for a folder, ending in `/` ("this folder and everything in it").
+    /// nil when the path is the sync folder itself or isn't inside it (neither can be
+    /// excluded by a pattern), or would corrupt the filter file.
+    ///
+    /// Note: a `*` or `?` in the folder's own name is still a wildcard in SyncTray's pattern
+    /// syntax, so such a pattern can match a little more than the one folder.
+    static func excludePattern(forBlockedPath blockedPath: String, localSyncPath: String, isDirectory: Bool) -> String? {
+        guard let relative = relativePath(of: blockedPath, within: localSyncPath),
+              !relative.isEmpty, !relative.contains(where: { $0.isNewline }) else { return nil }
+        return "/" + relative + (isDirectory ? "/" : "")
+    }
+
+    /// Whether `path` is the sync folder `localSyncPath` itself or inside it — what makes an
+    /// "operation not permitted" error a LOCAL (macOS privacy) denial rather than a remote
+    /// server's EPERM.
+    static func isWithinSyncFolder(_ path: String, localSyncPath: String) -> Bool {
+        relativePath(of: path, within: localSyncPath) != nil
+    }
+
+    /// `path` relative to `root` (`""` for the root itself), or nil when it isn't inside it.
+    /// Both are tilde-expanded and standardized first.
+    private static func relativePath(of path: String, within root: String) -> String? {
+        func normalized(_ value: String) -> String {
+            ((value as NSString).expandingTildeInPath as NSString).standardizingPath
+        }
+        let base = normalized(root)
+        let target = normalized(path)
+        guard !base.isEmpty, !target.isEmpty else { return nil }
+        if target == base { return "" }
+        let prefix = base.hasSuffix("/") ? base : base + "/"
+        guard target.hasPrefix(prefix) else { return nil }
+        return String(target.dropFirst(prefix.count))
+    }
 
     /// The rclone globs (without the `- ` prefix) that exclude exactly the files `pattern`
     /// matches under SyncTray's matcher. Empty for a blank pattern, or one containing a line

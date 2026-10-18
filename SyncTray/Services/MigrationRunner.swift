@@ -46,6 +46,7 @@ enum MigrationRunner {
         MigrationV2FixVFSCachePath(),
         MigrationV3BlobToPerProfileFiles(),
         MigrationV4Retired(),
+        MigrationV5PhotosLibraryExclude(),
     ]
 
     /// Run all pending migrations. Call this once at app startup,
@@ -373,4 +374,138 @@ struct MigrationV4Retired: ProfileMigration {
     let description = "Retired cache-pinning migration — intentionally a no-op"
 
     func migrateUserDefaults(_ defaults: UserDefaults) throws {}
+}
+
+// MARK: - Migration V5: exclude Apple Photos libraries from existing profiles
+
+/// Adds the Photos-library default rule (`SyncExcludeFilter.photosLibraryRule`) to the exclude
+/// filter of every existing Two-Way and One-Way profile. New filter files get it from
+/// `SyncSetupService.defaultExcludeFilter`; this covers files written before it was a default,
+/// which are otherwise only re-created from the defaults when a profile is disabled and
+/// re-enabled.
+///
+/// Per profile (read from its raw `{shortId}.profile.json`, before `ProfileStore` loads):
+/// - Stream (mount) profiles have no sync filter and are skipped.
+/// - A missing filter file is left missing — the next install writes it from the defaults,
+///   which already carry the rule.
+/// - A filter that already mentions `.photoslibrary` (the default, or the user's own rule) or
+///   isn't readable UTF-8 is left exactly as it is.
+/// - On a Two-Way profile whose local folder actually holds a `.photoslibrary`, the
+///   resync-pending marker is written right after the filter (the same filter-then-marker,
+///   roll-back-on-failure order `SyncSetupService.writeExcludeFilter` uses). A library the
+///   profile used to sync would otherwise vanish from bisync's listings at once, which counts
+///   as deletions against `--max-delete` and, for a library holding over half the profile's
+///   files, would stop every run at the safety abort. Profiles without a library get no
+///   marker: the rule matches nothing there, so there is nothing to resync.
+///
+/// Per-profile failures are logged and skipped, never thrown: one unwritable filter must not
+/// hold back the schema version (and every later migration) forever.
+struct MigrationV5PhotosLibraryExclude: ProfileMigration {
+    let version = 5
+    let description = "Exclude Apple Photos libraries (*.photoslibrary) from existing Two-Way and One-Way profiles"
+
+    /// Overridable for self-test isolation; defaults to the real profiles directory.
+    var profilesDirectoryOverride: String?
+
+    private var profilesDirectory: String { profilesDirectoryOverride ?? SyncProfile.configDirectory }
+
+    func migrateUserDefaults(_ defaults: UserDefaults) throws {
+        let outcome = Self.addPhotosLibraryExclude(in: profilesDirectory)
+        print("[SyncTray] Migration v5: added the Photos-library exclude to \(outcome.updated.count) profile(s), "
+            + "scheduled \(outcome.resyncScheduled.count) resync(s), \(outcome.failed.count) failure(s)")
+    }
+
+    /// Short ids of the profiles each step touched, so `ConfigSelfTest` can assert exactly
+    /// what changed.
+    struct Outcome: Equatable {
+        var updated: [String] = []
+        var resyncScheduled: [String] = []
+        var failed: [String] = []
+    }
+
+    /// Apply the migration to every `*.profile.json` in `directory`. Idempotent: a second pass
+    /// finds the rule already present and changes nothing.
+    /// - Parameter containsPhotosLibrary: whether a local sync folder holds a `.photoslibrary`;
+    ///   injectable so `ConfigSelfTest` doesn't depend on the machine's real folders.
+    @discardableResult
+    static func addPhotosLibraryExclude(
+        in directory: String,
+        containsPhotosLibrary: (String) -> Bool = { containsPhotosLibrary(under: $0) }
+    ) -> Outcome {
+        var outcome = Outcome()
+        let fm = FileManager.default
+        guard let files = try? fm.contentsOfDirectory(atPath: directory) else { return outcome }
+
+        for file in files.sorted() where file.hasSuffix(".profile.json") {
+            let profilePath = (directory as NSString).appendingPathComponent(file)
+            guard let data = fm.contents(atPath: profilePath),
+                  let dict = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+                  let idString = dict["id"] as? String, !idString.isEmpty else { continue }
+
+            // Same derivation as `SyncProfile.shortId`; a missing `syncMode` decodes as bisync.
+            let shortId = String(idString.prefix(8)).lowercased()
+            let syncMode = (dict["syncMode"] as? String) ?? SyncMode.bisync.rawValue
+            guard syncMode != SyncMode.mount.rawValue else { continue }
+
+            let filterPath = (directory as NSString).appendingPathComponent("\(shortId)-exclude.txt")
+            guard fm.fileExists(atPath: filterPath),
+                  let existing = try? String(contentsOfFile: filterPath, encoding: .utf8),
+                  let updated = SyncExcludeFilter.addingPhotosLibraryDefault(to: existing) else { continue }
+
+            do {
+                try updated.write(toFile: filterPath, atomically: true, encoding: .utf8)
+            } catch {
+                SyncTraySettings.debugLog("[MigrationV5] could not update \(filterPath): \(error.localizedDescription)")
+                outcome.failed.append(shortId)
+                continue
+            }
+
+            let localPath = (dict["localSyncPath"] as? String) ?? ""
+            if syncMode == SyncMode.bisync.rawValue, !localPath.isEmpty,
+               containsPhotosLibrary((localPath as NSString).expandingTildeInPath) {
+                let markerPath = (directory as NSString).appendingPathComponent("\(shortId).resync-pending")
+                do {
+                    try UUID().uuidString.write(toFile: markerPath, atomically: true, encoding: .utf8)
+                    outcome.resyncScheduled.append(shortId)
+                } catch {
+                    // Roll the filter back so the next launch can't skip this profile with the
+                    // rule in place but no resync scheduled (the schema version still advances,
+                    // so the profile simply keeps its old filter).
+                    try? existing.write(toFile: filterPath, atomically: true, encoding: .utf8)
+                    SyncTraySettings.debugLog("[MigrationV5] could not schedule a resync for \(shortId): \(error.localizedDescription)")
+                    outcome.failed.append(shortId)
+                    continue
+                }
+            }
+            outcome.updated.append(shortId)
+        }
+        return outcome
+    }
+
+    /// Whether `root` holds a `.photoslibrary` package within `maxDepth` folder levels. Hidden
+    /// entries and package contents are skipped, symlinks aren't followed, and the walk stops
+    /// after `maxEntries` entries so a huge tree can't stall launch; anything unreadable
+    /// (including a folder macOS won't let the app list) counts as "not found".
+    static func containsPhotosLibrary(under root: String, maxDepth: Int = 3, maxEntries: Int = 20_000) -> Bool {
+        let fm = FileManager.default
+        let keys: [URLResourceKey] = [.isDirectoryKey, .isSymbolicLinkKey, .isPackageKey]
+        var queue: [(url: URL, depth: Int)] = [(URL(fileURLWithPath: root, isDirectory: true), 0)]
+        var seen = 0
+        while !queue.isEmpty {
+            let (directory, depth) = queue.removeFirst()
+            guard let entries = try? fm.contentsOfDirectory(
+                at: directory, includingPropertiesForKeys: keys, options: [.skipsHiddenFiles]) else { continue }
+            for entry in entries {
+                seen += 1
+                if seen > maxEntries { return false }
+                if entry.pathExtension.lowercased() == "photoslibrary" { return true }
+                guard depth + 1 < maxDepth,
+                      let values = try? entry.resourceValues(forKeys: Set(keys)),
+                      values.isDirectory == true, values.isSymbolicLink != true,
+                      values.isPackage != true else { continue }
+                queue.append((entry, depth + 1))
+            }
+        }
+        return false
+    }
 }

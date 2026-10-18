@@ -98,8 +98,10 @@ final class LogParser {
             // Clean up error message using centralized patterns
             var errorMsg = SyncLogPatterns.cleanErrorMessage(msg)
 
-            // Truncate very long messages
-            if errorMsg.count > 200 {
+            // Truncate very long messages — except a macOS privacy denial: the path at its end
+            // is what the "macOS blocked access" recovery actions exclude, and a deep path
+            // easily runs past 200 characters.
+            if errorMsg.count > 200, SyncLogPatterns.operationNotPermittedPath(in: errorMsg) == nil {
                 errorMsg = String(errorMsg.prefix(200)) + "..."
             }
 

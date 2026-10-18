@@ -1301,8 +1301,11 @@ struct ProfileDetailView: View {
                         .background(Color.red.opacity(0.1))
                         .cornerRadius(4)
 
-                    // Action buttons for common errors
-                    if let errorAction = detectErrorAction(from: lastError) {
+                    // macOS privacy denial: its own two actions (exclude / allow access)
+                    if let blockedPath = SyncLogPatterns.macOSBlockedPath(in: lastError, localSyncPath: profile.localSyncPath) {
+                        macOSBlockedAccessActions(blockedPath: blockedPath, error: lastError)
+                    } else if let errorAction = detectErrorAction(from: lastError) {
+                        // Action buttons for common errors
                         VStack(alignment: .leading, spacing: 6) {
                             // Show additional context for "too many deletes" error
                             if errorAction == .forceSync {
@@ -3702,6 +3705,8 @@ struct ProfileDetailView: View {
         case retrySync
         case forceSync      // Override "too many deletes" safety check
         case mountAnyway    // Enable non-empty mount and retry
+        case excludeBlockedPath   // macOS blocked access: add the path to "Don't Sync", sync again
+        case openPrivacySettings  // macOS blocked access: open Full Disk Access in System Settings
 
         /// Bounded, low-cardinality id for telemetry (`recovery.action`).
         var telemetryName: String {
@@ -3714,6 +3719,8 @@ struct ProfileDetailView: View {
             case .retrySync: return "retry"
             case .forceSync: return "force_sync"
             case .mountAnyway: return "mount_anyway"
+            case .excludeBlockedPath: return "exclude_blocked_path"
+            case .openPrivacySettings: return "open_privacy_settings"
             }
         }
 
@@ -3735,6 +3742,10 @@ struct ProfileDetailView: View {
                 return "Force Sync (Override Safety)"
             case .mountAnyway:
                 return "Mount Anyway"
+            case .excludeBlockedPath:
+                return "Exclude from Sync"
+            case .openPrivacySettings:
+                return "Open Privacy Settings"
             }
         }
 
@@ -3756,6 +3767,10 @@ struct ProfileDetailView: View {
                 return "Force syncing..."
             case .mountAnyway:
                 return "Mounting..."
+            case .excludeBlockedPath:
+                return "Syncing..."
+            case .openPrivacySettings:
+                return "Opening..."
             }
         }
 
@@ -3777,6 +3792,10 @@ struct ProfileDetailView: View {
                 return "exclamationmark.triangle"
             case .mountAnyway:
                 return "folder.badge.plus"
+            case .excludeBlockedPath:
+                return "minus.circle"
+            case .openPrivacySettings:
+                return "lock.shield"
             }
         }
 
@@ -3798,6 +3817,10 @@ struct ProfileDetailView: View {
                 return "Override the 50% deletion safety limit and proceed with sync"
             case .mountAnyway:
                 return "Enable mounting to non-empty folder and retry"
+            case .excludeBlockedPath:
+                return "Add the blocked item to this profile's Don't Sync list, then sync again"
+            case .openPrivacySettings:
+                return "Open System Settings › Privacy & Security › Full Disk Access"
             }
         }
     }
@@ -3896,6 +3919,111 @@ struct ProfileDetailView: View {
             runForceSync()
         case .mountAnyway:
             enableNonEmptyMountAndReinstall()
+        case .excludeBlockedPath:
+            excludeBlockedPath()
+        case .openPrivacySettings:
+            openPrivacySettings()
+        }
+    }
+
+    // MARK: - macOS Blocked Access
+
+    /// Recovery for an rclone error naming a local path macOS privacy controls wouldn't let it
+    /// read (`SyncLogPatterns.operationNotPermittedPath`) — typically an Apple Photos library
+    /// inside the synced folder. Two ways out: exclude the path from this profile (through the
+    /// "Don't Sync" list, where the user can see and undo it), or allow access in System
+    /// Settings. Which process needs that access for a scheduled sync is deliberately not
+    /// named: launchd runs the sync script directly, not as a child of SyncTray.
+    @ViewBuilder
+    private func macOSBlockedAccessActions(blockedPath: String, error: String) -> some View {
+        let excludePattern = blockedAccessExcludePattern(blockedPath: blockedPath, error: error)
+        let name = (blockedPath as NSString).lastPathComponent
+        VStack(alignment: .leading, spacing: 6) {
+            if let summary = SyncLogPatterns.macOSBlockedAccessSummary(for: error, localSyncPath: profile.localSyncPath) {
+                Text(summary)
+                    .font(.caption.weight(.medium))
+            }
+            Text(blockedAccessExplanation(itemName: name, canExclude: excludePattern != nil))
+                .font(.caption)
+                .foregroundColor(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            HStack(spacing: 8) {
+                if excludePattern != nil {
+                    Button(action: {
+                        if isSyncRunningForProfile {
+                            showingSyncInProgressAlert = true
+                            return
+                        }
+                        handleErrorAction(.excludeBlockedPath)
+                    }) {
+                        Label(ErrorAction.excludeBlockedPath.buttonText,
+                              systemImage: ErrorAction.excludeBlockedPath.icon)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(isSyncRunningForProfile)
+                    .help(ErrorAction.excludeBlockedPath.helpText)
+                }
+                Button(action: { handleErrorAction(.openPrivacySettings) }) {
+                    Label(ErrorAction.openPrivacySettings.buttonText,
+                          systemImage: ErrorAction.openPrivacySettings.icon)
+                }
+                .buttonStyle(.bordered)
+                .help(ErrorAction.openPrivacySettings.helpText)
+            }
+        }
+    }
+
+    private func blockedAccessExplanation(itemName: String, canExclude: Bool) -> String {
+        var text = canExclude
+            ? "Exclude it from this profile to finish syncing, or allow access under System Settings › "
+                + "Privacy & Security › Full Disk Access."
+            : "Allow access under System Settings › Privacy & Security › Full Disk Access, then sync again."
+        text += " Until then, files deleted on one side aren't deleted on the other."
+        if itemName.lowercased().hasSuffix(".photoslibrary") {
+            text += " Apple Photos libraries are best excluded: copying one while Photos is open can "
+                + "produce a broken copy."
+        }
+        return text
+    }
+
+    /// The "Don't Sync" pattern that excludes `blockedPath` from this profile, or nil when it
+    /// can't be excluded: a Stream profile has no sync filter, and a path that is the sync
+    /// folder itself or outside it can't be matched by a pattern.
+    private func blockedAccessExcludePattern(blockedPath: String, error: String) -> String? {
+        guard !profile.isMountMode else { return nil }
+        var isDirectory: ObjCBool = false
+        let existsAsDirectory = FileManager.default.fileExists(atPath: blockedPath, isDirectory: &isDirectory)
+            && isDirectory.boolValue
+        return SyncExcludeFilter.excludePattern(
+            forBlockedPath: blockedPath,
+            localSyncPath: profile.localSyncPath,
+            isDirectory: SyncLogPatterns.isDirectoryOpenFailure(error) || existsAsDirectory
+        )
+    }
+
+    /// Add the blocked path to the profile's "Don't Sync" list — the same store-then-filter
+    /// path the list editor uses, so it shows up there and applies from the next sync with no
+    /// reinstall — then clear the now-stale error and sync again. Skips the sync when the
+    /// filter file couldn't be written (`syncFilterErrors`, shown under "Don't Sync"), since
+    /// it would only fail the same way.
+    private func excludeBlockedPath() {
+        guard let lastError = syncManager.lastError(for: profile.id),
+              let blockedPath = SyncLogPatterns.macOSBlockedPath(in: lastError, localSyncPath: profile.localSyncPath),
+              let pattern = blockedAccessExcludePattern(blockedPath: blockedPath, error: lastError) else {
+            return
+        }
+        let current = profileStore.profile(for: profile.id)?.syncExcludePatterns ?? profile.syncExcludePatterns
+        if !current.contains(pattern) {
+            syncManager.updateSyncExcludePatterns(current + [pattern], for: profile.id)
+        }
+        guard syncManager.syncFilterErrors[profile.id] == nil else { return }
+        syncManager.clearError(for: profile.id)
+        syncManager.triggerManualSync(for: profile)
+    }
+
+    private func openPrivacySettings() {
+        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles") {
+            NSWorkspace.shared.open(url)
         }
     }
 

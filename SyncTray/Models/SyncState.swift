@@ -477,6 +477,74 @@ enum SyncLogPatterns {
         return lower.contains("lack of support for") && lower.contains("exclusive")
     }
 
+    /// EPERM, which Go prints as "operation not permitted". From rclone's local backend this
+    /// is almost always macOS privacy controls (TCC) refusing access to a protected location —
+    /// e.g. `failed to open directory "Photos Library.photoslibrary": open
+    /// /Users/me/Pictures/Photos Library.photoslibrary: operation not permitted`. It is not
+    /// POSIX file permissions ("permission denied", EACCES): chmod can't fix it; only
+    /// excluding the path or granting access in System Settings can.
+    ///
+    /// `TelemetryService.categorizeError` buckets it as `permission_denied`.
+    static func isOperationNotPermitted(_ message: String) -> Bool {
+        message.lowercased().contains("operation not permitted")
+    }
+
+    /// The absolute local path an "operation not permitted" error names (the path after
+    /// Go's `open`/`lstat`/… prefix), or nil when the message names none — e.g. a remote
+    /// backend's EPERM, which carries no absolute local path. Paths may contain spaces.
+    ///
+    /// Single source for the "macOS blocked access" case: `LogParser` keeps such messages
+    /// whole (the path is what the recovery actions act on), the sync-failure notification
+    /// summarizes them (`macOSBlockedAccessSummary`), and `ProfileDetailView` offers
+    /// Exclude / Open Privacy Settings.
+    static func operationNotPermittedPath(in message: String) -> String? {
+        let pattern = #"(?:^|[\s:])(?:open|lstat|stat|opendir|readlink|mkdir|remove|rename|chmod|chtimes) (/.+?): operation not permitted"#
+        guard let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]),
+              let match = regex.firstMatch(in: message, range: NSRange(message.startIndex..., in: message)),
+              let range = Range(match.range(at: 1), in: message) else {
+            return nil
+        }
+        return String(message[range])
+    }
+
+    /// The path of a macOS privacy denial in `message`: an "operation not permitted" path that
+    /// is the profile's local folder or inside it. nil otherwise — including a remote server's
+    /// EPERM, whose absolute path is on the remote, where macOS settings can't help.
+    static func macOSBlockedPath(in message: String, localSyncPath: String) -> String? {
+        guard let path = operationNotPermittedPath(in: message),
+              SyncExcludeFilter.isWithinSyncFolder(path, localSyncPath: localSyncPath) else {
+            return nil
+        }
+        return path
+    }
+
+    /// One-line user-facing summary of a macOS privacy denial — "macOS blocked access to
+    /// “Photos Library.photoslibrary”." — or nil when `message` isn't one (see
+    /// `macOSBlockedPath`). Names only the last path component, which is what the user
+    /// recognizes.
+    static func macOSBlockedAccessSummary(for message: String, localSyncPath: String) -> String? {
+        guard let path = macOSBlockedPath(in: message, localSyncPath: localSyncPath) else { return nil }
+        let name = (path as NSString).lastPathComponent
+        return "macOS blocked access to “\(name.isEmpty ? path : name)”."
+    }
+
+    /// True when rclone failed to open a DIRECTORY (the local backend's listing error), as
+    /// opposed to a single file — so an exclude for it ends in `/` (folder and contents).
+    static func isDirectoryOpenFailure(_ message: String) -> Bool {
+        message.lowercased().contains("failed to open directory")
+    }
+
+    /// rclone `sync`/`bisync` refuses to propagate deletions after ANY read error during the
+    /// run ("not deleting files as there were IO errors", "…directories…"), so the
+    /// destination keeps files that were deleted at the source. It is a consequence, not a
+    /// cause — the run's first error says why. `TelemetryService.categorizeError` buckets it
+    /// as `io_errors_blocked_deletes` when that's all a failure has to go on.
+    static func isIOErrorsBlockedDeletes(_ message: String) -> Bool {
+        let lower = message.lowercased()
+        return lower.contains("not deleting files as there were io errors")
+            || lower.contains("not deleting directories as there were io errors")
+    }
+
     /// Generic messages that don't provide useful error info
     static func isGenericAbortMessage(_ message: String) -> Bool {
         message.contains("Bisync aborted") || message.contains("Failed to bisync")
