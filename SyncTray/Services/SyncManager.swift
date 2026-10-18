@@ -218,6 +218,10 @@ final class SyncManager: ObservableObject {
     /// drop classification decides its outcome: `dropped` for an unexpected drop, `unmounted`
     /// for a deliberate unmount (pause, reinstall, Cache Only switch).
     private var pendingStallEndDurations: [UUID: TimeInterval] = [:]
+    /// Identifies the outstanding responsiveness probe per profile. A probe whose state was
+    /// closed (and maybe replaced) while its call was still blocked carries a stale token,
+    /// so its late return is ignored instead of closing a later probe's stall.
+    private var mountProbeTokens: [UUID: UUID] = [:]
     /// Where the responsiveness probes run. Concurrent, and off the GCD global pool, because
     /// a probe on a hung hard NFS mount blocks its thread until the server answers; the
     /// one-outstanding-probe-per-profile rule in `MountStallProbe` bounds the threads.
@@ -4415,14 +4419,20 @@ final class SyncManager: ObservableObject {
                     }
 
                     let newMode = isMounted ? modes[profile.id] : nil
-                    // Stall and drop telemetry. Runs before the mode bookkeeping below so a
-                    // drop is still reported with the mode the mount was in.
-                    self.trackMountInterruption(
-                        for: profile,
-                        wasMounted: before.contains(profile.id),
-                        isMounted: isMounted,
-                        mode: newMode ?? self.profileMountModes[profile.id]
-                    )
+                    // Stall and drop telemetry, skipped while paused: a paused profile can't
+                    // drop, and the close at the top of this pass already ended its
+                    // interruptions, so probing it would only recreate a probe on every tick
+                    // (and leak a blocked thread each time on a stale mount pause left behind).
+                    // Runs before the mode bookkeeping below so a drop is still reported with
+                    // the mode the mount was in.
+                    if !self.pausedProfiles.contains(profile.id) {
+                        self.trackMountInterruption(
+                            for: profile,
+                            wasMounted: before.contains(profile.id),
+                            isMounted: isMounted,
+                            mode: newMode ?? self.profileMountModes[profile.id]
+                        )
+                    }
                     if newMode != self.profileMountModes[profile.id] {
                         self.notifiedBackOnNetworkEpisodes.remove(profile.id)
                         if let newMode {
@@ -4565,6 +4575,8 @@ final class SyncManager: ObservableObject {
     /// returns. On a hung hard NFS mount the call blocks until rclone answers (or the volume
     /// goes away), which is exactly what `MountStallProbe` measures.
     private func startMountResponsivenessProbe(for profile: SyncProfile) {
+        let token = UUID()
+        mountProbeTokens[profile.id] = token
         mountProbeQueue.async { [weak self] in
             let startedAt = Date()
             _ = Self.mountRootAnswers(profile.localSyncPath)
@@ -4578,7 +4590,7 @@ final class SyncManager: ObservableObject {
             }
             DispatchQueue.main.async {
                 self?.finishMountResponsivenessProbe(
-                    profileId: profile.id, finishedAt: finishedAt, volumeGone: volumeGone)
+                    profileId: profile.id, token: token, finishedAt: finishedAt, volumeGone: volumeGone)
             }
         }
     }
@@ -4590,7 +4602,12 @@ final class SyncManager: ObservableObject {
         (try? FileManager.default.attributesOfFileSystem(forPath: mountPoint)) != nil
     }
 
-    private func finishMountResponsivenessProbe(profileId: UUID, finishedAt: Date, volumeGone: Bool) {
+    private func finishMountResponsivenessProbe(
+        profileId: UUID, token: UUID, finishedAt: Date, volumeGone: Bool
+    ) {
+        // A superseded probe (its state closed while the call was blocked) reports nothing.
+        guard mountProbeTokens[profileId] == token else { return }
+        mountProbeTokens.removeValue(forKey: profileId)
         guard var probe = mountStallProbes[profileId] else { return }
         let event = probe.probeFinished(at: finishedAt)
         mountStallProbes[profileId] = probe
@@ -4680,6 +4697,7 @@ final class SyncManager: ObservableObject {
                     profileId: id, profileName: name, kind: "stall", outcome: "unmounted",
                     durationSeconds: duration, backend: backend, mode: mode)
             }
+            mountProbeTokens.removeValue(forKey: id)
             if var probe = mountStallProbes.removeValue(forKey: id),
                case let .stallEnded(duration) = probe.volumeWentAway(at: now) {
                 TelemetryService.shared.recordMountInterruptionEnded(
