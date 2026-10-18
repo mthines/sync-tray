@@ -2947,9 +2947,10 @@ enum ConfigSelfTest {
               TelemetryService.warmPauseReaderLabel("Johns Private Tool") == "app" else {
             return report(id, slug, false, "(a reader was not mapped to its bounded label)")
         }
-        guard TelemetryService.warmPauseReaderSummary(["zsh", "REAPER", "QuickLookSatellite", "REAPER"])
-                == "QuickLookSatellite,app,shell" else {
-            return report(id, slug, false, "(summary not distinct+sorted: \(TelemetryService.warmPauseReaderSummary(["zsh", "REAPER", "QuickLookSatellite"])))")
+        let summaryInput = ["zsh", "REAPER", "QuickLookSatellite", "REAPER"]
+        guard TelemetryService.warmPauseReaderSummary(summaryInput) == "QuickLookSatellite,app,shell" else {
+            return report(id, slug, false,
+                          "(summary not distinct+sorted: \(TelemetryService.warmPauseReaderSummary(summaryInput)))")
         }
         let many = ["QuickLookSatellite", "iconservicesagent", "revisiond", "bird", "cloudd", "backupd", "zsh", "X"]
         guard TelemetryService.warmPauseReaderSummary(many).split(separator: ",").count
