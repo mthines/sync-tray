@@ -157,6 +157,8 @@ final class TelemetryService {
     private var mountListingWarmCounter: LongCounterSdk?
     private var mountListingWarmDurationHistogram: DoubleHistogramMeterSdk?
     private var mountSpotlightMarkerCounter: LongCounterSdk?
+    private var mountInterruptionsCounter: LongCounterSdk?
+    private var mountInterruptionDurationHistogram: DoubleHistogramMeterSdk?
     private var activeOverlayUploadSpans: [UUID: any Span] = [:]
 
     // MARK: - Providers (kept alive for shutdown)
@@ -596,6 +598,16 @@ final class TelemetryService {
             .counterBuilder(name: "synctray.mount.spotlight_marker")
             .setDescription("Spotlight-exclusion marker writes at a streaming Stream mount root (written, exists, failed, skipped)")
             .setUnit("1")
+            .build()
+        mountInterruptionsCounter = meter
+            .counterBuilder(name: "synctray.mount.interruptions")
+            .setDescription("Stream mount interruptions observed by the mount monitor (mount.interruption_kind: stall = the mount root stopped answering, drop = the volume left the mount table without a requested unmount)")
+            .setUnit("1")
+            .build()
+        mountInterruptionDurationHistogram = meter
+            .histogramBuilder(name: "synctray.mount.interruption.duration")
+            .setDescription("How long a Stream mount interruption lasted, until recovery or unmount (seconds). A stall runs from the start of the probe that stalled (a lower bound); a drop from when the monitor saw the volume gone")
+            .setUnit("s")
             .build()
     }
 
@@ -2259,7 +2271,12 @@ final class TelemetryService {
     /// Record an offline-warm pause or resume. `source` is `"manual"` (the user's toggle) or
     /// `"auto"` (an app was detected reading the mount). Auto events fire only on the
     /// idle→paused edge, not every monitor tick, so the counter tracks distinct pauses.
-    func recordWarmPause(profileId: UUID, profileName: String, paused: Bool, source: String) {
+    ///
+    /// `readers` are the process names the lsof busy check found reading the mount on that
+    /// edge (`SyncManager.warmPauseReaders`). They go on the LOG only, never on the counter
+    /// (cardinality), and only as bounded labels (`warmPauseReaderSummary`): a macOS
+    /// component's own name, `shell`, or `app`. A third-party app's name is never sent.
+    func recordWarmPause(profileId: UUID, profileName: String, paused: Bool, source: String, readers: [String] = []) {
         guard SyncTraySettings.telemetryEnabled else { return }
         ensureSetup()
         let attrs: [String: AttributeValue] = [
@@ -2269,7 +2286,74 @@ final class TelemetryService {
             "warm.pause_source": .string(source),
         ]
         warmPausedCounter?.add(value: 1, attribute: attrs)
-        emitLog(severity: .info, body: paused ? "Offline warm paused" : "Offline warm resumed", attributes: attrs)
+        var logAttrs = attrs
+        if !readers.isEmpty {
+            logAttrs["warm.pause_readers"] = .string(Self.warmPauseReaderSummary(readers))
+            logAttrs["warm.pause_reader_count"] = .int(Set(readers).count)
+        }
+        emitLog(severity: .info, body: paused ? "Offline warm paused" : "Offline warm resumed", attributes: logAttrs)
+    }
+
+    /// macOS components reported BY NAME in `warm.pause_readers`: Apple system processes that
+    /// can open files on a mounted volume, plus SyncTray's own Finder extension. Their names
+    /// identify an OS component, not the user. Anything else is `shell` or `app` (see
+    /// `warmPauseReaderLabel`), the same fixed-allowlist approach as `normalizeFileExtension`.
+    static let warmPauseReaderAllowlist: Set<String> = [
+        // Finder previews and thumbnails
+        "QuickLookSatellite", "com.apple.quicklook.ThumbnailsAgent", "quicklookd",
+        // Icon rendering
+        "iconservicesagent", "iconservicesd",
+        // Finder copy/move operations
+        "DesktopServicesHelper",
+        // Spotlight and metadata (beyond the daemons the busy check already ignores)
+        "corespotlightd", "mdbulkimport", "mdsync", "mdwrite", "Spotlight",
+        // Versions, Time Machine, iCloud, File Provider
+        "revisiond", "backupd", "fileproviderd", "bird", "cloudd",
+        // Security scanning
+        "XprotectService", "syspolicyd",
+        // Photos and media analysis
+        "photoanalysisd", "mediaanalysisd",
+        // SyncTray's own Finder extension
+        "SyncTrayFinderSync",
+        // Already ignored by the busy check today; listed so a change there stays legible
+        "Finder", "mds", "mds_stores", "mdworker", "mdworker_shared", "fseventsd", "QuickLookUIService",
+    ]
+
+    /// Shells (and tmux) report as `shell`: a terminal whose working directory is inside the
+    /// mount holds it open for as long as the shell lives.
+    static let warmPauseShellNames: Set<String> = [
+        "zsh", "bash", "sh", "fish", "tcsh", "csh", "dash", "ksh", "nu", "tmux",
+    ]
+
+    /// Most distinct labels one pause reports.
+    static let warmPauseReaderSummaryLimit = 5
+
+    /// macOS `lsof` reports at most 31 characters of a process name (a 32-byte kernel buffer),
+    /// so an allowlisted name longer than that arrives cut short. Maps the cut form back to
+    /// the full allowlist entry (e.g. `com.apple.quicklook.ThumbnailsA` →
+    /// `com.apple.quicklook.ThumbnailsAgent`).
+    static let warmPauseReaderTruncatedNames: [String: String] = Dictionary(
+        warmPauseReaderAllowlist.filter { $0.count > 31 }.map { (String($0.prefix(31)), $0) },
+        uniquingKeysWith: { first, _ in first })
+
+    /// Bounded telemetry label for one reader process: its own name when it is an allowlisted
+    /// macOS component, `shell` for a shell, otherwise `app`. A leading `-` (login shell) is
+    /// ignored.
+    static func warmPauseReaderLabel(_ processName: String) -> String {
+        let name = processName.hasPrefix("-") ? String(processName.dropFirst()) : processName
+        if warmPauseReaderAllowlist.contains(name) { return name }
+        if let fullName = warmPauseReaderTruncatedNames[name] { return fullName }
+        if warmPauseShellNames.contains(name) { return "shell" }
+        return "app"
+    }
+
+    /// The `warm.pause_readers` value: distinct labels, sorted, at most
+    /// `warmPauseReaderSummaryLimit`, comma-separated. Covered by AC-WV3.
+    static func warmPauseReaderSummary(_ readers: [String]) -> String {
+        Set(readers.map(warmPauseReaderLabel))
+            .sorted()
+            .prefix(warmPauseReaderSummaryLimit)
+            .joined(separator: ",")
     }
 
     /// Start a `synctray warm` span for an offline-file warming run. No-op (returns an
@@ -2587,6 +2671,83 @@ final class TelemetryService {
         ]
         mountModeChangesCounter?.add(value: 1, attribute: attrs)
         emitLog(severity: .info, body: "Mount mode changed", attributes: attrs)
+    }
+
+    // MARK: - Mount Interruptions
+
+    /// Record the leading edge of a Stream mount interruption, as seen by the mount monitor
+    /// (`SyncManager.trackMountInterruption`). `kind` is `stall` (a `statfs` on the mount root
+    /// has been outstanding for `MountStallProbe.stallThreshold`: the condition macOS reports
+    /// as "Server connections interrupted") or `drop` (the volume left the mount table while
+    /// the profile's launchd agent stayed loaded, so no unmount was requested). Emitted at
+    /// detection, not at recovery, so an interruption that never recovers is still visible.
+    /// `mode` is the mount mode token with underscores (`streaming`, `cache_only_manual`, …)
+    /// or `unknown`.
+    func recordMountInterruptionStarted(
+        profileId: UUID,
+        profileName: String,
+        kind: String,
+        backend: String,
+        mode: String
+    ) {
+        guard SyncTraySettings.telemetryEnabled else { return }
+        ensureSetup()
+        mountInterruptionsCounter?.add(value: 1, attribute: [
+            "synctray.profile.id": .string(profileId.uuidString),
+            "synctray.profile.name": .string(profileName),
+            "mount.interruption_kind": .string(kind),
+            "mount.backend": .string(backend),
+            "mount.mode": .string(mode),
+        ])
+        emitLog(severity: .warn, body: "Mount interrupted", attributes: [
+            "synctray.profile.id": .string(profileId.uuidString),
+            "synctray.profile.name": .string(profileName),
+            "sync.mode": .string("mount"),
+            "mount.interruption_kind": .string(kind),
+            "mount.backend": .string(backend),
+            "mount.mode": .string(mode),
+        ])
+    }
+
+    /// Record the end of a Stream mount interruption. `outcome` is `recovered` (the mount
+    /// answered again / the volume came back), `dropped` (a stall that ended with the volume
+    /// leaving the mount table in an unexpected drop, which is then tracked as a drop of its
+    /// own), or `unmounted` (an interruption closed by a deliberate unmount, disable, delete,
+    /// pause or reinstall, including a drop the profile never came back from). For a stall,
+    /// `durationSeconds` runs from the start of the probe that stalled, so it is a lower bound.
+    func recordMountInterruptionEnded(
+        profileId: UUID,
+        profileName: String,
+        kind: String,
+        outcome: String,
+        durationSeconds: Double,
+        backend: String,
+        mode: String
+    ) {
+        guard SyncTraySettings.telemetryEnabled else { return }
+        ensureSetup()
+        mountInterruptionDurationHistogram?.record(value: durationSeconds, attributes: [
+            "synctray.profile.id": .string(profileId.uuidString),
+            "synctray.profile.name": .string(profileName),
+            "mount.interruption_kind": .string(kind),
+            "mount.interruption_outcome": .string(outcome),
+            "mount.backend": .string(backend),
+            "mount.mode": .string(mode),
+        ])
+        emitLog(
+            severity: outcome == "recovered" ? .info : .warn,
+            body: "Mount interruption ended",
+            attributes: [
+                "synctray.profile.id": .string(profileId.uuidString),
+                "synctray.profile.name": .string(profileName),
+                "sync.mode": .string("mount"),
+                "mount.interruption_kind": .string(kind),
+                "mount.interruption_outcome": .string(outcome),
+                "mount.interruption_duration_s": .double(durationSeconds),
+                "mount.backend": .string(backend),
+                "mount.mode": .string(mode),
+            ]
+        )
     }
 
     /// Record a whole-tree directory-*listing* warm run on a streaming Stream mount

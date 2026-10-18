@@ -270,6 +270,7 @@ final class SyncSetupService {
     /// paused profile stops firing scheduled syncs; resume calls `loadAgent`.
     @discardableResult
     func unloadAgent(for profile: SyncProfile) -> Bool {
+        noteDeliberateUnmount(for: profile)
         let result = runCommand("/bin/launchctl", arguments: ["unload", profile.plistPath])
         print("[SyncTray] launchctl unload exit code: \(result.exitCode), output: \(result.output)")
         return result.exitCode == 0
@@ -294,6 +295,7 @@ final class SyncSetupService {
         // straight to `launchctl unload` with no detach step at all and could freeze
         // an in-progress stream read for as long as the stale mount lingered.
         if profile.isMountMode {
+            noteDeliberateUnmount(for: profile)
             let detachStart = Date()
             let wasMounted = isMounted(profile: profile)
             var detachResult = "not_mounted"
@@ -983,6 +985,22 @@ enum SyncAbort {
 }
 
 extension SyncSetupService {
+    /// Record that SyncTray is about to detach this Stream profile's volume or unload its
+    /// agent on purpose, so the mount-interruption telemetry doesn't count the disappearance
+    /// as a drop (`MountDropClassifier`). Called by every detach path here, which the app and
+    /// the CLI share. Only the marker's modification time matters; the atomic write replaces
+    /// the file rather than writing through it. Best effort: a failed write can only make one
+    /// deliberate unmount look like a drop.
+    func noteDeliberateUnmount(for profile: SyncProfile) {
+        guard profile.isMountMode else { return }
+        try? Data().write(to: URL(fileURLWithPath: profile.deliberateUnmountMarkerPath), options: .atomic)
+    }
+
+    /// When `noteDeliberateUnmount` last ran for this profile, or nil if never (this boot).
+    func lastDeliberateUnmount(for profile: SyncProfile) -> Date? {
+        (try? FileManager.default.attributesOfItem(atPath: profile.deliberateUnmountMarkerPath))?[.modificationDate] as? Date
+    }
+
     /// Update just the profile config (without reinstalling the script)
     func updateConfig(for profile: SyncProfile) throws {
         let config = generateProfileConfig(for: profile)
@@ -1023,6 +1041,7 @@ extension SyncSetupService {
         guard profile.isMountMode else {
             throw SetupError.notMountMode
         }
+        noteDeliberateUnmount(for: profile)
 
         // Detach the volume if it's currently mounted (graceful, then force).
         if isMounted(profile: profile) {
@@ -1084,6 +1103,7 @@ extension SyncSetupService {
 
             // Leave a HEALTHY live mount alone; only clear a genuine orphan (job dead).
             if isMountAgentRunning(profile: profile) { continue }
+            noteDeliberateUnmount(for: profile)
             _ = runCommand("/usr/sbin/diskutil", arguments: ["unmount", "force", mountPoint])
         }
     }

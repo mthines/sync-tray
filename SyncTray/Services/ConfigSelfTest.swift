@@ -57,6 +57,8 @@ enum ConfigSelfTest {
             testListingWarmOnMount,
             testListingWarmDescentPrimitives,
             testSpotlightMarkerWrite,
+            testMountStallProbe,
+            testMountDropClassifier,
             testMountPollDecision,
             testLegacyOfflineLinkCleanup,
             testWarmReconcileTrigger,
@@ -106,6 +108,7 @@ enum ConfigSelfTest {
             testMountModeParse,
             testWarmMenuBarSummary,
             testWarmAutoPauseReaders,
+            testWarmPauseReaderTelemetry,
             testMountModeTransitionText,
             testMountNoFallbackOverride,
             testCacheSuffixConsolidation,
@@ -167,6 +170,7 @@ enum ConfigSelfTest {
             testAbortEscalation,
             testAbortRunEndSuppression,
             testAbortWiringPinned,
+            testRcloneErrorLinesNotFileChanges,
         ]
 
         for check in checks {
@@ -1132,6 +1136,111 @@ enum ConfigSelfTest {
             return report("AC-LW2", "listing-warm-descent", false, "(abort threshold wrong)")
         }
         return report("AC-LW2", "listing-warm-descent", true)
+    }
+
+    // MARK: - AC-MI1 — mount stall probe state machine
+
+    /// `MountStallProbe` (mount-interruption telemetry): one outstanding probe at a time,
+    /// probes spaced by `probeInterval`, a stall reported exactly once when a probe has been
+    /// outstanding for `stallThreshold`, closed with its duration when the probe returns,
+    /// and closed (then silenced) when the volume goes away mid-stall.
+    private static func testMountStallProbe() -> Bool {
+        let id = "AC-MI1", slug = "mount-stall-probe"
+        let t0 = Date(timeIntervalSince1970: 1_000_000)
+        var probe = MountStallProbe()
+
+        guard probe.shouldStartProbe(now: t0) else {
+            return report(id, slug, false, "(a fresh probe state did not want to start a probe)")
+        }
+        probe.probeStarted(at: t0)
+        guard !probe.shouldStartProbe(now: t0.addingTimeInterval(60)) else {
+            return report(id, slug, false, "(a second probe was allowed while one is outstanding)")
+        }
+        guard probe.evaluate(now: t0.addingTimeInterval(MountStallProbe.stallThreshold - 1)) == .none else {
+            return report(id, slug, false, "(a stall was reported before the threshold)")
+        }
+        guard probe.evaluate(now: t0.addingTimeInterval(MountStallProbe.stallThreshold)) == .stallStarted(since: t0) else {
+            return report(id, slug, false, "(no stall reported at the threshold)")
+        }
+        guard probe.evaluate(now: t0.addingTimeInterval(40)) == .none else {
+            return report(id, slug, false, "(the same stall was reported twice)")
+        }
+        let back = t0.addingTimeInterval(42)
+        guard probe.probeFinished(at: back) == .stallEnded(duration: 42) else {
+            return report(id, slug, false, "(the probe returning did not close the stall with its duration)")
+        }
+        guard !probe.shouldStartProbe(now: back.addingTimeInterval(MountStallProbe.probeInterval - 1)),
+              probe.shouldStartProbe(now: back.addingTimeInterval(MountStallProbe.probeInterval)) else {
+            return report(id, slug, false, "(probes were not spaced by probeInterval)")
+        }
+
+        // A quick probe never reports anything.
+        let t1 = back.addingTimeInterval(MountStallProbe.probeInterval)
+        probe.probeStarted(at: t1)
+        guard probe.probeFinished(at: t1.addingTimeInterval(0.2)) == .none else {
+            return report(id, slug, false, "(a probe that returned in time reported a stall end)")
+        }
+
+        // Volume goes away mid-stall: closed once, and the late return stays silent.
+        let t2 = t1.addingTimeInterval(MountStallProbe.probeInterval + 1)
+        probe.probeStarted(at: t2)
+        _ = probe.evaluate(now: t2.addingTimeInterval(MountStallProbe.stallThreshold))
+        guard probe.volumeWentAway(at: t2.addingTimeInterval(20)) == .stallEnded(duration: 20) else {
+            return report(id, slug, false, "(the volume going away did not close the open stall)")
+        }
+        guard probe.evaluate(now: t2.addingTimeInterval(60)) == .none,
+              probe.probeFinished(at: t2.addingTimeInterval(61)) == .none else {
+            return report(id, slug, false, "(a stall closed by the volume going away was reported again)")
+        }
+
+        // Volume goes away with a probe outstanding but no stall yet: that probe stays silent.
+        let t3 = t2.addingTimeInterval(200)
+        probe.probeStarted(at: t3)
+        guard probe.volumeWentAway(at: t3.addingTimeInterval(1)) == .none,
+              probe.evaluate(now: t3.addingTimeInterval(MountStallProbe.stallThreshold + 5)) == .none else {
+            return report(id, slug, false, "(a probe outstanding when the volume went away later reported a stall)")
+        }
+        return report(id, slug, true)
+    }
+
+    // MARK: - AC-MI2 — mount drop classification
+
+    /// `MountDropClassifier`: a disappearance is a drop only when the agent is still loaded,
+    /// the profile is an enabled, unpaused Stream profile, and no deliberate-unmount marker
+    /// explains it (written up to `deliberateWindow` before the disappearance). Also checks
+    /// that the marker lives in the per-user temp dir, never the shared /tmp.
+    private static func testMountDropClassifier() -> Bool {
+        let id = "AC-MI2", slug = "mount-drop-classifier"
+        let seen = Date(timeIntervalSince1970: 2_000_000)
+        func drop(_ loaded: Bool, _ enabled: Bool, _ paused: Bool, _ marker: Date?) -> Bool {
+            MountDropClassifier.isUnexpectedDrop(
+                agentLoaded: loaded, isEnabledMountProfile: enabled, isPaused: paused,
+                lastDeliberateUnmount: marker, disappearedAt: seen)
+        }
+        guard drop(true, true, false, nil) else {
+            return report(id, slug, false, "(a volume gone under a loaded agent with no marker was not a drop)")
+        }
+        guard !drop(false, true, false, nil) else {
+            return report(id, slug, false, "(an unloaded agent was counted as a drop)")
+        }
+        guard !drop(true, false, false, nil), !drop(true, true, true, nil) else {
+            return report(id, slug, false, "(a disabled or paused profile was counted as a drop)")
+        }
+        guard !drop(true, true, false, seen.addingTimeInterval(-3)),
+              !drop(true, true, false, seen.addingTimeInterval(-MountDropClassifier.deliberateWindow)) else {
+            return report(id, slug, false, "(a fresh deliberate-unmount marker did not rule out a drop, e.g. a reinstall)")
+        }
+        guard drop(true, true, false, seen.addingTimeInterval(-MountDropClassifier.deliberateWindow - 1)) else {
+            return report(id, slug, false, "(a stale deliberate-unmount marker still ruled out a drop)")
+        }
+        guard drop(true, true, false, seen.addingTimeInterval(30)) else {
+            return report(id, slug, false, "(a marker written well after the disappearance ruled out the drop)")
+        }
+        let marker = sampleProfile().deliberateUnmountMarkerPath
+        guard marker.hasPrefix(SyncProfile.privateTempDirectory), !marker.hasPrefix("/tmp/") else {
+            return report(id, slug, false, "(the deliberate-unmount marker is not in the per-user temp dir: \(marker))")
+        }
+        return report(id, slug, true)
     }
 
     // MARK: - AC-SM1 — Spotlight-exclusion marker write on mount
@@ -2920,6 +3029,48 @@ enum ConfigSelfTest {
             return report("AC-WV2", "warm-auto-pause", false, "(nil lsof must not pause)")
         }
         return report("AC-WV2", "warm-auto-pause", true)
+    }
+
+    // MARK: - AC-WV3 — an auto-pause reports which process took the link, bounded
+
+    /// The auto-pause hands its readers to telemetry (`SyncManager.warmPauseReaders`), and the
+    /// log attribute stays bounded and privacy-safe (`TelemetryService.warmPauseReaderSummary`):
+    /// allowlisted macOS components by name, shells as `shell`, every other app as `app`,
+    /// distinct, sorted, capped.
+    private static func testWarmPauseReaderTelemetry() -> Bool {
+        let id = "AC-WV3", slug = "warm-pause-reader-telemetry"
+        let lsof = "p1\ncFinder\np2\ncSyncTray\np3\ncQuickLookSatellite\np4\ncREAPER\np5\nczsh\np6\ncREAPER\n"
+        guard SyncManager.warmPauseReaders(lsofOutput: lsof) == ["QuickLookSatellite", "REAPER", "zsh"] else {
+            return report(id, slug, false, "(warmPauseReaders did not keep exactly the interactive readers)")
+        }
+        guard SyncManager.warmPauseReaders(lsofOutput: nil).isEmpty,
+              SyncManager.warmPauseReaders(lsofOutput: "p1\ncSyncTray\n").isEmpty else {
+            return report(id, slug, false, "(a failed lsof or the warmer alone produced readers)")
+        }
+        guard SyncManager.shouldAutoPauseWarm(lsofOutput: lsof),
+              !SyncManager.shouldAutoPauseWarm(lsofOutput: nil) else {
+            return report(id, slug, false, "(shouldAutoPauseWarm no longer agrees with warmPauseReaders)")
+        }
+        guard TelemetryService.warmPauseReaderLabel("QuickLookSatellite") == "QuickLookSatellite",
+              TelemetryService.warmPauseReaderLabel("SyncTrayFinderSync") == "SyncTrayFinderSync",
+              TelemetryService.warmPauseReaderLabel("com.apple.quicklook.ThumbnailsA")
+                  == "com.apple.quicklook.ThumbnailsAgent",
+              TelemetryService.warmPauseReaderLabel("-zsh") == "shell",
+              TelemetryService.warmPauseReaderLabel("REAPER") == "app",
+              TelemetryService.warmPauseReaderLabel("Johns Private Tool") == "app" else {
+            return report(id, slug, false, "(a reader was not mapped to its bounded label)")
+        }
+        let summaryInput = ["zsh", "REAPER", "QuickLookSatellite", "REAPER"]
+        guard TelemetryService.warmPauseReaderSummary(summaryInput) == "QuickLookSatellite,app,shell" else {
+            return report(id, slug, false,
+                          "(summary not distinct+sorted: \(TelemetryService.warmPauseReaderSummary(summaryInput)))")
+        }
+        let many = ["QuickLookSatellite", "iconservicesagent", "revisiond", "bird", "cloudd", "backupd", "zsh", "X"]
+        guard TelemetryService.warmPauseReaderSummary(many).split(separator: ",").count
+                == TelemetryService.warmPauseReaderSummaryLimit else {
+            return report(id, slug, false, "(summary was not capped at warmPauseReaderSummaryLimit)")
+        }
+        return report(id, slug, true)
     }
 
     // MARK: - AC-MT1 — Cache Only ↔ Streaming switch shows a direction-aware transition
@@ -8095,6 +8246,68 @@ enum ConfigSelfTest {
             return report("AC-AB4", "abort-wiring-pinned", false, "(the profile card no longer swaps Pause for Abort while a run is live)")
         }
         return report("AC-AB4", "abort-wiring-pinned", true)
+    }
+
+    // MARK: - AC-FC1 — rclone error lines that name a file are errors, not file changes
+
+    /// rclone logs a failed operation at ERROR with the file as `object` ("Failed to copy: …",
+    /// "Couldn't delete: …", "Failed to rename: …"). Those must parse as `.errorMessage` — never
+    /// as a Copied/Updated/Deleted/Renamed change — while rclone's genuine INFO change lines,
+    /// and bisync's object-less change lines, still parse as file changes.
+    private static func testRcloneErrorLinesNotFileChanges() -> Bool {
+        let name = "AC-FC1", slug = "error-lines-not-file-changes"
+        let parser = LogParser()
+        let decoder = JSONDecoder()
+        func line(level: String, msg: String, object: String? = nil, source: String) -> String? {
+            var dict: [String: Any] = ["level": level, "msg": msg, "source": source,
+                                       "time": "2026-10-13T07:13:40.943947+02:00"]
+            if let object { dict["object"] = object; dict["objectType"] = "*local.Object" }
+            return (try? JSONSerialization.data(withJSONObject: dict)).flatMap { String(data: $0, encoding: .utf8) }
+        }
+
+        // Failed operations, shaped like rclone's own log calls.
+        let errorLines: [(level: String, msg: String, object: String, source: String)] = [
+            ("error", "Failed to copy: failed to open source object: open /Users/someone/Pictures/a.txt: operation not permitted",
+             "a.txt", "operations/copy.go:354"),
+            ("error", "Couldn't delete: permission denied", "old/notes.txt", "operations/operations.go:579"),
+            ("error", "Failed to rename: file already exists", "dup.txt", "operations/dedupe.go:68"),
+            // "new" in the text used to make this a Copied change.
+            ("critical", "Failed to copy: new upload rejected: quota exceeded", "big.mov", "operations/copy.go:354"),
+        ]
+        for entry in errorLines {
+            guard let raw = line(level: entry.level, msg: entry.msg, object: entry.object, source: entry.source),
+                  let decoded = try? decoder.decode(RcloneLogEntry.self, from: Data(raw.utf8)) else {
+                return report(name, slug, false, "(could not build or decode \(entry.msg.debugDescription))")
+            }
+            guard decoded.fileChange == nil else {
+                return report(name, slug, false, "(\(entry.msg.debugDescription) was read as a file change)")
+            }
+            guard let event = parser.parse(line: raw),
+                  case .errorMessage(let message) = event.type,
+                  message.contains(String(entry.msg.prefix(14))) else {
+                return report(name, slug, false, "(\(entry.msg.debugDescription) did not surface as an errorMessage)")
+            }
+        }
+
+        // Genuine changes still parse as changes (the first is a real rclone line).
+        let changeLines: [(raw: String?, path: String, operation: FileChange.Operation)] = [
+            (line(level: "info", msg: "Copied (new)", object: "Camera Roll/2026/10/IMG_5257.HEIC", source: "operations/copy.go:380"),
+             "Camera Roll/2026/10/IMG_5257.HEIC", .copied),
+            (line(level: "info", msg: "Copied (replaced existing)", object: "notes.txt", source: "operations/copy.go:380"),
+             "notes.txt", .updated),
+            (line(level: "info", msg: "Deleted", object: "old/notes.txt", source: "operations/operations.go:582"),
+             "old/notes.txt", .deleted),
+            (line(level: "info", msg: "- Path1    File was deleted          - KAIJU/file.mp4", source: "bisync/queue.go:1"),
+             "KAIJU/file.mp4", .deleted),
+        ]
+        for expected in changeLines {
+            guard let raw = expected.raw, let event = parser.parse(line: raw),
+                  case .fileChange(let change) = event.type,
+                  change.path == expected.path, change.operation == expected.operation else {
+                return report(name, slug, false, "(a genuine change for \(expected.path) no longer parses as \(expected.operation))")
+            }
+        }
+        return report(name, slug, true)
     }
 }
 

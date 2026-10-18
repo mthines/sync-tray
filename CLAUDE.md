@@ -171,6 +171,40 @@ reconcile, and dry-run flag emission — resilient-on emits the rclone timeouts 
 `-o soft` on either backend). Pairs with the bandwidth cap above: the cap keeps the mount
 from *causing* the stall, this keeps a stall from *freezing* the machine.
 
+**Mount interruption telemetry — stalls and drops the mount table can't show.** A hard
+NFS mount whose server stops answering stays in the mount table, so the 5 s mount monitor
+(`reconcileMountStatesOffMain`, which reads `/sbin/mount`) still reports it mounted while
+Finder hangs and macOS shows "Server connections interrupted". Two kinds of interruption
+are recorded, both from the same monitor tick (`SyncManager.trackMountInterruption`):
+- **Stall.** For each mounted Stream profile the monitor sends one `statfs(2)` to the mount
+  root (an FSSTAT round trip to rclone's NFS server) on `mountProbeQueue`, at most one
+  outstanding per profile and spaced `MountStallProbe.probeInterval` (30 s) apart. A probe
+  still outstanding after `stallThreshold` (15 s) is a stall. The pure `MountStallProbe`
+  holds the state; the probe thread only reports when its call returned. The duration
+  runs from that probe's start, so it is a lower bound.
+- **Drop.** The volume left the mount table and nobody asked for it.
+  `MountDropClassifier` decides `confirmDelay` (10 s) after the disappearance: deliberate
+  if the launchd agent is unloaded, or if `SyncProfile.deliberateUnmountMarkerPath` was
+  touched within `deliberateWindow` (120 s) before it. Every detach path in
+  `SyncSetupService` touches that marker first (`unmount`, `uninstall` and therefore every
+  reinstall and Cache Only switch, `unloadAgent` for pause, `cleanupStaleMounts`), and the
+  CLI goes through the same code, so a reinstall that reloads the agent within seconds
+  still reads as deliberate. What's left is rclone exiting under a loaded agent, or macOS
+  detaching the volume (the "Disconnect" button in that dialog).
+
+Each interruption emits a WARN "Mount interrupted" log and the `synctray.mount.interruptions`
+counter at detection (`mount.interruption_kind` = `stall`/`drop`, plus `mount.backend`,
+`mount.mode`), so one that never recovers is still visible, and a "Mount interruption ended"
+log + `synctray.mount.interruption.duration` histogram at the end
+(`mount.interruption_outcome` = `recovered`, `dropped` for a stall that ended in an unexpected
+drop, or `unmounted` for one closed by a deliberate unmount, pause, reinstall, disable or
+delete; a stall whose volume disappears waits for the drop classification to pick between
+the two). Trade-off: the
+probe adds one FSSTAT every 30 s per mounted profile, and during a stall it is itself an
+outstanding RPC (a blocked thread, released when rclone answers or the volume goes away).
+Covered by `ConfigSelfTest` AC-MI1 (probe state machine) and AC-MI2 (drop classification and
+the marker's private location).
+
 **NFS backend caveats:** writes require `--vfs-cache-mode` ≥ `writes` (default is
 `full`, so this is satisfied). The NFS client couples access/modification times,
 which can occasionally cause an extra re-upload after a file is merely viewed in
@@ -184,6 +218,15 @@ mount and answers NFS3ERR_NOTSUPP; the macOS NFS client then retries the create 
 sync error" — a banner a Stream profile could never clear, since nothing but a sync
 start/complete clears it. `TelemetryService.categorizeError` keeps the
 `exclusive_mode_unsupported` bucket for the same predicate. Covered by `ConfigSelfTest` AC-NFS1.
+
+**An rclone error line is never a file change.** rclone logs a failed operation at ERROR
+with the file as `object` — `Failed to copy: …` (`operations/copy.go`), `Couldn't delete: …`
+(`operations.go`), `Failed to rename: …` (`dedupe.go`) — and `RcloneLogEntry.fileChange`'s
+substring match (`copy`/`delete`/`rename`/`update`) used to read those as Updated / Deleted /
+Renamed, so a failed transfer was listed in Recent Changes and counted in `files_changed`
+while its error never reached the banner or `Sync error` telemetry. `fileChange` now returns
+nil for `RcloneLogEntry.isErrorLevel` (error/critical — the same predicate `LogParser` uses
+for `.errorMessage`); rclone logs successful changes at INFO. Covered by `ConfigSelfTest` AC-FC1.
 
 **NFS read path is sensitive to the cache disk.** NFSv3 is stateless, so rclone
 serves every 32 KB READ as a full vfs open→read→close, and each open rewrites the
@@ -699,7 +742,16 @@ the warm faster (the link is the bound) but to make it **visible** and **yieldab
   covers the idle-Finder-browsing case. A failed/`nil` lsof does NOT pause (a missed pause just
   keeps warming — safe; unlike auto-resume, which fails closed). Pause state is in-memory and
   cleared when a run ends, so a later warm the user asks for starts un-paused. Telemetry:
-  `synctray.offline.warm.paused` (`warm.pause_source`: manual/auto). Covered by AC-WV1/AC-WV2.
+  `synctray.offline.warm.paused` (`warm.pause_source`: manual/auto). An auto-pause also says
+  WHICH process took the link: `refreshWarmAutoPause` passes the readers it found
+  (`SyncManager.warmPauseReaders`) to `recordWarmPause`, whose "Offline warm paused" log carries
+  `warm.pause_readers` and `warm.pause_reader_count`. The readers go on the log only (never
+  the counter, for cardinality), as bounded labels (`TelemetryService.warmPauseReaderSummary`):
+  an allowlisted macOS component by name (`QuickLookSatellite`, `iconservicesagent`,
+  `revisiond`, `SyncTrayFinderSync`, …), `shell` for a shell or tmux with its working directory
+  in the mount, and `app` for everything else, since a third-party app's name is never sent
+  (the disclosure sheet says so). The full process names go to the local debug log. Covered by
+  AC-WV1/AC-WV2/AC-WV3.
 - **Self-healing back-off on a struggling link.** `warmDirectory`'s per-file read task reports
   whether it FAILED (threw mid-read, or got zero bytes for a non-empty file — the degraded-SMB
   "fetch a few KB, stall, retry" signature) instead of swallowing the error with `try?`. After
@@ -1765,6 +1817,7 @@ Priority: process env vars > `~/.config/synctray/.env` > Info.plist. Key vars: `
 | `/tmp/synctray-sync-{shortId}.lock` | Lock file (prevents concurrent syncs) |
 | `~/.local/state/synctray/rc/{rcPort}.auth` | Mount mode only — 0600 secret for the streaming mount's rclone RC API. Generated by the sync script, passed to rclone as `RCLONE_RC_USER`/`RCLONE_RC_PASS` (env, never argv), read by `VFSCacheService.rcRequest` for HTTP Basic auth. The RC API never runs `--rc-no-auth` (any local process, or a web page via a cross-origin form POST, could otherwise drive it). Covered by `ConfigSelfTest` AC-SEC2. |
 | `$(getconf DARWIN_USER_TEMP_DIR)synctray-mount-{shortId}.mode` | Mount mode only — the currently active `MountMode` token (`streaming`/`cache-only-manual`/`cache-only-pending`/`cache-only-offline`), rewritten on every mount start. Lives in the per-user temp dir (`/var/folders/…/T/`, owner-only 0700, cleared at boot; `SyncProfile.privateTempDirectory`), **never** the shared `/tmp`: the script writes it with `echo >`, which follows a symlink another local user could plant at a predictable `/tmp` name (CWE-59). A derived config still naming the old `/tmp` path is rewritten at launch (`SyncSetupService.refreshMountModePathIfChanged`). Covered by `ConfigSelfTest` AC-SEC4. |
+| `$(getconf DARWIN_USER_TEMP_DIR)synctray-unmount-{shortId}.intent` | Mount mode only — empty marker touched by `SyncSetupService.noteDeliberateUnmount` right before SyncTray (app or CLI) detaches the volume or unloads the agent; its modification time lets the mount-interruption telemetry tell a requested unmount from a drop (`MountDropClassifier`). Same per-user 0700 temp dir as the mode file. |
 | `~/.config/synctray/profiles/{shortId}.cacheonly.rclone.conf` | Mount mode only — chmod-0600 `union` remote config for the Cache-only overlay mount |
 | `{vfsCachePath}/vfs/{primaryRemoteName}/{path}/…` | Mount mode only — VFS cached file **data**, keyed by the profile's own primary remote name (see "Cache key" above) |
 | `{vfsCachePath}/vfsMeta/{primaryRemoteName}/{path}/…` | Mount mode only — VFS metadata sidecars, including the `--vfs-cache-mode full` downloaded byte-range list. Load-bearing for Cache Directory Migration: moving `vfs` without `vfsMeta` makes rclone re-download everything. |

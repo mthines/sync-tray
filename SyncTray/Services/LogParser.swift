@@ -61,7 +61,9 @@ final class LogParser {
 
         let timestamp = entry.date ?? Date()
 
-        // Check for file operations
+        // Check for file operations. Safe ahead of the error branch below: `fileChange` is
+        // nil for every error/critical line (`RcloneLogEntry.isErrorLevel`), so a "Failed to
+        // copy: …" line naming a file falls through to `.errorMessage`.
         if let fileChange = entry.fileChange {
             return ParsedLogEvent(
                 timestamp: timestamp,
@@ -83,7 +85,7 @@ final class LogParser {
         let msg = stripANSI(entry.msg)
 
         // Capture error messages from rclone (error or critical level)
-        if entry.level == "error" || entry.level == "critical" {
+        if entry.isErrorLevel {
             // go-nfs's exclusive-create notice is logged at ERROR but is not a failure:
             // the macOS NFS client retries the create without O_EXCL and it succeeds.
             // Surfacing it would raise a "Last sync error" on a healthy Stream profile.
