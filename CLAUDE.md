@@ -219,6 +219,15 @@ sync error" — a banner a Stream profile could never clear, since nothing but a
 start/complete clears it. `TelemetryService.categorizeError` keeps the
 `exclusive_mode_unsupported` bucket for the same predicate. Covered by `ConfigSelfTest` AC-NFS1.
 
+**An rclone error line is never a file change.** rclone logs a failed operation at ERROR
+with the file as `object` — `Failed to copy: …` (`operations/copy.go`), `Couldn't delete: …`
+(`operations.go`), `Failed to rename: …` (`dedupe.go`) — and `RcloneLogEntry.fileChange`'s
+substring match (`copy`/`delete`/`rename`/`update`) used to read those as Updated / Deleted /
+Renamed, so a failed transfer was listed in Recent Changes and counted in `files_changed`
+while its error never reached the banner or `Sync error` telemetry. `fileChange` now returns
+nil for `RcloneLogEntry.isErrorLevel` (error/critical — the same predicate `LogParser` uses
+for `.errorMessage`); rclone logs successful changes at INFO. Covered by `ConfigSelfTest` AC-FC1.
+
 **NFS read path is sensitive to the cache disk.** NFSv3 is stateless, so rclone
 serves every 32 KB READ as a full vfs open→read→close, and each open rewrites the
 file's `vfsMeta` sidecar (`vfscache.Item._save`, found by sampling

@@ -166,6 +166,7 @@ enum ConfigSelfTest {
             testAbortEscalation,
             testAbortRunEndSuppression,
             testAbortWiringPinned,
+            testRcloneErrorLinesNotFileChanges,
         ]
 
         for check in checks {
@@ -7960,6 +7961,68 @@ enum ConfigSelfTest {
             return report("AC-AB4", "abort-wiring-pinned", false, "(the profile card no longer swaps Pause for Abort while a run is live)")
         }
         return report("AC-AB4", "abort-wiring-pinned", true)
+    }
+
+    // MARK: - AC-FC1 — rclone error lines that name a file are errors, not file changes
+
+    /// rclone logs a failed operation at ERROR with the file as `object` ("Failed to copy: …",
+    /// "Couldn't delete: …", "Failed to rename: …"). Those must parse as `.errorMessage` — never
+    /// as a Copied/Updated/Deleted/Renamed change — while rclone's genuine INFO change lines,
+    /// and bisync's object-less change lines, still parse as file changes.
+    private static func testRcloneErrorLinesNotFileChanges() -> Bool {
+        let name = "AC-FC1", slug = "error-lines-not-file-changes"
+        let parser = LogParser()
+        let decoder = JSONDecoder()
+        func line(level: String, msg: String, object: String? = nil, source: String) -> String? {
+            var dict: [String: Any] = ["level": level, "msg": msg, "source": source,
+                                       "time": "2026-10-13T07:13:40.943947+02:00"]
+            if let object { dict["object"] = object; dict["objectType"] = "*local.Object" }
+            return (try? JSONSerialization.data(withJSONObject: dict)).flatMap { String(data: $0, encoding: .utf8) }
+        }
+
+        // Failed operations, shaped like rclone's own log calls.
+        let errorLines: [(level: String, msg: String, object: String, source: String)] = [
+            ("error", "Failed to copy: failed to open source object: open /Users/someone/Pictures/a.txt: operation not permitted",
+             "a.txt", "operations/copy.go:354"),
+            ("error", "Couldn't delete: permission denied", "old/notes.txt", "operations/operations.go:579"),
+            ("error", "Failed to rename: file already exists", "dup.txt", "operations/dedupe.go:68"),
+            // "new" in the text used to make this a Copied change.
+            ("critical", "Failed to copy: new upload rejected: quota exceeded", "big.mov", "operations/copy.go:354"),
+        ]
+        for entry in errorLines {
+            guard let raw = line(level: entry.level, msg: entry.msg, object: entry.object, source: entry.source),
+                  let decoded = try? decoder.decode(RcloneLogEntry.self, from: Data(raw.utf8)) else {
+                return report(name, slug, false, "(could not build or decode \(entry.msg.debugDescription))")
+            }
+            guard decoded.fileChange == nil else {
+                return report(name, slug, false, "(\(entry.msg.debugDescription) was read as a file change)")
+            }
+            guard let event = parser.parse(line: raw),
+                  case .errorMessage(let message) = event.type,
+                  message.contains(String(entry.msg.prefix(14))) else {
+                return report(name, slug, false, "(\(entry.msg.debugDescription) did not surface as an errorMessage)")
+            }
+        }
+
+        // Genuine changes still parse as changes (the first is a real rclone line).
+        let changeLines: [(raw: String?, path: String, operation: FileChange.Operation)] = [
+            (line(level: "info", msg: "Copied (new)", object: "Camera Roll/2026/10/IMG_5257.HEIC", source: "operations/copy.go:380"),
+             "Camera Roll/2026/10/IMG_5257.HEIC", .copied),
+            (line(level: "info", msg: "Copied (replaced existing)", object: "notes.txt", source: "operations/copy.go:380"),
+             "notes.txt", .updated),
+            (line(level: "info", msg: "Deleted", object: "old/notes.txt", source: "operations/operations.go:582"),
+             "old/notes.txt", .deleted),
+            (line(level: "info", msg: "- Path1    File was deleted          - KAIJU/file.mp4", source: "bisync/queue.go:1"),
+             "KAIJU/file.mp4", .deleted),
+        ]
+        for expected in changeLines {
+            guard let raw = expected.raw, let event = parser.parse(line: raw),
+                  case .fileChange(let change) = event.type,
+                  change.path == expected.path, change.operation == expected.operation else {
+                return report(name, slug, false, "(a genuine change for \(expected.path) no longer parses as \(expected.operation))")
+            }
+        }
+        return report(name, slug, true)
     }
 }
 

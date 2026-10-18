@@ -134,7 +134,22 @@ extension RcloneLogEntry {
         return formatter.date(from: time)
     }
 
+    /// rclone's error and critical levels — the lines `LogParser` surfaces as `.errorMessage`.
+    /// Single source for that predicate, shared with `fileChange` below.
+    var isErrorLevel: Bool {
+        level == "error" || level == "critical"
+    }
+
     var fileChange: FileChange? {
+        // An error line is never a change, even when it names the file and its text contains
+        // an action word. rclone logs a failed operation at ERROR with the file as `object` —
+        // "Failed to copy: …" (operations/copy.go), "Couldn't delete: …" (operations.go),
+        // "Failed to rename: …" (dedupe.go) — and the substring match in `parseOperation` read
+        // those as Updated / Deleted / Renamed: the failed file showed up in Recent Changes and
+        // the sync-completed count, and the error never reached the "Last sync error" banner
+        // or the `Sync error` telemetry. rclone logs successful changes at INFO.
+        guard !isErrorLevel else { return nil }
+
         // Strip ANSI codes from msg before parsing
         let cleanMsg = stripANSICodes(msg)
 
