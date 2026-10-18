@@ -2621,8 +2621,11 @@ final class TelemetryService {
         guard SyncTraySettings.telemetryEnabled else { return }
         ensureSetup()
         mountInterruptionsCounter?.add(value: 1, attribute: [
+            "synctray.profile.id": .string(profileId.uuidString),
+            "synctray.profile.name": .string(profileName),
             "mount.interruption_kind": .string(kind),
             "mount.backend": .string(backend),
+            "mount.mode": .string(mode),
         ])
         emitLog(severity: .warn, body: "Mount interrupted", attributes: [
             "synctray.profile.id": .string(profileId.uuidString),
@@ -2652,9 +2655,12 @@ final class TelemetryService {
         guard SyncTraySettings.telemetryEnabled else { return }
         ensureSetup()
         mountInterruptionDurationHistogram?.record(value: durationSeconds, attributes: [
+            "synctray.profile.id": .string(profileId.uuidString),
+            "synctray.profile.name": .string(profileName),
             "mount.interruption_kind": .string(kind),
             "mount.interruption_outcome": .string(outcome),
             "mount.backend": .string(backend),
+            "mount.mode": .string(mode),
         ])
         emitLog(
             severity: outcome == "recovered" ? .info : .warn,
