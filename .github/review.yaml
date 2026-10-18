@@ -1,2 +1,9 @@
 agent0_fix_links: true
 agent0_environment: development
+
+# pr-reviewer run-level knobs, read from the PR's base commit
+# (agents/shared/rules/review-config.md § Run-level knobs in mthines/agent-skills).
+# Run the adversarial pre-mortem on every review, not only on risky paths.
+critical: always
+# Confidence bars critical 60 / high 65 / medium 70 / low 85, up to 7 inline comments per file.
+profile: assertive
