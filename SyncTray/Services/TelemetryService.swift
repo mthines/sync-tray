@@ -2639,10 +2639,10 @@ final class TelemetryService {
 
     /// Record the end of a Stream mount interruption. `outcome` is `recovered` (the mount
     /// answered again / the volume came back), `dropped` (a stall that ended with the volume
-    /// leaving the mount table, which is then tracked as a drop of its own), or `unmounted`
-    /// (a drop the profile never came back from before it was unmounted, disabled or removed
-    /// on purpose). For a stall, `durationSeconds` runs from the start of the probe that
-    /// stalled, so it is a lower bound.
+    /// leaving the mount table in an unexpected drop, which is then tracked as a drop of its
+    /// own), or `unmounted` (an interruption closed by a deliberate unmount, disable, delete,
+    /// pause or reinstall, including a drop the profile never came back from). For a stall,
+    /// `durationSeconds` runs from the start of the probe that stalled, so it is a lower bound.
     func recordMountInterruptionEnded(
         profileId: UUID,
         profileName: String,

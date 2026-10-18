@@ -196,8 +196,10 @@ Each interruption emits a WARN "Mount interrupted" log and the `synctray.mount.i
 counter at detection (`mount.interruption_kind` = `stall`/`drop`, plus `mount.backend`,
 `mount.mode`), so one that never recovers is still visible, and a "Mount interruption ended"
 log + `synctray.mount.interruption.duration` histogram at the end
-(`mount.interruption_outcome` = `recovered`, `dropped` for a stall that ended with the volume
-going away, or `unmounted` for one closed by an Unmount, disable or delete). Trade-off: the
+(`mount.interruption_outcome` = `recovered`, `dropped` for a stall that ended in an unexpected
+drop, or `unmounted` for one closed by a deliberate unmount, pause, reinstall, disable or
+delete; a stall whose volume disappears waits for the drop classification to pick between
+the two). Trade-off: the
 probe adds one FSSTAT every 30 s per mounted profile, and during a stall it is itself an
 outstanding RPC (a blocked thread, released when rclone answers or the volume goes away).
 Covered by `ConfigSelfTest` AC-MI1 (probe state machine) and AC-MI2 (drop classification and

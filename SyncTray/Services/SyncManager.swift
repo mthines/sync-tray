@@ -214,6 +214,10 @@ final class SyncManager: ObservableObject {
     /// Profiles whose mount-table disappearance is waiting for `MountDropClassifier.confirmDelay`
     /// before it is classified, so one disappearance schedules one check.
     private var pendingMountDropChecks: Set<UUID> = []
+    /// Duration of a stall that ended because the volume left the mount table, held until the
+    /// drop classification decides its outcome: `dropped` for an unexpected drop, `unmounted`
+    /// for a deliberate unmount (pause, reinstall, Cache Only switch).
+    private var pendingStallEndDurations: [UUID: TimeInterval] = [:]
     /// Where the responsiveness probes run. Concurrent, and off the GCD global pool, because
     /// a probe on a hung hard NFS mount blocks its thread until the server answers; the
     /// one-outstanding-probe-per-profile rule in `MountStallProbe` bounds the threads.
@@ -4533,9 +4537,9 @@ final class SyncManager: ObservableObject {
         } else if wasMounted {
             if var probe = mountStallProbes[id] {
                 if case let .stallEnded(duration) = probe.volumeWentAway(at: now) {
-                    TelemetryService.shared.recordMountInterruptionEnded(
-                        profileId: id, profileName: profile.name, kind: "stall", outcome: "dropped",
-                        durationSeconds: duration, backend: backend, mode: modeLabel)
+                    // Its outcome depends on whether this disappearance was a drop or a
+                    // deliberate unmount, which `scheduleMountDropCheck` decides.
+                    pendingStallEndDurations[id] = duration
                 }
                 mountStallProbes[id] = probe
             }
@@ -4599,6 +4603,12 @@ final class SyncManager: ObservableObject {
                     lastDeliberateUnmount: marker,
                     disappearedAt: disappearedAt
                 )
+                if let stallDuration = self.pendingStallEndDurations.removeValue(forKey: id) {
+                    TelemetryService.shared.recordMountInterruptionEnded(
+                        profileId: id, profileName: current?.name ?? profile.name, kind: "stall",
+                        outcome: unexpected ? "dropped" : "unmounted", durationSeconds: stallDuration,
+                        backend: (current ?? profile).mountBackend.rawValue, mode: modeLabel)
+                }
                 guard unexpected, let current else { return }
                 let backend = current.mountBackend.rawValue
                 TelemetryService.shared.recordMountInterruptionStarted(
@@ -4622,6 +4632,7 @@ final class SyncManager: ObservableObject {
     private func closeMountInterruptions(keeping: Set<UUID>? = nil, only: UUID? = nil) {
         let now = Date()
         let candidates = Set(mountDropStartedAt.keys).union(mountStallProbes.keys)
+            .union(pendingStallEndDurations.keys)
         for id in candidates {
             if let only, id != only { continue }
             if let keeping, keeping.contains(id) { continue }
@@ -4633,6 +4644,11 @@ final class SyncManager: ObservableObject {
                 TelemetryService.shared.recordMountInterruptionEnded(
                     profileId: id, profileName: name, kind: "drop", outcome: "unmounted",
                     durationSeconds: max(0, now.timeIntervalSince(since)), backend: backend, mode: mode)
+            }
+            if let duration = pendingStallEndDurations.removeValue(forKey: id) {
+                TelemetryService.shared.recordMountInterruptionEnded(
+                    profileId: id, profileName: name, kind: "stall", outcome: "unmounted",
+                    durationSeconds: duration, backend: backend, mode: mode)
             }
             if var probe = mountStallProbes.removeValue(forKey: id),
                case let .stallEnded(duration) = probe.volumeWentAway(at: now) {
