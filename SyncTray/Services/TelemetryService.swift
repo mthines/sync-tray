@@ -606,7 +606,7 @@ final class TelemetryService {
             .build()
         mountInterruptionDurationHistogram = meter
             .histogramBuilder(name: "synctray.mount.interruption.duration")
-            .setDescription("How long a Stream mount interruption lasted, from detection to recovery or unmount (seconds)")
+            .setDescription("How long a Stream mount interruption lasted, until recovery or unmount (seconds). A stall runs from the start of the probe that stalled (a lower bound); a drop from when the monitor saw the volume gone")
             .setUnit("s")
             .build()
     }
