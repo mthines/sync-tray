@@ -2940,6 +2940,8 @@ enum ConfigSelfTest {
         }
         guard TelemetryService.warmPauseReaderLabel("QuickLookSatellite") == "QuickLookSatellite",
               TelemetryService.warmPauseReaderLabel("SyncTrayFinderSync") == "SyncTrayFinderSync",
+              TelemetryService.warmPauseReaderLabel("com.apple.quicklook.ThumbnailsA")
+                  == "com.apple.quicklook.ThumbnailsAgent",
               TelemetryService.warmPauseReaderLabel("-zsh") == "shell",
               TelemetryService.warmPauseReaderLabel("REAPER") == "app",
               TelemetryService.warmPauseReaderLabel("Johns Private Tool") == "app" else {

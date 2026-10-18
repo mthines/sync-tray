@@ -2316,12 +2316,21 @@ final class TelemetryService {
     /// Most distinct labels one pause reports.
     static let warmPauseReaderSummaryLimit = 5
 
+    /// macOS `lsof` reports at most 31 characters of a process name (a 32-byte kernel buffer),
+    /// so an allowlisted name longer than that arrives cut short. Maps the cut form back to
+    /// the full allowlist entry (e.g. `com.apple.quicklook.ThumbnailsA` →
+    /// `com.apple.quicklook.ThumbnailsAgent`).
+    static let warmPauseReaderTruncatedNames: [String: String] = Dictionary(
+        warmPauseReaderAllowlist.filter { $0.count > 31 }.map { (String($0.prefix(31)), $0) },
+        uniquingKeysWith: { first, _ in first })
+
     /// Bounded telemetry label for one reader process: its own name when it is an allowlisted
     /// macOS component, `shell` for a shell, otherwise `app`. A leading `-` (login shell) is
     /// ignored.
     static func warmPauseReaderLabel(_ processName: String) -> String {
         let name = processName.hasPrefix("-") ? String(processName.dropFirst()) : processName
         if warmPauseReaderAllowlist.contains(name) { return name }
+        if let fullName = warmPauseReaderTruncatedNames[name] { return fullName }
         if warmPauseShellNames.contains(name) { return "shell" }
         return "app"
     }
