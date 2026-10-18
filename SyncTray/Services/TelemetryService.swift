@@ -2288,7 +2288,7 @@ final class TelemetryService {
     /// `warmPauseReaderLabel`), the same fixed-allowlist approach as `normalizeFileExtension`.
     static let warmPauseReaderAllowlist: Set<String> = [
         // Finder previews and thumbnails
-        "QuickLookSatellite", "com.apple.quicklook.ThumbnailsAgent", "quicklookd", "QuickLookUIService",
+        "QuickLookSatellite", "com.apple.quicklook.ThumbnailsAgent", "quicklookd",
         // Icon rendering
         "iconservicesagent", "iconservicesd",
         // Finder copy/move operations
@@ -2304,7 +2304,7 @@ final class TelemetryService {
         // SyncTray's own Finder extension
         "SyncTrayFinderSync",
         // Already ignored by the busy check today; listed so a change there stays legible
-        "Finder", "mds", "mds_stores", "mdworker", "mdworker_shared", "fseventsd",
+        "Finder", "mds", "mds_stores", "mdworker", "mdworker_shared", "fseventsd", "QuickLookUIService",
     ]
 
     /// Shells (and tmux) report as `shell`: a terminal whose working directory is inside the
