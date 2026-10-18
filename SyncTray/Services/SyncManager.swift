@@ -4507,7 +4507,8 @@ final class SyncManager: ObservableObject {
     /// (CLAUDE.md "Mount interruption telemetry"). While the volume is mounted: close an
     /// open drop, report a probe that has crossed the stall threshold, and start the next
     /// responsiveness probe when one is due. On the mounted → gone edge: close an open stall
-    /// as `dropped` and schedule the drop classification.
+    /// and schedule the drop classification, which reports that stall as `dropped` (an
+    /// unexpected drop) or `unmounted` (a deliberate unmount).
     private func trackMountInterruption(
         for profile: SyncProfile, wasMounted: Bool, isMounted: Bool, mode: MountMode?
     ) {

@@ -307,9 +307,9 @@ struct MountStallProbe: Equatable {
         return wasOpen ? .stallEnded(duration: max(0, date.timeIntervalSince(since))) : .none
     }
 
-    /// The volume left the mount table. Closes an open stall (the caller reports it with
-    /// outcome `dropped`) and settles the outstanding probe so it can't report again
-    /// when its blocked call finally returns.
+    /// The volume left the mount table. Closes an open stall (the caller reports it once the
+    /// drop classification has decided between `dropped` and `unmounted`) and settles the
+    /// outstanding probe so it can't report again when its blocked call finally returns.
     mutating func volumeWentAway(at date: Date) -> Event {
         guard let since = inFlightSince else { return .none }
         probeSettled = true
