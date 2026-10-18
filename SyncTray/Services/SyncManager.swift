@@ -770,13 +770,15 @@ final class SyncManager: ObservableObject {
         // Stop any warming first — reads through a mount that's going away would hang or fail.
         cancelWarm(for: profile.id)
         autoWarmedMounts.remove(profile.id)  // re-arm auto-warm for the next mount
-        // An open drop or stall ends here, by request (outcome `unmounted`).
-        closeMountInterruptions(only: profile.id)
 
         Task {
             do {
                 try setupService.unmount(profile: profile)
                 await MainActor.run {
+                    // An open drop or stall ends here, by request (outcome `unmounted`).
+                    // Only after the unmount succeeded: a hung volume that a failed forced
+                    // unmount left mounted keeps its stall open and reported once.
+                    closeMountInterruptions(only: profile.id)
                     profileMountStates[profile.id] = .unmounted
                     TelemetryService.shared.recordMountOperation(
                         profileId: profile.id,
