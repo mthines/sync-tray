@@ -3886,7 +3886,9 @@ struct ProfileDetailView: View {
         // Defense in depth: the buttons that call this already gate on
         // `isSyncRunningForProfile`, but check liveness again here so every path
         // into a recovery action — not just the button tap — is covered (R1).
-        guard !syncManager.isRunLive(for: profile) else {
+        // Open Privacy Settings is exempt: it only opens System Settings and starts
+        // no run, so refusing it while a sync is live would block the fix for nothing.
+        guard action == .openPrivacySettings || !syncManager.isRunLive(for: profile) else {
             TelemetryService.shared.recordUserRecoveryAction(
                 profileId: profile.id,
                 profileName: profile.name,
