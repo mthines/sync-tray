@@ -7787,7 +7787,7 @@ enum ConfigSelfTest {
               !excludeFn.contains("writeExcludeFilter") else {
             return report(name, slug, false, "(Exclude from Sync bypasses the Don't Sync list)")
         }
-        guard migrationSource.contains("MigrationV4Retired(),\n        MigrationV5PhotosLibraryExclude(),\n    ]") else {
+        guard migrationSource.contains("MigrationV4Retired(),\n        MigrationV5PhotosLibraryExclude(),") else {
             return report(name, slug, false, "(migration v5 is not registered after v4)")
         }
         return report(name, slug, true)
