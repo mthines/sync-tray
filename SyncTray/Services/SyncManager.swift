@@ -4537,7 +4537,15 @@ final class SyncManager: ObservableObject {
             }
             if probe.shouldStartProbe(now: now) {
                 probe.probeStarted(at: now)
-                startMountResponsivenessProbe(profileId: id, mountPoint: profile.localSyncPath)
+                startMountResponsivenessProbe(for: profile)
+            }
+            // A stall held because its probe returned with the volume gone, where the volume
+            // was back before any tick saw it missing: no drop check will claim it.
+            if !pendingMountDropChecks.contains(id),
+               let heldStall = pendingStallEndDurations.removeValue(forKey: id) {
+                TelemetryService.shared.recordMountInterruptionEnded(
+                    profileId: id, profileName: profile.name, kind: "stall", outcome: "recovered",
+                    durationSeconds: heldStall, backend: backend, mode: modeLabel)
             }
             mountStallProbes[id] = probe
         } else if wasMounted {
@@ -4556,12 +4564,21 @@ final class SyncManager: ObservableObject {
     /// Run one `statfs(2)` on the mount root off the main actor and report back when it
     /// returns. On a hung hard NFS mount the call blocks until rclone answers (or the volume
     /// goes away), which is exactly what `MountStallProbe` measures.
-    private func startMountResponsivenessProbe(profileId: UUID, mountPoint: String) {
+    private func startMountResponsivenessProbe(for profile: SyncProfile) {
         mountProbeQueue.async { [weak self] in
-            _ = Self.mountRootAnswers(mountPoint)
+            let startedAt = Date()
+            _ = Self.mountRootAnswers(profile.localSyncPath)
             let finishedAt = Date()
+            // A forced detach (the dialog's Disconnect, `diskutil unmount force`) releases a
+            // blocked statfs at once. So a call that returned only after the stall threshold
+            // is checked against the mount table before it counts as rclone answering again.
+            var volumeGone = false
+            if finishedAt.timeIntervalSince(startedAt) >= MountStallProbe.stallThreshold, let self {
+                volumeGone = !self.setupService.isMounted(profile: profile)
+            }
             DispatchQueue.main.async {
-                self?.finishMountResponsivenessProbe(profileId: profileId, finishedAt: finishedAt)
+                self?.finishMountResponsivenessProbe(
+                    profileId: profile.id, finishedAt: finishedAt, volumeGone: volumeGone)
             }
         }
     }
@@ -4573,12 +4590,19 @@ final class SyncManager: ObservableObject {
         (try? FileManager.default.attributesOfFileSystem(forPath: mountPoint)) != nil
     }
 
-    private func finishMountResponsivenessProbe(profileId: UUID, finishedAt: Date) {
+    private func finishMountResponsivenessProbe(profileId: UUID, finishedAt: Date, volumeGone: Bool) {
         guard var probe = mountStallProbes[profileId] else { return }
         let event = probe.probeFinished(at: finishedAt)
         mountStallProbes[profileId] = probe
-        guard case let .stallEnded(duration) = event,
-              let profile = profileStore.profile(for: profileId) else { return }
+        guard case let .stallEnded(duration) = event else { return }
+        if volumeGone {
+            // The call returned because the volume was detached, not because rclone answered.
+            // The drop classification decides `dropped` or `unmounted`, as for a stall the
+            // monitor saw vanish (`trackMountInterruption`).
+            pendingStallEndDurations[profileId] = duration
+            return
+        }
+        guard let profile = profileStore.profile(for: profileId) else { return }
         TelemetryService.shared.recordMountInterruptionEnded(
             profileId: profileId, profileName: profile.name, kind: "stall", outcome: "recovered",
             durationSeconds: duration, backend: profile.mountBackend.rawValue,
