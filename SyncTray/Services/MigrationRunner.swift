@@ -425,12 +425,12 @@ struct MigrationV5PhotosLibraryExclude: ProfileMigration {
 
     /// Apply the migration to every `*.profile.json` in `directory`. Idempotent: a second pass
     /// finds the rule already present and changes nothing.
-    /// - Parameter containsPhotosLibrary: whether a local sync folder holds a `.photoslibrary`;
+    /// - Parameter hasPhotosLibrary: whether a local sync folder holds a `.photoslibrary`;
     ///   injectable so `ConfigSelfTest` doesn't depend on the machine's real folders.
     @discardableResult
     static func addPhotosLibraryExclude(
         in directory: String,
-        containsPhotosLibrary: (String) -> Bool = { containsPhotosLibrary(under: $0) }
+        hasPhotosLibrary: (String) -> Bool = { MigrationV5PhotosLibraryExclude.containsPhotosLibrary(under: $0) }
     ) -> Outcome {
         var outcome = Outcome()
         let fm = FileManager.default
@@ -462,7 +462,7 @@ struct MigrationV5PhotosLibraryExclude: ProfileMigration {
 
             let localPath = (dict["localSyncPath"] as? String) ?? ""
             if syncMode == SyncMode.bisync.rawValue, !localPath.isEmpty,
-               containsPhotosLibrary((localPath as NSString).expandingTildeInPath) {
+               hasPhotosLibrary((localPath as NSString).expandingTildeInPath) {
                 let markerPath = (directory as NSString).appendingPathComponent("\(shortId).resync-pending")
                 do {
                     try UUID().uuidString.write(toFile: markerPath, atomically: true, encoding: .utf8)

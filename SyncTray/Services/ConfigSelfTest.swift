@@ -148,6 +148,10 @@ enum ConfigSelfTest {
             testSyncRunLockSessionNameAndParse,
             testPriorLockFileRejectedRun,
             testNFSExclusiveCreateNoticeNotAnError,
+            testPhotosLibraryDefaultExclude,
+            testMigrationV5PhotosLibraryExclude,
+            testMacOSBlockedAccessPatterns,
+            testMacOSBlockedAccessWiringPinned,
             testRunLivenessMountMode,
             testExclusiveRunRegistryStaleGrace,
             testSyncRunLockAcquire,
@@ -7355,6 +7359,287 @@ enum ConfigSelfTest {
                           "(a genuine rclone error line was no longer surfaced as an errorMessage)")
         }
         return report("AC-NFS1", "nfs-exclusive-create-not-an-error", true)
+    }
+
+    // MARK: - AC-PL1 — Apple Photos libraries are excluded by default
+
+    /// A new filter file carries `- *.photoslibrary/**`, and `addingPhotosLibraryDefault`
+    /// inserts it below the managed "Don't Sync" block and above the user's own rules
+    /// (including a `+` include, which would otherwise win first-match), stays stable under a
+    /// later `merged`, and never touches a file that already mentions `.photoslibrary`.
+    private static func testPhotosLibraryDefaultExclude() -> Bool {
+        let name = "AC-PL1", slug = "photos-library-default-exclude"
+        let rule = SyncExcludeFilter.photosLibraryRule
+
+        // 1. Defaults written on first create include the rule.
+        let dir = "\(selfTestRoot)/pl1"
+        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        let path = "\(dir)/exclude.txt"
+        var profile = sampleProfile()
+        profile.syncMode = .sync
+        do {
+            try SyncSetupService.shared.writeExcludeFilter(for: profile, at: path)
+        } catch {
+            return report(name, slug, false, "(first write threw: \(error))")
+        }
+        guard let fresh = try? String(contentsOfFile: path, encoding: .utf8),
+              fresh.contains("\n\(rule)\n"), fresh.contains("- .DS_Store") else {
+            return report(name, slug, false, "(a new filter file is missing \(rule))")
+        }
+
+        // 2. Inserted below the managed block, above the user's own rules.
+        let patterns = ["*.bak"]
+        let existing = SyncExcludeFilter.merged(existing: "- my-own-rule\n+ keep/**\n", patterns: patterns)
+        guard let migrated = SyncExcludeFilter.addingPhotosLibraryDefault(to: existing),
+              migrated.hasPrefix(SyncExcludeFilter.beginMarker),
+              let endRange = migrated.range(of: SyncExcludeFilter.endMarker),
+              let ruleRange = migrated.range(of: rule),
+              let includeRange = migrated.range(of: "+ keep/**"),
+              endRange.upperBound <= ruleRange.lowerBound,
+              ruleRange.upperBound <= includeRange.lowerBound,
+              migrated.contains("- my-own-rule"),
+              migrated.contains("- *.bak") else {
+            return report(name, slug, false, "(rule not placed between the managed block and the user's rules)")
+        }
+        guard SyncExcludeFilter.merged(existing: migrated, patterns: patterns) == migrated else {
+            return report(name, slug, false, "(a later merge with the same patterns rewrote the migrated file)")
+        }
+
+        // 3. No managed block: the rule goes first, the user's content follows untouched.
+        guard let plain = SyncExcludeFilter.addingPhotosLibraryDefault(to: "- my-own-rule\n"),
+              plain == SyncExcludeFilter.photosLibrarySection + "\n\n- my-own-rule\n" else {
+            return report(name, slug, false, "(unexpected output for a file without a managed block)")
+        }
+        guard SyncExcludeFilter.addingPhotosLibraryDefault(to: "") == SyncExcludeFilter.photosLibrarySection + "\n" else {
+            return report(name, slug, false, "(unexpected output for an empty file)")
+        }
+
+        // 4. Already present, or the user's own rule for it: left alone.
+        guard SyncExcludeFilter.addingPhotosLibraryDefault(to: fresh) == nil,
+              SyncExcludeFilter.addingPhotosLibraryDefault(to: "+ Photos Library.photoslibrary/**\n") == nil,
+              SyncExcludeFilter.addingPhotosLibraryDefault(to: "- Old.PhotosLibrary/**\n") == nil else {
+            return report(name, slug, false, "(a file that already mentions .photoslibrary was changed)")
+        }
+        return report(name, slug, true)
+    }
+
+    // MARK: - AC-PL2 — migration v5 adds the rule to existing profiles, once
+
+    /// Every Two-Way and One-Way profile's existing filter gains the rule; a Two-Way profile
+    /// whose folder holds a library also gets the resync-pending marker; Stream profiles,
+    /// missing filters and filters that already mention `.photoslibrary` are untouched; a
+    /// second pass changes nothing. Also exercises the real bounded folder walk.
+    private static func testMigrationV5PhotosLibraryExclude() -> Bool {
+        let name = "AC-PL2", slug = "migration-v5-photos-library"
+        let fm = FileManager.default
+        let dir = "\(selfTestRoot)/pl2"
+        try? fm.removeItem(atPath: dir)
+        try? fm.createDirectory(atPath: dir, withIntermediateDirectories: true)
+
+        struct Fixture {
+            let id = UUID()
+            let syncMode: String?
+            let localPath: String
+            let filter: String?
+            var shortId: String { String(id.uuidString.prefix(8)).lowercased() }
+        }
+        let withLibrary = "/tmp/synctray-selftest-pl2-with-library"
+        let fixtures: [String: Fixture] = [
+            "bisyncWithLibrary": Fixture(syncMode: "bisync", localPath: withLibrary, filter: "- .DS_Store\n"),
+            "oneWayWithLibrary": Fixture(syncMode: "sync", localPath: withLibrary, filter: "- .DS_Store\n"),
+            "bisyncNoLibrary": Fixture(syncMode: "bisync", localPath: "/tmp/synctray-selftest-pl2-plain", filter: "- .DS_Store\n"),
+            "legacyNoMode": Fixture(syncMode: nil, localPath: withLibrary, filter: "- .DS_Store\n"),
+            "mount": Fixture(syncMode: "mount", localPath: withLibrary, filter: "- .DS_Store\n"),
+            "userRule": Fixture(syncMode: "bisync", localPath: withLibrary, filter: "+ *.photoslibrary/**\n"),
+            "noFilter": Fixture(syncMode: "bisync", localPath: withLibrary, filter: nil),
+        ]
+        for fixture in fixtures.values {
+            var dict: [String: Any] = ["id": fixture.id.uuidString, "name": "PL2", "localSyncPath": fixture.localPath]
+            if let mode = fixture.syncMode { dict["syncMode"] = mode }
+            guard let data = try? JSONSerialization.data(withJSONObject: dict),
+                  (try? data.write(to: URL(fileURLWithPath: "\(dir)/\(fixture.shortId).profile.json"))) != nil else {
+                return report(name, slug, false, "(failed to seed a profile file)")
+            }
+            if let filter = fixture.filter {
+                try? filter.write(toFile: "\(dir)/\(fixture.shortId)-exclude.txt", atomically: true, encoding: .utf8)
+            }
+        }
+        func filter(_ key: String) -> String? {
+            try? String(contentsOfFile: "\(dir)/\(fixtures[key]!.shortId)-exclude.txt", encoding: .utf8)
+        }
+        func hasMarker(_ key: String) -> Bool {
+            fm.fileExists(atPath: "\(dir)/\(fixtures[key]!.shortId).resync-pending")
+        }
+
+        let outcome = MigrationV5PhotosLibraryExclude.addPhotosLibraryExclude(in: dir) { $0 == withLibrary }
+        let expectedUpdated = ["bisyncWithLibrary", "oneWayWithLibrary", "bisyncNoLibrary", "legacyNoMode"]
+            .map { fixtures[$0]!.shortId }.sorted()
+        guard outcome.updated.sorted() == expectedUpdated,
+              outcome.resyncScheduled.sorted() == ["bisyncWithLibrary", "legacyNoMode"].map({ fixtures[$0]!.shortId }).sorted(),
+              outcome.failed.isEmpty else {
+            return report(name, slug, false, "(unexpected outcome: \(outcome))")
+        }
+        for key in ["bisyncWithLibrary", "oneWayWithLibrary", "bisyncNoLibrary", "legacyNoMode"] {
+            guard let text = filter(key), text.contains(SyncExcludeFilter.photosLibraryRule), text.hasSuffix("- .DS_Store\n") else {
+                return report(name, slug, false, "(\(key) filter did not gain the rule above its own content)")
+            }
+        }
+        guard hasMarker("bisyncWithLibrary"), hasMarker("legacyNoMode"),
+              !hasMarker("oneWayWithLibrary"), !hasMarker("bisyncNoLibrary") else {
+            return report(name, slug, false, "(resync marker written for the wrong profiles)")
+        }
+        guard filter("mount") == "- .DS_Store\n", filter("userRule") == "+ *.photoslibrary/**\n",
+              !hasMarker("mount"), !hasMarker("userRule"),
+              filter("noFilter") == nil else {
+            return report(name, slug, false, "(a Stream profile, a user rule, or a missing filter was touched)")
+        }
+
+        // Idempotent: a second pass changes nothing, including the scheduled token.
+        let markerPath = "\(dir)/\(fixtures["bisyncWithLibrary"]!.shortId).resync-pending"
+        let token = try? String(contentsOfFile: markerPath, encoding: .utf8)
+        let filtersBefore = fixtures.keys.sorted().map { filter($0) }
+        let second = MigrationV5PhotosLibraryExclude.addPhotosLibraryExclude(in: dir) { $0 == withLibrary }
+        guard second == MigrationV5PhotosLibraryExclude.Outcome(),
+              fixtures.keys.sorted().map({ filter($0) }) == filtersBefore,
+              (try? String(contentsOfFile: markerPath, encoding: .utf8)) == token else {
+            return report(name, slug, false, "(a second pass changed something)")
+        }
+
+        // The real bounded walk: found within the depth limit, not past it, not in hidden folders.
+        let tree = "\(selfTestRoot)/pl2-tree"
+        try? fm.removeItem(atPath: tree)
+        try? fm.createDirectory(atPath: "\(tree)/shallow/a/b/Photos Library.photoslibrary", withIntermediateDirectories: true)
+        try? fm.createDirectory(atPath: "\(tree)/deep/a/b/c/d/Photos Library.photoslibrary", withIntermediateDirectories: true)
+        try? fm.createDirectory(atPath: "\(tree)/hidden/.cache/Photos Library.photoslibrary", withIntermediateDirectories: true)
+        try? fm.createDirectory(atPath: "\(tree)/none/a/b", withIntermediateDirectories: true)
+        guard MigrationV5PhotosLibraryExclude.containsPhotosLibrary(under: "\(tree)/shallow"),
+              !MigrationV5PhotosLibraryExclude.containsPhotosLibrary(under: "\(tree)/deep"),
+              !MigrationV5PhotosLibraryExclude.containsPhotosLibrary(under: "\(tree)/hidden"),
+              !MigrationV5PhotosLibraryExclude.containsPhotosLibrary(under: "\(tree)/none"),
+              !MigrationV5PhotosLibraryExclude.containsPhotosLibrary(under: "\(tree)/missing") else {
+            return report(name, slug, false, "(containsPhotosLibrary walk gave a wrong answer)")
+        }
+        return report(name, slug, true)
+    }
+
+    // MARK: - AC-PL3 — macOS privacy denials are recognized, kept whole and categorized
+
+    /// The real rclone line for a Photos library macOS won't let it read: its local path is
+    /// extracted (spaces included), recognized as a LOCAL denial only inside the sync folder,
+    /// kept whole by `LogParser` even past 200 characters, turned into the right "Don't Sync"
+    /// pattern, and categorized `permission_denied` — while rclone's closing "not deleting
+    /// files as there were IO errors" notice is `io_errors_blocked_deletes`.
+    private static func testMacOSBlockedAccessPatterns() -> Bool {
+        let name = "AC-PL3", slug = "macos-blocked-access-patterns"
+        let root = "/Users/someone/Pictures"
+        let library = "\(root)/Photos Library.photoslibrary"
+        let message = "failed to open directory \"Photos Library.photoslibrary\": open \(library): operation not permitted"
+
+        guard SyncLogPatterns.isOperationNotPermitted(message),
+              SyncLogPatterns.operationNotPermittedPath(in: message) == library,
+              SyncLogPatterns.macOSBlockedPath(in: message, localSyncPath: root) == library,
+              SyncLogPatterns.macOSBlockedPath(in: message, localSyncPath: root + "/") == library,
+              SyncLogPatterns.macOSBlockedPath(in: message, localSyncPath: "/Users/someone/Documents") == nil,
+              SyncLogPatterns.macOSBlockedAccessSummary(for: message, localSyncPath: root)
+                == "macOS blocked access to “Photos Library.photoslibrary”.",
+              SyncLogPatterns.isDirectoryOpenFailure(message) else {
+            return report(name, slug, false, "(the Photos-library denial was not recognized as a local macOS block)")
+        }
+        let remoteEPERM = "Failed to copy: sftp: open /home/me/share/x.txt: operation not permitted"
+        guard SyncLogPatterns.operationNotPermittedPath(in: remoteEPERM) == "/home/me/share/x.txt",
+              SyncLogPatterns.macOSBlockedPath(in: remoteEPERM, localSyncPath: root) == nil,
+              SyncLogPatterns.operationNotPermittedPath(in: "Failed to copy: permission denied") == nil,
+              SyncLogPatterns.macOSBlockedAccessSummary(for: "Failed to copy: permission denied", localSyncPath: root) == nil else {
+            return report(name, slug, false, "(a remote or unrelated error was treated as a macOS block)")
+        }
+
+        // LogParser keeps a deep denial whole, but still truncates other long errors.
+        let parser = LogParser()
+        func jsonLine(_ msg: String, object: String? = nil) -> String? {
+            var dict: [String: Any] = ["level": "error", "msg": msg, "source": "local/local.go:676",
+                                       "time": "2026-10-13T07:12:38.48317+02:00"]
+            if let object { dict["object"] = object; dict["objectType"] = "string" }
+            return (try? JSONSerialization.data(withJSONObject: dict)).flatMap { String(data: $0, encoding: .utf8) }
+        }
+        // Shaped like rclone's real line, `object` included (an object routes a line through
+        // file-change parsing first; this one must still come out as an error).
+        let deepLibrary = root + "/" + String(repeating: "A Very Long Folder Name/", count: 10) + "Photos Library.photoslibrary"
+        let deepMessage = "failed to open directory \"Photos Library.photoslibrary\": open \(deepLibrary): operation not permitted"
+        guard let deepLine = jsonLine(deepMessage, object: "Photos Library.photoslibrary"),
+              let deepEvent = parser.parse(line: deepLine),
+              case .errorMessage(let kept) = deepEvent.type,
+              SyncLogPatterns.macOSBlockedPath(in: kept, localSyncPath: root) == deepLibrary else {
+            return report(name, slug, false, "(LogParser cut the path off a long privacy denial)")
+        }
+        guard let longLine = jsonLine("Failed to copy: " + String(repeating: "x", count: 400)),
+              let longEvent = parser.parse(line: longLine),
+              case .errorMessage(let truncated) = longEvent.type, truncated.count <= 203 else {
+            return report(name, slug, false, "(LogParser stopped truncating other long errors)")
+        }
+
+        // The "Don't Sync" pattern for the blocked path, and the rclone rule it compiles to.
+        guard SyncExcludeFilter.excludePattern(forBlockedPath: library, localSyncPath: root, isDirectory: true)
+                == "/Photos Library.photoslibrary/",
+              SyncExcludeFilter.rcloneRules(for: "/Photos Library.photoslibrary/") == ["/Photos Library.photoslibrary/**"],
+              SyncExcludeFilter.excludePattern(forBlockedPath: "\(root)/a/b.heic", localSyncPath: root + "/", isDirectory: false)
+                == "/a/b.heic",
+              SyncExcludeFilter.excludePattern(forBlockedPath: root, localSyncPath: root, isDirectory: true) == nil,
+              SyncExcludeFilter.excludePattern(forBlockedPath: "/Users/someone/Picturesque/x", localSyncPath: root, isDirectory: true) == nil else {
+            return report(name, slug, false, "(wrong Don't Sync pattern for a blocked path)")
+        }
+
+        // Telemetry buckets.
+        let closingNotice = "Failed to sync with 2 errors: last error was: not deleting files as there were IO errors"
+        let checks: [(String?, String)] = [
+            (message, "permission_denied"),
+            (closingNotice, "io_errors_blocked_deletes"),
+            ("not deleting directories as there were IO errors", "io_errors_blocked_deletes"),
+            ("Failed to copy: permission denied", "permission_denied"),
+            ("Bisync critical error: out of sync - must run --resync", "out_of_sync"),
+            ("something unexpected happened", "other"),
+            (nil, "unknown"),
+        ]
+        for (input, expected) in checks {
+            let got = TelemetryService.categorizeError(input)
+            guard got == expected else {
+                return report(name, slug, false, "(categorizeError(\(input.debugDescription)) = \(got), expected \(expected))")
+            }
+        }
+        return report(name, slug, true)
+    }
+
+    // MARK: - AC-PL4 — the failure path categorizes the root error; the banner acts on it
+
+    /// Source pins: `.syncFailed` reports the run's first error (not rclone's closing notice)
+    /// to telemetry; the error banner checks for a macOS block before the generic actions; the
+    /// Exclude action goes through the "Don't Sync" list rather than writing the filter itself;
+    /// and migration v5 is registered.
+    private static func testMacOSBlockedAccessWiringPinned() -> Bool {
+        let name = "AC-PL4", slug = "macos-blocked-access-wiring"
+        guard let managerSource = readSourceFile("Services/SyncManager.swift"),
+              let viewSource = readSourceFile("Views/Settings/ProfileDetailView.swift"),
+              let migrationSource = readSourceFile("Services/MigrationRunner.swift") else {
+            return report(name, slug, false, "(could not read source files)")
+        }
+        guard managerSource.contains("errorMessage: profileErrors[profileId] ?? message"),
+              !managerSource.contains("errorMessage: message ?? profileErrors[profileId]") else {
+            return report(name, slug, false, "(recordSyncFailed is no longer given the run's first error)")
+        }
+        guard let blocked = viewSource.range(of: "if let blockedPath = SyncLogPatterns.macOSBlockedPath(in: lastError, localSyncPath: profile.localSyncPath) {"),
+              let generic = viewSource.range(of: "} else if let errorAction = detectErrorAction(from: lastError) {"),
+              blocked.upperBound <= generic.lowerBound else {
+            return report(name, slug, false, "(the error banner no longer offers the macOS-block actions first)")
+        }
+        guard let excludeFn = extractFunctionBody(startingAt: "private func excludeBlockedPath()", in: viewSource),
+              excludeFn.contains("syncManager.updateSyncExcludePatterns("),
+              excludeFn.contains("syncManager.clearError(for: profile.id)"),
+              !excludeFn.contains("writeExcludeFilter") else {
+            return report(name, slug, false, "(Exclude from Sync bypasses the Don't Sync list)")
+        }
+        guard migrationSource.contains("MigrationV4Retired(),\n        MigrationV5PhotosLibraryExclude(),\n    ]") else {
+            return report(name, slug, false, "(migration v5 is not registered after v4)")
+        }
+        return report(name, slug, true)
     }
 
     // MARK: - AC-SR7 — mount-mode liveness ignores lock files, registry only

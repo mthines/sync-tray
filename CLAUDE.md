@@ -955,6 +955,38 @@ deletions against the prior listing — and since an abort leaves that listing
 unchanged, every later run aborts too until the pattern is removed. Adding broad
 patterns in steps avoids it. Covered by `ConfigSelfTest` AC-DS1–AC-DS5.
 
+**macOS blocked access — Photos libraries and other privacy-protected paths.** rclone's
+local backend reports a path macOS privacy controls (TCC) won't let it read as EPERM,
+`… open /Users/me/Pictures/Photos Library.photoslibrary: operation not permitted` — not
+POSIX permissions, so nothing but excluding the path or granting access fixes it, and
+until then rclone also refuses every deletion ("not deleting files as there were IO
+errors") and the run exits 1. Four pieces, one predicate (`SyncLogPatterns.operationNotPermittedPath`
+/ `macOSBlockedPath`, which counts a path as a macOS block only when it is the profile's
+local folder or inside it — a remote server's EPERM is not):
+- **Default exclude.** `SyncExcludeFilter.photosLibraryRule` (`- *.photoslibrary/**`) is in
+  `defaultExcludeFilter`, so new filter files never sync a Photos library (a live database
+  macOS won't let other apps read, and one a file-by-file copy can break while Photos has it
+  open). It is plain user content, not a managed block — deleting it is how a user who has
+  granted access syncs one. Existing files get it once from migration v5 (below).
+- **Banner.** `ProfileDetailView` checks for a macOS block before `detectErrorAction` and
+  offers **Exclude from Sync** — adds the anchored pattern from
+  `SyncExcludeFilter.excludePattern(forBlockedPath:localSyncPath:isDirectory:)` to
+  `syncExcludePatterns` through `updateSyncExcludePatterns` (so it shows in "Don't Sync",
+  undoable, no reinstall), clears the error and syncs again — and **Open Privacy Settings**
+  (Full Disk Access). The copy deliberately doesn't name which binary needs access: launchd
+  runs the sync script directly, not as a child of SyncTray, so a grant to the app alone may
+  not reach a scheduled run. `LogParser` skips its 200-character truncation for these
+  messages, since the path is at the end.
+- **Notification.** The sync-failure notification says "macOS blocked access to “X”." instead
+  of rclone's raw line.
+- **Telemetry.** `.syncFailed` gives `recordSyncFailed` the run's FIRST error
+  (`profileErrors`, which keeps the first error or the first critical one) rather than
+  rclone's closing notice, which only says what was skipped because of it and filed every
+  such failure as `error.type=other`. `categorizeError` maps "operation not permitted" to
+  `permission_denied` and the closing "not deleting … as there were IO errors" notice to
+  `io_errors_blocked_deletes`.
+Covered by `ConfigSelfTest` AC-PL1–AC-PL4.
+
 **"Sync Only These Folders" (`syncIncludeFolders`) — selective folder sync for
 Two-Way and One-Way profiles.** A per-profile allowlist (profile editor's "Sync
 Only These Folders" section, sharing `ExcludePatternListEditor`'s row chrome
@@ -1053,6 +1085,21 @@ kept-but-no-op placeholder for the removed cache-pinning migration (see "Cache
 key" above) — kept, not deleted, so the schema-version numbering stays
 monotonic for a machine that already ran v4; deleting the slot would make its
 `schemaVersion == 4` skip whatever migration claims v4 next.
+
+**Migration v5 — Photos libraries excluded from existing profiles.**
+`MigrationV5PhotosLibraryExclude` adds `SyncExcludeFilter.photosLibraryRule` to every
+existing Two-Way and One-Way `{shortId}-exclude.txt` (read from the raw `.profile.json`,
+before `ProfileStore` loads), via `SyncExcludeFilter.addingPhotosLibraryDefault`: below the
+managed "Don't Sync" block, above the user's own rules (so a hand-written `+` include can't
+win first-match). It skips Stream profiles, missing filter files (the next install writes
+the defaults, which carry the rule) and any file that already mentions `.photoslibrary`.
+On a Two-Way profile whose local folder actually holds a `.photoslibrary`
+(`containsPhotosLibrary`: ≤ 3 levels, hidden and package contents skipped, 20k-entry cap)
+it also writes the resync-pending marker, filter first and rolled back if the marker
+fails — a library the profile used to sync would otherwise vanish from bisync's listings
+at once and, holding over half the files, stop every run at `--max-delete`. Per-profile
+failures are logged, never thrown, so one bad file can't pin the schema version.
+Covered by `ConfigSelfTest` AC-PL2.
 
 **Migration.** `MigrationV3BlobToPerProfileFiles` (`MigrationRunner.swift`)
 moves the legacy `syncProfiles` UserDefaults blob to per-profile files on
@@ -1710,7 +1757,7 @@ Priority: process env vars > `~/.config/synctray/.env` > Info.plist. Key vars: `
 |------|---------|
 | `~/.config/synctray/profiles/{shortId}.json` | Profile config |
 | `~/.config/synctray/profiles/{shortId}-exclude.txt` | Exclude filter (user-editable; SyncTray owns two managed blocks — the "Don't Sync" exclude block at the TOP and, when `syncIncludeFolders` is non-empty, the "Sync Only These Folders" include block at the BOTTOM) |
-| `~/.config/synctray/profiles/{shortId}.resync-pending` | Two-Way (bisync) profiles only, created only when `syncIncludeFolders` changes — a UUID token the sync script reads to schedule a safe `--resync --resync-mode newer` instead of a plain bisync, removed only after every required bisync session (see `.resync-pending.consumed`) has consumed it with an unchanged token |
+| `~/.config/synctray/profiles/{shortId}.resync-pending` | Two-Way (bisync) profiles only, created only when `syncIncludeFolders` changes (or once by migration v5, for a profile whose folder holds a Photos library) — a UUID token the sync script reads to schedule a safe `--resync --resync-mode newer` instead of a plain bisync, removed only after every required bisync session (see `.resync-pending.consumed`) has consumed it with an unchanged token |
 | `~/.config/synctray/profiles/{shortId}.resync-pending.consumed` | Two-Way (bisync) profiles only — per-token record of which bisync session(s) have already run their one-time resync for the current `.resync-pending` token; deleted together with the marker once every required session (primary, and the fallback's own session on a full remote swap) has consumed it |
 | `~/.local/bin/synctray-sync.sh` | Shared sync script (all profiles) |
 | `~/Library/LaunchAgents/com.synctray.sync.{shortId}.plist` | launchd schedule |
