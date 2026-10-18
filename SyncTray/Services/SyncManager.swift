@@ -4380,6 +4380,12 @@ final class SyncManager: ObservableObject {
     /// there are no mount profiles.
     private func reconcileMountStatesOffMain() {
         let mountProfiles = profileStore.enabledProfiles.filter { $0.isMountMode }
+        // A profile that is no longer an enabled, unpaused Stream profile (disabled, deleted,
+        // switched to a sync mode, paused) can't recover from an open drop or stall: close it
+        // as `unmounted`. Runs before the early return so the last Stream profile going away
+        // is covered too.
+        closeMountInterruptions(
+            keeping: Set(mountProfiles.filter { !pausedProfiles.contains($0.id) }.map(\.id)))
         guard !mountProfiles.isEmpty else { return }
         DispatchQueue.global(qos: .utility).async { [weak self] in
             guard let self else { return }
@@ -4482,9 +4488,6 @@ final class SyncManager: ObservableObject {
                 // fallback that established after the initial poll, a launchd/externally
                 // mounted profile, or one that recovered from .failed — never reaches the
                 // extension, so its right-click menu and badges silently never appear.
-                // A profile that is no longer an enabled Stream profile (disabled, deleted,
-                // switched to a sync mode) can't recover from an open drop or stall: close it.
-                self.closeMountInterruptions(keeping: Set(mountProfiles.map(\.id)))
                 let after = Set(self.profileMountStates.filter { $0.value == .mounted }.keys)
                 if before != after {
                     self.updateAppGroupMountPaths()
