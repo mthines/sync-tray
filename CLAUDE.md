@@ -1019,7 +1019,8 @@ signalling, no agent load/unload, no pause, no lock touch) and, once it has ende
 triggers Sync Now; `runSyncScript` still performs the deferred agent load a stopped
 initial sync needs. Telemetry: `recordProfileLifecycleOperation(operation:
 "apply_sync_filter", …)` with `result` one of `sync_now`, `stop_requested`, `restarted`,
-or `not_restarted` (the stop gave up before the sync could be restarted).
+or `not_restarted` (the stop gave up before the sync could be restarted, or the profile
+was deleted or disabled while the stop was in progress).
 
 Behaviour to know: matching files stop syncing but are never deleted on either side
 (bisync sees them vanish from both listings; one-way `sync` leaves excluded files at
@@ -1747,8 +1748,9 @@ has exited.
   (confirmed "Stop the Current Sync and Apply?" after a filter-changing Save while a run is
   live — see "Don't Sync" patterns above) is a second, independent caller of `abortSync`:
   it joins an abort already in flight or starts one via `abortSync` itself, awaits
-  `abortTasks[profile.id]`, and only then triggers Sync Now if the run actually ended. It
-  adds no new signalling, agent load/unload, pause, or lock touch of its own — every rule on
+  `abortTasks[profile.id]`, and only then triggers Sync Now if the run actually ended AND
+  the profile still exists and is enabled (a re-read from the store, not the stale snapshot).
+  It adds no new signalling, agent load/unload, pause, or lock touch of its own — every rule on
   this page still applies unchanged, `runSyncScript`'s own deferred-agent-load handles a
   stopped initial sync exactly as above.
 Covered by `ConfigSelfTest` AC-AB1 (process targets and run-root identity, incl. reused-PID and
