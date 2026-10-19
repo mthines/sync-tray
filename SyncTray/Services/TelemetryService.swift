@@ -209,6 +209,7 @@ final class TelemetryService {
         let metricsExporter = StableOtlpHTTPMetricExporter(
             endpoint: metricsEndpoint,
             aggregationTemporalitySelector: AggregationTemporality.deltaPreferred(),
+            useSession: Self.exportSession,
             envVarHeaders: Self.authHeaders
         )
 
@@ -234,6 +235,7 @@ final class TelemetryService {
         let tracesEndpoint = URL(string: "\(Self.endpoint)/v1/traces")!
         let tracesExporter = OtlpHttpTraceExporter(
             endpoint: tracesEndpoint,
+            useSession: Self.exportSession,
             envVarHeaders: Self.authHeaders
         )
 
@@ -253,6 +255,7 @@ final class TelemetryService {
         let logsEndpoint = URL(string: "\(Self.endpoint)/v1/logs")!
         let logsExporter = OtlpHttpLogExporter(
             endpoint: logsEndpoint,
+            useSession: Self.exportSession,
             envVarHeaders: Self.authHeaders
         )
 
@@ -1656,15 +1659,65 @@ final class TelemetryService {
         // short, bounded deadline. Telemetry is best-effort: if the flush hasn't
         // landed by the deadline, the process exits anyway and the event is lost —
         // far better than hanging the command.
+        //
+        // `forceFlush()` returning is not enough: opentelemetry-swift 1.17.1's OTLP/HTTP
+        // exporters start the request and return `.success` before it completes, so a
+        // process that exits right after the flush kills the request in flight — no CLI
+        // event had ever reached the collector. After flushing, wait (inside the same
+        // deadline) until the exporters' own session has nothing left in flight.
+        let deadline = DispatchTime.now() + timeout
         let group = DispatchGroup()
         group.enter()
         DispatchQueue.global(qos: .utility).async {
             _ = self.meterProvider?.forceFlush()
             self.logProcessor?.forceFlush()
             self.tracerProvider?.forceFlush()
+            _ = Self.waitUntilIdle(deadline: deadline, inFlight: Self.inFlightExportCount)
             group.leave()
         }
-        _ = group.wait(timeout: .now() + timeout)
+        _ = group.wait(timeout: deadline)
+    }
+
+    /// The session every OTLP exporter sends on (the SDK's own default is also an
+    /// ephemeral session). Owned here so `flushForExit` can see the requests in flight.
+    private static let exportSession = URLSession(configuration: .ephemeral)
+
+    /// Requests the exporters have started and not finished, or 0 if the session
+    /// doesn't answer within a second.
+    private static func inFlightExportCount() -> Int {
+        let done = DispatchSemaphore(value: 0)
+        let count = LockedCount()
+        exportSession.getAllTasks { tasks in
+            count.value = tasks.filter { $0.state == .running || $0.state == .suspended }.count
+            done.signal()
+        }
+        return done.wait(timeout: .now() + 1) == .timedOut ? 0 : count.value
+    }
+
+    private final class LockedCount: @unchecked Sendable {
+        private let lock = NSLock()
+        private var stored = 0
+        var value: Int {
+            get { lock.withLock { stored } }
+            set { lock.withLock { stored = newValue } }
+        }
+    }
+
+    /// Poll `inFlight` every `pollInterval` until it reports nothing in flight or
+    /// `deadline` passes. Returns whether it drained. Pure over its closures —
+    /// covered by `ConfigSelfTest` AC-CLI14.
+    static func waitUntilIdle(
+        deadline: DispatchTime,
+        pollInterval: TimeInterval = 0.05,
+        inFlight: () -> Int,
+        now: () -> DispatchTime = { .now() },
+        sleep: (TimeInterval) -> Void = { Thread.sleep(forTimeInterval: $0) }
+    ) -> Bool {
+        while inFlight() > 0 {
+            guard now() < deadline else { return false }
+            sleep(pollInterval)
+        }
+        return true
     }
 
     // MARK: - Offline Extension Setup Funnel

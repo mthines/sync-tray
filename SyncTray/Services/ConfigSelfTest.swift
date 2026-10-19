@@ -124,6 +124,7 @@ enum ConfigSelfTest {
             testRemoteFolderListingKeepsSpaces,
             testCLIRemoteFolders,
             testCLITelemetryConsent,
+            testCLITelemetryFlushWaitsForSend,
             testCacheOnlyUnionConfig,
             testCacheOnlyUnionBehaviour,
             testMountModeSelection,
@@ -3705,6 +3706,50 @@ enum ConfigSelfTest {
         guard SyncTrayCLI.run(.remoteFolders(target: "nope", json: false), env: failing) == 1,
               err.contains("didn't find section") else {
             return report(name, slug, false, "(rclone failure not surfaced: \(err.debugDescription))")
+        }
+        return report(name, slug, true)
+    }
+
+    // MARK: - AC-CLI14 — the CLI waits for its telemetry to be sent before exiting
+
+    /// opentelemetry-swift 1.17.1 OTLP/HTTP exporters return from `export` before the
+    /// request completes, so a CLI that exits right after `forceFlush()` sends nothing.
+    /// `waitUntilIdle` must keep polling while requests are in flight and give up at the
+    /// deadline; every exporter must send on the session `flushForExit` watches, and
+    /// `flushForExit` must actually wait on it.
+    private static func testCLITelemetryFlushWaitsForSend() -> Bool {
+        let name = "AC-CLI14", slug = "cli-telemetry-flush-waits"
+
+        // Drains: 2 in flight, then 1, then 0 → true after two sleeps.
+        var pending = [2, 1, 0]
+        var sleeps = 0
+        let drained = TelemetryService.waitUntilIdle(
+            deadline: .now() + 60,
+            inFlight: { pending.isEmpty ? 0 : pending.removeFirst() },
+            sleep: { _ in sleeps += 1 })
+        guard drained, sleeps == 2 else {
+            return report(name, slug, false, "(did not wait for in-flight requests: drained=\(drained) sleeps=\(sleeps))")
+        }
+
+        // Never drains: stops at the deadline instead of hanging the CLI.
+        let start = DispatchTime.now()
+        var ticks: UInt64 = 0
+        let gaveUp = !TelemetryService.waitUntilIdle(
+            deadline: start + .seconds(1),
+            inFlight: { 1 },
+            now: { ticks += 1; return start + .milliseconds(Int(ticks) * 300) },
+            sleep: { _ in })
+        guard gaveUp, ticks <= 5 else {
+            return report(name, slug, false, "(did not stop at the deadline: ticks=\(ticks))")
+        }
+
+        guard let source = readSourceFile("Services/TelemetryService.swift") else {
+            return report(name, slug, false, "(could not read TelemetryService.swift)")
+        }
+        let exporterSessions = source.components(separatedBy: "useSession: Self.exportSession").count - 1
+        let flush = extractFunctionBody(startingAt: "func flushForExit(", in: source) ?? ""
+        guard exporterSessions == 3, flush.contains("waitUntilIdle(") else {
+            return report(name, slug, false, "(exporters on the watched session: \(exporterSessions)/3; flushForExit waits: \(flush.contains("waitUntilIdle(")))")
         }
         return report(name, slug, true)
     }
