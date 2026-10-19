@@ -3210,7 +3210,8 @@ final class TelemetryService {
     /// checked first ("Failed to copy:", "Couldn't delete:", "Failed to move:"/"Couldn't
     /// move:"/"Failed to rename:", "error listing:"/"failed to list"/"error reading
     /// source|destination [root] directory:" (rclone's march listing errors), then
-    /// "mkdir"/"make directory"), and only then the bare words "copy", "delete" and
+    /// "mkdir"/"make directory", then "failed to rmdir" (rclone's rmdir/rmdirs failures,
+    /// labelled `delete`)), and only then the bare words "copy", "delete" and
     /// "listing". The bare words can also come from a file path inside the message, which
     /// is why they are the last resort. Pure.
     static func categorizeErrorOperation(_ message: String?) -> String {
