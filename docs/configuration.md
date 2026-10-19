@@ -116,7 +116,7 @@ The schema is authoritative: when this table and [`profile.schema.json`](../Sync
 | `~/.local/bin/synctray-sync.sh`                               | The sync script all profiles share             |
 | `~/Library/LaunchAgents/com.synctray.sync.{shortId}.plist`    | The profile's launchd schedule or mount job    |
 | `~/.local/log/synctray-sync-{shortId}.log`                    | The profile's sync log                         |
-| `/tmp/synctray-sync-{shortId}.lock`                           | Held while a run is in progress                |
+| `$(getconf DARWIN_USER_TEMP_DIR)synctray-sync-{shortId}.lock` | Held while a run is in progress (your own private temp folder, not the shared `/tmp`) |
 | `~/Library/Caches/rclone/bisync/`                             | rclone's two-way sync history                  |
 | `{vfsCachePath}/vfs/` and `{vfsCachePath}/vfsMeta/`           | Stream cache: file data and what's downloaded  |
 | `{vfsCachePath}/synctray-overlay/{shortId}/`                  | Files created or edited in Cache Only, until they upload |

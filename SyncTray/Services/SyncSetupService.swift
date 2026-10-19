@@ -98,15 +98,19 @@ final class SyncSetupService {
     /// (see `SyncProfile.mountModePath`, CWE-59). The derived config is otherwise only
     /// rewritten on install/save, so without this an upgraded install would keep the script
     /// writing the old `/tmp` path while the app reads the new one. A config without the key
-    /// (predating Cache Only) is left as it is. Called once at app startup.
+    /// (predating Cache Only) is left as it is. The same applies to a stale `lockFile` (the
+    /// run lock moved out of `/tmp` too — see `SyncProfile.lockFilePath`, CWE-377): the script
+    /// and the app must agree on one lock, or a run could start beside a live one. Called
+    /// once at app startup.
     func refreshMountModePathIfChanged(profiles: [SyncProfile]) {
         for profile in profiles {
-            guard Self.derivedConfigHasStaleMountModePath(
-                FileManager.default.contents(atPath: profile.configPath),
-                expected: profile.mountModePath) else { continue }
+            let configData = FileManager.default.contents(atPath: profile.configPath)
+            guard Self.derivedConfigHasStaleMountModePath(configData, expected: profile.mountModePath)
+                    || Self.derivedConfigHasStaleLockFile(configData, expected: profile.lockFilePath)
+            else { continue }
             do {
                 try updateConfig(for: profile)
-                SyncTraySettings.debugLog("Refreshed derived config for \(profile.shortId) (mount-mode file moved)")
+                SyncTraySettings.debugLog("Refreshed derived config for \(profile.shortId) (mount-mode or lock file moved)")
             } catch {
                 print("Failed to refresh derived config for \(profile.shortId): \(error)")
             }
@@ -119,6 +123,16 @@ final class SyncSetupService {
         guard let configData,
               let config = (try? JSONSerialization.jsonObject(with: configData)) as? [String: Any],
               let onDisk = config["mountModePath"] as? String else { return false }
+        return onDisk != expected
+    }
+
+    /// Pure decision for `refreshMountModePathIfChanged`: true only when the derived config
+    /// carries a `lockFile` that differs from `expected` (e.g. the legacy
+    /// `/tmp/synctray-sync-{shortId}.lock`). A config without the key is left as it is.
+    static func derivedConfigHasStaleLockFile(_ configData: Data?, expected: String) -> Bool {
+        guard let configData,
+              let config = (try? JSONSerialization.jsonObject(with: configData)) as? [String: Any],
+              let onDisk = config["lockFile"] as? String else { return false }
         return onDisk != expected
     }
 

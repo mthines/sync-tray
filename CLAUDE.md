@@ -934,7 +934,7 @@ running app applies the change live, without a restart.
 | Path | Contents | Notes |
 |------|----------|-------|
 | `profiles/{shortId}.profile.json` | Full `SyncProfile`, including `isEnabled`, `isMuted`, `mountAtStartup`, and the app-side warm fields `pinnedDirectories` / `warmExcludePatterns` | NEW authoritative file. Written by `ProfileStore.save()` (encodes the whole model, so any new `SyncProfile` field flows in automatically); read by `ProfileStore.load()` (file-authoritative). References `../schema/profile.schema.json` via `$schema`. |
-| `profiles/{shortId}.json` | Derived, script-only subset (frozen key set) | Unchanged, byte-for-byte — this is `SyncSetupService.generateProfileConfig`'s output, consumed only by the sync shell script. The app never reads it back, except to rewrite a stale `mountModePath` at launch (`SyncSetupService.refreshMountModePathIfChanged`). |
+| `profiles/{shortId}.json` | Derived, script-only subset (frozen key set) | Unchanged, byte-for-byte — this is `SyncSetupService.generateProfileConfig`'s output, consumed only by the sync shell script. The app never reads it back, except to rewrite a stale `mountModePath` or `lockFile` at launch (`SyncSetupService.refreshMountModePathIfChanged`). |
 | `settings.json` | Enumerated safe subset of `SyncTraySettings` (`debugLoggingEnabled`, `autoFixSyncIssues`, `telemetryEnabled`, `launchAtLogin`) | Written by `AppSettingsFileStore`. Never contains secrets or telemetry identifiers (`installationId`, `anonymousUserId`). |
 | `schema/profile.schema.json`, `schema/settings.schema.json` | Committed JSON Schemas | Copied out of the app bundle by `ConfigSchemaInstaller` at every launch. Kept in lockstep with `SyncProfile.CodingKeys` by the fail-closed `scripts/check-schema-in-sync.sh`, run locally and in CI. |
 
@@ -1593,7 +1593,7 @@ This is now structurally prevented:
 - **Every resync and manual-recovery launch path — reinstall resync, Resync, Smart Fix, Unlock
   & Resync, Force Sync, and auto-fix — goes through `SyncManager.beginExclusiveRun(for:source:)`**
   before touching any state. It refuses (returns `nil`) when: a registry token is already active
-  for the profile, the `/tmp` run lock's holder is live (a legacy `"pending"` sentinel counts as
+  for the profile, the run lock's holder is live (a legacy `"pending"` sentinel counts as
   live), or the profile's rclone bisync session lock (`SyncSetupService.bisyncSessionName(for:
   profile) + ".lck"`) holder is live. A blocked launch sets `showingSyncInProgressAlert`, records
   `blocked_already_running` telemetry, and starts no process — state, errors, and the output
@@ -1604,16 +1604,16 @@ This is now structurally prevented:
 - **Every unlock action is stale-only and scoped to one profile's own locks.** `SyncRunLock`
   (`SyncSetupService.swift`) is the single pure core for lock liveness and unlock decisions:
   `SyncRunLock.removeStaleLocks` (used by `canStartRun`-gated recovery — Unlock & Retry, Unlock)
-  refuses outright if either lock is live, and otherwise removes ONLY the `/tmp` run lock and
+  refuses outright if either lock is live, and otherwise removes ONLY the run lock and
   this profile's own `<session>.lck` — never a directory-wide sweep of
   `~/Library/Caches/rclone/bisync/*.lck`, which used to delete a still-live winner's lock or a
-  sibling profile's lock. A run releases its `/tmp` lock on exit only if the file still holds one
+  sibling profile's lock. A run releases its run lock on exit only if the file still holds one
   of its own tokens (`SyncRunLock.releaseIfOwned`), and swaps its launch-time placeholder for the
   real child PID only if the lock still holds that placeholder (`SyncRunLock.replaceIfOwned`).
 - **"Running" comes from real liveness, not the cosmetic `.syncing` state.** `isSyncRunningForProfile`
   and the "Last sync error" banner consult `SyncManager.isRunLive(for:)`, which is registry-token
   OR run-lock OR session-lock liveness (mount-mode profiles consult the registry only — R7: a
-  Stream profile's `/tmp` lock is held for the mount daemon's entire life, so lock liveness alone
+  Stream profile's run lock is held for the mount daemon's entire life, so lock liveness alone
   would disable Pause/Uninstall/Reinstall forever). A `prior lock file found` failure
   (`SyncLogPatterns.isPriorLockFileError`) seen while the session lock's holder is still live
   (`SyncRunLock.isRejectedConcurrentRun`) is a rejected CONCURRENT run's own failure, not this
@@ -1635,7 +1635,7 @@ initial sync left nothing to do but wait. Abort is not Pause: the launchd agent 
 the profile is never added to `pausedProfiles`, and Sync Now is available as soon as the run
 has exited.
 - **Which processes.** `SyncAbort` (`SyncSetupService.swift`, pure core next to `SyncRunLock`)
-  finds the run from the profile's two lock holders — the `/tmp` run lock (the script's bash,
+  finds the run from the profile's two lock holders — the run lock (the script's bash,
   or an app-launched rclone) and the bisync session `.lck` (rclone) — plus their descendants
   from one `ps -A -ww -o pid=,ppid=,comm=` read. A holder is used only when
   `SyncAbort.isRunRoot` identifies it as this profile's run: the script must be `bash` (or the
@@ -1738,7 +1738,7 @@ is the only way to make its next scheduled run bootstrap from scratch.
 ### Lock Files
 If sync appears stuck, check for stale lock files:
 ```bash
-ls -la /tmp/synctray-sync-*.lock
+ls -la "$(getconf DARWIN_USER_TEMP_DIR)"synctray-sync-*.lock
 ```
 
 The app automatically cleans stale locks on startup.
@@ -1814,7 +1814,7 @@ Priority: process env vars > `~/.config/synctray/.env` > Info.plist. Key vars: `
 | `~/.local/bin/synctray-sync.sh` | Shared sync script (all profiles) |
 | `~/Library/LaunchAgents/com.synctray.sync.{shortId}.plist` | launchd schedule |
 | `~/.local/log/synctray-sync-{shortId}.log` | Sync logs. `~/.local/log` and `~/.config/synctray/profiles/` are created owner-only (0700) — the logs name every synced file, the profile JSON names remotes, local paths and extra rclone flags — and a directory an earlier version left 0755 is tightened at launch (`SyncSetupService.tightenPrivateDirectoriesIfLoose`). Covered by `ConfigSelfTest` AC-SEC5. |
-| `/tmp/synctray-sync-{shortId}.lock` | Lock file (prevents concurrent syncs) |
+| `$(getconf DARWIN_USER_TEMP_DIR)synctray-sync-{shortId}.lock` | Run lock (prevents concurrent syncs; holds the run's PID, which Pause signals). Same per-user 0700 temp dir as the mode file (`SyncProfile.privateTempDirectory`), **never** the shared `/tmp`: another local user could pre-create the predictable name there — the script cannot remove a file it does not own in the sticky dir, so every run and mount would be skipped — and choose the PID Pause signals (CWE-377). A derived config still naming the old `/tmp` lock is rewritten at launch (`SyncSetupService.refreshMountModePathIfChanged`), and `detectRunningSyncPID` ignores PIDs ≤ 1. Covered by `ConfigSelfTest` AC-SEC6. |
 | `~/.local/state/synctray/rc/{rcPort}.auth` | Mount mode only — 0600 secret for the streaming mount's rclone RC API. Generated by the sync script, passed to rclone as `RCLONE_RC_USER`/`RCLONE_RC_PASS` (env, never argv), read by `VFSCacheService.rcRequest` for HTTP Basic auth. The RC API never runs `--rc-no-auth` (any local process, or a web page via a cross-origin form POST, could otherwise drive it). Covered by `ConfigSelfTest` AC-SEC2. |
 | `$(getconf DARWIN_USER_TEMP_DIR)synctray-mount-{shortId}.mode` | Mount mode only — the currently active `MountMode` token (`streaming`/`cache-only-manual`/`cache-only-pending`/`cache-only-offline`), rewritten on every mount start. Lives in the per-user temp dir (`/var/folders/…/T/`, owner-only 0700, cleared at boot; `SyncProfile.privateTempDirectory`), **never** the shared `/tmp`: the script writes it with `echo >`, which follows a symlink another local user could plant at a predictable `/tmp` name (CWE-59). A derived config still naming the old `/tmp` path is rewritten at launch (`SyncSetupService.refreshMountModePathIfChanged`). Covered by `ConfigSelfTest` AC-SEC4. |
 | `$(getconf DARWIN_USER_TEMP_DIR)synctray-unmount-{shortId}.intent` | Mount mode only — empty marker touched by `SyncSetupService.noteDeliberateUnmount` right before SyncTray (app or CLI) detaches the volume or unloads the agent; its modification time lets the mount-interruption telemetry tell a requested unmount from a drop (`MountDropClassifier`). Same per-user 0700 temp dir as the mode file. |

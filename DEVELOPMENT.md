@@ -333,7 +333,7 @@ Located at `~/Library/Caches/rclone/bisync/`. Use "Fix Sync Issues" in the app t
 ### Lock Files
 
 ```bash
-ls -la /tmp/synctray-sync-*.lock
+ls -la "$(getconf DARWIN_USER_TEMP_DIR)"synctray-sync-*.lock
 ```
 
 Stale locks are cleaned on app startup.

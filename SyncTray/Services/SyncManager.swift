@@ -429,7 +429,7 @@ final class SyncManager: ObservableObject {
         setupProfileObserver()
         cleanupStaleLockFiles()
         setupService.refreshSharedScriptIfChanged()  // Propagate script template updates
-        setupService.refreshMountModePathIfChanged(profiles: self.profileStore.profiles)  // Mode file moved out of /tmp
+        setupService.refreshMountModePathIfChanged(profiles: self.profileStore.profiles)  // Mode and lock files moved out of /tmp
         setupService.cleanupStaleMounts(mountProfiles: self.profileStore.profiles)  // Clean up stale mounts on startup
         detectAndResumeRunningSyncs()  // After cleanup, detect external syncs
         checkInitialState()
@@ -2242,12 +2242,15 @@ final class SyncManager: ObservableObject {
     private func detectRunningSyncPID(for profile: SyncProfile) -> Int32? {
         let holder = SyncRunLock.parseHolder(try? String(contentsOfFile: profile.lockFilePath, encoding: .utf8))
         guard case .pid(let pid) = holder, SyncRunLock.processIsAlive(pid) else { return nil }
-        // The `/tmp` lock briefly holds the app's own PID as a launch-gap placeholder
+        // The run lock briefly holds the app's own PID as a launch-gap placeholder
         // (D4, `beginExclusiveRun`) before it is swapped for the real rclone child PID.
         // Treating that window as "a sync process is running at this PID" would hand
         // SyncTray's own PID to `terminateRunningSync`'s `kill(-pid, SIGTERM)` — Pause
         // would SIGTERM the app itself (review finding). No running sync to detect yet.
-        guard pid != getpid() else { return nil }
+        // PIDs <= 1 are never a run either: `kill(-1, …)` signals every process of this
+        // user and `kill(1, …)` targets launchd — a forged or corrupt lock must not reach
+        // `terminateRunningSync` with them (CWE-377 defence in depth, AC-SEC6).
+        guard pid > 1, pid != getpid() else { return nil }
         return pid
     }
 
@@ -2319,13 +2322,13 @@ final class SyncManager: ObservableObject {
     }
 
     /// Clean up stale lock files on app startup
-    /// Removes /tmp lock files where the PID is no longer running
+    /// Removes run lock files where the PID is no longer running
     /// Also removes rclone bisync .lck files if no rclone process is running
     private func cleanupStaleLockFiles() {
         let fm = FileManager.default
         var staleLockCount = 0
 
-        // Clean up SyncTray's /tmp lock files
+        // Clean up SyncTray's run lock files
         for profile in profileStore.profiles {
             let lockPath = profile.lockFilePath
             guard fm.fileExists(atPath: lockPath) else { continue }

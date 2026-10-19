@@ -120,6 +120,7 @@ enum ConfigSelfTest {
             testRCAPIAuthenticated,
             testShimQuotesExecutablePath,
             testMountModeFileNotInSharedTmp,
+            testRunLockNotInSharedTmp,
             testLogAndProfileDirsOwnerOnly,
             testRemoteFolderListingKeepsSpaces,
             testCLIRemoteFolders,
@@ -3848,6 +3849,54 @@ enum ConfigSelfTest {
               !SyncSetupService.derivedConfigHasStaleMountModePath(config(nil), expected: path),
               !SyncSetupService.derivedConfigHasStaleMountModePath(nil, expected: path) else {
             return report(name, slug, false, "(stale-derived-config detection wrong)")
+        }
+        return report(name, slug, true)
+    }
+
+    // MARK: - AC-SEC6 — the per-profile run lock never lives in the shared /tmp
+
+    /// In the world-writable, sticky `/tmp` another local user could pre-create the
+    /// predictable `synctray-sync-{shortId}.lock`: the script's stale-lock `rm -f` cannot
+    /// remove a file it does not own, so every run and Stream mount is skipped, and the PID
+    /// the attacker wrote is what Pause's `terminateRunningSync` signals (CWE-377). Asserts
+    /// the lock is in this user's own 0700 temp dir, never `/tmp`; that an upgraded
+    /// install's derived config naming the old `/tmp` lock is flagged for the launch-time
+    /// rewrite (and a current one, one without the key, or no config is not); and that
+    /// `detectRunningSyncPID` refuses PIDs <= 1 (`kill(-1, …)` reaches every user process).
+    private static func testRunLockNotInSharedTmp() -> Bool {
+        let name = "AC-SEC6", slug = "run-lock-not-in-shared-tmp"
+        let profile = sampleProfile()
+        let path = profile.lockFilePath
+        guard !path.hasPrefix("/tmp/"), !path.hasPrefix("/private/tmp/") else {
+            return report(name, slug, false, "(run lock is in shared /tmp: \(path))")
+        }
+        let tempDir = SyncProfile.privateTempDirectory
+        let dirPrefix = tempDir.hasSuffix("/") ? tempDir : "\(tempDir)/"
+        guard path.hasPrefix(tempDir), path == "\(dirPrefix)synctray-sync-\(profile.shortId).lock" else {
+            return report(name, slug, false, "(run lock not in the per-user temp dir \(tempDir): \(path))")
+        }
+        func config(_ value: String?) -> Data? {
+            var dict: [String: Any] = ["profileId": profile.id.uuidString]
+            if let value { dict["lockFile"] = value }
+            return try? JSONSerialization.data(withJSONObject: dict)
+        }
+        let legacy = "/tmp/synctray-sync-\(profile.shortId).lock"
+        guard SyncSetupService.derivedConfigHasStaleLockFile(config(legacy), expected: path),
+              !SyncSetupService.derivedConfigHasStaleLockFile(config(path), expected: path),
+              !SyncSetupService.derivedConfigHasStaleLockFile(config(nil), expected: path),
+              !SyncSetupService.derivedConfigHasStaleLockFile(nil, expected: path) else {
+            return report(name, slug, false, "(stale-lockFile derived-config detection wrong)")
+        }
+        guard let generated = SyncSetupService.shared.generateProfileConfig(for: profile).data(using: .utf8),
+              !SyncSetupService.derivedConfigHasStaleLockFile(generated, expected: path) else {
+            return report(name, slug, false, "(generated derived config does not carry the current lockFile)")
+        }
+        guard let managerSource = readSourceFile("Services/SyncManager.swift") else {
+            return report(name, slug, false, "(could not read SyncManager.swift)")
+        }
+        guard let detectPID = extractFunctionBody(startingAt: "private func detectRunningSyncPID(", in: managerSource),
+              detectPID.contains("pid > 1") else {
+            return report(name, slug, false, "(detectRunningSyncPID no longer refuses PIDs <= 1)")
         }
         return report(name, slug, true)
     }

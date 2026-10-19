@@ -213,8 +213,14 @@ struct SyncProfile: Identifiable, Codable, Equatable {
         "com.synctray.sync.\(shortId)"
     }
 
+    /// Per-profile run lock: holds the PID of the run (script bash or app-launched rclone)
+    /// while a sync or Stream mount is live. Lives in the per-user Darwin temp dir
+    /// (`privateTempDirectory`), never the world-writable `/tmp`: there another local user
+    /// could pre-create this predictable name — they own it, so the script's stale-lock
+    /// `rm -f` fails in the sticky dir and every run and mount is skipped — and choose the
+    /// PID that Pause then signals (CWE-377). Covered by `ConfigSelfTest` AC-SEC6.
     var lockFilePath: String {
-        "/tmp/synctray-sync-\(shortId).lock"
+        (Self.privateTempDirectory as NSString).appendingPathComponent("synctray-sync-\(shortId).lock")
     }
 
     // MARK: - Cache-Only overlay paths
