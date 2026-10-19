@@ -226,7 +226,7 @@ rollout. No event is emitted on a fresh install.
 | `synctray.offline.pin_operations` | Counter | Offline pin/unpin operations from Finder or in-app UI (`action`: `pin` or `unpin`) |
 | `synctray.wizard.step` | Counter | Onboarding funnel events (`wizard.outcome`: started/provider_selected/remote_ready/folder_chosen/created/abandoned; `wizard.abandoned_at_step`, `provider.type`) |
 | `synctray.remote.oauth` | Counter | OAuth auth outcomes during remote setup (`result`: success/failure/cancelled; `provider.type`) |
-| `synctray.recovery.user_action` | Counter | User-initiated sync recovery actions (`recovery.action`: force_sync/resync/retry/…; `recovery.result`: `started` or `blocked_already_running` — the single-run guard refused because another run already held the profile's lock) — distinct from automatic auto-fix |
+| `synctray.recovery.user_action` | Counter | User-initiated sync recovery actions (`recovery.action`: force_sync/resync/retry/exclude_blocked_path/…; `recovery.result`: `started`, `staged` — the `exclude_blocked_path` banner action only stages the pattern into the form's "Don't Sync" list, no run started, see `apply_sync_filter` below for when it actually applies — or `blocked_already_running` — the single-run guard refused because another run already held the profile's lock) — distinct from automatic auto-fix |
 | `synctray.setting.changed` | Counter | App-wide preference changes (`setting.name`: auto_fix/launch_at_login/debug_logging/telemetry; `setting.enabled`) |
 | `synctray.offline.extension_setup` | Counter | Finder-extension enable funnel (`offline.extension_action`: prompt_shown/open_settings/rechecked/enabled) |
 | `synctray.offline.cache_clear` | Counter | Cache-clear operations (`offline.preserve_pinned`: whether pinned folders were kept) |
@@ -302,7 +302,8 @@ All key lifecycle events are emitted as structured OTel logs:
 - Offline pin operations: directory pinned or unpinned via Finder right-click or in-app UI (`offline.action`, `offline.path_count`)
 - Wizard step: onboarding funnel events (`wizard.outcome`, `wizard.abandoned_at_step`, `provider.type`) — new-profile flow only, not edit mode
 - OAuth outcome: OAuth auth result during remote setup (`result`, `provider.type`)
-- User recovery action: user-initiated recovery from the error banner (`recovery.action`, `recovery.result`: `started` or `blocked_already_running` when the single-run guard refused) — distinct from automatic auto-fix
+- User recovery action: user-initiated recovery from the error banner (`recovery.action`, `recovery.result`: `started`, `staged` for `exclude_blocked_path` — it only stages the pattern, see `apply_sync_filter` below — or `blocked_already_running` when the single-run guard refused) — distinct from automatic auto-fix
+- Apply sync filter (`profile.operation = "apply_sync_filter"`, via `recordProfileLifecycleOperation`): the staged "Don't Sync" Save follow-up (CLAUDE.md "Don't Sync" patterns / Rule 9's `stopRunThenSync`) — `profile.operation.result` is `sync_now` (nothing was running, Sync Now started immediately), `stop_requested` (a live run is being stopped first, behind the "Stop the Current Sync and Apply?" confirm), `restarted` (the stop finished and Sync Now started), or `not_restarted` (the stop gave up before Sync Now could run — the already-saved filter still applies from the next scheduled run)
 - Setting changed: app-wide preference toggled (`setting.name`, `setting.enabled`); the telemetry opt-out is recorded just before telemetry disables
 - Offline extension setup: Finder-extension enable-funnel steps (`offline.extension_action`)
 - Offline cache clear: cache cleared, with whether pinned folders were preserved (`offline.preserve_pinned`)

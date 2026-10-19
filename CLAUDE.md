@@ -993,42 +993,76 @@ block at the TOP of `{shortId}-exclude.txt` (first match wins in rclone, so a
 pattern beats any hand-written `+` include below). Changing the patterns never
 touches the lines outside the block (when `uninstall` deletes the file, as disable
 and delete always do, the next install recreates it from the defaults). The sync script re-reads that
-file on every run, so an edit only needs the file rewritten: the in-app editor
-(`SyncManager.updateSyncExcludePatterns`), the external-edit watcher and the CLI's
-`writeProfile` all go through `applySyncFilterReconcileIfNeeded` /
-`writeSyncExcludeFilter`, and `reconcileAction` returns `.none`. Keep it that way:
-a reinstall unloads the agent (stopping any sync in progress) and rewrites the
-script, plist and config, none of which a pattern edit needs. Behaviour to know: matching files
-stop syncing but are never deleted on either side (bisync sees them vanish from
-both listings; one-way `sync` leaves excluded files at the destination). A new
-pattern that covers more than half of a two-way profile's files trips bisync's
-`--max-delete` (50%) safety abort, because the newly-excluded files count as
-deletions against the prior listing — and since an abort leaves that listing
-unchanged, every later run aborts too until the pattern is removed. Adding broad
-patterns in steps avoids it. Covered by `ConfigSelfTest` AC-DS1–AC-DS5.
+file on every run, so an edit only needs the file rewritten, and `reconcileAction`
+returns `.none` for it — never a reinstall (which would unload the agent and stop
+any sync in progress for no reason a pattern edit needs). The external-edit watcher
+and the CLI's `writeProfile` still write immediately, through
+`applySyncFilterReconcileIfNeeded` / `writeSyncExcludeFilter`.
 
-**macOS blocked access — Photos libraries and other privacy-protected paths.** rclone's
-local backend reports a path macOS privacy controls (TCC) won't let it read as EPERM,
-`… open /Users/me/Pictures/Photos Library.photoslibrary: operation not permitted` — not
-POSIX permissions, so nothing but excluding the path or granting access fixes it, and
-until then rclone also refuses every deletion ("not deleting files as there were IO
-errors") and the run exits 1. Four pieces, one predicate (`SyncLogPatterns.operationNotPermittedPath`
-/ `macOSBlockedPath`, which counts a path as a macOS block only when it is the profile's
-local folder or inside it — a remote server's EPERM is not):
-- **Default exclude.** `SyncExcludeFilter.photosLibraryRule` (`- *.photoslibrary/**`) is in
-  `defaultExcludeFilter`, so new filter files never sync a Photos library (a live database
-  macOS won't let other apps read, and one a file-by-file copy can break while Photos has it
-  open). It is plain user content, not a managed block — deleting it is how a user who has
-  granted access syncs one. Existing files get it once from migration v5 (below).
-- **Banner.** `ProfileDetailView` checks for a macOS block before `detectErrorAction` and
-  offers **Exclude from Sync** — adds the anchored pattern from
-  `SyncExcludeFilter.excludePattern(forBlockedPath:localSyncPath:isDirectory:)` to
-  `syncExcludePatterns` through `updateSyncExcludePatterns` (so it shows in "Don't Sync",
-  undoable, no reinstall), clears the error and syncs again — and **Open Privacy Settings**
-  (Full Disk Access). The copy deliberately doesn't name which binary needs access: launchd
-  runs the sync script directly, not as a child of SyncTray, so a grant to the app alone may
-  not reach a scheduled run. `LogParser` skips its 200-character truncation for these
-  messages, since the path is at the end.
+**The in-app editor is staged until Save, not written on every keystroke.**
+`DontSyncSection` binds its list to `ProfileDetailView`'s own `@State
+syncExcludePatterns` (`@Binding var patterns`, not a `SyncManager` call) — an edit
+only updates the form, exactly like every other field, and the caption says so
+("…apply when you Save"). `hasChanges` compares it against `profile.syncExcludePatterns`
+so Save lights up on a pattern-only edit too. Pressing Save computes
+`SyncManager.filterSaveFollowUp(filterChanged:needsReinstall:runLive:installed:)` —
+a pure decision table: a reinstall-needing Save always wins (`.none`; the agent's own
+`RunAtLoad` starts the sync); otherwise a filter-only change with nothing running is
+`.syncNow` (write the filter, clear the error, trigger Sync Now immediately); with
+something running it's `.confirmStopThenSync`, which shows a "**Stop the Current Sync
+and Apply?**" confirmation before anything is persisted — Cancel leaves the form
+exactly as dirty as it was. Confirming (`applyFilterSaveAndFollowUp`) writes the filter
+and clears the error FIRST (so "saved == applied on disk" holds even if the stop gives
+up or the window closes), then calls `SyncManager.stopRunThenSync`, which joins an abort
+already in flight or starts one via the existing `abortSync` (CLAUDE.md Rule 9 — no new
+signalling, no agent load/unload, no pause, no lock touch) and, once it has ended,
+triggers Sync Now; `runSyncScript` still performs the deferred agent load a stopped
+initial sync needs. Telemetry: `recordProfileLifecycleOperation(operation:
+"apply_sync_filter", …)` with `result` one of `sync_now`, `stop_requested`, `restarted`,
+or `not_restarted` (the stop gave up before the sync could be restarted).
+
+Behaviour to know: matching files stop syncing but are never deleted on either side
+(bisync sees them vanish from both listings; one-way `sync` leaves excluded files at
+the destination). A new pattern that covers more than half of a two-way profile's files
+trips bisync's `--max-delete` (50%) safety abort, because the newly-excluded files count
+as deletions against the prior listing — and since an abort leaves that listing
+unchanged, every later run aborts too until the pattern is removed. Adding broad
+patterns in steps avoids it. Covered by `ConfigSelfTest` AC-DS1–AC-DS8.
+
+**macOS blocked access — Photos/Photo Booth libraries and other privacy-protected
+paths.** rclone's local backend reports a path macOS privacy controls (TCC) won't let
+it read as EPERM, `… open /Users/me/Pictures/Photos Library.photoslibrary: operation
+not permitted` — not POSIX permissions, so nothing but excluding the path or granting
+access fixes it, and until then rclone also refuses every deletion ("not deleting files
+as there were IO errors") and the run exits 1. Four pieces, one predicate
+(`SyncLogPatterns.operationNotPermittedPath` / `macOSBlockedPath`, which counts a path as
+a macOS block only when it is the profile's local folder or inside it — a remote
+server's EPERM is not):
+- **Default excludes.** `SyncExcludeFilter.DefaultExclude.photosLibrary` (`-
+  *.photoslibrary/**`) and `SyncExcludeFilter.DefaultExclude.photoBoothLibrary` (`- Photo
+  Booth Library/**`) are both in `defaultExcludeFilter`, so new filter files never sync
+  either kind of library (a live database macOS won't let other apps read, and one a
+  file-by-file copy can break while Photos/Photo Booth has it open). They are plain user
+  content, not a managed block — deleting one is how a user who has granted access syncs
+  that library. Existing files get the Photos rule once from migration v5, and the Photo
+  Booth rule once from `MigrationV6PhotoBoothLibraryExclude` (below) — both built on the
+  same shared `DefaultExcludeMigration` body, so they apply it identically (filter written
+  before any resync-pending marker, rolled back if the marker write fails).
+- **Banner stages, Save applies (plan: staged "Don't Sync" / stop-and-apply).**
+  `ProfileDetailView` checks for a macOS block before `detectErrorAction` and offers
+  **Exclude from Sync** — `stageBlockedPathExclusion()` appends the anchored pattern from
+  `SyncExcludeFilter.excludePattern(forBlockedPath:localSyncPath:isDirectory:)` to the
+  form's staged `syncExcludePatterns` ONLY (no filter write, no error clear, no sync
+  trigger — it starts no run, so unlike every other recovery action it stays enabled
+  while a sync is live). The button becomes a disabled "Excluded (unsaved)" once staged,
+  with "Added to Don't Sync below — press Save to apply." underneath; actually applying it
+  goes through the same staged "Don't Sync" Save flow described above — immediately
+  (`.syncNow`) when nothing is running, or behind the "**Stop the Current Sync and
+  Apply?**" confirm when something is. **Open Privacy Settings** (Full Disk Access) is the
+  other option, unchanged. The copy deliberately doesn't name which binary needs access:
+  launchd runs the sync script directly, not as a child of SyncTray, so a grant to the app
+  alone may not reach a scheduled run. `LogParser` skips its 200-character truncation for
+  these messages, since the path is at the end.
 - **Notification.** The sync-failure notification says "macOS blocked access to “X”." instead
   of rclone's raw line.
 - **Telemetry.** `.syncFailed` gives `recordSyncFailed` the run's FIRST error
@@ -1036,8 +1070,9 @@ local folder or inside it — a remote server's EPERM is not):
   rclone's closing notice, which only says what was skipped because of it and filed every
   such failure as `error.type=other`. `categorizeError` maps "operation not permitted" to
   `permission_denied` and the closing "not deleting … as there were IO errors" notice to
-  `io_errors_blocked_deletes`.
-Covered by `ConfigSelfTest` AC-PL1–AC-PL4.
+  `io_errors_blocked_deletes`. The banner action itself records `recovery.result = "staged"`
+  (not `"started"`) since it starts no run.
+Covered by `ConfigSelfTest` AC-PL1–AC-PL6.
 
 **"Sync Only These Folders" (`syncIncludeFolders`) — selective folder sync for
 Two-Way and One-Way profiles.** A per-profile allowlist (profile editor's "Sync
@@ -1153,6 +1188,21 @@ at once and, holding over half the files, stop every run at `--max-delete`. Per-
 failures are logged, never thrown, so one bad file can't pin the schema version.
 Covered by `ConfigSelfTest` AC-PL2.
 
+**Migration v6 — Photo Booth libraries excluded from existing profiles.**
+`MigrationV6PhotoBoothLibraryExclude` adds `- Photo Booth Library/**` to every existing
+Two-Way and One-Way `{shortId}-exclude.txt` the same way v5 adds the Photos rule — both
+are now thin wrappers over a single shared `DefaultExcludeMigration` body
+(`apply(_:in:hasEntry:logTag:)` for the filter-then-marker write with rollback on marker
+failure, `containsEntry(under:matching:maxDepth:maxEntries:)` for the bounded filesystem
+walk), parameterized by `SyncExcludeFilter.DefaultExclude` (`.photosLibrary` /
+`.photoBoothLibrary`) so the two migrations can never drift in behavior. It skips Stream
+profiles, missing filter files, and any file that already mentions "photo booth library"
+(any case). On a Two-Way profile whose local folder actually holds a `Photo Booth
+Library` package it writes the resync-pending marker the same way v5 does, for the same
+reason (a library the profile used to sync would otherwise vanish from bisync's listings
+at once). Covered by `ConfigSelfTest` AC-PL5 (the default rule and `addingDefault`) and
+AC-PL6 (the migration itself).
+
 **Migration.** `MigrationV3BlobToPerProfileFiles` (`MigrationRunner.swift`)
 moves the legacy `syncProfiles` UserDefaults blob to per-profile files on
 first launch. The blob is retained as a write-only mirror for one release
@@ -1227,13 +1277,13 @@ Covered by `ConfigSelfTest` AC-CLI4 and AC-SEC3.
 
 | Command | Purpose |
 |---------|---------|
-| `synctray doctor` | Health report: rclone found + version, config schemas installed, per-profile derived-config presence, launchd agent loaded (enabled profiles), stale lock files, remote reachability. Exits non-zero iff any check is `[fail]`; `[warn]` never fails the run. |
+| `synctray doctor` | Health report: rclone found + version, config schemas installed, per-profile derived-config presence, launchd agent loaded (enabled profiles), stale lock files (judged by **holder liveness** — `SyncRunLock.processIsAlive`, not mere file existence, so a live run's own lock reports `ok` "sync/mount running (PID …)" and only a dead holder's lock reports `warn` "stale lock file (PID … not running)"), remote reachability (probed with `rclone lsjson --stat <remote>:<path>` — never `lsd`, which lists the whole remote directory and can hang for minutes on a large folder; a watchdog timeout is reported by name as "timed out after 15s" rather than a bare non-zero exit, and the detail text prefers an ERROR/CRITICAL stderr line over rclone's shared-client_id NOTICE line). Exits non-zero iff any check is `[fail]`; `[warn]` never fails the run. |
 | `synctray status [name\|shortId] [--json]` | One tab-separated line per profile (or a single one): `enabled=`, `agent=loaded\|unloaded\|n/a`, `running=` (lock present), `last=started\|completed\|failed\|none` (from the log tail via the shared `SyncLogPatterns`), and `state=` — the field an agent should branch on. Stream profiles: `mounting` (rclone running, volume not attached yet — the startup cache scan takes minutes on a large cache), `mounted`, `stale` (volume in the mount table but no rclone serving it), `unmounted`, `disabled`; they also carry `mode=` (the `MountMode` token, `none` when rclone isn't running, `unknown` when the derived config predates Cache Only) and `pending_uploads=`. Sync profiles: `syncing` (lock held), `idle`, `disabled`. A Stream profile that requested Cache Only (`streamCacheOnly`) but whose live mode is `streaming` also carries `cache_only_fallback=true` — the silent script fallback surfaced synchronously (see "The silent fallback is measurable"). `--json` prints the same facts as a sorted-key array (`state`, `mountMode`, `pendingUploads`, `cacheOnlyFallback`, `syncMode`, …). `status <name|shortId> --wait <state>[,<state>] [--timeout s]` (default 600s) blocks until the profile reaches one of those states — exit 0 when reached, 1 on timeout, printing the last observed state either way. State derivation is the pure `SyncTrayCLI.runtimeState` (AC-CLI10); the mount table and the rclone process are sampled together because a `KeepAlive` agent stays loaded through every mount state. |
 | `synctray offline status [name\|shortId] [--json]` | Offline-readiness of a Stream profile before flipping Cache Only: per profile, `mounted=`, and (when mounted) `missing_files=`/`missing_bytes=` (not yet fully cached), `cached_files=`/`cached_bytes=` (already offline), and `ready=<bool>` (every non-excluded file cached). Scope is the profile's `pinnedDirectories`, or the whole mount when none are pinned. A down mount reports `mounted=false ready=unknown` (the tree can't be walked). Counts come from the pure, mount-free `VFSCacheService.estimateWarmWork` (reads `vfsMeta` sidecars, no network). Stream-only — a non-mount target exits 1. Covered by `ConfigSelfTest` AC-CLI11. |
 | `synctray profiles` | List every profile: name, shortId, mode, `enabled=`, `remote=` — no secrets. (`profile list` is an alias.) |
 | `synctray profile show <name\|shortId>` | Print one profile's FULL config as pretty, sorted-key JSON — the same shape as its `.profile.json`, so an agent can `show` → edit → `profile create`/`profile set` round-trip. No secrets (credentials live in `rclone.conf`). |
 | `synctray logs <name\|shortId> [--follow]` | Print (or `tail -f`) that profile's sync log. |
-| `synctray test-remote <name\|shortId>` | Probe one profile's remote with `rclone lsd` under a hard timeout; prints `reachable: <remote>` or the real rclone stderr. |
+| `synctray test-remote <name\|shortId>` | Probe one profile's remote with the same path-scoped `rclone lsjson --stat <remote>:<path>` probe `doctor` uses (never `lsd`) under a hard timeout; prints `reachable: <remote>` or the real rclone stderr (ERROR/CRITICAL preferred over a NOTICE line). |
 | `synctray listremotes` | `rclone listremotes`, passthrough. |
 | `synctray remote folders <remote>[:path] [--json]` | List a remote's folders exactly as the profile editor's folder chooser and the setup wizard show them — same `rclone lsf --dirs-only` arguments (`RcloneConfigService.folderListingArguments`, including the remote's `no_check_certificate`) and the same parser (`parseDirectoryListing`), so names with spaces come out verbatim. Needs no profile. `--json` prints a JSON array, which makes leading/trailing spaces visible. Covered by `ConfigSelfTest` AC-CLI12 (and AC-RF1 for the parser). |
 | `synctray telemetry [status\|on\|off] [--json]` | Show or change whether usage data is shared — the same setting as the app's telemetry toggle (see "Privacy and consent" below). `status --json` prints `{"asked":…,"enabled":…}`. `on`/`off` count as answering the first-run question. |
@@ -1693,6 +1743,14 @@ has exited.
   (`runSyncScript`) instead — Sync Now restarts the sync AND brings back its schedule; a Save
   reinstalls it anyway. Until then the directory watcher does not restart it. The deferral is
   in memory only: after an app restart the agent comes back at the next login or Save.
+- **A second caller: the staged "Don't Sync" Save flow.** `SyncManager.stopRunThenSync(for:)`
+  (confirmed "Stop the Current Sync and Apply?" after a filter-changing Save while a run is
+  live — see "Don't Sync" patterns above) is a second, independent caller of `abortSync`:
+  it joins an abort already in flight or starts one via `abortSync` itself, awaits
+  `abortTasks[profile.id]`, and only then triggers Sync Now if the run actually ended. It
+  adds no new signalling, agent load/unload, pause, or lock touch of its own — every rule on
+  this page still applies unchanged, `runSyncScript`'s own deferred-agent-load handles a
+  stopped initial sync exactly as above.
 Covered by `ConfigSelfTest` AC-AB1 (process targets and run-root identity, incl. reused-PID and
 no-table refusals), AC-AB2 (escalation, signals, orphans, completion), AC-AB3 (run-end
 suppression) and AC-AB4 (source pins: no pause/agent unload/direct lock delete in `abortSync`,
