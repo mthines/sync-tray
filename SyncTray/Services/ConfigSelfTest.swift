@@ -4035,7 +4035,7 @@ enum ConfigSelfTest {
         var certArgs: [String] = []
         let certEnv = fakeCLIEnvironment(
             runRclone: { args, _ in certArgs = args; return (0, "", "") },
-            remoteSkipsCertCheck: { $0 == "myremote:" }
+            remoteSkipsCertCheck: { $0 == "myremote" }
         )
         _ = SyncTrayCLI.remoteProbe(for: profile, env: certEnv)
         guard certArgs.contains("--no-check-certificate") else {

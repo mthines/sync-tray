@@ -3176,7 +3176,8 @@ final class TelemetryService {
     ///   folder or inside it — the case the error banner offers to exclude. Only when the
     ///   message names an absolute path and the caller passed the local folder.
     /// - `error.blocked_path.kind`: `volume_system_folder` (`SyncExcludeFilter.volumeSystemFolderNames`),
-    ///   `photos_library`, or `other` — only when the message names an absolute path.
+    ///   `photos_library`, `photo_booth_library`, or `other` — only when the message names an
+    ///   absolute path.
     static func accessDenialAttributes(for message: String?, localSyncPath: String?) -> [String: AttributeValue] {
         guard let message else { return [:] }
         guard let blocked = SyncLogPatterns.blockedAccess(in: message) else {

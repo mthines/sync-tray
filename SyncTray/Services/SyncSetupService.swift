@@ -2908,7 +2908,7 @@ enum SyncExcludeFilter {
                 - Photo Booth Library/**
                 """,
             mentionToken: "photo booth library",
-            matchesEntry: { $0.lastPathComponent == "Photo Booth Library" }
+            matchesEntry: { $0.lastPathComponent.caseInsensitiveCompare("Photo Booth Library") == .orderedSame }
         )
     }
 
