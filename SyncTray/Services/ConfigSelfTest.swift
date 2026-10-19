@@ -4041,8 +4041,18 @@ enum ConfigSelfTest {
         guard let cliSource = readSourceFile("CLI/SyncTrayCLI.swift"), !cliSource.contains("\"lsd\"") else {
             return report(name, slug, false, "(SyncTrayCLI.swift still references the old lsd probe)")
         }
-        guard cliSource.contains("!probe.reachable ? .fail : (probe.pathMissing ? .warn : .ok)") else {
-            return report(name, slug, false, "(doctor no longer reports a missing remote path as a warning)")
+        // End to end: a missing path is a doctor warning, never ok and never a failure.
+        let missingPathProfile = sampleProfile(isEnabled: false)
+        let missingPathEnv = fakeCLIEnvironment(
+            runRclone: { args, _ in args.first == "version" ? (0, "rclone v1.66.0", "") : (3, "", "") },
+            readProfiles: { [missingPathProfile] },
+            fileExists: { $0 == missingPathProfile.configPath },
+            schemaFilesPresent: { true }
+        )
+        let missingPathChecks = SyncTrayCLI.doctorChecks(env: missingPathEnv)
+        guard missingPathChecks.contains(where: { $0.status == .warn && $0.detail.hasPrefix("remote reachable, but path not found") }),
+              !missingPathChecks.contains(where: { $0.status == .fail }) else {
+            return report(name, slug, false, "(doctor did not report a missing path as a warning: \(missingPathChecks))")
         }
         return report(name, slug, true)
     }

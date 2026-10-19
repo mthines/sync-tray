@@ -42,7 +42,7 @@ These commands are read-only.
 | `synctray profiles`                        | One line per profile: name, short id, mode, `enabled=`, `remote=`. `profile list` is an alias.         |
 | `synctray profile show <name\|id>`         | The profile's full config as pretty JSON — the same shape as its `.profile.json`.                      |
 | `synctray logs <name\|id> [--follow]`      | Print the profile's sync log, or follow it like `tail -f`.                                             |
-| `synctray test-remote <name\|id>`          | Probe the profile's remote path with a hard timeout.                                                   |
+| `synctray test-remote <name\|id>`          | Probe the profile's remote path with a hard timeout. A path that doesn't exist yet prints `(path not found)`. |
 | `synctray listremotes`                     | Pass-through to `rclone listremotes`.                                                                  |
 | `synctray help`                            | Print the usage summary.                                                                               |
 
@@ -50,6 +50,7 @@ These commands are read-only.
 
 Prints one `[ok]`, `[warn]`, or `[fail]` line per check and exits `1` if any check failed.
 Warnings never fail the run.
+A remote that answers but has no folder at the profile's path is a warning (`remote reachable, but path not found: <path>`): normal before a Two-Way profile's first sync, and otherwise a sign of a typo in the remote path.
 
 ```console
 $ synctray doctor
