@@ -159,6 +159,7 @@ enum ConfigSelfTest {
             testMacOSBlockedAccessWiringPinned,
             testVolumeSystemFolderDefaultExclude,
             testMigrationV6VolumeSystemFolders,
+            testMigrationV7VolumeSystemFolderResync,
             testVolumeSystemFoldersRealRclone,
             testPermissionDeniedBlockedAccess,
             testTelemetryLockState,
@@ -7921,8 +7922,8 @@ enum ConfigSelfTest {
 
     // MARK: - AC-VS2 — migration v6 adds the rules to existing profiles, once
 
-    /// Every Two-Way and One-Way profile's filter gains the section; only a Two-Way profile with
-    /// a READABLE system folder at its root gets the resync marker; Stream profiles, missing
+    /// Every Two-Way and One-Way profile's filter gains the section; only a Two-Way profile whose
+    /// bisync listings hold a system folder gets the resync marker; Stream profiles, missing
     /// filters and complete filters are untouched; a second pass changes nothing.
     private static func testMigrationV6VolumeSystemFolders() -> Bool {
         let name = "AC-VS2", slug = "migration-v6-volume-system-folders"
@@ -7938,16 +7939,16 @@ enum ConfigSelfTest {
             let filter: String?
             var shortId: String { String(id.uuidString.prefix(8)).lowercased() }
         }
-        let readableRoot = "/tmp/synctray-selftest-vs2-readable-root"
+        let listedRoot = "/tmp/synctray-selftest-vs2-listed-root"
         let complete = SyncExcludeFilter.volumeSystemFoldersSection + "\n- .DS_Store\n"
         let fixtures: [String: Fixture] = [
-            "bisyncReadable": Fixture(syncMode: "bisync", localPath: readableRoot, filter: "- .DS_Store\n"),
-            "oneWayReadable": Fixture(syncMode: "sync", localPath: readableRoot, filter: "- .DS_Store\n"),
+            "bisyncListed": Fixture(syncMode: "bisync", localPath: listedRoot, filter: "- .DS_Store\n"),
+            "oneWayListed": Fixture(syncMode: "sync", localPath: listedRoot, filter: "- .DS_Store\n"),
             "bisyncPlain": Fixture(syncMode: "bisync", localPath: "/tmp/synctray-selftest-vs2-plain", filter: "- .DS_Store\n"),
-            "legacyNoMode": Fixture(syncMode: nil, localPath: readableRoot, filter: "- .DS_Store\n"),
-            "mount": Fixture(syncMode: "mount", localPath: readableRoot, filter: "- .DS_Store\n"),
-            "complete": Fixture(syncMode: "bisync", localPath: readableRoot, filter: complete),
-            "noFilter": Fixture(syncMode: "bisync", localPath: readableRoot, filter: nil),
+            "legacyNoMode": Fixture(syncMode: nil, localPath: listedRoot, filter: "- .DS_Store\n"),
+            "mount": Fixture(syncMode: "mount", localPath: listedRoot, filter: "- .DS_Store\n"),
+            "complete": Fixture(syncMode: "bisync", localPath: listedRoot, filter: complete),
+            "noFilter": Fixture(syncMode: "bisync", localPath: listedRoot, filter: nil),
         ]
         for fixture in fixtures.values {
             var dict: [String: Any] = ["id": fixture.id.uuidString, "name": "VS2", "localSyncPath": fixture.localPath]
@@ -7967,10 +7968,10 @@ enum ConfigSelfTest {
             fm.fileExists(atPath: "\(dir)/\(fixtures[key]!.shortId).resync-pending")
         }
 
-        let outcome = MigrationV6VolumeSystemFoldersExclude.addVolumeSystemFoldersExclude(in: dir) { $0 == readableRoot }
-        let updatedKeys = ["bisyncReadable", "oneWayReadable", "bisyncPlain", "legacyNoMode"]
+        let outcome = MigrationV6VolumeSystemFoldersExclude.addVolumeSystemFoldersExclude(in: dir) { $0 == listedRoot }
+        let updatedKeys = ["bisyncListed", "oneWayListed", "bisyncPlain", "legacyNoMode"]
         guard outcome.updated.sorted() == updatedKeys.map({ fixtures[$0]!.shortId }).sorted(),
-              outcome.resyncScheduled.sorted() == ["bisyncReadable", "legacyNoMode"].map({ fixtures[$0]!.shortId }).sorted(),
+              outcome.resyncScheduled.sorted() == ["bisyncListed", "legacyNoMode"].map({ fixtures[$0]!.shortId }).sorted(),
               outcome.failed.isEmpty else {
             return report(name, slug, false, "(unexpected outcome: \(outcome))")
         }
@@ -7980,8 +7981,8 @@ enum ConfigSelfTest {
                 return report(name, slug, false, "(\(key) filter did not gain the section above its own content)")
             }
         }
-        guard hasMarker("bisyncReadable"), hasMarker("legacyNoMode"),
-              !hasMarker("oneWayReadable"), !hasMarker("bisyncPlain"),
+        guard hasMarker("bisyncListed"), hasMarker("legacyNoMode"),
+              !hasMarker("oneWayListed"), !hasMarker("bisyncPlain"),
               filter("mount") == "- .DS_Store\n", !hasMarker("mount"),
               filter("complete") == complete, !hasMarker("complete"),
               filter("noFilter") == nil else {
@@ -7989,26 +7990,119 @@ enum ConfigSelfTest {
         }
 
         let filtersBefore = fixtures.keys.sorted().map { filter($0) }
-        let second = MigrationV6VolumeSystemFoldersExclude.addVolumeSystemFoldersExclude(in: dir) { $0 == readableRoot }
+        let second = MigrationV6VolumeSystemFoldersExclude.addVolumeSystemFoldersExclude(in: dir) { $0 == listedRoot }
         guard second == MigrationV6VolumeSystemFoldersExclude.Outcome(),
               fixtures.keys.sorted().map({ filter($0) }) == filtersBefore else {
             return report(name, slug, false, "(a second pass changed something)")
         }
 
-        // The real check: a readable system folder at the root counts, an unreadable one and a
-        // nested one don't (skipped as root, who can read anything).
-        let tree = "\(selfTestRoot)/vs2-tree"
-        try? fm.removeItem(atPath: tree)
-        try? fm.createDirectory(atPath: "\(tree)/readable/.TemporaryItems", withIntermediateDirectories: true)
-        try? fm.createDirectory(atPath: "\(tree)/unreadable/.Spotlight-V100", withIntermediateDirectories: true)
-        try? fm.createDirectory(atPath: "\(tree)/nested/sub/.Trashes", withIntermediateDirectories: true)
-        try? fm.setAttributes([.posixPermissions: 0o000], ofItemAtPath: "\(tree)/unreadable/.Spotlight-V100")
-        defer { try? fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: "\(tree)/unreadable/.Spotlight-V100") }
-        guard MigrationV6VolumeSystemFoldersExclude.containsReadableSystemFolder(at: "\(tree)/readable"),
-              getuid() == 0 || !MigrationV6VolumeSystemFoldersExclude.containsReadableSystemFolder(at: "\(tree)/unreadable"),
-              !MigrationV6VolumeSystemFoldersExclude.containsReadableSystemFolder(at: "\(tree)/nested"),
-              !MigrationV6VolumeSystemFoldersExclude.containsReadableSystemFolder(at: "\(tree)/missing") else {
-            return report(name, slug, false, "(containsReadableSystemFolder gave a wrong answer)")
+        // The real check reads bisync's listings: a listed system folder counts at any depth,
+        // under the raw or the `~`-expanded local path and in either listing; the user's own
+        // files, another profile's session, a `.lst-new` and a missing cache don't.
+        let work = "\(selfTestRoot)/vs2-bisync"
+        try? fm.removeItem(atPath: work)
+        try? fm.createDirectory(atPath: work, withIntermediateDirectories: true)
+        let header = "# bisync listing v1 from 2026-10-19T05:47:08.596618000+0000\n"
+        func listing(_ remote: String, _ local: String, _ side: String, _ paths: [String], suffix: String = "") {
+            let body = paths.map { "-       36 - - 2026-10-18T01:12:35.000000000+0000 \"\($0)\"" }.joined(separator: "\n")
+            let file = "\(work)/\(SyncSetupService.bisyncSessionName(remote: remote, localPath: local)).\(side).lst\(suffix)"
+            try? (header + body + "\n").write(toFile: file, atomically: true, encoding: .utf8)
+        }
+        let tildeLocal = "~/SelfTestVS2 Drive"
+        listing("nas:Kaiju", "/Volumes/Kaiju", "path1", ["Config/a.zip", ".fseventsd/fseventsd-uuid"])
+        listing("nas:Kaiju", "/Volumes/Kaiju", "path2", ["Config/a.zip"])
+        listing("nas:Nested", "/Volumes/Nested", "path2", ["Projects/disk/.Trashes/501/x"])
+        listing("nas:Tilde", (tildeLocal as NSString).expandingTildeInPath, "path1", [".Spotlight-V100/Store-V2/x"])
+        listing("nas:Plain", "/Volumes/Plain", "path1", ["Config/a.zip", "notes/.fseventsd-like.txt"])
+        listing("nas:Partial", "/Volumes/Partial", "path1", [".TemporaryItems/x"], suffix: "-new")
+        listing("nas:Other", "/Volumes/Other Drive", "path1", [".fseventsd/x"])
+        guard VolumeSystemFolderListings.containSystemFolder(localPath: "/Volumes/Kaiju", workDir: work),
+              VolumeSystemFolderListings.containSystemFolder(localPath: "/Volumes/Kaiju/", workDir: work),
+              VolumeSystemFolderListings.containSystemFolder(localPath: "/Volumes/Nested", workDir: work),
+              VolumeSystemFolderListings.containSystemFolder(localPath: tildeLocal, workDir: work),
+              !VolumeSystemFolderListings.containSystemFolder(localPath: "/Volumes/Plain", workDir: work),
+              !VolumeSystemFolderListings.containSystemFolder(localPath: "/Volumes/Partial", workDir: work),
+              !VolumeSystemFolderListings.containSystemFolder(localPath: "/Volumes/Other", workDir: work),
+              !VolumeSystemFolderListings.containSystemFolder(localPath: "/Volumes/Missing", workDir: work),
+              !VolumeSystemFolderListings.containSystemFolder(localPath: "/Volumes/Kaiju", workDir: "\(work)/absent") else {
+            return report(name, slug, false, "(VolumeSystemFolderListings gave a wrong answer)")
+        }
+        guard VolumeSystemFolderListings.listedPath(in: header.dropLast()) == nil,
+              VolumeSystemFolderListings.listedPath(in: "") == nil,
+              VolumeSystemFolderListings.listedPath(in: "- 1 - - 2026 \"a b/c\"") == "a b/c" else {
+            return report(name, slug, false, "(listedPath parsed a line wrong)")
+        }
+        return report(name, slug, true)
+    }
+
+    // MARK: - AC-VS5 — migration v7 schedules the resync the first v6 missed, from the listings
+
+    /// After the first v6 (which looked at the drive, so missed an unplugged one): a Two-Way
+    /// profile whose filter has every volume rule, no marker, and listings that hold a system
+    /// folder gets a marker. A pending marker is kept as it is; a One-Way, Stream, unlisted or
+    /// not-yet-migrated profile gets none; a second pass changes nothing.
+    private static func testMigrationV7VolumeSystemFolderResync() -> Bool {
+        let name = "AC-VS5", slug = "migration-v7-volume-system-folder-resync"
+        let fm = FileManager.default
+        let dir = "\(selfTestRoot)/vs5"
+        try? fm.removeItem(atPath: dir)
+        try? fm.createDirectory(atPath: dir, withIntermediateDirectories: true)
+
+        struct Fixture {
+            let id = UUID()
+            let syncMode: String?
+            let localPath: String
+            let filter: String?
+            var marker: String? = nil
+            var shortId: String { String(id.uuidString.prefix(8)).lowercased() }
+        }
+        let listed = "/Volumes/SelfTestVS5Listed"
+        let migrated = SyncExcludeFilter.volumeSystemFoldersSection + "\n- .DS_Store\n"
+        let fixtures: [String: Fixture] = [
+            "unpluggedAtV6": Fixture(syncMode: "bisync", localPath: listed, filter: migrated),
+            "legacyNoMode": Fixture(syncMode: nil, localPath: listed, filter: migrated),
+            "pending": Fixture(syncMode: "bisync", localPath: listed, filter: migrated, marker: "include-edit-token"),
+            "notListed": Fixture(syncMode: "bisync", localPath: "/Volumes/SelfTestVS5Plain", filter: migrated),
+            "oneWay": Fixture(syncMode: "sync", localPath: listed, filter: migrated),
+            "mount": Fixture(syncMode: "mount", localPath: listed, filter: migrated),
+            "notMigrated": Fixture(syncMode: "bisync", localPath: listed, filter: "- .DS_Store\n"),
+            "noFilter": Fixture(syncMode: "bisync", localPath: listed, filter: nil),
+        ]
+        func markerPath(_ key: String) -> String { "\(dir)/\(fixtures[key]!.shortId).resync-pending" }
+        for fixture in fixtures.values {
+            var dict: [String: Any] = ["id": fixture.id.uuidString, "name": "VS5", "localSyncPath": fixture.localPath]
+            if let mode = fixture.syncMode { dict["syncMode"] = mode }
+            guard let data = try? JSONSerialization.data(withJSONObject: dict),
+                  (try? data.write(to: URL(fileURLWithPath: "\(dir)/\(fixture.shortId).profile.json"))) != nil else {
+                return report(name, slug, false, "(failed to seed a profile file)")
+            }
+            if let filter = fixture.filter {
+                try? filter.write(toFile: "\(dir)/\(fixture.shortId)-exclude.txt", atomically: true, encoding: .utf8)
+            }
+            if let marker = fixture.marker {
+                try? marker.write(toFile: "\(dir)/\(fixture.shortId).resync-pending", atomically: true, encoding: .utf8)
+            }
+        }
+        let filtersBefore = fixtures.keys.sorted().map { try? String(contentsOfFile: "\(dir)/\(fixtures[$0]!.shortId)-exclude.txt", encoding: .utf8) }
+
+        let outcome = MigrationV7VolumeSystemFolderResyncFromListings.scheduleResyncs(in: dir) { $0 == listed }
+        guard outcome.resyncScheduled.sorted() == ["unpluggedAtV6", "legacyNoMode"].map({ fixtures[$0]!.shortId }).sorted(),
+              outcome.failed.isEmpty else {
+            return report(name, slug, false, "(unexpected outcome: \(outcome))")
+        }
+        guard fm.fileExists(atPath: markerPath("unpluggedAtV6")), fm.fileExists(atPath: markerPath("legacyNoMode")),
+              (try? String(contentsOfFile: markerPath("pending"), encoding: .utf8)) == "include-edit-token",
+              ["notListed", "oneWay", "mount", "notMigrated", "noFilter"].allSatisfy({ !fm.fileExists(atPath: markerPath($0)) }) else {
+            return report(name, slug, false, "(a marker was written, kept or replaced for the wrong profile)")
+        }
+        guard fixtures.keys.sorted().map({ try? String(contentsOfFile: "\(dir)/\(fixtures[$0]!.shortId)-exclude.txt", encoding: .utf8) }) == filtersBefore else {
+            return report(name, slug, false, "(v7 edited a filter)")
+        }
+        let tokenBefore = try? String(contentsOfFile: markerPath("unpluggedAtV6"), encoding: .utf8)
+        let second = MigrationV7VolumeSystemFolderResyncFromListings.scheduleResyncs(in: dir) { $0 == listed }
+        guard second == MigrationV7VolumeSystemFolderResyncFromListings.Outcome(),
+              (try? String(contentsOfFile: markerPath("unpluggedAtV6"), encoding: .utf8)) == tokenBefore else {
+            return report(name, slug, false, "(a second pass changed something)")
         }
         return report(name, slug, true)
     }

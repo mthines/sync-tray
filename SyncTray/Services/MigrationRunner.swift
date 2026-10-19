@@ -48,6 +48,7 @@ enum MigrationRunner {
         MigrationV4Retired(),
         MigrationV5PhotosLibraryExclude(),
         MigrationV6VolumeSystemFoldersExclude(),
+        MigrationV7VolumeSystemFolderResyncFromListings(),
     ]
 
     /// Run all pending migrations. Call this once at app startup,
@@ -526,11 +527,10 @@ struct MigrationV5PhotosLibraryExclude: ProfileMigration {
 /// Same per-profile rules as v5 (raw `{shortId}.profile.json`, before `ProfileStore` loads):
 /// Stream profiles and missing or unreadable filters are skipped, a filter that already has
 /// every rule is left as it is, and failures are logged, never thrown. A Two-Way profile gets
-/// the resync-pending marker (filter first, rolled back if the marker fails) only when one of
-/// the folders exists at its local root AND is readable: only then can a past run have synced
-/// it into bisync's listings, where excluding it now would count as deletions. An unreadable
-/// one never reached the listings — every run that tried to list it failed — so it needs no
-/// resync (and a profile failing on it already resyncs on its own if an include edit queued one).
+/// the resync-pending marker (filter first, rolled back if the marker fails) only when bisync's
+/// own listings hold one of the folders (`VolumeSystemFolderListings`): only then does excluding
+/// it now count as deletions. The listings live in `~/Library/Caches`, so the answer doesn't
+/// depend on whether the profile's drive is plugged in at upgrade.
 struct MigrationV6VolumeSystemFoldersExclude: ProfileMigration {
     let version = 6
     let description = "Exclude macOS volume system folders (.Spotlight-V100, .Trashes, …) from existing Two-Way and One-Way profiles"
@@ -555,13 +555,13 @@ struct MigrationV6VolumeSystemFoldersExclude: ProfileMigration {
     }
 
     /// Apply the migration to every `*.profile.json` in `directory`. Idempotent.
-    /// - Parameter hasReadableSystemFolder: whether a local sync folder holds a readable volume
-    ///   system folder at its root; injectable so `ConfigSelfTest` doesn't depend on the
-    ///   machine's real volumes.
+    /// - Parameter listsSystemFolder: whether bisync's listings for a local sync folder hold a
+    ///   volume system folder; injectable so `ConfigSelfTest` doesn't depend on the machine's
+    ///   real bisync cache.
     @discardableResult
     static func addVolumeSystemFoldersExclude(
         in directory: String,
-        hasReadableSystemFolder: (String) -> Bool = { MigrationV6VolumeSystemFoldersExclude.containsReadableSystemFolder(at: $0) }
+        listsSystemFolder: (String) -> Bool = { VolumeSystemFolderListings.containSystemFolder(localPath: $0) }
     ) -> Outcome {
         var outcome = Outcome()
         let fm = FileManager.default
@@ -592,8 +592,7 @@ struct MigrationV6VolumeSystemFoldersExclude: ProfileMigration {
             }
 
             let localPath = (dict["localSyncPath"] as? String) ?? ""
-            if syncMode == SyncMode.bisync.rawValue, !localPath.isEmpty,
-               hasReadableSystemFolder((localPath as NSString).expandingTildeInPath) {
+            if syncMode == SyncMode.bisync.rawValue, !localPath.isEmpty, listsSystemFolder(localPath) {
                 let markerPath = (directory as NSString).appendingPathComponent("\(shortId).resync-pending")
                 do {
                     try UUID().uuidString.write(toFile: markerPath, atomically: true, encoding: .utf8)
@@ -609,17 +608,122 @@ struct MigrationV6VolumeSystemFoldersExclude: ProfileMigration {
         }
         return outcome
     }
+}
 
-    /// Whether `root` has one of `SyncExcludeFilter.volumeSystemFolderNames` directly inside it
-    /// that the current user can list. Only the root is checked: that is where macOS creates
-    /// them. A missing drive or an unreadable root counts as "no".
-    static func containsReadableSystemFolder(at root: String) -> Bool {
-        let fm = FileManager.default
-        return SyncExcludeFilter.volumeSystemFolderNames.contains { name in
-            let path = (root as NSString).appendingPathComponent(name)
-            var isDirectory: ObjCBool = false
-            return fm.fileExists(atPath: path, isDirectory: &isDirectory) && isDirectory.boolValue
-                && fm.isReadableFile(atPath: path)
+// MARK: - Bisync listings: did a past run sync a volume system folder?
+
+/// Reads rclone bisync's listing files (`<session>.path1.lst` / `.path2.lst` in
+/// `SyncSetupService.bisyncWorkDir`) to tell whether a profile's last successful two-way sync
+/// included one of `SyncExcludeFilter.volumeSystemFolderNames`. That is the exact condition
+/// under which the new excludes need a resync: a listed system folder that the filter now drops
+/// counts as deleted on both sides, and enough of them stop every run at `--max-delete`.
+///
+/// Why the listings and not the folder on disk: the listings sit in `~/Library/Caches`, so they
+/// answer even while the profile's external drive is unplugged, and they never claim a folder
+/// that "Sync Only These Folders" or a hand-written rule kept out of the sync.
+enum VolumeSystemFolderListings {
+    /// Whether any listing whose session ends in this local folder lists a path with a volume
+    /// system folder as one of its components. Every session is checked — the primary's and a
+    /// fallback's full-swap session share the local half of the name. The rules are unanchored,
+    /// so a nested folder counts too. A missing or unreadable cache counts as "no".
+    static func containSystemFolder(localPath: String, workDir: String = SyncSetupService.bisyncWorkDir) -> Bool {
+        let locals = Set([localPath, (localPath as NSString).expandingTildeInPath])
+            .map { ".." + SyncSetupService.canonicalBisyncPath($0) }
+        guard let names = try? FileManager.default.contentsOfDirectory(atPath: workDir) else { return false }
+        let listings = names.filter { name in
+            locals.contains { name.hasSuffix($0 + ".path1.lst") || name.hasSuffix($0 + ".path2.lst") }
         }
+        return listings.contains { name in
+            guard let text = try? String(contentsOfFile: (workDir as NSString).appendingPathComponent(name), encoding: .utf8) else {
+                return false
+            }
+            return text.split(separator: "\n").contains { line in
+                guard let path = listedPath(in: line) else { return false }
+                return path.split(separator: "/").contains { SyncExcludeFilter.volumeSystemFolderNames.contains(String($0)) }
+            }
+        }
+    }
+
+    /// The quoted path at the end of a listing line
+    /// (`- 36 - - 2026-10-18T01:12:35.000000000+0000 ".fseventsd/fseventsd-uuid"`), or nil for
+    /// the `#` header and blank lines.
+    static func listedPath<S: StringProtocol>(in line: S) -> String? {
+        guard !line.hasPrefix("#"), let first = line.firstIndex(of: "\""), let last = line.lastIndex(of: "\""),
+              first < last else { return nil }
+        return String(line[line.index(after: first)..<last])
+    }
+}
+
+// MARK: - Migration V7: schedule the resync v6 decided from the drive instead of the listings
+
+/// The first release of v6 decided the resync from the drive: a readable system folder at the
+/// local root. So a profile whose external drive was unplugged at upgrade got the new excludes
+/// but no resync, though its listings still hold the folders — once they outnumber the user's
+/// own files, every run stops at `--max-delete`. v6 now reads the listings; this re-runs that
+/// decision once for installs that already ran the first v6.
+///
+/// For every Two-Way profile whose filter already carries all the volume-system-folder rules
+/// and that has no resync-pending marker, it writes one when `VolumeSystemFolderListings` finds
+/// a listed system folder. It never edits a filter. A marker already present (from v6, an include
+/// edit or v5) is left alone, and after a run has synced under the new rules the listings no
+/// longer hold the folders, so nothing is scheduled twice.
+struct MigrationV7VolumeSystemFolderResyncFromListings: ProfileMigration {
+    let version = 7
+    let description = "Schedule the resync the volume-system-folder excludes need, from bisync's listings"
+
+    /// Overridable for self-test isolation; defaults to the real profiles directory.
+    var profilesDirectoryOverride: String?
+
+    private var profilesDirectory: String { profilesDirectoryOverride ?? SyncProfile.configDirectory }
+
+    func migrateUserDefaults(_ defaults: UserDefaults) throws {
+        let outcome = Self.scheduleResyncs(in: profilesDirectory)
+        print("[SyncTray] Migration v7: scheduled \(outcome.resyncScheduled.count) volume-system-folder resync(s), "
+            + "\(outcome.failed.count) failure(s)")
+    }
+
+    struct Outcome: Equatable {
+        var resyncScheduled: [String] = []
+        var failed: [String] = []
+    }
+
+    /// Apply the migration to every `*.profile.json` in `directory`. Idempotent.
+    @discardableResult
+    static func scheduleResyncs(
+        in directory: String,
+        listsSystemFolder: (String) -> Bool = { VolumeSystemFolderListings.containSystemFolder(localPath: $0) }
+    ) -> Outcome {
+        var outcome = Outcome()
+        let fm = FileManager.default
+        guard let files = try? fm.contentsOfDirectory(atPath: directory) else { return outcome }
+
+        for file in files.sorted() where file.hasSuffix(".profile.json") {
+            let profilePath = (directory as NSString).appendingPathComponent(file)
+            guard let data = fm.contents(atPath: profilePath),
+                  let dict = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+                  let idString = dict["id"] as? String, !idString.isEmpty else { continue }
+
+            // Same derivation as `SyncProfile.shortId`; a missing `syncMode` decodes as bisync.
+            let shortId = String(idString.prefix(8)).lowercased()
+            let syncMode = (dict["syncMode"] as? String) ?? SyncMode.bisync.rawValue
+            let localPath = (dict["localSyncPath"] as? String) ?? ""
+            guard syncMode == SyncMode.bisync.rawValue, !localPath.isEmpty else { continue }
+
+            let filterPath = (directory as NSString).appendingPathComponent("\(shortId)-exclude.txt")
+            let markerPath = (directory as NSString).appendingPathComponent("\(shortId).resync-pending")
+            guard !fm.fileExists(atPath: markerPath),
+                  let filter = try? String(contentsOfFile: filterPath, encoding: .utf8),
+                  SyncExcludeFilter.addingVolumeSystemFolderDefaults(to: filter) == nil,
+                  listsSystemFolder(localPath) else { continue }
+
+            do {
+                try UUID().uuidString.write(toFile: markerPath, atomically: true, encoding: .utf8)
+                outcome.resyncScheduled.append(shortId)
+            } catch {
+                SyncTraySettings.debugLog("[MigrationV7] could not schedule a resync for \(shortId): \(error.localizedDescription)")
+                outcome.failed.append(shortId)
+            }
+        }
+        return outcome
     }
 }

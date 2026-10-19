@@ -1183,10 +1183,21 @@ Covered by `ConfigSelfTest` AC-PL2.
 `MigrationV6VolumeSystemFoldersExclude` adds `SyncExcludeFilter.volumeSystemFoldersSection` to
 every existing Two-Way and One-Way filter with the same placement, skips and failure handling
 as v5 (`addingVolumeSystemFolderDefaults` returns nil once every rule is present). It writes the
-resync-pending marker only for a Two-Way profile with one of the folders at its local root that
-the user can READ (`containsReadableSystemFolder`): only such a folder can be in bisync's
-listings, where excluding it would count as deletions. An unreadable one never reached them —
-every run that tried to list it failed. Covered by `ConfigSelfTest` AC-VS2.
+resync-pending marker only for a Two-Way profile whose bisync listings hold one of the folders
+(`VolumeSystemFolderListings.containSystemFolder`: any component of a path in a `.path1.lst` /
+`.path2.lst` of any session whose local half is this profile's folder): only then does excluding
+it count as deletions. The listings sit in `~/Library/Caches`, so the decision doesn't depend on
+the drive being plugged in at upgrade, and a folder "Sync Only These Folders" kept out of the
+sync is never resynced for. Covered by `ConfigSelfTest` AC-VS2.
+
+**Migration v7 — the resync the first v6 missed.** v6 first shipped (v0.122.0) deciding the
+resync from the drive instead (a readable system folder at the local root), so a Two-Way
+profile whose drive was unplugged at upgrade got the excludes but no marker.
+`MigrationV7VolumeSystemFolderResyncFromListings` re-runs the listing decision once: for every
+Two-Way profile whose filter has all the volume rules and no resync-pending marker, it writes one
+when the listings hold a system folder. It never edits a filter and never replaces a marker; once
+a run has synced under the new rules the listings no longer hold the folders, so it can't
+schedule a second resync. Covered by `ConfigSelfTest` AC-VS5.
 
 **Migration.** `MigrationV3BlobToPerProfileFiles` (`MigrationRunner.swift`)
 moves the legacy `syncProfiles` UserDefaults blob to per-profile files on
