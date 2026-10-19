@@ -218,13 +218,16 @@ enum AppSettingsFileStore {
 
     /// The keys whose valid value in `file` differs from what the app last wrote
     /// (`snapshot`) — the edits made outside the app since then (a hand edit, or
-    /// the CLI's merge write). Launch applies only these, so a value the app
-    /// changed without rewriting the file (the telemetry banner) is never
+    /// the CLI's merge write). Launch and the live watcher path
+    /// (`SyncManager.applyExternalSettingsEdit`) apply only these, so a value the
+    /// app changed without rewriting the file (the telemetry banner) is never
     /// reverted by the stale file. Values compare normalized (`Bool` for a
     /// `SafeKey`, `StringKey.normalize` for a `StringKey`); a key missing from
     /// the snapshot counts as changed, an invalid file value never does. A nil
     /// snapshot (the app has never written the file, e.g. the first launch after
     /// an upgrade) changes nothing: the app's own settings stay authoritative.
+    /// The live path passes an empty snapshot instead of nil, so there every
+    /// valid key counts as changed and a hand edit is never ignored.
     static func keysChangedSinceLastWrite(file: [String: Any], snapshot: [String: Any]?) -> Set<String> {
         guard let snapshot else { return [] }
         var changed: Set<String> = []

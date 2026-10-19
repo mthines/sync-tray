@@ -1165,11 +1165,23 @@ final class SyncManager: ObservableObject {
         startWarm(for: profileId, dirs: dirs, trigger: trigger)
     }
 
-    /// Apply an external edit to `settings.json`. Safe keys apply directly;
-    /// `launchAtLogin` goes through `SettingsReconciler`'s ISOLATED path so an
-    /// `SMAppService` failure can never corrupt anything else.
+    /// Apply an external edit to `settings.json` — only the keys changed since the
+    /// app last wrote the file (`keysChangedSinceLastWrite`, the same filter launch
+    /// uses), so a stale neighbour key the CLI's merge write carries along never
+    /// reverts a value the app changed without rewriting the file (the telemetry
+    /// banner, a login item toggled in System Settings). With no snapshot (the
+    /// launch write failed) every valid key counts as changed, so a hand edit is
+    /// never ignored. Safe keys apply directly; `launchAtLogin` goes through
+    /// `SettingsReconciler`'s ISOLATED path so an `SMAppService` failure can never
+    /// corrupt anything else. The file and snapshot are then rewritten to match
+    /// (a self-noted write, so the watcher ignores it).
     func applyExternalSettingsEdit() {
-        applySettingsFile(includeLoginItem: true)
+        let changed = AppSettingsFileStore.keysChangedSinceLastWrite(
+            file: AppSettingsFileStore.readSettingsFileJSON() ?? [:],
+            snapshot: AppSettingsFileStore.lastWrittenSnapshot() ?? [:]
+        )
+        applySettingsFile(includeLoginItem: true, onlyKeys: changed)
+        refreshSettingsFile()
         TelemetryService.shared.recordExternalConfigEdit(kind: "settings")
     }
 

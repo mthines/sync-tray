@@ -3983,6 +3983,12 @@ enum ConfigSelfTest {
               !managerSource[decideAt.upperBound..<rewriteAt.lowerBound].contains("func ") else {
             return report(name, slug, false, "(launch doesn't apply the outside-the-app changes in settings.json before rewriting it)")
         }
+        // The live watcher path uses the same filter, then rewrites the file and snapshot.
+        guard let liveBody = extractFunctionBody(startingAt: "func applyExternalSettingsEdit()", in: managerSource),
+              liveBody.contains("keysChangedSinceLastWrite("),
+              liveBody.contains("refreshSettingsFile()") else {
+            return report(name, slug, false, "(applyExternalSettingsEdit doesn't apply only the outside-the-app changes, then rewrite settings.json)")
+        }
 
         return report(name, slug, true)
     }
