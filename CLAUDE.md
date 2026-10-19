@@ -1184,9 +1184,11 @@ Covered by `ConfigSelfTest` AC-PL2.
 every existing Two-Way and One-Way filter with the same placement, skips and failure handling
 as v5 (`addingVolumeSystemFolderDefaults` returns nil once every rule is present). It writes the
 resync-pending marker only for a Two-Way profile whose bisync listings hold one of the folders
-(`VolumeSystemFolderListings.containSystemFolder`: any component of a path in a `.path1.lst` /
-`.path2.lst` of any session whose local half is this profile's folder): only then does excluding
-it count as deletions. The listings sit in `~/Library/Caches`, so the decision doesn't depend on
+(`VolumeSystemFolderListings.containSystemFolder`: any component of a path in the `.path1.lst` /
+`.path2.lst` of exactly the sessions the sync script's `REQUIRED_SESSIONS` runs — the primary,
+plus the fallback's own when it swaps the whole remote — so a leftover session from an old
+fallback, or another folder with the same canonical name, never counts): only then does
+excluding it count as deletions. The listings sit in `~/Library/Caches`, so the decision doesn't depend on
 the drive being plugged in at upgrade, and a folder "Sync Only These Folders" kept out of the
 sync is never resynced for. Covered by `ConfigSelfTest` AC-VS2.
 

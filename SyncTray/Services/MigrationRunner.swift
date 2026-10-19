@@ -555,13 +555,13 @@ struct MigrationV6VolumeSystemFoldersExclude: ProfileMigration {
     }
 
     /// Apply the migration to every `*.profile.json` in `directory`. Idempotent.
-    /// - Parameter listsSystemFolder: whether bisync's listings for a local sync folder hold a
-    ///   volume system folder; injectable so `ConfigSelfTest` doesn't depend on the machine's
-    ///   real bisync cache.
+    /// - Parameter listsSystemFolder: whether bisync's listings for a raw profile hold a volume
+    ///   system folder; injectable so `ConfigSelfTest` doesn't depend on the machine's real
+    ///   bisync cache.
     @discardableResult
     static func addVolumeSystemFoldersExclude(
         in directory: String,
-        listsSystemFolder: (String) -> Bool = { VolumeSystemFolderListings.containSystemFolder(localPath: $0) }
+        listsSystemFolder: ([String: Any]) -> Bool = { VolumeSystemFolderListings.containSystemFolder(profile: $0) }
     ) -> Outcome {
         var outcome = Outcome()
         let fm = FileManager.default
@@ -592,7 +592,7 @@ struct MigrationV6VolumeSystemFoldersExclude: ProfileMigration {
             }
 
             let localPath = (dict["localSyncPath"] as? String) ?? ""
-            if syncMode == SyncMode.bisync.rawValue, !localPath.isEmpty, listsSystemFolder(localPath) {
+            if syncMode == SyncMode.bisync.rawValue, !localPath.isEmpty, listsSystemFolder(dict) {
                 let markerPath = (directory as NSString).appendingPathComponent("\(shortId).resync-pending")
                 do {
                     try UUID().uuidString.write(toFile: markerPath, atomically: true, encoding: .utf8)
@@ -622,26 +622,52 @@ struct MigrationV6VolumeSystemFoldersExclude: ProfileMigration {
 /// answer even while the profile's external drive is unplugged, and they never claim a folder
 /// that "Sync Only These Folders" or a hand-written rule kept out of the sync.
 enum VolumeSystemFolderListings {
-    /// Whether any listing whose session ends in this local folder lists a path with a volume
-    /// system folder as one of its components. Every session is checked — the primary's and a
-    /// fallback's full-swap session share the local half of the name. The rules are unanchored,
-    /// so a nested folder counts too. A missing or unreadable cache counts as "no".
-    static func containSystemFolder(localPath: String, workDir: String = SyncSetupService.bisyncWorkDir) -> Bool {
-        let locals = Set([localPath, (localPath as NSString).expandingTildeInPath])
-            .map { ".." + SyncSetupService.canonicalBisyncPath($0) }
-        guard let names = try? FileManager.default.contentsOfDirectory(atPath: workDir) else { return false }
-        let listings = names.filter { name in
-            locals.contains { name.hasSuffix($0 + ".path1.lst") || name.hasSuffix($0 + ".path2.lst") }
-        }
-        return listings.contains { name in
-            guard let text = try? String(contentsOfFile: (workDir as NSString).appendingPathComponent(name), encoding: .utf8) else {
-                return false
-            }
-            return text.split(separator: "\n").contains { line in
-                guard let path = listedPath(in: line) else { return false }
-                return path.split(separator: "/").contains { SyncExcludeFilter.volumeSystemFolderNames.contains(String($0)) }
+    /// Whether the listings of any session the sync script would run for this raw
+    /// `{shortId}.profile.json` list a path with a volume system folder as one of its
+    /// components (the rules are unanchored, so a nested folder counts). Only those exact
+    /// sessions are read: a leftover session from an old fallback, or another folder whose
+    /// canonical name happens to match, never counts. A missing or unreadable cache is "no".
+    static func containSystemFolder(profile: [String: Any], workDir: String = SyncSetupService.bisyncWorkDir) -> Bool {
+        sessionNames(profile: profile).contains { session in
+            ["path1", "path2"].contains { side in
+                let file = (workDir as NSString).appendingPathComponent("\(session).\(side).lst")
+                guard let text = try? String(contentsOfFile: file, encoding: .utf8) else { return false }
+                return text.split(separator: "\n").contains { line in
+                    guard let path = listedPath(in: line) else { return false }
+                    return path.split(separator: "/").contains { SyncExcludeFilter.volumeSystemFolderNames.contains(String($0)) }
+                }
             }
         }
+    }
+
+    /// The bisync sessions the sync script's `REQUIRED_SESSIONS` holds for this profile: the
+    /// primary (`remote` = `SyncProfile.fullRemotePath`), plus the fallback's own session when
+    /// the fallback swaps the whole remote reference (a fallback path is set, or it needs a cache
+    /// rebuild) — the same condition and the same `${FALLBACK_REMOTE}:${FALLBACK_PATH:-$REMOTE_PATH}`
+    /// reference. Each is named for both the stored and the `~`-expanded local folder.
+    static func sessionNames(profile: [String: Any]) -> [String] {
+        let localPath = (profile["localSyncPath"] as? String) ?? ""
+        let rcloneRemote = (profile["rcloneRemote"] as? String) ?? ""
+        let remotePath = (profile["remotePath"] as? String) ?? ""
+        guard !localPath.isEmpty, !rcloneRemote.isEmpty else { return [] }
+        let base = rcloneRemote.hasSuffix(":") ? String(rcloneRemote.dropLast()) : rcloneRemote
+        var remotes = [remotePath.isEmpty ? "\(base):" : "\(base):\(remotePath)"]
+
+        let fallbackRemote = (profile["fallbackRemote"] as? String) ?? ""
+        let fallbackPath = (profile["fallbackRemotePath"] as? String) ?? ""
+        let rebuild = (profile["fallbackRequiresCacheRebuild"] as? Bool) ?? false
+        if !fallbackRemote.isEmpty, !fallbackPath.isEmpty || rebuild {
+            remotes.append("\(fallbackRemote):\(fallbackPath.isEmpty ? remotePath : fallbackPath)")
+        }
+        let locals = [localPath, (localPath as NSString).expandingTildeInPath]
+        var names: [String] = []
+        for remote in remotes {
+            for local in locals {
+                let name = SyncSetupService.bisyncSessionName(remote: remote, localPath: local)
+                if !names.contains(name) { names.append(name) }
+            }
+        }
+        return names
     }
 
     /// The quoted path at the end of a listing line
@@ -691,7 +717,7 @@ struct MigrationV7VolumeSystemFolderResyncFromListings: ProfileMigration {
     @discardableResult
     static func scheduleResyncs(
         in directory: String,
-        listsSystemFolder: (String) -> Bool = { VolumeSystemFolderListings.containSystemFolder(localPath: $0) }
+        listsSystemFolder: ([String: Any]) -> Bool = { VolumeSystemFolderListings.containSystemFolder(profile: $0) }
     ) -> Outcome {
         var outcome = Outcome()
         let fm = FileManager.default
@@ -714,7 +740,7 @@ struct MigrationV7VolumeSystemFolderResyncFromListings: ProfileMigration {
             guard !fm.fileExists(atPath: markerPath),
                   let filter = try? String(contentsOfFile: filterPath, encoding: .utf8),
                   SyncExcludeFilter.addingVolumeSystemFolderDefaults(to: filter) == nil,
-                  listsSystemFolder(localPath) else { continue }
+                  listsSystemFolder(dict) else { continue }
 
             do {
                 try UUID().uuidString.write(toFile: markerPath, atomically: true, encoding: .utf8)

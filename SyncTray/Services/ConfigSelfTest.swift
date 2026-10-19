@@ -7968,7 +7968,7 @@ enum ConfigSelfTest {
             fm.fileExists(atPath: "\(dir)/\(fixtures[key]!.shortId).resync-pending")
         }
 
-        let outcome = MigrationV6VolumeSystemFoldersExclude.addVolumeSystemFoldersExclude(in: dir) { $0 == listedRoot }
+        let outcome = MigrationV6VolumeSystemFoldersExclude.addVolumeSystemFoldersExclude(in: dir) { ($0["localSyncPath"] as? String) == listedRoot }
         let updatedKeys = ["bisyncListed", "oneWayListed", "bisyncPlain", "legacyNoMode"]
         guard outcome.updated.sorted() == updatedKeys.map({ fixtures[$0]!.shortId }).sorted(),
               outcome.resyncScheduled.sorted() == ["bisyncListed", "legacyNoMode"].map({ fixtures[$0]!.shortId }).sorted(),
@@ -7990,15 +7990,18 @@ enum ConfigSelfTest {
         }
 
         let filtersBefore = fixtures.keys.sorted().map { filter($0) }
-        let second = MigrationV6VolumeSystemFoldersExclude.addVolumeSystemFoldersExclude(in: dir) { $0 == listedRoot }
+        let second = MigrationV6VolumeSystemFoldersExclude.addVolumeSystemFoldersExclude(in: dir) { ($0["localSyncPath"] as? String) == listedRoot }
         guard second == MigrationV6VolumeSystemFoldersExclude.Outcome(),
               fixtures.keys.sorted().map({ filter($0) }) == filtersBefore else {
             return report(name, slug, false, "(a second pass changed something)")
         }
 
-        // The real check reads bisync's listings: a listed system folder counts at any depth,
-        // under the raw or the `~`-expanded local path and in either listing; the user's own
-        // files, another profile's session, a `.lst-new` and a missing cache don't.
+        // The real check reads the listings of exactly the sessions the sync script runs: the
+        // primary, and a fallback's own session only when it swaps the whole remote. A listed
+        // system folder counts at any depth, in either listing, under the stored or the
+        // `~`-expanded folder. A leftover session, a transport-override fallback's (it shares the
+        // primary's), another folder with the same canonical name, a `.lst-new` and a missing
+        // cache don't.
         let work = "\(selfTestRoot)/vs2-bisync"
         try? fm.removeItem(atPath: work)
         try? fm.createDirectory(atPath: work, withIntermediateDirectories: true)
@@ -8008,6 +8011,9 @@ enum ConfigSelfTest {
             let file = "\(work)/\(SyncSetupService.bisyncSessionName(remote: remote, localPath: local)).\(side).lst\(suffix)"
             try? (header + body + "\n").write(toFile: file, atomically: true, encoding: .utf8)
         }
+        func lists(_ profile: [String: Any]) -> Bool {
+            VolumeSystemFolderListings.containSystemFolder(profile: profile, workDir: work)
+        }
         let tildeLocal = "~/SelfTestVS2 Drive"
         listing("nas:Kaiju", "/Volumes/Kaiju", "path1", ["Config/a.zip", ".fseventsd/fseventsd-uuid"])
         listing("nas:Kaiju", "/Volumes/Kaiju", "path2", ["Config/a.zip"])
@@ -8015,17 +8021,33 @@ enum ConfigSelfTest {
         listing("nas:Tilde", (tildeLocal as NSString).expandingTildeInPath, "path1", [".Spotlight-V100/Store-V2/x"])
         listing("nas:Plain", "/Volumes/Plain", "path1", ["Config/a.zip", "notes/.fseventsd-like.txt"])
         listing("nas:Partial", "/Volumes/Partial", "path1", [".TemporaryItems/x"], suffix: "-new")
-        listing("nas:Other", "/Volumes/Other Drive", "path1", [".fseventsd/x"])
-        guard VolumeSystemFolderListings.containSystemFolder(localPath: "/Volumes/Kaiju", workDir: work),
-              VolumeSystemFolderListings.containSystemFolder(localPath: "/Volumes/Kaiju/", workDir: work),
-              VolumeSystemFolderListings.containSystemFolder(localPath: "/Volumes/Nested", workDir: work),
-              VolumeSystemFolderListings.containSystemFolder(localPath: tildeLocal, workDir: work),
-              !VolumeSystemFolderListings.containSystemFolder(localPath: "/Volumes/Plain", workDir: work),
-              !VolumeSystemFolderListings.containSystemFolder(localPath: "/Volumes/Partial", workDir: work),
-              !VolumeSystemFolderListings.containSystemFolder(localPath: "/Volumes/Other", workDir: work),
-              !VolumeSystemFolderListings.containSystemFolder(localPath: "/Volumes/Missing", workDir: work),
-              !VolumeSystemFolderListings.containSystemFolder(localPath: "/Volumes/Kaiju", workDir: "\(work)/absent") else {
+        // Plain's session is clean, but a session from a fallback it no longer has is not.
+        listing("old-sftp:Plain", "/Volumes/Plain", "path1", [".fseventsd/x"])
+        // `My Work` and `My_Work` canonicalize alike; only the remote half tells them apart.
+        listing("nas:Other", "/Volumes/My_Work", "path1", [".fseventsd/x"])
+        listing("sftp:Swap", "/Volumes/Swap", "path1", [".Trashes/x"])
+        guard lists(["rcloneRemote": "nas", "remotePath": "Kaiju", "localSyncPath": "/Volumes/Kaiju"]),
+              lists(["rcloneRemote": "nas:", "remotePath": "Kaiju", "localSyncPath": "/Volumes/Kaiju/"]),
+              lists(["rcloneRemote": "nas", "remotePath": "Nested", "localSyncPath": "/Volumes/Nested"]),
+              lists(["rcloneRemote": "nas", "remotePath": "Tilde", "localSyncPath": tildeLocal]),
+              !lists(["rcloneRemote": "nas", "remotePath": "Plain", "localSyncPath": "/Volumes/Plain"]),
+              !lists(["rcloneRemote": "nas", "remotePath": "Partial", "localSyncPath": "/Volumes/Partial"]),
+              !lists(["rcloneRemote": "nas", "remotePath": "Work", "localSyncPath": "/Volumes/My Work"]),
+              !lists(["rcloneRemote": "nas", "remotePath": "Missing", "localSyncPath": "/Volumes/Missing"]),
+              !lists(["rcloneRemote": "nas", "localSyncPath": ""]),
+              !VolumeSystemFolderListings.containSystemFolder(
+                  profile: ["rcloneRemote": "nas", "remotePath": "Kaiju", "localSyncPath": "/Volumes/Kaiju"],
+                  workDir: "\(work)/absent") else {
             return report(name, slug, false, "(VolumeSystemFolderListings gave a wrong answer)")
+        }
+        // The fallback's own session counts only when it swaps the whole remote reference.
+        let swap: [String: Any] = ["rcloneRemote": "nas", "remotePath": "Swap", "localSyncPath": "/Volumes/Swap", "fallbackRemote": "sftp"]
+        var swapByRebuild = swap; swapByRebuild["fallbackRequiresCacheRebuild"] = true
+        var swapByPath = swap; swapByPath["fallbackRemotePath"] = "Swap"
+        guard !lists(swap), lists(swapByRebuild), lists(swapByPath),
+              VolumeSystemFolderListings.sessionNames(profile: swap)
+                == [SyncSetupService.bisyncSessionName(remote: "nas:Swap", localPath: "/Volumes/Swap")] else {
+            return report(name, slug, false, "(the fallback session was counted under the wrong condition)")
         }
         guard VolumeSystemFolderListings.listedPath(in: header.dropLast()) == nil,
               VolumeSystemFolderListings.listedPath(in: "") == nil,
@@ -8085,7 +8107,7 @@ enum ConfigSelfTest {
         }
         let filtersBefore = fixtures.keys.sorted().map { try? String(contentsOfFile: "\(dir)/\(fixtures[$0]!.shortId)-exclude.txt", encoding: .utf8) }
 
-        let outcome = MigrationV7VolumeSystemFolderResyncFromListings.scheduleResyncs(in: dir) { $0 == listed }
+        let outcome = MigrationV7VolumeSystemFolderResyncFromListings.scheduleResyncs(in: dir) { ($0["localSyncPath"] as? String) == listed }
         guard outcome.resyncScheduled.sorted() == ["unpluggedAtV6", "legacyNoMode"].map({ fixtures[$0]!.shortId }).sorted(),
               outcome.failed.isEmpty else {
             return report(name, slug, false, "(unexpected outcome: \(outcome))")
@@ -8099,7 +8121,7 @@ enum ConfigSelfTest {
             return report(name, slug, false, "(v7 edited a filter)")
         }
         let tokenBefore = try? String(contentsOfFile: markerPath("unpluggedAtV6"), encoding: .utf8)
-        let second = MigrationV7VolumeSystemFolderResyncFromListings.scheduleResyncs(in: dir) { $0 == listed }
+        let second = MigrationV7VolumeSystemFolderResyncFromListings.scheduleResyncs(in: dir) { ($0["localSyncPath"] as? String) == listed }
         guard second == MigrationV7VolumeSystemFolderResyncFromListings.Outcome(),
               (try? String(contentsOfFile: markerPath("unpluggedAtV6"), encoding: .utf8)) == tokenBefore else {
             return report(name, slug, false, "(a second pass changed something)")
