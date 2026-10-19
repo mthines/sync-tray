@@ -7912,8 +7912,10 @@ enum ConfigSelfTest {
 
     /// Source pins: `.syncFailed` reports the run's first error (not rclone's closing notice)
     /// to telemetry; the error banner checks for a macOS block before the generic actions; the
-    /// Exclude action goes through the "Don't Sync" list rather than writing the filter itself;
-    /// and migration v5 is registered.
+    /// Exclude action only STAGES the pattern into the form's "Don't Sync" state (it calls
+    /// neither `updateSyncExcludePatterns` — retired — nor `triggerManualSync`, and never
+    /// writes the filter file directly: that happens on Save, via `filterSaveFollowUp` — plan
+    /// D9/D10); and migration v6 is registered after v5.
     private static func testMacOSBlockedAccessWiringPinned() -> Bool {
         let name = "AC-PL4", slug = "macos-blocked-access-wiring"
         guard let managerSource = readSourceFile("Services/SyncManager.swift"),
@@ -7930,14 +7932,14 @@ enum ConfigSelfTest {
               blocked.upperBound <= generic.lowerBound else {
             return report(name, slug, false, "(the error banner no longer offers the macOS-block actions first)")
         }
-        guard let excludeFn = extractFunctionBody(startingAt: "private func excludeBlockedPath()", in: viewSource),
-              excludeFn.contains("syncManager.updateSyncExcludePatterns("),
-              excludeFn.contains("syncManager.clearError(for: profile.id)"),
+        guard let excludeFn = extractFunctionBody(startingAt: "private func stageBlockedPathExclusion()", in: viewSource),
+              !excludeFn.contains("syncManager.updateSyncExcludePatterns("),
+              !excludeFn.contains("triggerManualSync"),
               !excludeFn.contains("writeExcludeFilter") else {
             return report(name, slug, false, "(Exclude from Sync bypasses the Don't Sync list)")
         }
-        guard migrationSource.contains("MigrationV4Retired(),\n        MigrationV5PhotosLibraryExclude(),") else {
-            return report(name, slug, false, "(migration v5 is not registered after v4)")
+        guard migrationSource.contains("MigrationV4Retired(),\n        MigrationV5PhotosLibraryExclude(),\n        MigrationV6PhotoBoothLibraryExclude(),") else {
+            return report(name, slug, false, "(migration v6 is not registered after v5)")
         }
         return report(name, slug, true)
     }

@@ -204,8 +204,9 @@ extension SyncManager {
     /// Decide whether an edit should rewrite the exclude filter file and, if so, invoke
     /// `write`. Pure decision + injected side effect (same idiom as
     /// `applyWarmReconcileIfNeeded`), so `ConfigSelfTest` covers the trigger with a spy. Both
-    /// the in-app editor (`updateSyncExcludePatterns`) and the external-edit watcher
-    /// (`applyExternalProfileEdit`) go through here, so they fire on the same conditions.
+    /// the in-app editor's Save path (`ProfileDetailView.applyFilterSaveAndFollowUp`) and the
+    /// external-edit watcher (`applyExternalProfileEdit`) go through here, so they fire on the
+    /// same conditions.
     nonisolated static func applySyncFilterReconcileIfNeeded(
         from current: SyncProfile,
         to updated: SyncProfile,
@@ -213,18 +214,6 @@ extension SyncManager {
     ) {
         guard syncFilterReconcileNeeded(from: current, to: updated) else { return }
         write(updated)
-    }
-
-    /// In-app "Don't Sync" edit: persist the new patterns, then rewrite the filter file
-    /// through the same gate an external edit uses. Applies from the next sync; no reinstall.
-    /// A failed write is recorded in `syncFilterErrors`, which the editor shows.
-    func updateSyncExcludePatterns(_ patterns: [String], for profileId: UUID) {
-        guard let current = profileStore.profile(for: profileId) else { return }
-        var updated = current
-        updated.syncExcludePatterns = patterns
-        guard updated != current else { return }
-        profileStore.update(updated)
-        applySyncFilterReconcile(from: current, to: updated)
     }
 
     /// Rewrite the filter file when an edit needs it (the `applySyncFilterReconcileIfNeeded`
@@ -245,9 +234,9 @@ extension SyncManager {
     }
 
     /// In-app "Sync Only These Folders" edit: persist the new folder list, then rewrite the
-    /// filter file through the same gate `updateSyncExcludePatterns` uses — a bisync profile
-    /// whose compiled rules actually change picks up the resync-pending marker there, never a
-    /// reinstall. Applies from the next sync.
+    /// filter file through the same `applySyncFilterReconcile` gate the staged "Don't Sync"
+    /// Save path uses — a bisync profile whose compiled rules actually change picks up the
+    /// resync-pending marker there, never a reinstall. Applies from the next sync.
     func updateSyncIncludeFolders(_ folders: [String], for profileId: UUID) {
         guard let current = profileStore.profile(for: profileId) else { return }
         var updated = current

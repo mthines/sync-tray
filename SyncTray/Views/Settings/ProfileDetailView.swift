@@ -3870,7 +3870,7 @@ struct ProfileDetailView: View {
             case .mountAnyway:
                 return "Mounting..."
             case .excludeBlockedPath:
-                return "Syncing..."
+                return "Adding to Don't Sync..."
             case .openPrivacySettings:
                 return "Opening..."
             }
@@ -3920,7 +3920,7 @@ struct ProfileDetailView: View {
             case .mountAnyway:
                 return "Enable mounting to non-empty folder and retry"
             case .excludeBlockedPath:
-                return "Add the blocked item to this profile's Don't Sync list, then sync again"
+                return "Add the blocked item to this profile's Don't Sync list below — press Save to apply"
             case .openPrivacySettings:
                 return "Open System Settings › Privacy & Security › Full Disk Access"
             }
@@ -3988,9 +3988,12 @@ struct ProfileDetailView: View {
         // Defense in depth: the buttons that call this already gate on
         // `isSyncRunningForProfile`, but check liveness again here so every path
         // into a recovery action — not just the button tap — is covered (R1).
-        // Open Privacy Settings is exempt: it only opens System Settings and starts
-        // no run, so refusing it while a sync is live would block the fix for nothing.
-        guard action == .openPrivacySettings || !syncManager.isRunLive(for: profile) else {
+        // Open Privacy Settings and Exclude from Sync are both exempt: Open Privacy
+        // Settings only opens System Settings, and Exclude from Sync only stages a
+        // pattern into the form's "Don't Sync" state (D9) — neither starts a run, so
+        // refusing either while a sync is live would block the fix for nothing.
+        guard action == .openPrivacySettings || action == .excludeBlockedPath
+            || !syncManager.isRunLive(for: profile) else {
             TelemetryService.shared.recordUserRecoveryAction(
                 profileId: profile.id,
                 profileName: profile.name,
@@ -4004,7 +4007,7 @@ struct ProfileDetailView: View {
             profileId: profile.id,
             profileName: profile.name,
             action: action.telemetryName,
-            result: "started"
+            result: action == .excludeBlockedPath ? "staged" : "started"
         )
         switch action {
         case .smartFix:
@@ -4024,7 +4027,7 @@ struct ProfileDetailView: View {
         case .mountAnyway:
             enableNonEmptyMountAndReinstall()
         case .excludeBlockedPath:
-            excludeBlockedPath()
+            stageBlockedPathExclusion()
         case .openPrivacySettings:
             openPrivacySettings()
         }
@@ -4033,14 +4036,16 @@ struct ProfileDetailView: View {
     // MARK: - macOS Blocked Access
 
     /// Recovery for an rclone error naming a local path macOS privacy controls wouldn't let it
-    /// read (`SyncLogPatterns.operationNotPermittedPath`) — typically an Apple Photos library
-    /// inside the synced folder. Two ways out: exclude the path from this profile (through the
-    /// "Don't Sync" list, where the user can see and undo it), or allow access in System
-    /// Settings. Which process needs that access for a scheduled sync is deliberately not
-    /// named: launchd runs the sync script directly, not as a child of SyncTray.
+    /// read (`SyncLogPatterns.operationNotPermittedPath`) — typically an Apple Photos or Photo
+    /// Booth library inside the synced folder. Two ways out: exclude the path from this profile
+    /// (staged into the "Don't Sync" list below, where the user can see, edit, or undo it before
+    /// Save applies it — D9), or allow access in System Settings. Which process needs that
+    /// access for a scheduled sync is deliberately not named: launchd runs the sync script
+    /// directly, not as a child of SyncTray.
     @ViewBuilder
     private func macOSBlockedAccessActions(blockedPath: String, error: String) -> some View {
         let excludePattern = blockedAccessExcludePattern(blockedPath: blockedPath, error: error)
+        let alreadyStaged = excludePattern.map { syncExcludePatterns.contains($0) } ?? false
         let name = (blockedPath as NSString).lastPathComponent
         VStack(alignment: .leading, spacing: 6) {
             if let summary = SyncLogPatterns.macOSBlockedAccessSummary(for: error, localSyncPath: profile.localSyncPath) {
@@ -4051,20 +4056,19 @@ struct ProfileDetailView: View {
                 .font(.caption)
                 .foregroundColor(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
+            if alreadyStaged {
+                Text("Added to Don't Sync below — press Save to apply.")
+                    .font(.caption.weight(.medium))
+                    .foregroundColor(.secondary)
+            }
             HStack(spacing: 8) {
                 if excludePattern != nil {
-                    Button(action: {
-                        if isSyncRunningForProfile {
-                            showingSyncInProgressAlert = true
-                            return
-                        }
-                        handleErrorAction(.excludeBlockedPath)
-                    }) {
-                        Label(ErrorAction.excludeBlockedPath.buttonText,
-                              systemImage: ErrorAction.excludeBlockedPath.icon)
+                    Button(action: { handleErrorAction(.excludeBlockedPath) }) {
+                        Label(alreadyStaged ? "Excluded (unsaved)" : ErrorAction.excludeBlockedPath.buttonText,
+                              systemImage: alreadyStaged ? "checkmark.circle" : ErrorAction.excludeBlockedPath.icon)
                     }
                     .buttonStyle(.borderedProminent)
-                    .disabled(isSyncRunningForProfile)
+                    .disabled(alreadyStaged)
                     .help(ErrorAction.excludeBlockedPath.helpText)
                 }
                 Button(action: { handleErrorAction(.openPrivacySettings) }) {
@@ -4086,6 +4090,9 @@ struct ProfileDetailView: View {
         if itemName.lowercased().hasSuffix(".photoslibrary") {
             text += " Apple Photos libraries are best excluded: copying one while Photos is open can "
                 + "produce a broken copy."
+        } else if itemName.caseInsensitiveCompare("Photo Booth Library") == .orderedSame {
+            text += " Photo Booth libraries are best excluded: copying one while Photo Booth is open can "
+                + "produce a broken copy."
         }
         return text
     }
@@ -4105,24 +4112,19 @@ struct ProfileDetailView: View {
         )
     }
 
-    /// Add the blocked path to the profile's "Don't Sync" list — the same store-then-filter
-    /// path the list editor uses, so it shows up there and applies from the next sync with no
-    /// reinstall — then clear the now-stale error and sync again. Skips the sync when the
-    /// filter file couldn't be written (`syncFilterErrors`, shown under "Don't Sync"), since
-    /// it would only fail the same way.
-    private func excludeBlockedPath() {
+    /// Stage the blocked path into the form's "Don't Sync" list (D9) — appends the anchored
+    /// pattern to `syncExcludePatterns` if it isn't already there, and touches nothing else:
+    /// no filter-file write, no error clear, no sync trigger. It shows up in the "Don't Sync"
+    /// editor below immediately (undoable like any other staged edit) and only takes effect
+    /// once the user presses Save, which runs it through `filterSaveFollowUp`.
+    private func stageBlockedPathExclusion() {
         guard let lastError = syncManager.lastError(for: profile.id),
               let blockedPath = SyncLogPatterns.macOSBlockedPath(in: lastError, localSyncPath: profile.localSyncPath),
               let pattern = blockedAccessExcludePattern(blockedPath: blockedPath, error: lastError) else {
             return
         }
-        let current = profileStore.profile(for: profile.id)?.syncExcludePatterns ?? profile.syncExcludePatterns
-        if !current.contains(pattern) {
-            syncManager.updateSyncExcludePatterns(current + [pattern], for: profile.id)
-        }
-        guard syncManager.syncFilterErrors[profile.id] == nil else { return }
-        syncManager.clearError(for: profile.id)
-        syncManager.triggerManualSync(for: profile)
+        guard !syncExcludePatterns.contains(pattern) else { return }
+        syncExcludePatterns.append(pattern)
     }
 
     private func openPrivacySettings() {
