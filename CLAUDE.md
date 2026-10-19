@@ -923,7 +923,7 @@ the warmer reads as before — safe degradation.
 
 | File | Purpose |
 |------|---------|
-| `SyncTrayCLI.swift` | Headless `synctray` CLI — `CLICommand`, `parse`/`execute`/`run` (pure over `CLIEnvironment`), `doctorChecks`, `resolveProfile`, `applyProfileAssignment` (bounded `profile set` key set); mutating commands (`profile create`/`show`/`set`/`enable`/`disable`/`delete`, `sync`, `mount`/`unmount`, `install`/`reinstall`) drive `ProfileStore.writeProfileFile` + `SyncSetupService`; `runMeasured` records one `synctray.cli.invoked` event + flushes; dispatched from `SyncTrayApp.init` before SwiftUI/`SyncManager` |
+| `SyncTrayCLI.swift` | Headless `synctray` CLI — `CLICommand`, `parse`/`execute`/`run` (pure over `CLIEnvironment`), `doctorChecks`, `resolveProfile`, `applyProfileAssignment` (bounded `profile set` key set); mutating commands (`profile create`/`show`/`set`/`enable`/`disable`/`delete`, `settings set`, `sync`, `mount`/`unmount`, `install`/`reinstall`) drive `ProfileStore.writeProfileFile` + `SyncSetupService`; `runMeasured` records one `synctray.cli.invoked` event + flushes; dispatched from `SyncTrayApp.init` before SwiftUI/`SyncManager` |
 | `CLIShimInstaller.swift` | Writes/refreshes the `~/.local/bin/synctray` shim on every launch; marker-guarded so it never clobbers a non-SyncTray file |
 
 ### File-Backed Configuration
@@ -1357,7 +1357,7 @@ Covered by `ConfigSelfTest` AC-CLI4 and AC-SEC3.
 | `synctray test-remote <name\|shortId>` | Probe one profile's remote with the same path-scoped `rclone lsjson --stat <remote>:<path>` probe `doctor` uses (never `lsd`) under a hard timeout; prints `reachable: <remote>` (with ` (path not found)` appended, still exit 0, when the remote answered but the path doesn't exist) or the real rclone stderr (ERROR/CRITICAL preferred over a NOTICE line). |
 | `synctray listremotes` | `rclone listremotes`, passthrough. |
 | `synctray remote folders <remote>[:path] [--json]` | List a remote's folders exactly as the profile editor's folder chooser and the setup wizard show them — same `rclone lsf --dirs-only` arguments (`RcloneConfigService.folderListingArguments`, including the remote's `no_check_certificate`) and the same parser (`parseDirectoryListing`), so names with spaces come out verbatim. Needs no profile. `--json` prints a JSON array, which makes leading/trailing spaces visible. Covered by `ConfigSelfTest` AC-CLI12 (and AC-RF1 for the parser). |
-| `synctray settings [show\|get <key>] [--json]` | Every app-wide setting (`AppSettingsFileStore.allKeyNames`) with the value the app actually uses (UserDefaults, `SMAppService` for launch at login) — `key=value` lines, or a sorted-key object with `--json`. |
+| `synctray settings [show] [--json]` / `settings get <key>` | Every app-wide setting (or, with `get`, one) (`AppSettingsFileStore.allKeyNames`) with the value the app actually uses (UserDefaults, `SMAppService` for launch at login) — `key=value` lines, or a sorted-key object with `--json`. |
 | `synctray telemetry [status\|on\|off] [--json]` | Show or change whether usage data is shared — the same setting as the app's telemetry toggle (see "Privacy and consent" below). `status --json` prints `{"asked":…,"enabled":…}`. `on`/`off` count as answering the first-run question. |
 
 **Configure** (mutating — headless-capable, no running app required):
@@ -1904,7 +1904,7 @@ open ~/Library/Developer/Xcode/DerivedData/SyncTray-*/Build/Products/Debug/SyncT
 | `SettingsView.swift` | Main settings UI with profile editing |
 | `ProfileStore.swift` | File-backed profile persistence — authoritative `{shortId}.profile.json` per profile, write-only blob mirror (see "File-Backed Configuration") |
 | `ConfigFileWatcher.swift` | Live-apply watcher for `~/.config/synctray` (profiles + settings); routes an unknown-id `.profile.json` to create-via-file |
-| `SyncTrayCLI.swift` | Headless `synctray` CLI: inspect (`doctor`/`status`/`profiles`/`profile show`/`logs`/`test-remote`/`listremotes`/`remote folders`/`telemetry`), configure (`profile create`/`set`/`enable`/`disable`/`delete`, `install`/`reinstall`), operate (`sync`/`mount`/`unmount`/`cache move`), support (`report`); dispatched from `SyncTrayApp.init` (see "Agent-Editable Configuration & CLI") |
+| `SyncTrayCLI.swift` | Headless `synctray` CLI: inspect (`doctor`/`status`/`profiles`/`profile show`/`logs`/`test-remote`/`listremotes`/`remote folders`/`telemetry`/`settings show`/`settings get`), configure (`profile create`/`set`/`enable`/`disable`/`delete`, `settings set`, `install`/`reinstall`), operate (`sync`/`mount`/`unmount`/`cache move`), support (`report`); dispatched from `SyncTrayApp.init` (see "Agent-Editable Configuration & CLI") |
 | `DiagnosticReport.swift` | User-sent diagnostic report: build, redact, render, OTLP-encode and upload (see "Diagnostic reports") |
 | `CLIShimInstaller.swift` | Installs the `~/.local/bin/synctray` shim (`~/.local/bin` must be on `PATH`) |
 | `SyncLogPatterns` | Centralized log message pattern matching (includes `isOutOfSyncError`) |
