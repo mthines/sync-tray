@@ -7899,6 +7899,24 @@ enum ConfigSelfTest {
               !SyncAbort.isProfileProcess(rclone701, arguments: arguments[701], configPath: configPath, localSyncPath: "") else {
             return report(name, slug, false, "(isProfileProcess accepted a process that is not this profile's run)")
         }
+
+        // The folder must be a whole argument: another profile's rclone syncing a folder INSIDE
+        // this one, or — for a profile syncing the home folder — any SyncTray rclone, whose
+        // `--filter-from ~/.config/synctray/profiles/…` starts with the home path, is not ours.
+        let homeProfileFolder = "/Users/me"
+        let otherProfileRclone = "rclone bisync /Users/me/Pictures gdrive:Pictures --filter-from /Users/me/.config/synctray/profiles/abcd1234-exclude.txt"
+        guard !SyncAbort.isProfileProcess(rclone701, arguments: "rclone bisync remote:Photos /Users/me/Sync/Photos --verbose",
+                                          configPath: configPath, localSyncPath: localSyncPath),
+              !SyncAbort.isProfileProcess(rclone701, arguments: otherProfileRclone,
+                                          configPath: configPath, localSyncPath: homeProfileFolder) else {
+            return report(name, slug, false, "(isProfileProcess accepted an rclone for a folder inside or under this profile's)")
+        }
+        guard SyncAbort.isProfileProcess(rclone701, arguments: "rclone bisync gdrive:Home /Users/me --verbose --filter-from /Users/me/.config/synctray/profiles/c6169dcc-exclude.txt",
+                                         configPath: configPath, localSyncPath: homeProfileFolder),
+              SyncAbort.isProfileProcess(rclone701, arguments: "rclone sync /Users/me/ gdrive:Home",
+                                         configPath: configPath, localSyncPath: homeProfileFolder) else {
+            return report(name, slug, false, "(isProfileProcess rejected an rclone whose argument is exactly this profile's home folder)")
+        }
         return report(name, slug, true)
     }
 
@@ -7933,6 +7951,16 @@ enum ConfigSelfTest {
             ("Failed to copy: read tcp 10.0.0.2:52311->142.250.0.1:443: read: connection reset by peer", "network"),
             ("Failed to copy: write tcp 10.0.0.2:52311->10.0.0.5:445: write: broken pipe", "network"),
             ("Failed to copy: Get \"https://www.googleapis.com/drive/v3/files\": context deadline exceeded (Client.Timeout exceeded while awaiting headers)", "timeout"),
+            // A token refresh that timed out is a timeout, not an auth failure ("oauth2:" /
+            // "failed to refresh token" must not win over the timeout wording).
+            ("oauth2: cannot fetch token: Post \"https://oauth2.googleapis.com/token\": dial tcp 1.2.3.4:443: i/o timeout", "timeout"),
+            ("oauth2: cannot fetch token: Post \"https://oauth2.googleapis.com/token\": net/http: TLS handshake timeout", "timeout"),
+            ("failed to refresh token: Post \"https://api.proton.me/auth/refresh\": dial tcp 1.2.3.4:443: connect: operation timed out", "timeout"),
+            // Go's JSON decoder on an HTML reply (e.g. a captive portal or proxy) is not a bad
+            // file name.
+            ("failed to get StartPageToken: invalid character '<' looking for beginning of value", "other"),
+            // A file merely named x509 is not a TLS error.
+            ("open /Users/me/Sync/certs/x509.pem: no such file or directory", "file_not_found"),
             // Unchanged buckets.
             (photosDenial, "permission_denied"),
             ("Failed to sync with 2 errors: last error was: not deleting files as there were IO errors", "io_errors_blocked_deletes"),

@@ -1807,7 +1807,10 @@ lock files, rclone.conf and `ps` read off the main actor, only when telemetry is
   `quota_exceeded`, `disk_full`, `auth_failed`, `tls_certificate`, `name_too_long`, `invalid_name`,
   `checksum_mismatch`, `file_changed_during_transfer`, `file_busy`, `duplicate_object`,
   `directory_not_empty`, and more `network` / `timeout` phrasings ("no such host" is `network`,
-  not `file_not_found`). Existing buckets keep their inputs (AC-TS2). The `Sync error` log and
+  not `file_not_found`; a token refresh that timed out is `timeout`, not `auth_failed`). A
+  message the old buckets matched keeps its bucket unless it also names a more specific cause
+  (e.g. a rate-limit or auth phrase), which now wins; besides that, Go's "directory not empty"
+  moved from `critical` to `directory_not_empty` (AC-TS2). The `Sync error` log and
   the `Sync failed` log and span also carry `error.operation`: `copy` / `delete` / `move` /
   `list` / `mkdir` / `other`.
 - `Profile configuration` carries `config.local_path_kind` (`SyncPathKind.classify`: `desktop`,

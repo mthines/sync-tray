@@ -5393,9 +5393,11 @@ final class SyncManager: ObservableObject {
                         holder: held.session, appPID: appPID, isAlive: isAlive, identify: identify)
                 }
             }
+            // The stored error when there is one, else the state's own message: "Script not
+            // found" / "Config not found" set `.error` without ever storing a profile error.
             var errorType: String?
-            if case .error = snapshot.state {
-                errorType = TelemetryService.categorizeError(snapshot.storedError)
+            if case .error(let stateMessage) = snapshot.state {
+                errorType = TelemetryService.categorizeError(snapshot.storedError ?? stateMessage)
             }
             let remoteTypes = RemoteBackendType.types(for: profile, rcloneConfig: rcloneConfig)
             reports.statuses.append(ProfileStatusReport(

@@ -1099,11 +1099,30 @@ final class TelemetryService {
     /// Captures only feature preferences — never paths, remote names, or credentials.
     func recordProfileConfiguration(_ profile: SyncProfile) {
         guard SyncTraySettings.telemetryEnabled else { return }
-        emitProfileConfiguration(profile, rcloneConfig: RcloneConfigService.shared.readConfigContents())
+        emitProfileConfigurationsAfterReadingRcloneConfig([profile])
+    }
+
+    /// Read rclone.conf (for `config.remote_type` / `config.fallback_remote_type`) on a
+    /// `.utility` queue — never the caller's thread, which is the main thread for both
+    /// callers (`ProfileStore.update`, the launch snapshot) — then emit one `Profile
+    /// configuration` log per profile back on main, where `emitProfileConfiguration` always
+    /// ran. The file is read once for all `profiles`; the attributes are unchanged.
+    private func emitProfileConfigurationsAfterReadingRcloneConfig(_ profiles: [SyncProfile]) {
+        guard !profiles.isEmpty else { return }
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            guard let self = self else { return }
+            let rcloneConfig = RcloneConfigService.shared.readConfigContents()
+            DispatchQueue.main.async {
+                for profile in profiles {
+                    self.emitProfileConfiguration(profile, rcloneConfig: rcloneConfig)
+                }
+            }
+        }
     }
 
     /// `recordProfileConfiguration` with rclone.conf's text already read (nil = unreadable),
     /// so a launch snapshot of every profile reads the file once, not once per profile.
+    /// Re-checks the opt-in, since telemetry may have been turned off while the file was read.
     private func emitProfileConfiguration(_ profile: SyncProfile, rcloneConfig: String?) {
         guard SyncTraySettings.telemetryEnabled else { return }
         ensureSetup()
@@ -1235,11 +1254,9 @@ final class TelemetryService {
             ]
         )
 
-        // Individual profile configs — rclone.conf read once for all of them.
-        let rcloneConfig = RcloneConfigService.shared.readConfigContents()
-        for profile in profiles {
-            emitProfileConfiguration(profile, rcloneConfig: rcloneConfig)
-        }
+        // Individual profile configs — rclone.conf read once for all of them, off the main
+        // thread; the per-profile logs follow the summary once it has been read.
+        emitProfileConfigurationsAfterReadingRcloneConfig(profiles)
     }
 
     // MARK: - Profile Lifecycle Operations
@@ -3066,9 +3083,11 @@ final class TelemetryService {
     /// Order: the `SyncLogPatterns` checks first (unchanged), then the specific buckets in
     /// `specificErrorBuckets` (matched on a lowercased copy), then the original generic
     /// `not found` / `permission` / `timeout` / `network` checks on the raw message, exactly
-    /// as before. So a message the generic checks matched keeps its bucket unless one of the
-    /// specific needles names the real cause (e.g. "no such host" is `network`, not the
-    /// `file_not_found` its "no such" used to give it).
+    /// as before. So a message the generic checks used to bucket keeps that bucket, except
+    /// when it also names a more specific cause — a rate-limit, quota or auth phrase, "no
+    /// such host" (`network`, not the `file_not_found` its "no such" used to give it), and so
+    /// on — which now wins; and Go's "directory not empty" moved from `critical` to
+    /// `directory_not_empty` (see below).
     static func categorizeError(_ message: String?) -> String {
         guard let msg = message else { return "unknown" }
         let lower = msg.lowercased()
@@ -3130,27 +3149,33 @@ final class TelemetryService {
     /// - `rate_limited` before `quota_exceeded`: Google's per-minute limit reads "Quota
     ///   exceeded for quota metric … rateLimitExceeded" and is a rate limit, not a full drive.
     /// - `network`, `timeout` and `tls_certificate` before `auth_failed`: a token refresh that
-    ///   failed because DNS, the connection or TLS failed ("couldn't fetch token: … no such
-    ///   host") is a network problem, not bad credentials.
+    ///   failed because DNS, the connection or TLS failed or timed out ("couldn't fetch token:
+    ///   … no such host", "oauth2: cannot fetch token: … i/o timeout", "… TLS handshake
+    ///   timeout") is a network problem, not bad credentials. That is why `timeout` repeats
+    ///   the generic "timed out" and also takes "i/o timeout" / "handshake timeout": without
+    ///   them such a message would reach the "oauth2:" needle first.
     /// - all of these before the generic checks: "no such host" would otherwise be
     ///   `file_not_found` via "no such".
     /// Needles are phrases rclone and the Go runtime actually print, kept narrow because the
     /// message usually also carries a file path: TLS is matched by Go's `x509:` / `tls:`
-    /// error prefixes rather than the bare word "certificate", which would claim any error
-    /// about a file named e.g. "Birth Certificate.pdf". The values are bounded labels; the
-    /// message itself never leaves the machine.
+    /// error prefixes rather than the bare words "x509" or "certificate", which would claim
+    /// any error about a file named e.g. "x509.pem" or "Birth Certificate.pdf"; and
+    /// `invalid_name` takes "invalid characters" (plural), not "invalid character", which is
+    /// how Go's JSON decoder reports an HTML page where JSON was expected ("invalid character
+    /// '<' looking for beginning of value"). The values are bounded labels; the message
+    /// itself never leaves the machine.
     static let specificErrorBuckets: [(bucket: String, needles: [String])] = [
         ("disk_full", ["no space left on device"]),
         ("rate_limited", ["ratelimitexceeded", "userratelimitexceeded", "rate limit", "too many requests"]),
         ("quota_exceeded", ["storagequotaexceeded", "quotaexceeded", "quota exceeded", "insufficient storage"]),
         ("network", ["no such host", "connection reset", "connection refused", "network is unreachable", "broken pipe"]),
-        ("timeout", ["context deadline exceeded", "deadline exceeded"]),
-        ("tls_certificate", ["x509", "tls:", "certificate signed by", "certificate has expired",
+        ("timeout", ["context deadline exceeded", "deadline exceeded", "i/o timeout", "timed out", "handshake timeout"]),
+        ("tls_certificate", ["x509:", "tls:", "certificate signed by", "certificate has expired",
                              "certificate verify failed", "bad certificate"]),
         ("auth_failed", ["invalid_grant", "token expired", "expired token", "oauth2:", "unauthorized",
                          "authentication failed", "couldn't fetch token", "failed to refresh token"]),
         ("name_too_long", ["file name too long", "name too long", "path too long"]),
-        ("invalid_name", ["illegal character", "invalid character", "invalid name", "invalid file name",
+        ("invalid_name", ["illegal character", "invalid characters", "invalid name", "invalid file name",
                           "invalid filename"]),
         ("checksum_mismatch", ["corrupted on transfer", "hash differ", "hashes differ", "md5 differ", "sizes differ"]),
         ("file_changed_during_transfer", ["source file is being updated", "changed size during"]),
@@ -3242,7 +3267,8 @@ struct ProfileStatusReport: Equatable {
     /// `SyncRunLock.lockState` of the bisync session `.lck`, or `n/a` for a One-Way or
     /// Stream profile.
     let sessionLockState: String
-    /// `TelemetryService.categorizeError` of the stored error, only in an error state.
+    /// `TelemetryService.categorizeError` of the stored error (or, when none was stored, the
+    /// error state's own message, e.g. "Script not found"), only in an error state.
     let errorType: String?
     /// `SyncPathKind.classify`.
     let localPathKind: String

@@ -97,7 +97,7 @@ On app launch and every profile save, a structured log captures the user's chose
 - Folder kind and storage backend (all modes), never the path or the remote's name:
   - `config.local_path_kind` — `SyncPathKind.classify` of the local folder: `desktop`/`documents`/`downloads`/`pictures`/`music`/`movies`/`public` (`~/<Folder>` or below), `icloud_drive` (`~/Library/Mobile Documents`), `cloud_storage` (`~/Library/CloudStorage`), `library` (anything else under `~/Library`), `home_root` (the home folder itself), `home_other`, `external_volume` (`/Volumes/<name>/…`), `other`, `unknown` (empty). Case-insensitive, `~`-expanding, trailing-slash tolerant
   - `config.local_path_privacy_protected` (bool) — true for `desktop`, `documents`, `downloads`, `icloud_drive`, `library`, `external_volume`: folders macOS privacy controls (TCC) can refuse a launchd-run script
-  - `config.remote_type` / `config.fallback_remote_type` — the remote's `type = …` from rclone.conf (`RcloneConfigService.remoteType(named:inConfig:)`), bucketed by `RemoteBackendType.bucket` through an allowlist of rclone backend names (`drive`, `protondrive`, `smb`, `s3`, …): a known type is itself, any other type `other`, a missing section / no rclone.conf `unknown`; the fallback is `none` when no fallback is configured. rclone.conf is read once per launch snapshot (and once per profile save)
+  - `config.remote_type` / `config.fallback_remote_type` — the remote's `type = …` from rclone.conf (`RcloneConfigService.remoteType(named:inConfig:)`), bucketed by `RemoteBackendType.bucket` through an allowlist of rclone backend names (`drive`, `protondrive`, `smb`, `s3`, …): a known type is itself, any other type `other`, a missing section / no rclone.conf `unknown`; the fallback is `none` when no fallback is configured. rclone.conf is read once per launch snapshot (and once per profile save), on a background `.utility` queue — the `Profile configuration` logs are emitted on main once it has been read
 - A summary log with `config.total_profiles`, `config.enabled_profiles`, mode breakdown
 
 This lets you understand feature adoption and preference patterns across installations.
@@ -141,7 +141,9 @@ them. **Never** the names of the files in flight (`SyncProgress.transferringFile
 (`idle`/`syncing`/`paused`/`error`/`drive_not_mounted`/`not_configured`; a profile in
 `pausedProfiles` is `paused`), `profile.run_live` (bool, `SyncManager.runLiveness`),
 `sync.lock_state`, `sync.session_lock_state`, `error.type` (only in an error state, from the
-stored error), `config.local_path_kind`, `config.remote_type`, `config.fallback_remote_type`.
+stored error, or the state's own message when none was stored — "Script not found" / "Config
+not found" never store one), `config.local_path_kind`, `config.remote_type`,
+`config.fallback_remote_type`.
 
 `sync.lock_state` describes the `/tmp` run lock and `sync.session_lock_state` the rclone bisync
 session `.lck` (`SyncRunLock.lockState`, pure):
@@ -153,7 +155,7 @@ session `.lck` (`SyncRunLock.lockState`, pure):
 | `unreadable` | Neither a PID nor rclone's lock JSON |
 | `stale` | The PID is no longer running |
 | `live_app` | The PID is the app's own — the launch-gap placeholder |
-| `live_verified` | The PID is alive and identified as this profile's run (`SyncAbort.isProfileProcess`: `bash`/the script naming this profile's `configPath`, or an rclone naming its `localSyncPath`, whatever its parent) |
+| `live_verified` | The PID is alive and identified as this profile's run (`SyncAbort.isProfileProcess`: `bash`/the script naming this profile's `configPath`, or an rclone with its `localSyncPath` as a whole argument — not a folder inside it, not a `--filter-from` path under it — whatever its parent) |
 | `live_unverified` | The PID is alive but NOT identifiable as this profile's run — the signature of a stale lock whose PID was reused, which `kill(pid, 0)` alone counts as live |
 | `n/a` | Both values for a Stream profile (its `/tmp` lock is the mount daemon's for the mount's whole life — Critical Rule 8 / R7); the session value for a One-Way profile (only bisync has a session lock) |
 
@@ -165,7 +167,9 @@ message; the message itself never leaves the machine. Order: the `SyncLogPattern
 `permission_denied` for EPERM, `io_errors_blocked_deletes`), then the specific buckets of
 `TelemetryService.specificErrorBuckets` (lowercased, first match wins), then the original
 generic checks (`file_not_found`, `permission_denied`, `timeout`, `network`), else `other`;
-`unknown` for no message.
+`unknown` for no message. A message the old buckets matched keeps its bucket unless it also
+names a more specific cause (e.g. a rate-limit or auth phrase), which now wins; besides that,
+Go's "directory not empty" moved from `critical` to `directory_not_empty`.
 
 | Bucket | Matches (lowercased) |
 |--------|----------------------|
@@ -173,11 +177,11 @@ generic checks (`file_not_found`, `permission_denied`, `timeout`, `network`), el
 | `rate_limited` | "ratelimitexceeded", "userratelimitexceeded", "rate limit", "too many requests" — before `quota_exceeded`, since Google's per-minute limit says "Quota exceeded … rateLimitExceeded" |
 | `quota_exceeded` | "storagequotaexceeded", "quotaexceeded", "quota exceeded", "insufficient storage" |
 | `network` | "no such host" (ahead of the generic "no such" → `file_not_found`), "connection reset", "connection refused", "network is unreachable", "broken pipe" — plus the generic "network"/"connection" |
-| `timeout` | "context deadline exceeded", "deadline exceeded" — plus the generic "timeout"/"timed out" |
-| `tls_certificate` | "x509", "tls:", "certificate signed by", "certificate has expired", "certificate verify failed", "bad certificate" (not the bare word "certificate", which would claim errors about a file named "…Certificate.pdf") |
-| `auth_failed` | "invalid_grant", "token expired", "expired token", "oauth2:", "unauthorized", "authentication failed", "couldn't fetch token", "failed to refresh token" — after `network`/`timeout`/`tls_certificate`, so a token refresh that failed on DNS or TLS keeps that cause |
+| `timeout` | "context deadline exceeded", "deadline exceeded", "i/o timeout", "timed out", "handshake timeout" — ahead of `auth_failed`, so "oauth2: cannot fetch token: … i/o timeout" stays a timeout; plus the generic "timeout" |
+| `tls_certificate` | "x509:", "tls:", "certificate signed by", "certificate has expired", "certificate verify failed", "bad certificate" (Go's error prefixes, not the bare words "x509" / "certificate", which would claim errors about a file named "x509.pem" or "…Certificate.pdf") |
+| `auth_failed` | "invalid_grant", "token expired", "expired token", "oauth2:", "unauthorized", "authentication failed", "couldn't fetch token", "failed to refresh token" — after `network`/`timeout`/`tls_certificate`, so a token refresh that failed on DNS, TLS or a timeout keeps that cause |
 | `name_too_long` | "file name too long", "name too long", "path too long" |
-| `invalid_name` | "illegal character", "invalid character", "invalid name", "invalid file name", "invalid filename" |
+| `invalid_name` | "illegal character", "invalid characters", "invalid name", "invalid file name", "invalid filename" (plural "characters": Go's JSON decoder says "invalid character '<' looking for beginning of value" when a proxy returns HTML, which stays `other`) |
 | `checksum_mismatch` | "corrupted on transfer", "hash differ", "hashes differ", "md5 differ", "sizes differ" |
 | `file_changed_during_transfer` | "source file is being updated", "changed size during" |
 | `file_busy` | "resource busy", "text file busy", "file is locked", "being used by another process" |

@@ -1023,9 +1023,12 @@ extension SyncAbort {
     /// `identify` check behind `SyncRunLock.lockState`'s `live_verified`. Accepts:
     /// - the sync script — `bash` (or the shared script's own file name, depending on how `ps`
     ///   reports a `#!` script) whose command line names this profile's `configPath`;
-    /// - an rclone whose command line names this profile's `localSyncPath` (as stored or
-    ///   `~`-expanded, trailing slash ignored), as a whole path — not merely a prefix of a
-    ///   sibling folder's (`/x/Pictures` does not match `/x/Pictures2`).
+    /// - an rclone whose command line has this profile's `localSyncPath` (as stored or
+    ///   `~`-expanded, trailing slash ignored) as a whole ARGUMENT (`containsWholePath`) —
+    ///   not a sibling folder sharing its prefix (`/x/Pictures2`), not a folder inside it
+    ///   (another profile syncing `/x/Pictures/Holiday`), and not a path that merely starts
+    ///   with it (every SyncTray rclone carries `--filter-from ~/.config/synctray/profiles/…`,
+    ///   which would otherwise make a profile syncing the home folder match them all).
     /// Unlike `isRunRoot` an rclone qualifies whatever its parent: telemetry only describes
     /// the lock, it never signals anything, so a script run's rclone holding the session lock
     /// must count too. `arguments` nil (the process is gone, or `ps` failed) never
@@ -1045,18 +1048,16 @@ extension SyncAbort {
         return !configPath.isEmpty && arguments.contains(configPath)
     }
 
-    /// Whether `path` occurs in `arguments` followed by the end, a space, a `/` or a quote —
-    /// i.e. as that path or one inside it, not as the prefix of a longer folder name. Pure.
+    /// Whether `path` (or `path/`) is one whole argument of `arguments`, the space-joined
+    /// command line `ps -o args=` prints: delimited by spaces or the ends of the line, so a
+    /// longer path that starts with it — a sibling (`/x/Sync2`), a folder inside it
+    /// (`/x/Sync/Photos`), a file under it (`--filter-from /x/.config/…`) — never matches.
+    /// `ps` doesn't quote arguments, so a folder name containing a space could still match
+    /// a longer name that continues after that space; telemetry accepts that ambiguity. Pure.
     private static func containsWholePath(_ arguments: String, _ path: String) -> Bool {
         guard !path.isEmpty else { return false }
-        var searchRange = arguments.startIndex..<arguments.endIndex
-        while let found = arguments.range(of: path, range: searchRange) {
-            if found.upperBound == arguments.endIndex { return true }
-            let next = arguments[found.upperBound]
-            if next == " " || next == "/" || next == "\"" || next == "'" { return true }
-            searchRange = arguments.index(after: found.lowerBound)..<arguments.endIndex
-        }
-        return false
+        let padded = " " + arguments + " "
+        return padded.contains(" \(path) ") || padded.contains(" \(path)/ ")
     }
 
     private static func trimmingTrailingSlashes(_ path: String) -> String {
