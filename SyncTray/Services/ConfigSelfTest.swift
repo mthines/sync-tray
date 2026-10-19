@@ -177,6 +177,7 @@ enum ConfigSelfTest {
             testDiagnosticOTLPEncoding,
             testCLIReportParsing,
             testCLIReportExecute,
+            testReportSheetCancelStopsSend,
         ]
 
         for check in checks {
@@ -8808,6 +8809,29 @@ enum ConfigSelfTest {
               SyncTrayCLI.telemetryVerb(for: ["report", "Work", "--send", "--yes"]) == "report-send",
               SyncTrayCLI.usage.contains("report [name|id]") else {
             return report(name, slug, false, "(telemetry verbs or help text missing report)")
+        }
+        return report(name, slug, true)
+    }
+
+    // MARK: - AC-DR7 — Cancel while collecting never sends
+
+    /// The sheet's build task is cancelled by Cancel and on close, and the build checks for
+    /// cancellation before running its action — so Send then Cancel uploads nothing.
+    private static func testReportSheetCancelStopsSend() -> Bool {
+        let name = "AC-DR7", slug = "report-sheet-cancel-stops-send"
+        guard let source = readSourceFile("Views/Settings/DiagnosticReportSheet.swift") else {
+            return report(name, slug, false, "(could not read DiagnosticReportSheet.swift)")
+        }
+        let build = extractFunctionBody(startingAt: "private func withReport(", in: source) ?? ""
+        let guarded: Bool = {
+            guard let task = build.range(of: "buildTask = Task"),
+                  let check = build.range(of: "guard !Task.isCancelled else { return }"),
+                  let action = build.range(of: "action(built.report)") else { return false }
+            return task.lowerBound < check.lowerBound && check.lowerBound < action.lowerBound
+        }()
+        let cancels = source.components(separatedBy: "buildTask?.cancel()").count - 1
+        guard guarded, cancels >= 2 else {
+            return report(name, slug, false, "(build checks cancellation before its action: \(guarded); cancel sites: \(cancels)/2)")
         }
         return report(name, slug, true)
     }

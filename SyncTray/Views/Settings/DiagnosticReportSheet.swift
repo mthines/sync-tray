@@ -48,6 +48,9 @@ struct DiagnosticReportSheet: View {
     @State private var showingPreview: Bool = false
     @State private var saveMessage: String?
     @State private var copied: Bool = false
+    /// The in-flight report build. Cancelled when the sheet closes, so a Send pressed
+    /// while collecting never uploads after the user has cancelled.
+    @State private var buildTask: Task<Void, Never>?
 
     init(allProfiles: [SyncProfile], focusProfile: SyncProfile? = nil) {
         self.allProfiles = allProfiles
@@ -79,6 +82,9 @@ struct DiagnosticReportSheet: View {
         }
         .padding(24)
         .frame(width: 560)
+        .onDisappear {
+            buildTask?.cancel()
+        }
     }
 
     // MARK: - Compose
@@ -153,6 +159,7 @@ struct DiagnosticReportSheet: View {
                 }
 
                 Button("Cancel") {
+                    buildTask?.cancel()
                     dismiss()
                 }
                 .keyboardShortcut(.cancelAction)
@@ -224,11 +231,14 @@ struct DiagnosticReportSheet: View {
         let requestedScope = scope
         phase = .building
         saveMessage = nil
-        Task { @MainActor in
+        buildTask = Task { @MainActor in
             let built = await Task.detached(priority: .userInitiated) { () -> BuiltReport in
                 let fresh = DiagnosticReportBuilder.build(profiles: profiles, environment: .production())
                 return BuiltReport(report: fresh, text: fresh.render())
             }.value
+            buildTask = nil
+            // Cancelled while collecting (the sheet closed): run nothing, above all not a send.
+            guard !Task.isCancelled else { return }
             report = built.report
             reportScope = requestedScope
             previewText = built.text
