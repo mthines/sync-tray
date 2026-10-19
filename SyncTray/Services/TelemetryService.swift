@@ -1652,7 +1652,7 @@ final class TelemetryService {
     /// collector before the process dies. No-op when telemetry is disabled.
     func flushForExit(timeout: TimeInterval = 3) {
         guard SyncTraySettings.telemetryEnabled else { return }
-        // The OTLP exporters run on a default URLSession with no custom request
+        // The OTLP exporters send on `exportSession`, which sets no custom request
         // timeout, so a synchronous `forceFlush()` can block ~60s against an
         // unreachable/black-holed collector. That is unacceptable for a CLI meant
         // for fast agent scripting, so flush on a background queue and wait only a
