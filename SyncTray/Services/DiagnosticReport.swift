@@ -380,9 +380,9 @@ enum DiagnosticReportBuilder {
         let (psExit, psOutput) = env.runProcess("/bin/ps", ["-axww", "-o", "pid=,ppid=,etime=,args="])
         var processLines: [String]
         if psExit == 0 {
-            processLines = syncProcessLines(fromPS: psOutput)
+            processLines = syncProcessLines(fromPS: psOutput, profiles: profiles)
             if processLines.isEmpty {
-                processLines = ["(no synctray-sync.sh or rclone processes running)"]
+                processLines = ["(no synctray-sync.sh or rclone processes running for these profiles)"]
             }
         } else {
             processLines = ["(ps failed with exit code \(psExit))"]
@@ -393,9 +393,7 @@ enum DiagnosticReportBuilder {
         let (launchctlExit, launchctlOutput) = env.runProcess("/bin/launchctl", ["list"])
         var launchdLines: [String]
         if launchctlExit == 0 {
-            launchdLines = splitLines(launchctlOutput).filter {
-                $0.range(of: "synctray", options: .caseInsensitive) != nil
-            }
+            launchdLines = launchdAgentLines(fromLaunchctl: launchctlOutput, profiles: profiles)
             launchdLines = launchdLines.isEmpty
                 ? ["(no SyncTray launchd agents loaded)"]
                 : ["PID\tStatus\tLabel"] + launchdLines
@@ -547,11 +545,35 @@ enum DiagnosticReportBuilder {
         return "\(label) \(path): \(state); contents: \(raw)"
     }
 
-    /// `ps -axww -o pid=,ppid=,etime=,args=` output filtered to the sync script and rclone.
-    static func syncProcessLines(fromPS output: String) -> [String] {
-        splitLines(output).compactMap { line -> String? in
+    /// `ps -axww -o pid=,ppid=,etime=,args=` output filtered to the sync script and rclone
+    /// processes of `profiles`: a process whose command line names one of their config files,
+    /// local folders or remote paths, or whose parent is such a process (the script's own
+    /// rclone children). Any other rclone on the Mac — another profile's, or the user's own
+    /// unrelated jobs — never enters the report.
+    static func syncProcessLines(fromPS output: String, profiles: [SyncProfile]) -> [String] {
+        let markers = profiles.flatMap { profile -> [String] in
+            [profile.configPath, (profile.localSyncPath as NSString).expandingTildeInPath, profile.fullRemotePath]
+        }.filter { $0.count > 2 }  // an empty field (":" for a blank remote) would match anything
+        let candidates = splitLines(output).compactMap { line -> (pid: String, ppid: String, etime: String, args: String)? in
             guard let fields = parsePSLine(line), isSyncProcess(args: fields.args) else { return nil }
+            return fields
+        }
+        let owned = Set(candidates.filter { fields in markers.contains { fields.args.contains($0) } }.map(\.pid))
+        return candidates.compactMap { fields -> String? in
+            guard owned.contains(fields.pid) || owned.contains(fields.ppid) else { return nil }
             return "pid=\(fields.pid) ppid=\(fields.ppid) elapsed=\(fields.etime) args=\(fields.args)"
+        }
+    }
+
+    /// `launchctl list` output filtered to SyncTray: the agents of `profiles`, plus SyncTray's
+    /// own non-profile entries. Another profile's sync agent is left out.
+    static func launchdAgentLines(fromLaunchctl output: String, profiles: [SyncProfile]) -> [String] {
+        let labels = Set(profiles.map(\.launchdLabel))
+        return splitLines(output).filter { line in
+            guard line.range(of: "synctray", options: .caseInsensitive) != nil else { return false }
+            guard let label = line.split(whereSeparator: { $0 == "\t" || $0 == " " }).last.map(String.init),
+                  label.hasPrefix("com.synctray.sync.") else { return true }
+            return labels.contains(label)
         }
     }
 

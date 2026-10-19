@@ -8973,10 +8973,15 @@ enum ConfigSelfTest {
 
         var requested: [String] = []
         let profileJSON = "{\n  \"additionalRcloneFlags\" : \"--sftp-pass hunter2\",\n  \"name\" : \"DR Bisync\"\n}\n"
+        // 101/102: this profile's script and its rclone child (named by parent, not args).
+        // 104: another profile's script; 105: the user's own unrelated rclone job. Neither may
+        // enter a report about these profiles.
         let psOutput = """
-              101     1 01:02:03 /bin/bash /Users/x/.local/bin/synctray-sync.sh /Users/x/.config/synctray/profiles/abcd.json
+              101     1 01:02:03 /bin/bash /Users/x/.local/bin/synctray-sync.sh \(bisync.configPath)
               102   101    00:10 /opt/homebrew/bin/rclone bisync /a b: --sftp-pass hunter2
               103     1    00:05 /usr/bin/vim notes.txt
+              104     1    00:07 /bin/bash /Users/x/.local/bin/synctray-sync.sh /Users/x/.config/synctray/profiles/other.json
+              105     1    00:09 /opt/homebrew/bin/rclone copy /Users/x/Private secret:vault
 
             """
         let env = DiagnosticReportEnvironment(
@@ -8993,7 +8998,7 @@ enum ConfigSelfTest {
             },
             runProcess: { launchPath, _ in
                 if launchPath == "/bin/ps" { return (0, psOutput) }
-                return (0, "PID\tStatus\tLabel\n123\t0\tcom.synctray.sync.abcd1234\n-\t0\tcom.apple.other\n")
+                return (0, "PID\tStatus\tLabel\n123\t0\t\(bisync.launchdLabel)\n124\t0\tcom.synctray.sync.otherjob\n-\t0\tcom.apple.other\n")
             },
             isProcessAlive: { $0 == 4242 },
             statusJSON: { _ in "[\n  {\n    \"state\" : \"idle\"\n  }\n]\n" },
@@ -9045,10 +9050,10 @@ enum ConfigSelfTest {
         guard !rendered.contains("hunter2"),
               built.sections[5].lines.contains(where: { $0.contains("--sftp-pass [REDACTED]") }),
               built.sections[3].lines.count == 2,
-              built.sections[3].lines.allSatisfy({ !$0.contains("vim") }),
+              built.sections[3].lines.allSatisfy({ !$0.contains("vim") && !$0.contains("other.json") && !$0.contains("vault") }),
               built.sections[3].lines.contains(where: { $0.contains("--sftp-pass [REDACTED]") && $0.hasPrefix("pid=102 ppid=101 elapsed=00:10 ") }),
-              built.sections[4].lines.contains(where: { $0.contains("com.synctray.sync.abcd1234") }),
-              !built.sections[4].lines.contains(where: { $0.contains("com.apple.other") }) else {
+              built.sections[4].lines.contains(where: { $0.contains(bisync.launchdLabel) }),
+              !built.sections[4].lines.contains(where: { $0.contains("com.apple.other") || $0.contains("otherjob") }) else {
             return report(name, slug, false, "(redaction or process/launchd filtering wrong)")
         }
         guard built.sections[7].lines.count == 2,
