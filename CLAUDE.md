@@ -1265,7 +1265,7 @@ Covered by `ConfigSelfTest` AC-CLI4 and AC-SEC3.
 
 | Command | Purpose |
 |---------|---------|
-| `synctray report [name\|shortId] [--lines N] [--output <path>] [--send] [--yes] [--json]` | Build a diagnostic report (all profiles when no target; see "Diagnostic reports" under Telemetry) via the injected `CLIEnvironment.buildDiagnosticReport`. Without `--send`: print the rendered report (or write it to `--output` and print the path) and say `Nothing was sent.` on stderr. With `--send`: print `DiagnosticReportCopy.disclosure` on stderr, then ask `Send this report? [y/N]` (default No, EOF = No) unless `--yes`; a non-interactive `--send` without `--yes` exits `64` before building anything. On success prints `Report code: ST-XXXXXX` (or `{"code":"ST-XXXXXX"}` with `--json`) and exits 0; on failure prints the error and exits 1. Telemetry verbs `report` / `report-send`. Covered by `ConfigSelfTest` AC-DR5/AC-DR6. |
+| `synctray report [name\|shortId] [--lines N] [--output <path>] [--send] [--yes] [--json]` | Build a diagnostic report (all profiles when no target; see "Diagnostic reports" under Telemetry) via the injected `CLIEnvironment.buildDiagnosticReport`. Without `--send`: print the rendered report (or write it to `--output` and print the path) and say `Nothing was sent.` on stderr. With `--send`: print `DiagnosticReportCopy.disclosure` on stderr, then ask `Send this report? [y/N]` (default No, EOF = No) unless `--yes`/`-y`; a non-interactive `--send` without `--yes` (stdin or stderr not a terminal, or `CI` set) exits `64` before building anything. `--send --output` saves a copy, then sends; `--json` without `--send` is a usage error. On success prints `Report code: ST-XXXXXX` (or `{"code":"ST-XXXXXX"}` with `--json`) and exits 0; on failure prints the error and exits 1. Telemetry verbs `report` / `report-send`. Covered by `ConfigSelfTest` AC-DR5/AC-DR6. |
 
 `<name|shortId>` resolution tries an exact `shortId` match first, then a
 case-insensitive `name` match; an unmatched (or ambiguous) target exits
@@ -1872,8 +1872,10 @@ who finds the report in Dash0 by `diagnostics.report_id`.
   through `DiagnosticReportEnvironment`): per profile, the last `lineLimit` (default 500) lines of
   `profile.logPath`, the `.profile.json`, the `{shortId}-exclude.txt` filter, the `/tmp` run lock
   and (bisync) the session `.lck` with whether each holder PID is alive (`SyncRunLock`); globally,
-  the `synctray-sync.sh`/rclone processes from `ps -axww -o pid=,ppid=,etime=,args=`, `launchctl
-  list` lines naming synctray, the CLI's own `status --json` (`SyncTrayCLI.statusReport`) and
+  the reported profiles' `synctray-sync.sh`/rclone processes from `ps -axww -o pid=,ppid=,etime=,args=`
+  (`syncProcessLines`: args naming a profile's config file, local folder or remote path, or a child
+  of such a process — never another profile's or the user's own rclone jobs), `launchctl list`
+  lines naming synctray minus other profiles' sync agents (`launchdAgentLines`), the CLI's own `status --json` (`SyncTrayCLI.statusReport`) and
   `doctor` (`SyncTrayCLI.doctorChecks`), and the app, rclone and macOS versions plus whether usage
   data is on. `render()` is the plain text used by Preview, Save and the CLI.
 - **Never read**, by construction: `rclone.conf` (and any `*.rclone.conf`, including

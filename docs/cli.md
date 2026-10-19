@@ -182,7 +182,7 @@ Use `profile enable` and `profile disable` for `isEnabled`.
 | `synctray report [name\|id] [--lines N] [--output <path>]`       | Build a diagnostic report for one profile, or all of them, and print it — or save it to `<path>` and print the path. Nothing is sent. |
 | `synctray report [name\|id] --send [--yes] [--json]`             | Send the report to the SyncTray developer and print its code, `Report code: ST-XXXXXX` (or `{"code":"ST-XXXXXX"}` with `--json`). |
 
-A report holds the last `--lines` lines of each profile's sync log (default 500), the profile's `.profile.json` and filter file, its lock files and whether their holders are running, the `synctray-sync.sh` and rclone processes, the SyncTray launchd agents, the output of `status --json` and `doctor`, and the SyncTray, rclone, and macOS versions.
+A report holds the last `--lines` lines of each profile's sync log (default 500), the profile's `.profile.json` and filter file, its lock files and whether their holders are running, its `synctray-sync.sh` and rclone processes, its SyncTray launchd agents, the output of `status --json` and `doctor`, and the SyncTray, rclone, and macOS versions.
 Unlike usage data, it can contain file and folder names, paths in your home folder (including your username), remote names, and full error messages.
 SyncTray replaces the passwords, tokens, and other secrets it recognizes with `[REDACTED]` before anything is printed, saved, or sent, and `rclone.conf`, `~/.config/synctray/.env`, and the mount's RC API secrets are never read.
 If usage data is on, the report is linked to SyncTray's anonymous install and device IDs; with it off, it carries neither.
@@ -190,8 +190,10 @@ A saved copy (`--output`) is created readable only by you.
 
 - Without `--send`, the report goes to stdout (or to `--output`) and stderr says `Nothing was sent.`
 - `--send` prints the disclosure on stderr, then asks `Send this report? [y/N]` — anything but `y` or `yes`, or end of input, sends nothing.
-  `--yes` skips the question.
-  When stdin or stderr isn't a terminal, `--send` without `--yes` refuses with exit code `64`, so a script never sends a report by accident.
+  `--yes` (or `-y`) skips the question.
+  When stdin or stderr isn't a terminal, or the `CI` environment variable is set, `--send` without `--yes` refuses with exit code `64`, so a script never sends a report by accident.
+- `--send --output <path>` saves a copy to `<path>` first, then sends.
+- The report lists only the sync script and rclone processes and the launchd agents of the profiles it covers, never another profile's or your own unrelated rclone jobs.
 - Sending doesn't depend on the usage-data setting: it works with usage data off.
   Builds without an upload endpoint fail with "Diagnostic upload isn't configured in this build" — save the report with `--output` and send the file instead.
 - Give the developer the `ST-XXXXXX` code so they can find your report.
