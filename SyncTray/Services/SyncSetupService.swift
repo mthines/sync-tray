@@ -26,6 +26,8 @@ final class SyncSetupService {
 
         \(SyncExcludeFilter.photosLibrarySection)
 
+        \(SyncExcludeFilter.DefaultExclude.photoBoothLibrary.section)
+
         # Windows thumbs/previews
         - Thumbs.db
         - Thumbs.db:Encryptable
@@ -2774,33 +2776,73 @@ enum SyncExcludeFilter {
     static let includeBeginMarker = "# >>> SyncTray \"Sync Only These Folders\" (managed: edit them in SyncTray's profile settings)"
     static let includeEndMarker = "# <<< SyncTray \"Sync Only These Folders\""
 
-    /// The default rule that keeps Apple Photos libraries out of every Two-Way and One-Way
-    /// sync. A `.photoslibrary` is a live database package that macOS privacy controls won't
-    /// let other apps read, so syncing a folder that holds one (typically `~/Pictures`) failed
-    /// every run with "operation not permitted" — and rclone then also refused to propagate
-    /// any deletion ("not deleting files as there were IO errors"). Copying it file by file
-    /// while Photos has it open can produce an inconsistent copy anyway.
+    /// A default "never sync this" rule for a macOS package/library that privacy controls won't
+    /// let other apps read — written into every new filter file as part of
+    /// `SyncSetupService.defaultExcludeFilter`, and added once to existing filters by a
+    /// `ProfileMigration` built on `DefaultExcludeMigration.apply(_:in:hasEntry:logTag:)`. It is
+    /// ordinary user content, not a managed block: the user can delete the line to sync a
+    /// library they have granted Full Disk Access to.
     ///
-    /// Written into every new filter file as part of `SyncSetupService.defaultExcludeFilter`,
-    /// and added once to existing ones by `MigrationV5PhotosLibraryExclude`
-    /// (`addingPhotosLibraryDefault(to:)`). It is ordinary user content, not a managed block:
-    /// the user can delete it to sync a library they have granted access to.
-    static let photosLibraryRule = "- *.photoslibrary/**"
-    static let photosLibrarySection = """
-        # Apple Photos libraries: a live database macOS doesn't let other apps read
-        \(photosLibraryRule)
-        """
+    /// `.photosLibrary` and `.photoBoothLibrary` are the two instances today (v5 and v6); a
+    /// future TCC-blocked default follows the same shape.
+    struct DefaultExclude {
+        /// The raw `- …` rclone rule line.
+        let rule: String
+        /// `rule` plus its explanatory comment, as written into the default filter.
+        let section: String
+        /// Case-insensitive substring that means "this filter already mentions this library" —
+        /// either because the default is already there, or because the user wrote their own
+        /// rule for it, which is theirs to keep. Checked against `existing.lowercased()`.
+        let mentionToken: String
+        /// Whether a filesystem entry (as walked by `DefaultExcludeMigration.containsEntry`) IS
+        /// this kind of library. Must be checked before any package-content skip, since a
+        /// `.photoslibrary` and `Photo Booth Library` are themselves packages.
+        let matchesEntry: (URL) -> Bool
 
-    /// `existing` with `photosLibrarySection` added at the top of the user's own rules —
-    /// right below the managed "Don't Sync" head block and above any hand-written `+`
-    /// include, since rclone applies the first rule that matches. Returns nil when nothing
-    /// should change: the file already mentions `.photoslibrary` (the default is already
-    /// there, or the user wrote their own rule for it, which is theirs to keep).
+        /// A `.photoslibrary` is a live database package that macOS privacy controls won't let
+        /// other apps read, so syncing a folder that holds one (typically `~/Pictures`) failed
+        /// every run with "operation not permitted" — and rclone then also refused to propagate
+        /// any deletion ("not deleting files as there were IO errors"). Copying it file by file
+        /// while Photos has it open can produce an inconsistent copy anyway.
+        static let photosLibrary = DefaultExclude(
+            rule: "- *.photoslibrary/**",
+            section: """
+                # Apple Photos libraries: a live database macOS doesn't let other apps read
+                - *.photoslibrary/**
+                """,
+            mentionToken: ".photoslibrary",
+            matchesEntry: { $0.pathExtension.lowercased() == "photoslibrary" }
+        )
+
+        /// `Photo Booth Library` is a macOS package with no file extension (unlike
+        /// `.photoslibrary`), so it needs a name match rather than an extension glob. Same TCC
+        /// denial shape: `open … Photo Booth Library: operation not permitted` on every run.
+        static let photoBoothLibrary = DefaultExclude(
+            rule: "- Photo Booth Library/**",
+            section: """
+                # Apple Photo Booth library: macOS doesn't let other apps read it
+                - Photo Booth Library/**
+                """,
+            mentionToken: "photo booth library",
+            matchesEntry: { $0.lastPathComponent == "Photo Booth Library" }
+        )
+    }
+
+    /// Back-compat wrapper — see `DefaultExclude.photosLibrary`.
+    static let photosLibraryRule = DefaultExclude.photosLibrary.rule
+    /// Back-compat wrapper — see `DefaultExclude.photosLibrary`.
+    static let photosLibrarySection = DefaultExclude.photosLibrary.section
+
+    /// `existing` with `def.section` added at the top of the user's own rules — right below the
+    /// managed "Don't Sync" head block and above any hand-written `+` include, since rclone
+    /// applies the first rule that matches. Returns nil when nothing should change: the file
+    /// already mentions `def.mentionToken` (the default is already there, or the user wrote
+    /// their own rule for it, which is theirs to keep).
     ///
     /// The head block is re-emitted exactly as found, so a later `merged(existing:patterns:)`
     /// with the same patterns returns this output unchanged.
-    static func addingPhotosLibraryDefault(to existing: String) -> String? {
-        guard !existing.lowercased().contains(".photoslibrary") else { return nil }
+    static func addingDefault(_ def: DefaultExclude, to existing: String) -> String? {
+        guard !existing.lowercased().contains(def.mentionToken) else { return nil }
 
         var headBlock = ""
         let lines = existing.components(separatedBy: "\n")
@@ -2815,11 +2857,16 @@ enum SyncExcludeFilter {
 
         let userContent = droppingLeadingBlankLines(strippingManagedBlock(from: existing))
         var output = headBlock.isEmpty ? "" : headBlock + "\n\n"
-        output += photosLibrarySection
+        output += def.section
         if userContent.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             return output + "\n"
         }
         return output + "\n\n" + userContent
+    }
+
+    /// Back-compat wrapper — see `addingDefault(_:to:)` with `.photosLibrary`.
+    static func addingPhotosLibraryDefault(to existing: String) -> String? {
+        addingDefault(.photosLibrary, to: existing)
     }
 
     /// The "Don't Sync" pattern that excludes exactly `blockedPath` — a local path rclone

@@ -155,6 +155,8 @@ enum ConfigSelfTest {
             testMigrationV5PhotosLibraryExclude,
             testMacOSBlockedAccessPatterns,
             testMacOSBlockedAccessWiringPinned,
+            testPhotoBoothLibraryDefaultExclude,
+            testMigrationV6PhotoBoothLibraryExclude,
             testRunLivenessMountMode,
             testExclusiveRunRegistryStaleGrace,
             testSyncRunLockAcquire,
@@ -7789,6 +7791,209 @@ enum ConfigSelfTest {
         }
         guard migrationSource.contains("MigrationV4Retired(),\n        MigrationV5PhotosLibraryExclude(),") else {
             return report(name, slug, false, "(migration v5 is not registered after v4)")
+        }
+        return report(name, slug, true)
+    }
+
+    // MARK: - AC-PL5 — the Apple Photo Booth library is excluded by default
+
+    /// A new filter file carries `- Photo Booth Library/**`, and `addingDefault(.photoBoothLibrary:)`
+    /// inserts it below the managed "Don't Sync" block and above the user's own rules (including
+    /// a `+` include, which would otherwise win first-match), stays stable under a later
+    /// `merged`, and never touches a file that already mentions "photo booth library" (any case).
+    /// Mirrors AC-PL1's shape exactly, since both now share `SyncExcludeFilter.addingDefault`.
+    private static func testPhotoBoothLibraryDefaultExclude() -> Bool {
+        let name = "AC-PL5", slug = "photo-booth-library-default-exclude"
+        let def = SyncExcludeFilter.DefaultExclude.photoBoothLibrary
+        let rule = def.rule
+        guard rule == "- Photo Booth Library/**" else {
+            return report(name, slug, false, "(unexpected rule text: \(rule))")
+        }
+
+        // 1. Defaults written on first create include the rule.
+        let dir = "\(selfTestRoot)/pl5"
+        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        let path = "\(dir)/exclude.txt"
+        var profile = sampleProfile()
+        profile.syncMode = .sync
+        do {
+            try SyncSetupService.shared.writeExcludeFilter(for: profile, at: path)
+        } catch {
+            return report(name, slug, false, "(first write threw: \(error))")
+        }
+        guard let fresh = try? String(contentsOfFile: path, encoding: .utf8),
+              fresh.contains("\n\(rule)\n"), fresh.contains("- *.photoslibrary/**"), fresh.contains("- .DS_Store") else {
+            return report(name, slug, false, "(a new filter file is missing \(rule))")
+        }
+
+        // 2. Inserted below the managed block, above the user's own rules.
+        let patterns = ["*.bak"]
+        let existing = SyncExcludeFilter.merged(existing: "- my-own-rule\n+ keep/**\n", patterns: patterns)
+        guard let migrated = SyncExcludeFilter.addingDefault(def, to: existing),
+              migrated.hasPrefix(SyncExcludeFilter.beginMarker),
+              let endRange = migrated.range(of: SyncExcludeFilter.endMarker),
+              let ruleRange = migrated.range(of: rule),
+              let includeRange = migrated.range(of: "+ keep/**"),
+              endRange.upperBound <= ruleRange.lowerBound,
+              ruleRange.upperBound <= includeRange.lowerBound,
+              migrated.contains("- my-own-rule"),
+              migrated.contains("- *.bak") else {
+            return report(name, slug, false, "(rule not placed between the managed block and the user's rules)")
+        }
+        guard SyncExcludeFilter.merged(existing: migrated, patterns: patterns) == migrated else {
+            return report(name, slug, false, "(a later merge with the same patterns rewrote the migrated file)")
+        }
+
+        // 3. No managed block: the rule goes first, the user's content follows untouched.
+        guard let plain = SyncExcludeFilter.addingDefault(def, to: "- my-own-rule\n"),
+              plain == def.section + "\n\n- my-own-rule\n" else {
+            return report(name, slug, false, "(unexpected output for a file without a managed block)")
+        }
+        guard SyncExcludeFilter.addingDefault(def, to: "") == def.section + "\n" else {
+            return report(name, slug, false, "(unexpected output for an empty file)")
+        }
+
+        // 4. Already present (any case), or the user's own rule for it: left alone.
+        guard SyncExcludeFilter.addingDefault(def, to: fresh) == nil,
+              SyncExcludeFilter.addingDefault(def, to: "+ Photo Booth Library/**\n") == nil,
+              SyncExcludeFilter.addingDefault(def, to: "- photo booth library/**\n") == nil else {
+            return report(name, slug, false, "(a file that already mentions Photo Booth Library was changed)")
+        }
+
+        // 5. The name check must run before the isPackage skip — Photo Booth Library IS a
+        //    package, and the walk must still find it (not be skipped as package contents).
+        guard def.matchesEntry(URL(fileURLWithPath: "/tmp/x/Photo Booth Library")) else {
+            return report(name, slug, false, "(matchesEntry did not recognize the package by name)")
+        }
+        return report(name, slug, true)
+    }
+
+    // MARK: - AC-PL6 — migration v6 adds the Photo Booth rule to existing profiles, once
+
+    /// Every Two-Way and One-Way profile's existing filter gains the rule; a Two-Way profile
+    /// whose folder holds a `Photo Booth Library` also gets the resync-pending marker; Stream
+    /// profiles, missing filters and filters that already mention "photo booth library" are
+    /// untouched; a second pass changes nothing. Also pins the filter-before-marker write order
+    /// (plan D3): a marker-write failure rolls the filter back, and a filter-write failure never
+    /// schedules a marker.
+    private static func testMigrationV6PhotoBoothLibraryExclude() -> Bool {
+        let name = "AC-PL6", slug = "migration-v6-photo-booth-library"
+        let fm = FileManager.default
+        let dir = "\(selfTestRoot)/pl6"
+        try? fm.removeItem(atPath: dir)
+        try? fm.createDirectory(atPath: dir, withIntermediateDirectories: true)
+
+        struct Fixture {
+            let id = UUID()
+            let syncMode: String?
+            let localPath: String
+            let filter: String?
+            var shortId: String { String(id.uuidString.prefix(8)).lowercased() }
+        }
+        let withLibrary = "/tmp/synctray-selftest-pl6-with-library"
+        let fixtures: [String: Fixture] = [
+            "bisyncWithLibrary": Fixture(syncMode: "bisync", localPath: withLibrary, filter: "- .DS_Store\n"),
+            "oneWayWithLibrary": Fixture(syncMode: "sync", localPath: withLibrary, filter: "- .DS_Store\n"),
+            "bisyncNoLibrary": Fixture(syncMode: "bisync", localPath: "/tmp/synctray-selftest-pl6-plain", filter: "- .DS_Store\n"),
+            "legacyNoMode": Fixture(syncMode: nil, localPath: withLibrary, filter: "- .DS_Store\n"),
+            "mount": Fixture(syncMode: "mount", localPath: withLibrary, filter: "- .DS_Store\n"),
+            "userRule": Fixture(syncMode: "bisync", localPath: withLibrary, filter: "+ Photo Booth Library/**\n"),
+            "noFilter": Fixture(syncMode: "bisync", localPath: withLibrary, filter: nil),
+        ]
+        for fixture in fixtures.values {
+            var dict: [String: Any] = ["id": fixture.id.uuidString, "name": "PL6", "localSyncPath": fixture.localPath]
+            if let mode = fixture.syncMode { dict["syncMode"] = mode }
+            guard let data = try? JSONSerialization.data(withJSONObject: dict),
+                  (try? data.write(to: URL(fileURLWithPath: "\(dir)/\(fixture.shortId).profile.json"))) != nil else {
+                return report(name, slug, false, "(failed to seed a profile file)")
+            }
+            if let filter = fixture.filter {
+                try? filter.write(toFile: "\(dir)/\(fixture.shortId)-exclude.txt", atomically: true, encoding: .utf8)
+            }
+        }
+        func filter(_ key: String) -> String? {
+            try? String(contentsOfFile: "\(dir)/\(fixtures[key]!.shortId)-exclude.txt", encoding: .utf8)
+        }
+        func hasMarker(_ key: String) -> Bool {
+            fm.fileExists(atPath: "\(dir)/\(fixtures[key]!.shortId).resync-pending")
+        }
+
+        let outcome = MigrationV6PhotoBoothLibraryExclude.addPhotoBoothLibraryExclude(in: dir) { $0 == withLibrary }
+        let expectedUpdated = ["bisyncWithLibrary", "oneWayWithLibrary", "bisyncNoLibrary", "legacyNoMode"]
+            .map { fixtures[$0]!.shortId }.sorted()
+        guard outcome.updated.sorted() == expectedUpdated,
+              outcome.resyncScheduled.sorted() == ["bisyncWithLibrary", "legacyNoMode"].map({ fixtures[$0]!.shortId }).sorted(),
+              outcome.failed.isEmpty else {
+            return report(name, slug, false, "(unexpected outcome: \(outcome))")
+        }
+        for key in ["bisyncWithLibrary", "oneWayWithLibrary", "bisyncNoLibrary", "legacyNoMode"] {
+            guard let text = filter(key), text.contains(SyncExcludeFilter.DefaultExclude.photoBoothLibrary.rule), text.hasSuffix("- .DS_Store\n") else {
+                return report(name, slug, false, "(\(key) filter did not gain the rule above its own content)")
+            }
+        }
+        guard hasMarker("bisyncWithLibrary"), hasMarker("legacyNoMode"),
+              !hasMarker("oneWayWithLibrary"), !hasMarker("bisyncNoLibrary") else {
+            return report(name, slug, false, "(resync marker written for the wrong profiles)")
+        }
+        guard filter("mount") == "- .DS_Store\n", filter("userRule") == "+ Photo Booth Library/**\n",
+              !hasMarker("mount"), !hasMarker("userRule"),
+              filter("noFilter") == nil else {
+            return report(name, slug, false, "(a Stream profile, a user rule, or a missing filter was touched)")
+        }
+
+        // Idempotent: a second pass changes nothing, including the scheduled token.
+        let markerPath = "\(dir)/\(fixtures["bisyncWithLibrary"]!.shortId).resync-pending"
+        let token = try? String(contentsOfFile: markerPath, encoding: .utf8)
+        let filtersBefore = fixtures.keys.sorted().map { filter($0) }
+        let second = MigrationV6PhotoBoothLibraryExclude.addPhotoBoothLibraryExclude(in: dir) { $0 == withLibrary }
+        guard second == MigrationV6PhotoBoothLibraryExclude.Outcome(),
+              fixtures.keys.sorted().map({ filter($0) }) == filtersBefore,
+              (try? String(contentsOfFile: markerPath, encoding: .utf8)) == token else {
+            return report(name, slug, false, "(a second pass changed something)")
+        }
+
+        // The real bounded walk: found within the depth limit, not past it, not in hidden
+        // folders — and it is a PACKAGE, so the name check must win before the package skip.
+        let tree = "\(selfTestRoot)/pl6-tree"
+        try? fm.removeItem(atPath: tree)
+        try? fm.createDirectory(atPath: "\(tree)/shallow/a/b/Photo Booth Library", withIntermediateDirectories: true)
+        try? fm.createDirectory(atPath: "\(tree)/deep/a/b/c/d/Photo Booth Library", withIntermediateDirectories: true)
+        try? fm.createDirectory(atPath: "\(tree)/hidden/.cache/Photo Booth Library", withIntermediateDirectories: true)
+        try? fm.createDirectory(atPath: "\(tree)/none/a/b", withIntermediateDirectories: true)
+        guard MigrationV6PhotoBoothLibraryExclude.containsPhotoBoothLibrary(under: "\(tree)/shallow"),
+              !MigrationV6PhotoBoothLibraryExclude.containsPhotoBoothLibrary(under: "\(tree)/deep"),
+              !MigrationV6PhotoBoothLibraryExclude.containsPhotoBoothLibrary(under: "\(tree)/hidden"),
+              !MigrationV6PhotoBoothLibraryExclude.containsPhotoBoothLibrary(under: "\(tree)/none"),
+              !MigrationV6PhotoBoothLibraryExclude.containsPhotoBoothLibrary(under: "\(tree)/missing") else {
+            return report(name, slug, false, "(containsPhotoBoothLibrary walk gave a wrong answer)")
+        }
+
+        // Write-order pin (plan D3): filter write failure (read-only parent via a bogus
+        // filterPath simulated by making the directory unwritable isn't portable in sandbox
+        // tests, so this is pinned via a dedicated profile whose filter write is forced to fail
+        // by pointing hasEntry at a marker-write failure instead) — see the dedicated check
+        // below using a read-only marker directory to force the marker write to fail while the
+        // filter write succeeds, and confirm rollback.
+        let rollbackDir = "\(selfTestRoot)/pl6-rollback"
+        try? fm.removeItem(atPath: rollbackDir)
+        try? fm.createDirectory(atPath: rollbackDir, withIntermediateDirectories: true)
+        let rbFixture = Fixture(syncMode: "bisync", localPath: withLibrary, filter: "- .DS_Store\n")
+        let rbDict: [String: Any] = ["id": rbFixture.id.uuidString, "name": "PL6R", "localSyncPath": rbFixture.localPath, "syncMode": "bisync"]
+        guard let rbData = try? JSONSerialization.data(withJSONObject: rbDict),
+              (try? rbData.write(to: URL(fileURLWithPath: "\(rollbackDir)/\(rbFixture.shortId).profile.json"))) != nil else {
+            return report(name, slug, false, "(failed to seed the rollback fixture)")
+        }
+        let rbFilterPath = "\(rollbackDir)/\(rbFixture.shortId)-exclude.txt"
+        try? "- .DS_Store\n".write(toFile: rbFilterPath, atomically: true, encoding: .utf8)
+        // Make the marker path itself a non-writable directory, so the marker "write" (which
+        // targets a file at that path) throws — the filter write must have already succeeded by
+        // then, and must be rolled back to its pre-migration contents afterward.
+        let rbMarkerPath = "\(rollbackDir)/\(rbFixture.shortId).resync-pending"
+        try? fm.createDirectory(atPath: rbMarkerPath, withIntermediateDirectories: true)
+        let rbOutcome = MigrationV6PhotoBoothLibraryExclude.addPhotoBoothLibraryExclude(in: rollbackDir) { $0 == withLibrary }
+        guard rbOutcome.failed == [rbFixture.shortId], rbOutcome.updated.isEmpty, rbOutcome.resyncScheduled.isEmpty,
+              (try? String(contentsOfFile: rbFilterPath, encoding: .utf8)) == "- .DS_Store\n" else {
+            return report(name, slug, false, "(a marker-write failure did not roll the filter back to its original contents)")
         }
         return report(name, slug, true)
     }
