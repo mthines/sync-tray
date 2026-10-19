@@ -8122,6 +8122,16 @@ enum ConfigSelfTest {
         guard def.matchesEntry(URL(fileURLWithPath: "/tmp/x/Photo Booth Library")) else {
             return report(name, slug, false, "(matchesEntry did not recognize the package by name)")
         }
+        // Telemetry: a Photo Booth denial gets its own bounded kind, never the path.
+        let boothDenial = "ERROR : Pictures/Photo Booth Library: error reading source directory: "
+            + "open /Users/me/Pictures/Photo Booth Library: operation not permitted"
+        guard TelemetryService.blockedPathKind("/Users/me/Pictures/Photo Booth Library") == "photo_booth_library",
+              TelemetryService.blockedPathKind("/Users/me/Pictures/photo booth library/Pictures") == "photo_booth_library",
+              TelemetryService.blockedPathKind("/Users/me/Pictures/Photo Booth Library Backup") == "other",
+              TelemetryService.accessDenialAttributes(for: boothDenial, localSyncPath: "/Users/me/Pictures")["error.blocked_path.kind"]
+                == .string("photo_booth_library") else {
+            return report(name, slug, false, "(a Photo Booth denial isn't bucketed as photo_booth_library)")
+        }
         return report(name, slug, true)
     }
 

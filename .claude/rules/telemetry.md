@@ -212,7 +212,7 @@ Log/span only — never a metric label.
   [Error categories](#error-categories) for the buckets
 - A `permission_denied` failure also carries bounded `error.access_denial`
   (`operation_not_permitted` = EPERM/macOS privacy, `permission_denied` = EACCES/file
-  permissions), `error.blocked_path.kind` (`volume_system_folder` / `photos_library` / `other`)
+  permissions), `error.blocked_path.kind` (`volume_system_folder` / `photos_library` / `photo_booth_library` / `other`)
   and `error.blocked_path.in_sync_folder` from `TelemetryService.accessDenialAttributes` —
   derived from the message, never the path itself
 - **Carve-out:** `vcs.repository.url.full` (the *source code* repository's origin

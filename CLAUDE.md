@@ -1096,7 +1096,7 @@ load-bearing: in rclone a bare name (the old `- .fseventsd`) is a FILE rule (`fs
 get the section from migration v6 (below). Telemetry keeps `error.type=permission_denied` for
 both errnos and adds bounded `error.access_denial` (`operation_not_permitted` /
 `permission_denied`, also a label on `synctray.sync.errors`), `error.blocked_path.kind`
-(`volume_system_folder` / `photos_library` / `other`) and `error.blocked_path.in_sync_folder`
+(`volume_system_folder` / `photos_library` / `photo_booth_library` / `other`) and `error.blocked_path.in_sync_folder`
 (`TelemetryService.accessDenialAttributes`) — never the path. Covered by `ConfigSelfTest`
 AC-VS1–AC-VS4 (AC-VS3 runs the real rclone against unreadable folders, with the old default as
 the failing control).
