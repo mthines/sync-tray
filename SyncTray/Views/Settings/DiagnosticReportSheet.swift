@@ -294,6 +294,10 @@ struct DiagnosticReportSheet: View {
                 } catch {
                     TelemetryService.shared.recordDiagnosticReport(
                         reportId: built.code, sourceUI: "app", succeeded: false, lineCount: built.lineCount)
+                    // Batches before the failure may already have landed under this code, so a
+                    // retry builds a fresh report (and code) rather than sending them twice.
+                    report = nil
+                    reportScope = nil
                     phase = .failed(message: DiagnosticReportUploader.message(for: error))
                 }
             }
