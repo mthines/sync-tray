@@ -2317,8 +2317,12 @@ extension CLIEnvironment {
                 setTelemetryEnabledProcess(enabled)  // writes settings.json itself
                 continue
             case (.launchAtLogin?, .bool(let enabled)):
+                // Already in that state: skip, as SettingsReconciler does — a
+                // redundant unregister() throws and would block the other keys.
                 do {
-                    if enabled { try SMAppService.mainApp.register() } else { try SMAppService.mainApp.unregister() }
+                    if enabled != (SMAppService.mainApp.status == .enabled) {
+                        if enabled { try SMAppService.mainApp.register() } else { try SMAppService.mainApp.unregister() }
+                    }
                 } catch {
                     return "couldn't \(enabled ? "enable" : "disable") launch at login: \(error.localizedDescription)"
                 }
