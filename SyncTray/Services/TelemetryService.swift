@@ -209,6 +209,7 @@ final class TelemetryService {
         let metricsExporter = StableOtlpHTTPMetricExporter(
             endpoint: metricsEndpoint,
             aggregationTemporalitySelector: AggregationTemporality.deltaPreferred(),
+            useSession: Self.exportSession,
             envVarHeaders: Self.authHeaders
         )
 
@@ -234,6 +235,7 @@ final class TelemetryService {
         let tracesEndpoint = URL(string: "\(Self.endpoint)/v1/traces")!
         let tracesExporter = OtlpHttpTraceExporter(
             endpoint: tracesEndpoint,
+            useSession: Self.exportSession,
             envVarHeaders: Self.authHeaders
         )
 
@@ -253,6 +255,7 @@ final class TelemetryService {
         let logsEndpoint = URL(string: "\(Self.endpoint)/v1/logs")!
         let logsExporter = OtlpHttpLogExporter(
             endpoint: logsEndpoint,
+            useSession: Self.exportSession,
             envVarHeaders: Self.authHeaders
         )
 
@@ -1682,27 +1685,82 @@ final class TelemetryService {
     /// Flush every signal for a short-lived process (the CLI) that is about to
     /// `exit()`. Unlike `shutdown()` — the app's terminate path, which prints a
     /// diagnostic line and ends the sync spans — this is SILENT (no stdout, so
-    /// it never pollutes CLI output) and also flushes the logger, so a CLI run's
-    /// `synctray.cli.invoked` counter AND its "CLI invoked" log both reach the
-    /// collector before the process dies. No-op when telemetry is disabled.
+    /// it never pollutes CLI output) and never shuts the providers down. It flushes
+    /// the logger too, so a CLI run's `synctray.cli.invoked` counter AND its
+    /// "CLI invoked" log both reach the collector before the process dies. No-op
+    /// when telemetry is disabled.
     func flushForExit(timeout: TimeInterval = 3) {
         guard SyncTraySettings.telemetryEnabled else { return }
-        // The OTLP exporters run on a default URLSession with no custom request
+        // The OTLP exporters send on `exportSession`, which sets no custom request
         // timeout, so a synchronous `forceFlush()` can block ~60s against an
         // unreachable/black-holed collector. That is unacceptable for a CLI meant
         // for fast agent scripting, so flush on a background queue and wait only a
         // short, bounded deadline. Telemetry is best-effort: if the flush hasn't
         // landed by the deadline, the process exits anyway and the event is lost —
         // far better than hanging the command.
+        //
+        // `forceFlush()` returning is not enough: opentelemetry-swift 1.17.1's OTLP/HTTP
+        // exporters start the request and return `.success` before it completes, so a
+        // process that exits right after the flush kills the request in flight — no CLI
+        // event had ever reached the collector. After flushing, wait (inside the same
+        // deadline) until the exporters' own session has nothing left in flight.
+        let deadline = DispatchTime.now() + timeout
         let group = DispatchGroup()
         group.enter()
         DispatchQueue.global(qos: .utility).async {
             _ = self.meterProvider?.forceFlush()
             self.logProcessor?.forceFlush()
             self.tracerProvider?.forceFlush()
+            _ = Self.waitUntilIdle(deadline: deadline, inFlight: Self.inFlightExportCount)
             group.leave()
         }
-        _ = group.wait(timeout: .now() + timeout)
+        _ = group.wait(timeout: deadline)
+    }
+
+    /// The session every OTLP exporter sends on (the SDK's own default is also an
+    /// ephemeral session). Owned here so `flushForExit` can see the requests in flight.
+    private static let exportSession: URLSession = {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.urlCache = nil  // as the SDK's own default session: don't keep request bodies
+        return URLSession(configuration: configuration)
+    }()
+
+    /// Requests the exporters have started and not finished, or 0 if the session
+    /// doesn't answer within a second.
+    private static func inFlightExportCount() -> Int {
+        let done = DispatchSemaphore(value: 0)
+        let count = LockedCount()
+        exportSession.getAllTasks { tasks in
+            count.value = tasks.filter { $0.state == .running || $0.state == .suspended }.count
+            done.signal()
+        }
+        return done.wait(timeout: .now() + 1) == .timedOut ? 0 : count.value
+    }
+
+    private final class LockedCount: @unchecked Sendable {
+        private let lock = NSLock()
+        private var stored = 0
+        var value: Int {
+            get { lock.withLock { stored } }
+            set { lock.withLock { stored = newValue } }
+        }
+    }
+
+    /// Poll `inFlight` every `pollInterval` until it reports nothing in flight or
+    /// `deadline` passes. Returns whether it drained. Pure over its closures —
+    /// covered by `ConfigSelfTest` AC-CLI14.
+    static func waitUntilIdle(
+        deadline: DispatchTime,
+        pollInterval: TimeInterval = 0.05,
+        inFlight: () -> Int,
+        now: () -> DispatchTime = { .now() },
+        sleep: (TimeInterval) -> Void = { Thread.sleep(forTimeInterval: $0) }
+    ) -> Bool {
+        while inFlight() > 0 {
+            guard now() < deadline else { return false }
+            sleep(pollInterval)
+        }
+        return true
     }
 
     // MARK: - Offline Extension Setup Funnel
@@ -2287,6 +2345,11 @@ final class TelemetryService {
         // run points at the OTLP /v1/metrics exchange as the real culprit.
         let metricsFlush = meterProvider?.forceFlush()
         Self.diagnostic("metrics forceFlush on shutdown: \(String(describing: metricsFlush)) → \(Self.endpoint)/v1/metrics")
+        logProcessor?.forceFlush()
+        tracerProvider?.forceFlush()
+        // The flushes only start the sends (see `flushForExit`); the app exits right
+        // after this returns, so wait briefly for them to finish, as the CLI does.
+        _ = Self.waitUntilIdle(deadline: .now() + 2, inFlight: Self.inFlightExportCount)
         _ = meterProvider?.shutdown()
         tracerProvider?.shutdown()
     }

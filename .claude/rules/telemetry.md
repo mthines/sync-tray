@@ -433,6 +433,20 @@ StableMeterProviderSdk.builder()
 
 Ref: https://github.com/open-telemetry/opentelemetry-swift/issues/500
 
+## Swift SDK Gotcha: `forceFlush()` Does Not Wait for the Send
+
+The OTLP/HTTP exporters (`OtlpHttpLogExporter`, `OtlpHttpTraceExporter`,
+`StableOtlpHTTPMetricExporter`) start the HTTP request and return `.success` before
+it completes, so `forceFlush()` returning only means the requests have *started*.
+A process that exits right after the flush kills the request — the CLI on every
+run, and the app on quit. Before this was handled, no `CLI invoked`
+(`synctray.process.kind=cli`) record had ever reached Dash0.
+
+So every exporter is built with `useSession: Self.exportSession`, and
+`flushForExit` waits (inside its 3 s deadline) until that session has nothing in
+flight (`waitUntilIdle`); the app's `shutdown()` does the same with a 2 s deadline.
+A new exporter must use the same session, or its exit-time events are lost again. Covered by `ConfigSelfTest` AC-CLI14.
+
 ## Configuration
 
 Priority (first non-empty wins):
