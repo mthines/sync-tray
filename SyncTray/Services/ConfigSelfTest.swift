@@ -8120,12 +8120,31 @@ enum ConfigSelfTest {
             return report(name, slug, false, "(containsPhotoBoothLibrary walk gave a wrong answer)")
         }
 
-        // Write-order pin (plan D3): filter write failure (read-only parent via a bogus
-        // filterPath simulated by making the directory unwritable isn't portable in sandbox
-        // tests, so this is pinned via a dedicated profile whose filter write is forced to fail
-        // by pointing hasEntry at a marker-write failure instead) — see the dedicated check
-        // below using a read-only marker directory to force the marker write to fail while the
-        // filter write succeeds, and confirm rollback.
+        // Write-order pin (plan D3), filter-write-fails side: a read-only directory blocks the
+        // atomic write's temp-file create (confirmed: `String.write(atomically: true)` creates a
+        // sibling temp file and renames over the target, which needs directory WRITE permission,
+        // not just file permission — unlike truncating an existing writable file in place). The
+        // filter write must fail BEFORE any marker is attempted, so `failed` is recorded and NO
+        // marker file exists at all — distinct from the rollback case below, where the filter
+        // write succeeds and only the marker write fails.
+        let filterFailDir = "\(selfTestRoot)/pl6-filter-fail"
+        try? fm.removeItem(atPath: filterFailDir)
+        try? fm.createDirectory(atPath: filterFailDir, withIntermediateDirectories: true)
+        let ffFixture = Fixture(syncMode: "bisync", localPath: withLibrary, filter: "- .DS_Store\n")
+        let ffDict: [String: Any] = ["id": ffFixture.id.uuidString, "name": "PL6F", "localSyncPath": ffFixture.localPath, "syncMode": "bisync"]
+        guard let ffData = try? JSONSerialization.data(withJSONObject: ffDict),
+              (try? ffData.write(to: URL(fileURLWithPath: "\(filterFailDir)/\(ffFixture.shortId).profile.json"))) != nil else {
+            return report(name, slug, false, "(failed to seed the filter-write-failure fixture)")
+        }
+        try? "- .DS_Store\n".write(toFile: "\(filterFailDir)/\(ffFixture.shortId)-exclude.txt", atomically: true, encoding: .utf8)
+        try? fm.setAttributes([.posixPermissions: 0o555], ofItemAtPath: filterFailDir)
+        let ffOutcome = MigrationV6PhotoBoothLibraryExclude.addPhotoBoothLibraryExclude(in: filterFailDir) { $0 == withLibrary }
+        try? fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: filterFailDir)
+        guard ffOutcome.failed == [ffFixture.shortId], ffOutcome.updated.isEmpty, ffOutcome.resyncScheduled.isEmpty,
+              !fm.fileExists(atPath: "\(filterFailDir)/\(ffFixture.shortId).resync-pending") else {
+            return report(name, slug, false, "(a filter write failure did not record failed with no marker attempted: \(ffOutcome))")
+        }
+
         let rollbackDir = "\(selfTestRoot)/pl6-rollback"
         try? fm.removeItem(atPath: rollbackDir)
         try? fm.createDirectory(atPath: rollbackDir, withIntermediateDirectories: true)

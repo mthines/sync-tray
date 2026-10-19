@@ -314,7 +314,6 @@ struct ProfileDetailView: View {
             savedSyncExcludePatternsBaseline: $savedSyncExcludePatternsBaseline,
             pendingStopAndApplyProfile: $pendingStopAndApplyProfile,
             showingStopAndApplyConfirm: $showingStopAndApplyConfirm,
-            currentProfile: profile,
             onConfirmStopAndApply: { [self] updated in
                 applyFilterSaveAndFollowUp(current: profile, updated: updated, followUp: .confirmStopThenSync)
             }
@@ -4045,7 +4044,13 @@ struct ProfileDetailView: View {
     @ViewBuilder
     private func macOSBlockedAccessActions(blockedPath: String, error: String) -> some View {
         let excludePattern = blockedAccessExcludePattern(blockedPath: blockedPath, error: error)
-        let alreadyStaged = excludePattern.map { syncExcludePatterns.contains($0) } ?? false
+        // Only "unsaved" while it's staged in the form but NOT yet in the saved profile — once
+        // Save applies it, the pattern is in `profile.syncExcludePatterns` too, and the banner
+        // must stop claiming it's unsaved (there's nothing left to Save for this pattern, and
+        // the button would otherwise stay stuck on "Excluded (unsaved)" forever).
+        let alreadyStaged = excludePattern.map {
+            syncExcludePatterns.contains($0) && !profile.syncExcludePatterns.contains($0)
+        } ?? false
         let name = (blockedPath as NSString).lastPathComponent
         VStack(alignment: .leading, spacing: 6) {
             if let summary = SyncLogPatterns.macOSBlockedAccessSummary(for: error, localSyncPath: profile.localSyncPath) {
@@ -4719,7 +4724,6 @@ private struct StagedSyncExcludePatternsModifier: ViewModifier {
     @Binding var savedSyncExcludePatternsBaseline: [String]
     @Binding var pendingStopAndApplyProfile: SyncProfile?
     @Binding var showingStopAndApplyConfirm: Bool
-    let currentProfile: SyncProfile
     let onConfirmStopAndApply: (SyncProfile) -> Void
 
     func body(content: Content) -> some View {
