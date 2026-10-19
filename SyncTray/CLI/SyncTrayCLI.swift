@@ -878,7 +878,7 @@ enum SyncTrayCLI {
         guard var arguments = SyncManager.reachabilityProbeArguments(remote: profile.rcloneRemote, path: profile.remotePath) else {
             return (false, false, "remote unreachable: no remote configured")
         }
-        if env.remoteSkipsCertCheck(profile.rcloneRemote) {
+        if env.remoteSkipsCertCheck(profile.primaryRemoteName) {
             arguments.append("--no-check-certificate")
         }
         let (exit, _, stderr) = env.runRclone(arguments, remoteProbeTimeout)
