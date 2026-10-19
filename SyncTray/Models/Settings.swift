@@ -268,8 +268,8 @@ enum MenuBarIconStyle: String, CaseIterable, Identifiable {
 struct MenuBarIconAppearance {
     /// UserDefaults keys. `SyncTrayApp` reads them with `@AppStorage`, so the menu bar
     /// icon redraws as soon as `AppSettingsView` (which writes them) changes one.
-    /// Deliberately not mirrored into `settings.json` (`AppSettingsFileStore` is a
-    /// Bool-only safe-key mirror); they are display preferences, not sync behaviour.
+    /// Mirrored to `settings.json` as `AppSettingsFileStore.StringKey`, whose raw values
+    /// must equal these keys, and changeable with `synctray settings set`.
     static let styleKey = "menuBarIconStyle"
     static let syncingColorKey = "menuBarIconSyncingColor"
     static let idleColorKey = "menuBarIconIdleColor"
