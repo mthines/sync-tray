@@ -683,8 +683,8 @@ enum SyncLogPatterns {
     }
 
     /// One-line user-facing summary of a local access denial — "macOS blocked access to
-    /// “Photos Library.photoslibrary”." for a privacy denial, "SyncTray isn't allowed to read
-    /// “.Spotlight-V100”." for a permissions one — or nil when `message` isn't one (see
+    /// “Photos Library.photoslibrary”." for a privacy denial, "SyncTray doesn't have permission
+    /// to access “.Spotlight-V100”." for a permissions one — or nil when `message` isn't one (see
     /// `macOSBlockedPath`). Names only the last path component, which is what the user
     /// recognizes.
     static func macOSBlockedAccessSummary(for message: String, localSyncPath: String) -> String? {
@@ -693,7 +693,7 @@ enum SyncLogPatterns {
         let shown = name.isEmpty ? blocked.path : name
         switch blocked.kind {
         case .macOSPrivacy: return "macOS blocked access to “\(shown)”."
-        case .filePermissions: return "SyncTray isn't allowed to read “\(shown)”."
+        case .filePermissions: return "SyncTray doesn't have permission to access “\(shown)”."
         }
     }
 

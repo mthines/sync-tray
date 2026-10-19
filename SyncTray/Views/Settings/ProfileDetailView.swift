@@ -4021,9 +4021,9 @@ struct ProfileDetailView: View {
                     + "holds your files. Exclude it from this profile to finish syncing."
             } else {
                 text = canExclude
-                    ? "Its permissions don't let you read it. Exclude it from this profile to finish syncing, "
-                        + "or give yourself read access in Finder › Get Info › Sharing & Permissions."
-                    : "Its permissions don't let you read it. Give yourself read access in Finder › Get Info › "
+                    ? "Its permissions don't let SyncTray access it. Exclude it from this profile to finish syncing, "
+                        + "or give yourself Read & Write access in Finder › Get Info › Sharing & Permissions."
+                    : "Its permissions don't let SyncTray access it. Give yourself Read & Write access in Finder › Get Info › "
                         + "Sharing & Permissions, then sync again."
             }
         }

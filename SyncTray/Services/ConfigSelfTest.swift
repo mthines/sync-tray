@@ -8101,7 +8101,7 @@ enum ConfigSelfTest {
               SyncLogPatterns.macOSBlockedPath(in: message, localSyncPath: root) == folder,
               SyncLogPatterns.macOSBlockedPath(in: message, localSyncPath: "/Volumes/Other") == nil,
               SyncLogPatterns.macOSBlockedAccessSummary(for: message, localSyncPath: root)
-                == "SyncTray isn't allowed to read “.Spotlight-V100”.",
+                == "SyncTray doesn't have permission to access “.Spotlight-V100”.",
               SyncExcludeFilter.excludePattern(forBlockedPath: folder, localSyncPath: root, isDirectory: true)
                 == "/.Spotlight-V100/" else {
             return report(name, slug, false, "(the EACCES line was not recognized as a local permissions denial)")
