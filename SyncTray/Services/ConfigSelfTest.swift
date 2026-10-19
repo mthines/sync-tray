@@ -198,6 +198,24 @@ enum ConfigSelfTest {
         return passed
     }
 
+    /// Runs `/usr/bin/chflags <flag> <path>` and waits for it to exit. Used to isolate a single
+    /// fixture FILE's writability (`uchg` blocks a rename-over-target write without needing the
+    /// containing directory to be read-only, which would also block sibling writes) — see
+    /// AC-PL6's filter-write-fails case.
+    private static func runChflags(_ flag: String, _ path: String) {
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/usr/bin/chflags")
+        proc.arguments = [flag, path]
+        proc.standardOutput = Pipe()
+        proc.standardError = Pipe()
+        do {
+            try proc.run()
+            proc.waitUntilExit()
+        } catch {
+            // Best-effort — the caller's own assertions will fail loudly if this didn't work.
+        }
+    }
+
     private static func sampleProfile(
         id: UUID = UUID(),
         name: String = "SelfTest Profile",
@@ -8120,13 +8138,18 @@ enum ConfigSelfTest {
             return report(name, slug, false, "(containsPhotoBoothLibrary walk gave a wrong answer)")
         }
 
-        // Write-order pin (plan D3), filter-write-fails side: a read-only directory blocks the
-        // atomic write's temp-file create (confirmed: `String.write(atomically: true)` creates a
-        // sibling temp file and renames over the target, which needs directory WRITE permission,
-        // not just file permission — unlike truncating an existing writable file in place). The
-        // filter write must fail BEFORE any marker is attempted, so `failed` is recorded and NO
-        // marker file exists at all — distinct from the rollback case below, where the filter
-        // write succeeds and only the marker write fails.
+        // Write-order pin (plan D3), filter-write-fails side: a 0555 DIRECTORY was tried first
+        // and rejected (pre-push review) — it blocks the marker write too (both are new sibling
+        // files via the same atomic-write pattern), so "no marker" would pass even under a
+        // marker-first order; it only proved a filter failure stops at `failed`, not the order.
+        // Instead, only the FILTER FILE itself is made immutable (`chflags uchg`, macOS's
+        // user-immutable flag — blocks the rename-over-target `String.write(atomically: true)`
+        // needs, even though the directory stays writable). The marker path is a distinct new
+        // file in the same (writable) directory, so only the filter write is forced to fail —
+        // isolating "filter write fails" from "marker write fails" (the rollback case below).
+        // The filter write must fail BEFORE any marker is attempted, so `failed` is recorded and
+        // NO marker file exists at all; if the order were ever flipped to marker-first, the
+        // marker would be written (nothing blocks it here) and this assertion would catch it.
         let filterFailDir = "\(selfTestRoot)/pl6-filter-fail"
         try? fm.removeItem(atPath: filterFailDir)
         try? fm.createDirectory(atPath: filterFailDir, withIntermediateDirectories: true)
@@ -8136,10 +8159,11 @@ enum ConfigSelfTest {
               (try? ffData.write(to: URL(fileURLWithPath: "\(filterFailDir)/\(ffFixture.shortId).profile.json"))) != nil else {
             return report(name, slug, false, "(failed to seed the filter-write-failure fixture)")
         }
-        try? "- .DS_Store\n".write(toFile: "\(filterFailDir)/\(ffFixture.shortId)-exclude.txt", atomically: true, encoding: .utf8)
-        try? fm.setAttributes([.posixPermissions: 0o555], ofItemAtPath: filterFailDir)
+        let ffFilterPath = "\(filterFailDir)/\(ffFixture.shortId)-exclude.txt"
+        try? "- .DS_Store\n".write(toFile: ffFilterPath, atomically: true, encoding: .utf8)
+        runChflags("uchg", ffFilterPath)
         let ffOutcome = MigrationV6PhotoBoothLibraryExclude.addPhotoBoothLibraryExclude(in: filterFailDir) { $0 == withLibrary }
-        try? fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: filterFailDir)
+        runChflags("nouchg", ffFilterPath)
         guard ffOutcome.failed == [ffFixture.shortId], ffOutcome.updated.isEmpty, ffOutcome.resyncScheduled.isEmpty,
               !fm.fileExists(atPath: "\(filterFailDir)/\(ffFixture.shortId).resync-pending") else {
             return report(name, slug, false, "(a filter write failure did not record failed with no marker attempted: \(ffOutcome))")
