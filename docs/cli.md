@@ -184,7 +184,9 @@ Use `profile enable` and `profile disable` for `isEnabled`.
 
 A report holds the last `--lines` lines of each profile's sync log (default 500), the profile's `.profile.json` and filter file, its lock files and whether their holders are running, the `synctray-sync.sh` and rclone processes, the SyncTray launchd agents, the output of `status --json` and `doctor`, and the SyncTray, rclone, and macOS versions.
 Unlike usage data, it can contain file and folder names, paths in your home folder (including your username), remote names, and full error messages.
-Passwords, tokens, and other secrets are replaced with `[REDACTED]` before anything is printed, saved, or sent, and `rclone.conf`, `~/.config/synctray/.env`, and the mount's RC API secrets are never read.
+SyncTray replaces the passwords, tokens, and other secrets it recognizes with `[REDACTED]` before anything is printed, saved, or sent, and `rclone.conf`, `~/.config/synctray/.env`, and the mount's RC API secrets are never read.
+If usage data is on, the report is linked to SyncTray's anonymous install ID; with it off, the report carries no install ID.
+A saved copy (`--output`) is created readable only by you.
 
 - Without `--send`, the report goes to stdout (or to `--output`) and stderr says `Nothing was sent.`
 - `--send` prints the disclosure on stderr, then asks `Send this report? [y/N]` — anything but `y` or `yes`, or end of input, sends nothing.

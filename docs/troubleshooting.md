@@ -129,7 +129,8 @@ When the developer asks for logs, send a diagnostic report instead of digging fi
 
 The report holds recent sync log lines, your profile settings, and their status.
 Unlike usage data, it can include file and folder names, paths in your home folder (including your username), remote names, and full error messages.
-Passwords and tokens are removed first, and nothing is sent until you press **Send** — it works even with usage data off.
+SyncTray removes the passwords and tokens it recognizes before anything is sent, and nothing is sent until you press **Send** — it works even with usage data off.
+If usage data is on, the report is linked to SyncTray's anonymous install ID.
 **Save to Desktop** writes the same report to a file instead, if you'd rather attach it yourself.
 
 From a terminal: `synctray report <name>` prints the report, and `synctray report <name> --send` sends it and prints the code.

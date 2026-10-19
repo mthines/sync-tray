@@ -6,7 +6,7 @@ import Foundation
 ///
 /// Unlike usage telemetry (`TelemetryService`), a report CAN contain personal paths, file
 /// and folder names, remote names and full error text — the user is told so in plain words
-/// (`DiagnosticReportCopy.disclosure`) and consents per send. Secrets are always stripped:
+/// (`DiagnosticReportCopy.disclosure`) and consents per send. Recognized secrets are stripped:
 /// every line of every section goes through `DiagnosticRedactor.redact` before it is stored,
 /// and the builder never reads a credential file (`DiagnosticReportBuilder.isNeverRead`).
 /// See CLAUDE.md "Diagnostic reports".
@@ -140,7 +140,7 @@ struct DiagnosticReport: Equatable {
 /// The disclosure and follow-up copy, shared by the app's sheet and the CLI so the two
 /// always say the same thing.
 enum DiagnosticReportCopy {
-    static let disclosure = "This report includes recent sync log lines, your profile settings and their status. Unlike usage data, it can include file and folder names, paths in your home folder (including your username), remote names and full error messages. Passwords and tokens are removed before anything is sent. It goes to the SyncTray developer, and nothing is sent until you press Send."
+    static let disclosure = "This report includes recent sync log lines, your profile settings and their status. Unlike usage data, it can include file and folder names, paths in your home folder (including your username), remote names and full error messages. SyncTray removes the passwords and tokens it recognizes before anything is sent. If usage data is on, the report is linked to SyncTray's anonymous install ID. It goes to the SyncTray developer, and nothing is sent until you press Send."
 
     static let shareCode = "Send this code to the developer so they can find your report."
 }
@@ -191,11 +191,12 @@ enum DiagnosticRedactor {
     }
 
     /// Order matters: JSON keys and headers first (they consume whole values, so the later
-    /// key=value rule never sees half a header), then env vars and flags, then generic keys.
+    /// key=value rule never sees half a header), then env vars and flags, then generic keys,
+    /// URL userinfo and signed-URL query values.
     /// Each rule skips a value that is already `[REDACTED]`, so `redact` is idempotent.
     private static let ruleSpecs: [(pattern: String, template: String)] = [
         // 1. JSON `"<key>": "<value>"` for a secret key (exact key match).
-        (#"(?i)("(?:password|passwd|pass|token|access[_\-]?token|refresh[_\-]?token|auth[_\-]?token|session[_\-]?token|client[_\-]?secret|secret|api[_\-]?key|cookie|set-cookie|authorization|proxy-authorization)"\s*:\s*")(?:[^"\\]|\\.)*(")"#,
+        (#"(?i)("(?:password|passwd|pass|token|access[_\-]?token|refresh[_\-]?token|auth[_\-]?token|session[_\-]?token|client[_\-]?secret|secret[_\-]?access[_\-]?key|private[_\-]?key|account[_\-]?key|sas[_\-]?url|secret|api[_\-]?key|cookie|set-cookie|authorization|proxy-authorization)"\s*:\s*")(?:[^"\\]|\\.)*(")"#,
          "$1[REDACTED]$2"),
         // 2. `Authorization: …` / `Cookie: …` header values, up to a quote or end of line.
         (#"(?i)(\b(?:proxy-)?authorization\s*+[:=]\s*+|\b(?:set-)?cookie\s*+:\s*+)(?!\[REDACTED\])[^"\r\n]+"#,
@@ -210,14 +211,17 @@ enum DiagnosticRedactor {
         // 5. CLI flags whose name ends in -pass/-password/-token/-secret/-key (so also
         //    -client-secret, -secret-access-key), `--flag value` and `--flag=value`. The flag
         //    must start a word, so a path like `a-b-token notes` is not a flag.
-        (#"(?i)(?<![^\s"'])(--?(?:[a-z0-9][a-z0-9_\-]*-)?(?:pass|password|token|secret|key|key-pem|credentials)[0-9]?)(=|\s++)(?!\[REDACTED\])(?!--[a-z])(?:\{[^\{\}\r\n]*\}|\\".*?\\"|"[^"]*"|'[^']*'|[^\s"]+)"#,
+        (#"(?i)(?<![^\s"'])(--?(?:[a-z0-9][a-z0-9_\-]*-)?(?:pass|password|token|secret|key|key-pem|credentials|sas-url)[0-9]?)(=|\s++)(?!\[REDACTED\])(?!--[a-z])(?:\{[^\{\}\r\n]*\}|\\".*?\\"|"[^"]*"|'[^']*'|[^\s"]+)"#,
          "$1$2[REDACTED]"),
         // 6. `key=value`, `key: value`, `key = value` for a known secret key.
-        (#"(?i)(?<![a-z0-9])(password|passwd|pass|access_token|refresh_token|auth_token|session_token|client_secret|secret|api_key|apikey|cookie|token)(\s*+[=:]\s*+)(?!\[REDACTED\])("[^"]*"|'[^']*'|[^\s,;\&"'\}\]]+)"#,
+        (#"(?i)(?<![a-z0-9])(password|passwd|pass|access_token|refresh_token|auth_token|session_token|client_secret|secret_access_key|private_key|account_key|sas_url|secret|api_key|api-key|apikey|cookie|token)(\s*+[=:]\s*+)(?!\[REDACTED\])("[^"]*"|'[^']*'|[^\s,;\&"'\}\]]+)"#,
          "$1$2[REDACTED]"),
         // 7. URL userinfo: scheme://user:pass@host → scheme://[REDACTED]@host.
         (#"(?i)\b([a-z][a-z0-9+.\-]*://)(?!\[REDACTED\]@)[^/\s@"']+@"#,
          "$1[REDACTED]@"),
+        // 8. Signed-URL query parameters (Azure SAS `sig=`, S3 `X-Amz-Signature=`).
+        (#"(?i)([?\&](?:sig|signature|x-amz-signature)=)(?!\[REDACTED\])[^\&\s"'#]+"#,
+         "$1[REDACTED]"),
     ]
 
     private static let rules: [Rule] = ruleSpecs.compactMap { spec -> Rule? in

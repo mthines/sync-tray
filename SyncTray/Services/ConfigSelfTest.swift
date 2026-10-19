@@ -8419,6 +8419,17 @@ enum ConfigSelfTest {
             ("DASH0_AUTH_TOKEN=auth_abc123", "DASH0_AUTH_TOKEN=[REDACTED]"),
             ("OTEL_EXPORTER_OTLP_HEADERS=Authorization=Bearer abc123", "OTEL_EXPORTER_OTLP_HEADERS=[REDACTED]"),
             ("OTEL_EXPORTER_OTLP_HEADERS=Dash0-Dataset=x,Authorization=Bearer abc123", "OTEL_EXPORTER_OTLP_HEADERS=[REDACTED]"),
+            ("secret_access_key = AKIAabc/xyz", "secret_access_key = [REDACTED]"),
+            // rclone connection string: the value runs to the next , ; & or space, so the
+            // trailing `:bucket` goes with it; the access key ID is not a secret.
+            (":s3,provider=AWS,access_key_id=AKIA1,secret_access_key=abc123:bucket",
+             ":s3,provider=AWS,access_key_id=AKIA1,secret_access_key=[REDACTED]"),
+            (#"{"private_key": "-----BEGIN PRIVATE KEY-----\nMIIabc\n-----END PRIVATE KEY-----\n"}"#,
+             #"{"private_key": "[REDACTED]"}"#),
+            ("X-Api-Key: abc123", "X-Api-Key: [REDACTED]"),
+            ("--azureblob-sas-url https://acct.blob.core.windows.net/c?sv=2022&sig=abc%2B123", "--azureblob-sas-url [REDACTED]"),
+            ("https://bucket.s3.amazonaws.com/o?X-Amz-Algorithm=AWS4&X-Amz-Signature=deadbeef",
+             "https://bucket.s3.amazonaws.com/o?X-Amz-Algorithm=AWS4&X-Amz-Signature=[REDACTED]"),
         ]
         for entry in redacted {
             let got = DiagnosticRedactor.redact(entry.input)
@@ -8445,6 +8456,7 @@ enum ConfigSelfTest {
             #""remotePath" : "Kaiju/KAIJU","#,
             "Compass: north.txt",
             "bypass=1.txt",
+            "Design sig=draft.txt",
             "",
         ]
         for line in unchanged {
