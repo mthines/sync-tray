@@ -1099,6 +1099,13 @@ final class TelemetryService {
     /// Captures only feature preferences — never paths, remote names, or credentials.
     func recordProfileConfiguration(_ profile: SyncProfile) {
         guard SyncTraySettings.telemetryEnabled else { return }
+        emitProfileConfiguration(profile, rcloneConfig: RcloneConfigService.shared.readConfigContents())
+    }
+
+    /// `recordProfileConfiguration` with rclone.conf's text already read (nil = unreadable),
+    /// so a launch snapshot of every profile reads the file once, not once per profile.
+    private func emitProfileConfiguration(_ profile: SyncProfile, rcloneConfig: String?) {
+        guard SyncTraySettings.telemetryEnabled else { return }
         ensureSetup()
 
         let cacheVolume = profile.isMountMode
@@ -1106,10 +1113,19 @@ final class TelemetryService {
 
         let intervalBucket = bucketSyncInterval(profile.syncIntervalMinutes)
 
+        // What kind of folder / storage backend this is — bounded buckets, never the path or
+        // the remote's name (`SyncPathKind`, `RemoteBackendType`).
+        let localPathKind = SyncPathKind.classify(localPath: profile.localSyncPath, homeDirectory: NSHomeDirectory())
+        let remoteTypes = RemoteBackendType.types(for: profile, rcloneConfig: rcloneConfig)
+
         emitLog(
             severity: .info,
             body: "Profile configuration",
             attributes: [
+                "config.local_path_kind": .string(localPathKind),
+                "config.local_path_privacy_protected": .bool(SyncPathKind.isPrivacyProtected(localPathKind)),
+                "config.remote_type": .string(remoteTypes.primary),
+                "config.fallback_remote_type": .string(remoteTypes.fallback),
                 "synctray.profile.id": .string(profile.id.uuidString),
                 "synctray.profile.name": .string(profile.name),
                 "config.sync_mode": .string(profile.syncMode.rawValue),
@@ -1219,9 +1235,10 @@ final class TelemetryService {
             ]
         )
 
-        // Individual profile configs
+        // Individual profile configs — rclone.conf read once for all of them.
+        let rcloneConfig = RcloneConfigService.shared.readConfigContents()
         for profile in profiles {
-            recordProfileConfiguration(profile)
+            emitProfileConfiguration(profile, rcloneConfig: rcloneConfig)
         }
     }
 
@@ -3083,5 +3100,129 @@ final class TelemetryService {
         return result
     }
 
+}
+
+// MARK: - Bounded profile descriptors (never a path or a remote name)
+
+/// What kind of folder a profile syncs — `config.local_path_kind` — so telemetry can tell a
+/// Pictures sync from one of `~/Library` or an external drive without ever sending the path.
+/// Pure: the home directory is injected, nothing touches the file system.
+enum SyncPathKind {
+    /// Folders macOS privacy controls (TCC) guard, so a sync script run by launchd can be
+    /// refused access to them even when the app itself has it — `config.local_path_privacy_protected`.
+    static let privacyProtectedKinds: Set<String> = [
+        "desktop", "documents", "downloads", "icloud_drive", "library", "external_volume",
+    ]
+
+    /// The home sub-folders reported by name: `~/<Folder>` itself or anything under it.
+    private static let homeFolderKinds: [String: String] = [
+        "desktop": "desktop",
+        "documents": "documents",
+        "downloads": "downloads",
+        "pictures": "pictures",
+        "music": "music",
+        "movies": "movies",
+        "public": "public",
+    ]
+
+    /// Bucket a local sync path: `desktop` | `documents` | `downloads` | `pictures` | `music` |
+    /// `movies` | `public` (each `~/<Folder>` or below), `icloud_drive` (`~/Library/Mobile
+    /// Documents`), `cloud_storage` (`~/Library/CloudStorage`), `library` (anything else under
+    /// `~/Library`), `home_root` (the home folder itself), `home_other` (any other folder under
+    /// home), `external_volume` (`/Volumes/<name>/…`), `other`, or `unknown` (empty path).
+    /// Case-insensitive (APFS is by default), expands a leading `~`, and ignores trailing and
+    /// doubled slashes and `.`/`..` components. Pure.
+    static func classify(localPath: String, homeDirectory: String) -> String {
+        let raw = localPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !raw.isEmpty else { return "unknown" }
+        let expanded: String
+        if raw == "~" {
+            expanded = homeDirectory
+        } else if raw.hasPrefix("~/") {
+            expanded = homeDirectory + "/" + String(raw.dropFirst(2))
+        } else {
+            expanded = raw
+        }
+        // A relative path (or `~otheruser/…`) can't be placed.
+        guard expanded.hasPrefix("/") else { return "other" }
+
+        let path = normalizedComponents(expanded.lowercased())
+        let home = normalizedComponents(homeDirectory.lowercased())
+        if !home.isEmpty, path.count >= home.count, Array(path.prefix(home.count)) == home {
+            let rest = Array(path.dropFirst(home.count))
+            guard let first = rest.first else { return "home_root" }
+            if let kind = homeFolderKinds[first] { return kind }
+            if first == "library" {
+                if rest.count >= 2, rest[1] == "mobile documents" { return "icloud_drive" }
+                if rest.count >= 2, rest[1] == "cloudstorage" { return "cloud_storage" }
+                return "library"
+            }
+            return "home_other"
+        }
+        if path.count >= 2, path[0] == "volumes" { return "external_volume" }
+        return "other"
+    }
+
+    /// Whether a `classify` result is a folder macOS privacy controls guard. Pure.
+    static func isPrivacyProtected(_ kind: String) -> Bool {
+        privacyProtectedKinds.contains(kind)
+    }
+
+    /// Path components with empty and `.` components dropped and `..` applied. Pure.
+    private static func normalizedComponents(_ path: String) -> [String] {
+        var parts: [String] = []
+        for component in path.split(separator: "/", omittingEmptySubsequences: true) {
+            if component == "." { continue }
+            if component == ".." {
+                if !parts.isEmpty { parts.removeLast() }
+                continue
+            }
+            parts.append(String(component))
+        }
+        return parts
+    }
+}
+
+/// Which storage backend a profile's remote is — `config.remote_type` /
+/// `config.fallback_remote_type` — read from the remote's `type = …` line in rclone.conf and
+/// bucketed through a fixed allowlist of rclone backend names, so a hand-edited or future
+/// type can never put free text into telemetry. The remote's NAME is never sent.
+enum RemoteBackendType {
+    /// rclone's backend type names (`rclone help backends`).
+    static let knownTypes: Set<String> = [
+        "alias", "azureblob", "azurefiles", "b2", "box", "cache", "chunker", "cloudinary",
+        "combine", "compress", "crypt", "drive", "dropbox", "fichier", "filefabric", "filescom",
+        "ftp", "gofile", "googlecloudstorage", "googlephotos", "hasher", "hdfs", "hidrive",
+        "http", "iclouddrive", "imagekit", "internetarchive", "jottacloud", "koofr", "linkbox",
+        "local", "mailru", "mega", "memory", "netstorage", "onedrive", "opendrive",
+        "oracleobjectstorage", "pcloud", "pikpak", "pixeldrain", "premiumizeme", "protondrive",
+        "putio", "qingstor", "quatrix", "s3", "seafile", "sftp", "sharefile", "sia", "smb",
+        "storj", "sugarsync", "swift", "ulozto", "union", "uptobox", "webdav", "yandex", "zoho",
+    ]
+
+    /// A known backend type is reported as itself, any other non-empty type as `other`, and a
+    /// missing or unreadable one (no such section, no `type` line, no rclone.conf) as
+    /// `unknown`. Case-insensitive. Pure.
+    static func bucket(_ rawType: String?) -> String {
+        guard let type = rawType?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
+              !type.isEmpty else { return "unknown" }
+        return knownTypes.contains(type) ? type : "other"
+    }
+
+    /// `(config.remote_type, config.fallback_remote_type)` for a profile, given rclone.conf's
+    /// text (`nil` when it could not be read). The fallback is `none` when the profile has no
+    /// fallback remote. Pure.
+    static func types(for profile: SyncProfile, rcloneConfig: String?) -> (primary: String, fallback: String) {
+        let primaryRaw = rcloneConfig.flatMap {
+            RcloneConfigService.remoteType(named: profile.primaryRemoteName, inConfig: $0)
+        }
+        guard profile.hasFallback else { return (bucket(primaryRaw), "none") }
+        let fallbackName = profile.fallbackRemote.hasSuffix(":")
+            ? String(profile.fallbackRemote.dropLast()) : profile.fallbackRemote
+        let fallbackRaw = rcloneConfig.flatMap {
+            RcloneConfigService.remoteType(named: fallbackName, inConfig: $0)
+        }
+        return (bucket(primaryRaw), bucket(fallbackRaw))
+    }
 }
 
