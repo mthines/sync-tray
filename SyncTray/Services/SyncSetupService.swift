@@ -2867,7 +2867,7 @@ enum SyncExcludeFilter {
     /// ordinary user content, not a managed block: the user can delete the line to sync a
     /// library they have granted Full Disk Access to.
     ///
-    /// `.photosLibrary` and `.photoBoothLibrary` are the two instances today (migrations v5 and v7); a
+    /// `.photosLibrary` and `.photoBoothLibrary` are the two instances today (migrations v5 and v8); a
     /// future TCC-blocked default follows the same shape.
     struct DefaultExclude {
         /// The raw `- …` rclone rule line.
