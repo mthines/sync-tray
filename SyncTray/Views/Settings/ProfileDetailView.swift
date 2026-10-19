@@ -2302,9 +2302,11 @@ struct ProfileDetailView: View {
         updatedProfile.downloadConnections = downloadConnections
         updatedProfile.bandwidthLimit = SyncProfile.normalizedBandwidthLimit(bandwidthLimit)
         updatedProfile.mountResilient = mountResilient
-        // Lists edited outside the form and saved the moment they change ("Don't Sync",
-        // "Don't Download", pinned folders): take them from the store, so a Save can never
-        // write back an older copy held by this view.
+        // Lists edited outside the form and saved the moment they change ("Sync Only These
+        // Folders", "Don't Download", pinned folders): take them from the store, so a Save can
+        // never write back an older copy held by this view. "Don't Sync" (syncExcludePatterns)
+        // is staged form state instead — the placeholder read here is overwritten by
+        // `saveProfile()` with the staged list before it writes.
         if let live = profileStore.profile(for: profile.id) {
             updatedProfile.syncExcludePatterns = live.syncExcludePatterns
             updatedProfile.syncIncludeFolders = live.syncIncludeFolders
@@ -4825,7 +4827,8 @@ struct DontSyncSection: View {
 /// for a two-way profile, uploaded/downloaded for a one-way profile) instead of everything
 /// under the profile's root pair. Folders are literal paths relative to `remotePath` (and,
 /// symmetrically, `localSyncPath`) — picked via `RemoteFolderBrowserSheet` in multi-select
-/// mode, or typed by hand. Applies immediately on change, exactly like `DontSyncSection`.
+/// mode, or typed by hand. Applies immediately on change — unlike `DontSyncSection`'s "Don't
+/// Sync" patterns, which now stage into the form until Save.
 struct SyncOnlyFoldersSection: View {
     let profile: SyncProfile
     @ObservedObject var profileStore: ProfileStore
