@@ -777,14 +777,16 @@ enum SyncTrayCLI {
         guard exists else {
             return DoctorCheck(name: label, status: .ok, detail: "no stale lock")
         }
-        switch SyncRunLock.parseHolder(contents) {
-        case .pid(let pid) where isAlive(pid):
-            return DoctorCheck(name: label, status: .ok, detail: "\(isMount ? "mount" : "sync") running (PID \(pid))")
+        let holder = SyncRunLock.parseHolder(contents)
+        let live = SyncRunLock.isLive(holder, isAlive: isAlive)
+        switch holder {
         case .pid(let pid):
-            return DoctorCheck(name: label, status: .warn, detail: "stale lock file (PID \(pid) not running)")
-        case .pending:
+            return live
+                ? DoctorCheck(name: label, status: .ok, detail: "\(isMount ? "mount" : "sync") running (PID \(pid))")
+                : DoctorCheck(name: label, status: .warn, detail: "stale lock file (PID \(pid) not running)")
+        case .pending where live:
             return DoctorCheck(name: label, status: .ok, detail: "sync starting")
-        case .none, .unreadable:
+        case .pending, .none, .unreadable:
             return DoctorCheck(name: label, status: .warn, detail: "stale lock file (no PID recorded)")
         }
     }

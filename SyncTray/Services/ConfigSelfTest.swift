@@ -3930,6 +3930,12 @@ enum ConfigSelfTest {
         guard absent.status == .ok, absent.detail == "no stale lock" else {
             return report(name, slug, false, "(absent lock did not report ok no stale lock: \(absent))")
         }
+        // lockCheck must delegate liveness to SyncRunLock.isLive, so doctor and the app's
+        // single-run guard can never disagree about whether a lock is live.
+        guard let lockSource = readSourceFile("CLI/SyncTrayCLI.swift"),
+              lockSource.contains("SyncRunLock.isLive(holder, isAlive: isAlive)") else {
+            return report(name, slug, false, "(lockCheck no longer judges liveness via SyncRunLock.isLive)")
+        }
 
         // Full doctor run: a dead-holder lock is a .warn, never a .fail, and exits 0.
         let profile = sampleProfile(isEnabled: false)
