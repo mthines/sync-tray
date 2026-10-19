@@ -191,3 +191,15 @@ Use `profile enable` and `profile disable` for `isEnabled`.
 
 CLI output goes only to your terminal.
 If you've opted in to usage data, each command records its verb, result, exit code, and duration — never its arguments, paths, profile names, or remotes.
+
+### Periodic backups without syncing on file changes
+
+```bash
+synctray profile set Projects syncOnLocalChanges false syncIntervalMinutes 10080
+```
+
+This sets schedule-only syncing every seven days. `syncOnLocalChanges` defaults
+to `true`; `syncIntervalMinutes` accepts 1–525600 minutes. Daily is 1440 minutes,
+weekly is 10080 and every two weeks is 20160. `synctray sync Projects` explicitly
+bypasses the due-time check and restarts the interval. Failed scheduled attempts
+also restart it; automatic recovery does not run between attempts in this mode.

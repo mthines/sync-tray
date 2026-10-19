@@ -51,6 +51,8 @@ enum ConfigSelfTest {
             testDeleteDurable,
             testWarmExcludePatternsRoundTrip,
             testBandwidthLimit,
+            testSyncScheduleConfiguration,
+            testSyncScheduleScript,
             testMountResilient,
             testWarmSkipsCachedFiles,
             testMountMonitorAutoWarm,
@@ -648,6 +650,229 @@ enum ConfigSelfTest {
             return report("AC-20", "warm-exclude-roundtrip", false, "(missing key did not default to [])")
         }
         return report("AC-20", "warm-exclude-roundtrip", true)
+    }
+
+    // MARK: - AC-SC — longer intervals and durable schedule-only syncing
+
+    private static func testSyncScheduleConfiguration() -> Bool {
+        let name = "AC-SC1", slug = "sync-schedule-configuration"
+        var profile = sampleProfile()
+        guard profile.syncOnLocalChanges,
+              let data = try? JSONEncoder().encode(profile),
+              var old = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
+            return report(name, slug, false, "(default or encode failed)")
+        }
+        old.removeValue(forKey: "syncOnLocalChanges")
+        guard let legacyData = try? JSONSerialization.data(withJSONObject: old),
+              let legacy = try? JSONDecoder().decode(SyncProfile.self, from: legacyData),
+              legacy.syncOnLocalChanges else {
+            return report(name, slug, false, "(legacy behavior changed)")
+        }
+        let original = profile
+        profile.syncOnLocalChanges = false
+        profile.syncIntervalMinutes = 10_080
+        guard let encoded = try? JSONEncoder().encode(profile),
+              let decoded = try? JSONDecoder().decode(SyncProfile.self, from: encoded), decoded == profile,
+              SyncManager.reconcileAction(from: original, to: profile) == .reinstall,
+              SyncTrayCLI.applyProfileAssignment(&profile, key: "syncOnLocalChanges", value: "false") == nil,
+              SyncTrayCLI.applyProfileAssignment(&profile, key: "syncIntervalMinutes", value: "20160") == nil,
+              SyncTrayCLI.applyProfileAssignment(&profile, key: "syncIntervalMinutes", value: "0") != nil,
+              SyncTrayCLI.applyProfileAssignment(&profile, key: "syncIntervalMinutes", value: "525601") != nil,
+              SyncTrayCLI.applyProfileAssignment(&profile, key: "syncOnLocalChanges", value: "invalid") != nil else {
+            return report(name, slug, false, "(round-trip/reconcile/CLI validation failed)")
+        }
+        guard let json = SyncSetupService.shared.generateProfileConfig(for: profile).data(using: .utf8),
+              let config = (try? JSONSerialization.jsonObject(with: json)) as? [String: Any],
+              config["syncOnLocalChanges"] as? Bool == false,
+              config["scheduleStatePath"] as? String == profile.scheduleStatePath else {
+            return report(name, slug, false, "(derived schedule fields missing)")
+        }
+        func plist(_ p: SyncProfile) -> [String: Any]? {
+            guard let data = SyncSetupService.shared.generateLaunchdPlist(for: p).data(using: .utf8) else { return nil }
+            return (try? PropertyListSerialization.propertyList(from: data, format: nil)) as? [String: Any]
+        }
+        guard plist(profile)?["StartInterval"] as? Int == 60 else {
+            return report(name, slug, false, "(schedule-only agent does not poll due time)")
+        }
+        profile.syncOnLocalChanges = true
+        guard plist(profile)?["StartInterval"] as? Int == 1_209_600,
+              SyncScheduleInterval.label(for: 20_160) == "2 weeks",
+              SyncScheduleInterval.label(for: 1_440) == "1 day",
+              SyncScheduleInterval.label(for: 61) == "61 minutes",
+              SyncScheduleInterval.minutes(quantity: "3", unit: .weeks) == 30_240,
+              SyncScheduleInterval.minutes(quantity: "1.5", unit: .hours) == nil,
+              SyncScheduleInterval.minutes(quantity: String(Int.max), unit: .weeks) == nil,
+              SyncScheduleInterval.minutes(quantity: "0", unit: .days) == nil else {
+            return report(name, slug, false, "(interval conversion/formatting failed)")
+        }
+        profile.syncMode = .mount
+        guard plist(profile)?["StartInterval"] == nil else {
+            return report(name, slug, false, "(streaming acquired a sync schedule)")
+        }
+        return report(name, slug, true)
+    }
+
+    /// Execute the real generated shell with a local recording rclone stub and a
+    /// fixed clock. Every path is isolated; no agent, user directory or cloud is touched.
+    private static func testSyncScheduleScript() -> Bool {
+        let name = "AC-SC2", slug = "sync-schedule-script"
+        let dir = "\(selfTestRoot)/schedule-script"
+        let fm = FileManager.default
+        let now = 2_000_000_000
+        let interval = 10_080 * 60
+        do {
+            try fm.createDirectory(atPath: dir, withIntermediateDirectories: true)
+            var profile = sampleProfile()
+            profile.syncMode = .sync
+            profile.syncOnLocalChanges = false
+            profile.syncIntervalMinutes = 10_080
+            profile.localSyncPath = "\(dir)/Local files"
+            let configPath = "\(dir)/config.json", statePath = "\(dir)/schedule.json"
+            let callsPath = "\(dir)/calls", lockPath = "\(dir)/run.lock", stub = "\(dir)/rclone"
+            let scriptPath = "\(dir)/script.sh"
+            let stubSource = """
+                #!/bin/bash
+                printf '%s\\n' "$*" >> "$SCHEDULE_CALLS"
+                if [[ "$1" == "config" ]]; then
+                    echo '{"selftest-fixture-remote":{"type":"local"}}'
+                elif [[ "$1" == "sync" || "$1" == "bisync" ]]; then
+                    exit "${SCHEDULE_EXIT:-0}"
+                fi
+                """
+            try stubSource.write(toFile: stub, atomically: true, encoding: .utf8)
+            try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: stub)
+            let script = SyncSetupService.shared.generateSyncScript()
+                .replacingOccurrences(of: "RCLONE_CANDIDATES=(", with: "RCLONE_CANDIDATES=(\n    \"\(stub)\"")
+                .replacingOccurrences(of: "now = int(time.time())", with: "now = \(now)")
+            try script.write(toFile: scriptPath, atomically: true, encoding: .utf8)
+            var config = (try JSONSerialization.jsonObject(with:
+                Data(SyncSetupService.shared.generateProfileConfig(for: profile).utf8))) as! [String: Any]
+            config["scheduleStatePath"] = statePath
+            config["logPath"] = "\(dir)/sync.log"
+            config["lockFile"] = lockPath
+            config["filterPath"] = "\(dir)/exclude.txt"
+            try "".write(toFile: "\(dir)/exclude.txt", atomically: true, encoding: .utf8)
+            func saveConfig() throws {
+                try JSONSerialization.data(withJSONObject: config).write(to: URL(fileURLWithPath: configPath))
+            }
+            func saveState(_ last: Int, identity: [String]? = nil) throws {
+                try JSONSerialization.data(withJSONObject: ["identity": identity ?? profile.scheduleIdentity,
+                                                            "lastAttempt": last])
+                    .write(to: URL(fileURLWithPath: statePath))
+            }
+            func stateTime() -> Int? {
+                guard let data = fm.contents(atPath: statePath),
+                      let state = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { return nil }
+                return state["lastAttempt"] as? Int
+            }
+            func calls() -> String { (try? String(contentsOfFile: callsPath, encoding: .utf8)) ?? "" }
+            func clearCalls() { try? fm.removeItem(atPath: callsPath) }
+            func run(manual: Bool = false, fail: Bool = false, dry: Bool = false) throws -> Int32 {
+                let proc = Process()
+                proc.executableURL = URL(fileURLWithPath: "/bin/bash")
+                proc.arguments = [scriptPath, configPath] + (manual ? ["--manual"] : [])
+                var env = ProcessInfo.processInfo.environment
+                env["SCHEDULE_CALLS"] = callsPath
+                env["SCHEDULE_EXIT"] = fail ? "9" : "0"
+                env["SYNCTRAY_DRY_RUN"] = dry ? "1" : "0"
+                proc.environment = env
+                let pipe = Pipe()
+                proc.standardOutput = pipe
+                proc.standardError = pipe
+                try proc.run()
+                _ = pipe.fileHandleForReading.readDataToEndOfFile()
+                proc.waitUntilExit()
+                return proc.terminationStatus
+            }
+            try saveConfig()
+            guard try run() == 0, calls().isEmpty, stateTime() == now,
+                  !fm.fileExists(atPath: profile.localSyncPath) else {
+                return report(name, slug, false, "(no-history load did I/O instead of seeding)")
+            }
+            try saveState(now - interval + 1)
+            guard try run() == 0, calls().isEmpty, stateTime() == now - interval + 1 else {
+                return report(name, slug, false, "(ran before one full interval or moved the due time)")
+            }
+            try saveState(now - interval)
+            guard try run() == 0, calls().contains("sync "), stateTime() == now else {
+                return report(name, slug, false, "(did not run exactly when due)")
+            }
+            clearCalls()
+            guard try run() == 0, calls().isEmpty else {
+                return report(name, slug, false, "(restart repeated an already-consumed interval)")
+            }
+            guard try run(manual: true) == 0, calls().contains("sync "), stateTime() == now else {
+                return report(name, slug, false, "(manual override did not run/reset cadence)")
+            }
+            clearCalls()
+            try saveState(now - interval * 3)
+            _ = try run(fail: true)
+            guard calls().contains("sync "), stateTime() == now else {
+                return report(name, slug, false, "(failed attempt did not consume interval)")
+            }
+            clearCalls()
+            guard try run() == 0, calls().isEmpty else {
+                return report(name, slug, false, "(failed attempt retried before due)")
+            }
+            try saveState(now + interval)
+            guard try run() == 0, calls().isEmpty, stateTime() == now + interval else {
+                return report(name, slug, false, "(backward clock allowed an early run)")
+            }
+            try saveState(now - interval * 3, identity: ["different folders"])
+            guard try run() == 0, calls().isEmpty, stateTime() == now else {
+                return report(name, slug, false, "(changed folder identity reused stale cadence)")
+            }
+            try "broken".write(toFile: statePath, atomically: true, encoding: .utf8)
+            guard try run() == 0, calls().isEmpty, stateTime() == now else {
+                return report(name, slug, false, "(corrupt state triggered an early upload)")
+            }
+            try saveState(now - interval)
+            guard try run(dry: true) == 0, stateTime() == now - interval else {
+                return report(name, slug, false, "(dry run advanced the real cadence)")
+            }
+            clearCalls()
+            try String(getpid()).write(toFile: lockPath, atomically: true, encoding: .utf8)
+            guard try run() == 0, calls().isEmpty, stateTime() == now - interval,
+                  fm.fileExists(atPath: lockPath) else {
+                return report(name, slug, false, "(contending run advanced state/deleted live lock)")
+            }
+            try fm.removeItem(atPath: lockPath)
+            config["drivePath"] = "\(dir)/missing-drive"
+            try saveConfig()
+            guard try run() == 0, calls().isEmpty, stateTime() == now - interval else {
+                return report(name, slug, false, "(disconnected drive consumed a due attempt)")
+            }
+            config["drivePath"] = ""
+            config["scheduleStatePath"] = "\(configPath)/not-a-directory"
+            try saveConfig()
+            guard try run() != 0, calls().isEmpty else {
+                return report(name, slug, false, "(unwritable state ran anyway)")
+            }
+            config["scheduleStatePath"] = statePath
+            config["syncOnLocalChanges"] = true
+            try saveConfig()
+            try saveState(now)
+            guard try run() == 0, calls().contains("sync ") else {
+                return report(name, slug, false, "(default automatic behavior changed)")
+            }
+            clearCalls()
+            config.removeValue(forKey: "syncOnLocalChanges")
+            config.removeValue(forKey: "scheduleStatePath")
+            try saveConfig()
+            guard try run() == 0, calls().contains("sync ") else {
+                return report(name, slug, false, "(old derived config stopped working)")
+            }
+            profile.syncOnLocalChanges = false
+            try SyncSetupService.recordSyncAttempt(for: profile,
+                at: Date(timeIntervalSince1970: TimeInterval(now)), statePath: statePath)
+            guard stateTime() == now,
+                  (try fm.attributesOfItem(atPath: statePath)[.posixPermissions] as? Int) == 0o600 else {
+                return report(name, slug, false, "(direct initial-sync cadence/permissions failed)")
+            }
+        } catch {
+            return report(name, slug, false, "(\(error))")
+        }
+        return report(name, slug, true)
     }
 
     // MARK: - AC-BW1 — bandwidth limit: validation, round-trip, reconcile, script emission
@@ -2849,10 +3074,10 @@ enum ConfigSelfTest {
         try? SyncSetupService.shared.generateSyncScript().write(
             toFile: scriptPath, atomically: true, encoding: .utf8)
         let configPath = "\(dir)/config.json"
-        if let overrides = configOverrides,
-           let baseData = SyncSetupService.shared.generateProfileConfig(for: profile).data(using: .utf8),
+        if let baseData = SyncSetupService.shared.generateProfileConfig(for: profile).data(using: .utf8),
            var configDict = (try? JSONSerialization.jsonObject(with: baseData)) as? [String: Any] {
-            for (key, value) in overrides { configDict[key] = value }
+            configDict["scheduleStatePath"] = "\(dir)/schedule.json"
+            for (key, value) in configOverrides ?? [:] { configDict[key] = value }
             if let mergedData = try? JSONSerialization.data(withJSONObject: configDict, options: [.prettyPrinted, .sortedKeys]) {
                 try? mergedData.write(to: URL(fileURLWithPath: configPath))
             }

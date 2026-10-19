@@ -62,7 +62,8 @@ To start it, set `"isEnabled": true` in the file, or run `synctray profile enabl
 | `isEnabled`               | `false`                | all              | Whether the launchd agent is installed and running                               |
 | `syncMode`                | `bisync`               | all              | `bisync` (two-way), `sync` (one-way), or `mount` (Stream)                        |
 | `syncDirection`           | `localToRemote`        | one-way          | `localToRemote` or `remoteToLocal`                                               |
-| `syncIntervalMinutes`     | `5`                    | two-way, one-way | Minutes between scheduled syncs                                                  |
+| `syncOnLocalChanges`      | `true`                 | two-way, one-way | Sync on local changes as well as the schedule; `false` enables schedule-only      |
+| `syncIntervalMinutes`     | `5`                    | two-way, one-way | Minutes between scheduled syncs (1–525600); with schedule-only, minimum time between attempts                                                  |
 | `isMuted`                 | `false`                | all              | Mute change notifications                                                        |
 | `drivePathToMonitor`      | `""`                   | all              | External drive to watch; syncs skip while it's unplugged                        |
 | `additionalRcloneFlags`   | `""`                   | all              | Extra flags for every rclone command, split like a shell would — never evaluated |
@@ -123,3 +124,14 @@ The schema is authoritative: when this table and [`profile.schema.json`](../Sync
 
 Uninstalling with `brew uninstall --zap --cask synctray` removes `~/.config/synctray`, the logs, and the launch agents.
 Your synced folders, rclone's config, and the Stream cache are left in place.
+
+### Schedule-only state
+
+With `syncOnLocalChanges: false`, SyncTray stores each profile's last attempt and
+folder/mode/direction identity in
+`~/.local/state/synctray/schedules/{shortId}.json`. This runtime file is separate
+from the editable profile and survives reinstalls, disable/enable and restarts.
+Do not edit it to configure the schedule; set `syncIntervalMinutes` instead.
+The interval is measured from the last attempt (including failures and manual
+runs). Missing/corrupt state starts a full interval without an immediate sync.
+Automatic checks fail closed if this state cannot be written.

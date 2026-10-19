@@ -251,7 +251,7 @@ enum SyncTrayCLI {
 
     profile set keys: name, rcloneRemote, remotePath, localSyncPath,
       drivePathToMonitor, additionalRcloneFlags, syncMode (bisync|sync|mount),
-      syncDirection (localToRemote|remoteToLocal), syncIntervalMinutes,
+      syncDirection (localToRemote|remoteToLocal), syncIntervalMinutes, syncOnLocalChanges,
       fallbackRemote, fallbackRemotePath, mountBackend (nfs|macfuse),
       vfsCacheMode (off|minimal|writes|full), vfsCacheMaxSize, vfsCacheMaxAge,
       vfsCachePath, allowNonEmptyMount, mountAtStartup,
@@ -1604,7 +1604,9 @@ enum SyncTrayCLI {
 
         // Ints (with range validation where the model clamps).
         case "syncIntervalMinutes":
-            guard let n = int(value), n >= 1 else { return "syncIntervalMinutes must be an integer ≥ 1" }
+            guard let n = int(value), (1...SyncProfile.maximumSyncIntervalMinutes).contains(n) else {
+                return "syncIntervalMinutes must be an integer in 1...\(SyncProfile.maximumSyncIntervalMinutes)"
+            }
             profile.syncIntervalMinutes = n
         case "downloadConnections":
             guard let n = int(value), (1...16).contains(n) else { return "downloadConnections must be an integer in 1...16" }
@@ -1623,6 +1625,9 @@ enum SyncTrayCLI {
         case "isMuted":
             guard let b = bool(value) else { return "isMuted must be true or false" }
             profile.isMuted = b
+        case "syncOnLocalChanges":
+            guard let b = bool(value) else { return "syncOnLocalChanges must be true or false" }
+            profile.syncOnLocalChanges = b
         case "mountAtStartup":
             guard let b = bool(value) else { return "mountAtStartup must be true or false" }
             profile.mountAtStartup = b
@@ -1792,7 +1797,7 @@ extension CLIEnvironment {
             runSyncScript: { configPath in
                 let (exit, _) = CLIEnvironment.runProcess(
                     launchPath: "/bin/bash",
-                    args: [SyncProfile.sharedScriptPath, configPath],
+                    args: [SyncProfile.sharedScriptPath, configPath, "--manual"],
                     timeout: 3600  // a large repo's first bisync can run for minutes
                 )
                 return exit

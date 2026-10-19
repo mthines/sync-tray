@@ -1284,9 +1284,105 @@ extension SyncSetupService {
             LOG_FILE=$(parse_json "logPath" "")
             LOCK_FILE=$(parse_json "lockFile" "")
             DRIVE_PATH=$(parse_json "drivePath" "")
+            SYNC_MODE=$(parse_json "syncMode" "bisync")
+
+            if [[ -z "$REMOTE" || -z "$LOCAL_PATH" ]]; then
+                echo "Error: Invalid config - missing remote or localPath"
+                exit 1
+            fi
+
+            # Check if drive is mounted (if configured)
+            if [[ -n "$DRIVE_PATH" && ! -d "$DRIVE_PATH" ]]; then
+                echo "$(date '+%Y-%m-%d %H:%M:%S') - Drive not mounted, skipping sync" >> "$LOG_FILE"
+                exit 0
+            fi
+
+            # Acquire the lock ATOMICALLY. `set -o noclobber` makes the '>'
+            # redirection fail if the file already exists, so the check and the
+            # write are a single atomic step — closing the check-then-write
+            # (TOCTOU) race where two launchd/manual runs could both pass the
+            # old `[[ -f ]]` test and start concurrently. The PID is still stored
+            # as the file's contents, so the app's lock readers are unchanged.
+            acquire_lock() {
+                ( set -o noclobber; echo $$ > "$LOCK_FILE" ) 2>/dev/null
+            }
+
+            if ! acquire_lock; then
+                PID=$(cat "$LOCK_FILE" 2>/dev/null)
+                if [[ -n "$PID" ]] && ps -p "$PID" > /dev/null 2>&1; then
+                    echo "$(date '+%Y-%m-%d %H:%M:%S') - Sync already running (PID $PID), skipping" >> "$LOG_FILE"
+                    exit 0
+                fi
+                # Lock owner is gone — reclaim the stale lock and retry once.
+                echo "$(date '+%Y-%m-%d %H:%M:%S') - Removing stale lock (PID ${PID:-unknown} not running)" >> "$LOG_FILE"
+                rm -f "$LOCK_FILE"
+                if ! acquire_lock; then
+                    echo "$(date '+%Y-%m-%d %H:%M:%S') - Could not acquire lock, skipping" >> "$LOG_FILE"
+                    exit 0
+                fi
+            fi
+            trap 'rm -f "$LOCK_FILE"' EXIT
+
+            # Keep the due-time decision inside the existing atomic run lock, before
+            # any directory creation, reachability probe or rclone invocation. Missing
+            # history starts a full interval rather than uploading merely on Save/login.
+            # A manual run is an explicit override; all actual attempts reset the cadence,
+            # including failures. Dry runs inspect eligibility without advancing state.
+            if [[ "$SYNC_MODE" != "mount" ]]; then
+                python3 - "$CONFIG_FILE" "${2:-}" "${SYNCTRAY_DRY_RUN:-}" <<'SYNCTRAY_SCHEDULE'
+            import json, os, sys, tempfile, time
+            try:
+                with open(sys.argv[1]) as f:
+                    config = json.load(f)
+                scheduled_only = config.get('syncOnLocalChanges', True) is False
+                if not scheduled_only:
+                    sys.exit(0)
+                state_path = config.get('scheduleStatePath', '')
+                if not state_path:
+                    raise ValueError('schedule state path is missing')
+                interval = config.get('syncIntervalMinutes', 5)
+                if type(interval) is not int or not 1 <= interval <= 525600:
+                    raise ValueError('invalid sync interval')
+                identity = [config['remote'], config['localPath'], config['syncMode'], config['syncDirection']]
+                now = int(time.time())
+                last = None
+                try:
+                    with open(state_path) as f:
+                        state = json.load(f)
+                    if state.get('identity') == identity and type(state.get('lastAttempt')) is int and state['lastAttempt'] >= 0:
+                        last = state['lastAttempt']
+                except (FileNotFoundError, ValueError, TypeError, AttributeError):
+                    pass  # no usable history: seed safely, never run early
+                manual = sys.argv[2] == '--manual'
+                skip = scheduled_only and not manual and (last is None or now < last + interval * 60)
+                if not skip or last is None:
+                    if sys.argv[3] != '1':
+                        parent = os.path.dirname(state_path)
+                        os.makedirs(parent, mode=0o700, exist_ok=True)
+                        fd, tmp = tempfile.mkstemp(prefix='.schedule-', dir=parent)
+                        try:
+                            with os.fdopen(fd, 'w') as f:
+                                json.dump({'identity': identity, 'lastAttempt': now}, f)
+                            os.replace(tmp, state_path)
+                        finally:
+                            if os.path.exists(tmp):
+                                os.unlink(tmp)
+                sys.exit(10 if skip else 0)
+            except Exception as error:
+                print('SyncTray schedule check failed: %s' % error, file=sys.stderr)
+                sys.exit(1)
+            SYNCTRAY_SCHEDULE
+                SCHEDULE_STATUS=$?
+                if [[ $SCHEDULE_STATUS -eq 10 ]]; then
+                    exit 0
+                elif [[ $SCHEDULE_STATUS -ne 0 ]]; then
+                    echo "$(date '+%Y-%m-%d %H:%M:%S') - Schedule check failed; sync skipped" >> "$LOG_FILE"
+                    exit 1
+                fi
+            fi
+
             ADDITIONAL_FLAGS=$(parse_json "additionalFlags" "")
             FILTER_FILE=$(parse_json "filterPath" "")
-            SYNC_MODE=$(parse_json "syncMode" "bisync")
             SYNC_DIRECTION=$(parse_json "syncDirection" "localToRemote")
             FALLBACK_REMOTE=$(parse_json "fallbackRemote" "")
             FALLBACK_PATH=$(parse_json "fallbackRemotePath" "")
@@ -1342,11 +1438,6 @@ extension SyncSetupService {
             # Mount resilience (mount mode). Default true, matching the Swift model default
             # so a config that predates the field hardens on its next mount.
             MOUNT_RESILIENT=$(parse_json "mountResilient" "true")
-
-            if [[ -z "$REMOTE" || -z "$LOCAL_PATH" ]]; then
-                echo "Error: Invalid config - missing remote or localPath"
-                exit 1
-            fi
 
             # Find rclone binary. Cover the common package-manager locations,
             # including nix-darwin's system and per-user profiles which live outside
@@ -1460,37 +1551,7 @@ extension SyncSetupService {
                 [[ $rc -eq 0 || $rc -eq 3 || $rc -eq 4 ]]
             }
 
-            # Check if drive is mounted (if configured)
-            if [[ -n "$DRIVE_PATH" && ! -d "$DRIVE_PATH" ]]; then
-                echo "$(date '+%Y-%m-%d %H:%M:%S') - Drive not mounted, skipping sync" >> "$LOG_FILE"
-                exit 0
-            fi
 
-            # Acquire the lock ATOMICALLY. `set -o noclobber` makes the '>'
-            # redirection fail if the file already exists, so the check and the
-            # write are a single atomic step — closing the check-then-write
-            # (TOCTOU) race where two launchd/manual runs could both pass the
-            # old `[[ -f ]]` test and start concurrently. The PID is still stored
-            # as the file's contents, so the app's lock readers are unchanged.
-            acquire_lock() {
-                ( set -o noclobber; echo $$ > "$LOCK_FILE" ) 2>/dev/null
-            }
-
-            if ! acquire_lock; then
-                PID=$(cat "$LOCK_FILE" 2>/dev/null)
-                if [[ -n "$PID" ]] && ps -p "$PID" > /dev/null 2>&1; then
-                    echo "$(date '+%Y-%m-%d %H:%M:%S') - Sync already running (PID $PID), skipping" >> "$LOG_FILE"
-                    exit 0
-                fi
-                # Lock owner is gone — reclaim the stale lock and retry once.
-                echo "$(date '+%Y-%m-%d %H:%M:%S') - Removing stale lock (PID ${PID:-unknown} not running)" >> "$LOG_FILE"
-                rm -f "$LOCK_FILE"
-                if ! acquire_lock; then
-                    echo "$(date '+%Y-%m-%d %H:%M:%S') - Could not acquire lock, skipping" >> "$LOG_FILE"
-                    exit 0
-                fi
-            fi
-            trap 'rm -f "$LOCK_FILE"' EXIT
 
             # Ensure local sync directory exists
             mkdir -p "$LOCAL_PATH"
@@ -2448,6 +2509,21 @@ extension SyncSetupService {
         ]
     }
 
+    /// Direct initial-sync/recovery runs bypass the shared script, but still reset
+    /// the schedule. Call only while the profile's exclusive run lock is held.
+    static func recordSyncAttempt(for profile: SyncProfile, at date: Date = Date(), statePath: String? = nil) throws {
+        guard !profile.isMountMode, !profile.syncOnLocalChanges else { return }
+        let path = statePath ?? profile.scheduleStatePath
+        let parent = (path as NSString).deletingLastPathComponent
+        try FileManager.default.createDirectory(atPath: parent, withIntermediateDirectories: true,
+                                                attributes: [.posixPermissions: 0o700])
+        let state: [String: Any] = ["identity": profile.scheduleIdentity,
+                                    "lastAttempt": Int(date.timeIntervalSince1970)]
+        let data = try JSONSerialization.data(withJSONObject: state, options: [.sortedKeys])
+        try data.write(to: URL(fileURLWithPath: path), options: .atomic)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: path)
+    }
+
     /// Generate profile-specific JSON config.
     /// Not private — `ConfigSelfTest` calls this directly to verify the
     /// derived config's key set stays frozen (AC-2) without going through
@@ -2464,6 +2540,8 @@ extension SyncSetupService {
             "additionalFlags": profile.additionalRcloneFlags,
             "filterPath": profile.filterFilePath,
             "syncIntervalMinutes": profile.syncIntervalMinutes,
+            "syncOnLocalChanges": profile.syncOnLocalChanges,
+            "scheduleStatePath": profile.scheduleStatePath,
             "syncMode": profile.syncMode.rawValue,
             "syncDirection": profile.syncDirection.rawValue,
             "fallbackRemote": profile.fallbackRemote,
@@ -2493,7 +2571,7 @@ extension SyncSetupService {
         return "{}"
     }
 
-    private func generateLaunchdPlist(for profile: SyncProfile) -> String {
+    func generateLaunchdPlist(for profile: SyncProfile) -> String {
         let scriptPath = SyncProfile.sharedScriptPath
         let configPath = profile.configPath
         let logDir = (profile.logPath as NSString).deletingLastPathComponent
@@ -2543,7 +2621,10 @@ extension SyncSetupService {
                 """
         } else {
             // Sync modes: use StartInterval for periodic execution
-            let intervalSeconds = profile.syncIntervalMinutes * 60
+            // Schedule-only checks are cheap local due-time checks. Polling avoids
+            // losing a week-long timer when launchd reloads at login or after sleep.
+            let intervalSeconds = profile.syncOnLocalChanges
+                ? min(max(1, profile.syncIntervalMinutes), SyncProfile.maximumSyncIntervalMinutes) * 60 : 60
             return """
                 <?xml version="1.0" encoding="UTF-8"?>
                 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
