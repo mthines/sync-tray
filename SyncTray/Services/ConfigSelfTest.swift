@@ -3987,8 +3987,11 @@ enum ConfigSelfTest {
         }
         // The live watcher path uses the same filter, then rewrites the file and snapshot.
         guard let liveBody = extractFunctionBody(startingAt: "func applyExternalSettingsEdit()", in: managerSource),
-              liveBody.contains("keysChangedSinceLastWrite("),
-              liveBody.contains("refreshSettingsFile()") else {
+              let liveDecideAt = liveBody.range(of: "let changed = AppSettingsFileStore.keysChangedSinceLastWrite("),
+              let liveApplyAt = liveBody.range(
+                of: "applySettingsFile(includeLoginItem: true, onlyKeys: changed)",
+                range: liveDecideAt.upperBound..<liveBody.endIndex),
+              liveBody.range(of: "refreshSettingsFile()", range: liveApplyAt.upperBound..<liveBody.endIndex) != nil else {
             return report(name, slug, false, "(applyExternalSettingsEdit doesn't apply only the outside-the-app changes, then rewrite settings.json)")
         }
 
