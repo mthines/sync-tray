@@ -1905,7 +1905,8 @@ who finds the report in Dash0 by `diagnostics.report_id`.
   `diagnosticExportHeaders` / `diagnosticResourceAttributes(includeInstallIdentity:)`, which don't
   change how telemetry is set up), plus `synctray.process.kind=diagnostics`, in batches of ≤ 200
   records and about 1 MB (`DiagnosticOTLPEncoder.batches`; one oversize record goes alone); a
-  non-2xx response throws with its status. One record per line, after a leading `Diagnostic
+  non-2xx response throws with its status. A failed send drops the sheet's cached report, so a
+  retry builds a new one under a new code instead of re-sending the batches that already landed. One record per line, after a leading `Diagnostic
   report` summary record. Every record is stamped with the report's creation time plus its
   ordinal in nanoseconds — never rclone's own line time, which travels as `rclone.time` — so a
   report sits together at send time and keeps its order in a time-sorted view. Record and
@@ -1914,15 +1915,16 @@ who finds the report in Dash0 by `diagnostics.report_id`.
   `enduser.id` and `service.instance.id` (`DiagnosticReportUploader.resourceAttributes(base:telemetryEnabled:)`)
   and `SyncTraySettings.installationId` is never read — reading it creates and persists an ID for
   someone who never opted in. With usage data on, the report is linked to the anonymous install
-  ID, and the disclosure says so. A build with
+  and device IDs (`service.instance.id`, `enduser.id`), and the disclosure says so. A build with
   no OTLP auth headers throws "Diagnostic upload isn't configured in this build" and the sheet
   keeps **Save to Desktop** available (`SyncTray-report-<code>.txt`, written 0600).
 - **Usage telemetry about it** — only when usage data is on — is one bounded `Diagnostic report
   sent`/`failed` log (`TelemetryService.recordDiagnosticReport`), never report content.
 
 Covered by `ConfigSelfTest` AC-DR1 (code), AC-DR2 (redaction table), AC-DR3 (builder, limits,
-never-read), AC-DR4 (OTLP encoding, timestamps, batching, install identity), AC-DR5 (CLI parse)
-and AC-DR6 (CLI consent, send routing, 0600 saved copy).
+never-read), AC-DR4 (OTLP encoding, timestamps, batching, install identity), AC-DR5 (CLI parse),
+AC-DR6 (CLI consent, send routing, 0600 saved copy) and AC-DR7 (the sheet: Cancel while
+collecting never sends, a retry after a failed send never re-sends).
 
 ## Generated Files (per profile)
 
