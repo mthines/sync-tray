@@ -18,6 +18,7 @@ If `synctray` isn't found, see [Install the CLI](cli.md#install-the-cli).
 - [Cache Only is on, but the mount is still streaming](#cache-only-is-on-but-the-mount-is-still-streaming)
 - [The Finder "Available Offline" menu is missing](#the-finder-available-offline-menu-is-missing)
 - [macOS says the app can't be opened](#macos-says-the-app-cant-be-opened)
+- [Send a diagnostic report](#send-a-diagnostic-report)
 
 ## A sync shows an error
 
@@ -117,6 +118,22 @@ Update to the latest release.
 To open a build you trust anyway, try to open it once, then allow it under **System Settings → Privacy & Security → Open Anyway**.
 Avoid `xattr -cr` on a downloaded app: it strips the quarantine flag and skips Gatekeeper's checks entirely.
 
+## Send a diagnostic report
+
+When the developer asks for logs, send a diagnostic report instead of digging files out of `~/.local/log`:
+
+1. Open the profile in **Settings…** and choose **Send Report…** — on the "Last sync error" banner, or at the bottom of the profile.
+   For a problem that isn't tied to one profile, use **App Settings → Help & Feedback → Send Diagnostic Report…**.
+2. Pick **This profile** or **All profiles**, and choose **Preview** to read exactly what will be sent.
+3. Choose **Send**, then **Copy** the `ST-XXXXXX` code and give it to the developer on Discord or in your GitHub issue.
+
+The report holds recent sync log lines, your profile settings, and their status.
+Unlike usage data, it can include file and folder names, paths in your home folder (including your username), remote names, and full error messages.
+Passwords and tokens are removed first, and nothing is sent until you press **Send** — it works even with usage data off.
+**Save to Desktop** writes the same report to a file instead, if you'd rather attach it yourself.
+
+From a terminal: `synctray report <name>` prints the report, and `synctray report <name> --send` sends it and prints the code.
+
 ## Still stuck?
 
-Turn on **Debug Logging** in App Settings, reproduce the problem, and bring the log from `synctray logs <name>` to the [SyncTray Discord](https://discord.gg/KBp8kb3EwP) or a [GitHub issue](https://github.com/mthines/sync-tray/issues).
+Turn on **Debug Logging** in App Settings, reproduce the problem, and [send a diagnostic report](#send-a-diagnostic-report) — or bring the log from `synctray logs <name>` to the [SyncTray Discord](https://discord.gg/KBp8kb3EwP) or a [GitHub issue](https://github.com/mthines/sync-tray/issues).

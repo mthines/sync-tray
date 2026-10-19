@@ -25,7 +25,7 @@ struct TelemetryDetailsSheet: View {
                 )
 
                 section(
-                    title: "What we never collect",
+                    title: "What usage data never includes",
                     items: [
                         "File names, folder names, or file contents",
                         "Remote names, hostnames, server addresses, or credentials",
@@ -58,6 +58,17 @@ struct TelemetryDetailsSheet: View {
                         .font(.headline)
                     Text("Open App Settings (gear icon in the sidebar) and toggle off \"Share usage data\". Takes effect immediately.")
                         .foregroundStyle(.secondary)
+                }
+
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("Diagnostic reports — only when you send one")
+                        .font(.headline)
+                    Text("The lists above describe automatic usage data. A diagnostic report is different: SyncTray never sends one on its own, and it works whether usage data is on or off. You send one yourself with \"Send Diagnostic Report…\" and get a code to share with the developer.")
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Text(DiagnosticReportCopy.disclosure)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
             }
             .padding(24)

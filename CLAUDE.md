@@ -917,6 +917,7 @@ the warmer reads as before — safe degradation.
 | `CacheMigrationService.swift` | The cache-move engine — injected `CacheMigrationFileSystem`, free-space preflight, copy → verify → delete per file with a same-volume rename fast path, cancellation, resume, rollback |
 | `OverlaySyncService.swift` | Cache-only overlay sync-back engine — scans the overlay, plans per-file upload/conflict decisions (`plan`), uploads with verify-then-delete (`run`, `.drain`/`.keep` modes), conflict-copy naming, and the manifest read/write "Upload Now" relies on |
 | `LegacyOfflineLink.swift` | Cleans up the retired "(Offline)" sibling browse point left behind by an upgrading install; never creates anything |
+| `DiagnosticReport.swift` | User-sent diagnostic reports (see "Diagnostic reports" under Telemetry) — `DiagnosticReport` model + `render()`, `DiagnosticReportCode` (`ST-XXXXXX`), `DiagnosticRedactor`, `DiagnosticReportBuilder` (injected `DiagnosticReportEnvironment`, never-read list), `DiagnosticOTLPEncoder` (pure OTLP/HTTP JSON), `DiagnosticReportUploader` |
 
 ### CLI/
 
@@ -1179,7 +1180,8 @@ is the separate, fail-closed schema-drift gate.
 | `SyncProgressDetailView.swift` | Detailed per-file transfer progress during sync |
 | `RecentChangesView.swift` | List of recently synced files |
 | `TelemetryOptInBanner.swift` | Dismissable banner prompting telemetry opt-in (consent-versioned) |
-| `TelemetryDetailsSheet.swift` | Full privacy disclosure sheet — reachable from wizard, banner, and settings |
+| `TelemetryDetailsSheet.swift` | Full privacy disclosure sheet — reachable from wizard, banner, and settings; its "Diagnostic reports — only when you send one" section explains the manual-report carve-out |
+| `DiagnosticReportSheet.swift` | "Send Diagnostic Report" sheet — scope picker, disclosure, Preview / Save to Desktop / Send, then the report code with Copy. Opened from the "Last sync error" banner and footer of `ProfileDetailView` and from App Settings → Help & Feedback |
 | `SetupWizardView.swift` | New-profile creation wizard, including optional `.helpImprove` epilogue step |
 
 ## Agent-Editable Configuration & CLI
@@ -1258,6 +1260,12 @@ Covered by `ConfigSelfTest` AC-CLI4 and AC-SEC3.
 | `synctray mount <name\|shortId> [--timeout s]` | Mount a Stream (mount-mode) profile now — `loadAgent` + `startAgent` (`launchctl kickstart -k`, the same pair the app's `mountProfile` uses) — then BLOCK until it attaches, up to `--timeout` (default 600s: the startup VFS cache scan alone takes minutes on a ~100 GB cache, so the old fixed 60s reported failure on a mount that was merely still scanning). Exit 0 on a confirmed mount (or if already mounted). On timeout it distinguishes *still mounting* (rclone running — resume with `status --wait mounted`) from a mount that never came up; if rclone isn't running for 60 consecutive seconds it fails early with the tail of the sync log so the real reason (auth, unreachable remote, unwritable cache dir) is visible. The wait loop lives in the pure core over `probeMount`, covered by AC-CLI10. Refuses a non-mount profile. |
 | `synctray unmount <name\|shortId>` | Unmount a mounted Stream profile — graceful+forced `diskutil unmount` then unload the agent so `rclone nfsmount` actually exits (`SyncSetupService.unmount`). Refuses a non-mount profile. |
 | `synctray cache move <name\|shortId> --to <path> [--include-overlapping]` | Relocate a Stream profile's rclone VFS cache (both the `vfs` content tree and the `vfsMeta` byte-range-list tree) to `<path>` and BLOCK until it finishes, returning non-zero on rejection or failure. Detaches/reinstalls around the move like the app does. Refuses a non-mount profile, and refuses an overlapping sibling profile (same on-disk bytes) unless `--include-overlapping` is passed — there's nobody to prompt non-interactively. See "Cache Directory Migration" above. |
+
+**Support:**
+
+| Command | Purpose |
+|---------|---------|
+| `synctray report [name\|shortId] [--lines N] [--output <path>] [--send] [--yes] [--json]` | Build a diagnostic report (all profiles when no target; see "Diagnostic reports" under Telemetry) via the injected `CLIEnvironment.buildDiagnosticReport`. Without `--send`: print the rendered report (or write it to `--output` and print the path) and say `Nothing was sent.` on stderr. With `--send`: print `DiagnosticReportCopy.disclosure` on stderr, then ask `Send this report? [y/N]` (default No, EOF = No) unless `--yes`; a non-interactive `--send` without `--yes` exits `64` before building anything. On success prints `Report code: ST-XXXXXX` (or `{"code":"ST-XXXXXX"}` with `--json`) and exits 0; on failure prints the error and exits 1. Telemetry verbs `report` / `report-send`. Covered by `ConfigSelfTest` AC-DR5/AC-DR6. |
 
 `<name|shortId>` resolution tries an exact `shortId` match first, then a
 case-insensitive `name` match; an unmatched (or ambiguous) target exits
@@ -1766,7 +1774,8 @@ open ~/Library/Developer/Xcode/DerivedData/SyncTray-*/Build/Products/Debug/SyncT
 | `SettingsView.swift` | Main settings UI with profile editing |
 | `ProfileStore.swift` | File-backed profile persistence — authoritative `{shortId}.profile.json` per profile, write-only blob mirror (see "File-Backed Configuration") |
 | `ConfigFileWatcher.swift` | Live-apply watcher for `~/.config/synctray` (profiles + settings); routes an unknown-id `.profile.json` to create-via-file |
-| `SyncTrayCLI.swift` | Headless `synctray` CLI: inspect (`doctor`/`status`/`profiles`/`profile show`/`logs`/`test-remote`/`listremotes`/`remote folders`/`telemetry`), configure (`profile create`/`set`/`enable`/`disable`/`delete`, `install`/`reinstall`), operate (`sync`/`mount`/`unmount`/`cache move`); dispatched from `SyncTrayApp.init` (see "Agent-Editable Configuration & CLI") |
+| `SyncTrayCLI.swift` | Headless `synctray` CLI: inspect (`doctor`/`status`/`profiles`/`profile show`/`logs`/`test-remote`/`listremotes`/`remote folders`/`telemetry`), configure (`profile create`/`set`/`enable`/`disable`/`delete`, `install`/`reinstall`), operate (`sync`/`mount`/`unmount`/`cache move`), support (`report`); dispatched from `SyncTrayApp.init` (see "Agent-Editable Configuration & CLI") |
+| `DiagnosticReport.swift` | User-sent diagnostic report: build, redact, render, OTLP-encode and upload (see "Diagnostic reports") |
 | `CLIShimInstaller.swift` | Installs the `~/.local/bin/synctray` shim (`~/.local/bin` must be on `PATH`) |
 | `SyncLogPatterns` | Centralized log message pattern matching (includes `isOutOfSyncError`) |
 | `TelemetryService.swift` | OTel singleton — traces, metrics, logs via OTLP/HTTP |
@@ -1798,10 +1807,65 @@ Pseudonymous, opt-in telemetry using OpenTelemetry (opentelemetry-swift 1.17.1).
 - `host.arch` — `arm64` / `amd64`, resolved at compile time so a universal binary reports the executing slice; omitted entirely on any other architecture rather than sending an undocumented value.
 
 ### Privacy
-No file paths, sync remote names, or credentials in telemetry. File operations tracked by normalized extension only. Error messages categorized into low-cardinality types. Profile names are user-chosen display names, not paths. Carve-out: `vcs.repository.url.full` (the source repo's origin URL, credentials stripped at build time) is exempt — it identifies the codebase, not a user's sync destination.
+No file paths, sync remote names, or credentials in telemetry. File operations tracked by normalized extension only. Error messages categorized into low-cardinality types. Profile names are user-chosen display names, not paths. Carve-out: `vcs.repository.url.full` (the source repo's origin URL, credentials stripped at build time) is exempt — it identifies the codebase, not a user's sync destination. These rules govern automatic usage data; a diagnostic report the user explicitly sends is the one exception (see "Diagnostic reports" below).
 
 ### Configuration
 Priority: process env vars > `~/.config/synctray/.env` > Info.plist. Key vars: `OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_EXPORTER_OTLP_HEADERS`, `DASH0_AUTH_TOKEN`.
+
+### Diagnostic reports (manual, per-send consent)
+When a sync misbehaves, the user can send a **diagnostic report** instead of digging log files
+out of `~/.local/log` by hand: **Send Report…** on a profile's "Last sync error" banner or footer,
+**Send Diagnostic Report…** in App Settings → Help & Feedback (`DiagnosticReportSheet`), or
+`synctray report --send`. They get a code (`ST-` + 6 characters from
+`23456789ABCDEFGHJKMNPQRSTUVWXYZ`, no 0/O/1/I/L — `DiagnosticReportCode`) to hand the maintainer,
+who finds the report in Dash0 by `diagnostics.report_id`.
+
+- **The privacy carve-out.** A report is the ONE thing SyncTray sends that may carry file and
+  folder names, paths (including the home folder, so the username), remote names and full error
+  text — everything the Privacy rules above forbid in automatic telemetry. That is allowed only
+  because the user chooses to send each report, after reading `DiagnosticReportCopy.disclosure`
+  (shown verbatim by the sheet, the CLI and `TelemetryDetailsSheet`). It is independent of
+  `telemetryEnabled`: a report can be sent with usage data off, and nothing about a report is
+  ever sent automatically. Keep it that way — never attach report content to an automatic event.
+- **Contents** (`DiagnosticReportBuilder.build(profiles:environment:lineLimit:)`, all I/O injected
+  through `DiagnosticReportEnvironment`): per profile, the last `lineLimit` (default 500) lines of
+  `profile.logPath`, the `.profile.json`, the `{shortId}-exclude.txt` filter, the `/tmp` run lock
+  and (bisync) the session `.lck` with whether each holder PID is alive (`SyncRunLock`); globally,
+  the `synctray-sync.sh`/rclone processes from `ps -axww -o pid=,ppid=,etime=,args=`, `launchctl
+  list` lines naming synctray, the CLI's own `status --json` (`SyncTrayCLI.statusReport`) and
+  `doctor` (`SyncTrayCLI.doctorChecks`), and the app, rclone and macOS versions plus whether usage
+  data is on. `render()` is the plain text used by Preview, Save and the CLI.
+- **Never read**, by construction: `rclone.conf` (and any `*.rclone.conf`, including
+  `{shortId}.cacheonly.rclone.conf`), `~/.config/synctray/.env`, and the RC API secrets
+  `~/.local/state/synctray/rc/*.auth`. Every read is checked against
+  `DiagnosticReportBuilder.isNeverRead` before the injected reader runs — including the reads the
+  CLI's status/doctor helpers make — and `plannedReads(for:)` lists everything a build reads.
+- **Redaction.** `DiagnosticRedactor.redact` runs on every line of every section BEFORE the 8 KB
+  per-line cap (so a cut can't leave half a secret). It replaces values with `[REDACTED]` and keeps
+  the key/flag name: JSON `"password": "…"`-style keys, `key=value`/`key: value` for
+  password/passwd/pass/token/access_token/refresh_token/client_secret/secret/api_key/apikey/
+  auth_token/session_token/cookie, `Authorization:`/`Cookie:` headers and `Bearer` tokens, rclone
+  flags ending in `-pass`/`-password`/`-token`/`-secret`/`-key` (`--x value` and `--x=value`), URL
+  userinfo (`scheme://[REDACTED]@host`), and `RCLONE_…_PASS/_TOKEN/_SECRET/_KEY`,
+  `RCLONE_RC_PASS`, `DASH0_AUTH_TOKEN`, `OTEL_EXPORTER_OTLP_HEADERS` assignments. Every rule needs
+  that context, so ordinary file names (`Keynote.key`, `passport.pdf`) survive.
+- **Limits.** Lines are capped at 8 KB (`…[truncated]`); the whole report at ~5 MB, dropping the
+  oldest log lines first and saying so (`notes`, `diagnostics.truncated`).
+- **Transport.** `DiagnosticReportUploader.send` POSTs OTLP/HTTP JSON (`ExportLogsServiceRequest`,
+  built by the pure `DiagnosticOTLPEncoder`) to `<endpoint>/v1/logs` with the telemetry exporter's
+  own headers and resource attributes (read through `TelemetryService.diagnosticExportEndpoint` /
+  `diagnosticExportHeaders` / `diagnosticResourceAttributes()`, which don't change how telemetry
+  is set up), plus `synctray.process.kind=diagnostics`, in batches of ≤ 200 records; a non-2xx
+  response throws with its status. One record per line, after a leading `Diagnostic report`
+  summary record; record and attribute details are in `.claude/rules/telemetry.md`. A build with
+  no OTLP auth headers throws "Diagnostic upload isn't configured in this build" and the sheet
+  keeps **Save to Desktop** available (`SyncTray-report-<code>.txt`, written 0600).
+- **Usage telemetry about it** — only when usage data is on — is one bounded `Diagnostic report
+  sent`/`failed` log (`TelemetryService.recordDiagnosticReport`), never report content.
+
+Covered by `ConfigSelfTest` AC-DR1 (code), AC-DR2 (redaction table), AC-DR3 (builder, limits,
+never-read), AC-DR4 (OTLP encoding and batching), AC-DR5 (CLI parse) and AC-DR6 (CLI consent and
+send routing).
 
 ## Generated Files (per profile)
 
