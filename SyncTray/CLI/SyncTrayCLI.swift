@@ -760,7 +760,8 @@ enum SyncTrayCLI {
         )
 
         let probe = remoteProbe(for: profile, env: env)
-        checks.append(DoctorCheck(name: label, status: probe.reachable ? .ok : .fail, detail: probe.detail))
+        let probeStatus: DoctorCheck.Status = !probe.reachable ? .fail : (probe.pathMissing ? .warn : .ok)
+        checks.append(DoctorCheck(name: label, status: probeStatus, detail: probe.detail))
 
         return checks
     }
@@ -794,28 +795,31 @@ enum SyncTrayCLI {
 
     /// The single reachability probe shared by `doctor` and `test-remote` (plan D5): `lsjson
     /// --stat <remote>:<path>` — never `lsd`, which lists the whole directory and can hang for
-    /// minutes on a large remote folder. Exit 0/3/4 means reachable (the remote answered, even
-    /// "not found"); a watchdog timeout is reported by name rather than as a bare non-zero exit;
+    /// minutes on a large remote folder. Exit 0/3/4 means reachable (the remote answered); 3/4
+    /// ("not found") also sets `pathMissing`, which `doctor` reports as a warning — a missing path
+    /// is normal before a Two-Way profile's first sync, but is also how a typo looks; a watchdog timeout is reported by name rather than as a bare non-zero exit;
     /// the error text prefers an ERROR/CRITICAL stderr line over rclone's shared-client_id
     /// NOTICE line.
-    static func remoteProbe(for profile: SyncProfile, env: CLIEnvironment) -> (reachable: Bool, detail: String) {
+    static func remoteProbe(for profile: SyncProfile, env: CLIEnvironment) -> (reachable: Bool, pathMissing: Bool, detail: String) {
         guard var arguments = SyncManager.reachabilityProbeArguments(remote: profile.rcloneRemote, path: profile.remotePath) else {
-            return (false, "remote unreachable: no remote configured")
+            return (false, false, "remote unreachable: no remote configured")
         }
         if env.remoteSkipsCertCheck(profile.rcloneRemote) {
             arguments.append("--no-check-certificate")
         }
         let (exit, _, stderr) = env.runRclone(arguments, remoteProbeTimeout)
         if SyncManager.reachabilityProbeSucceeded(exitCode: exit) {
-            return (true, "remote reachable")
+            return exit == 0
+                ? (true, false, "remote reachable")
+                : (true, true, "remote reachable, but path not found: \(profile.remotePath)")
         }
         if exit == CLIEnvironment.rcloneTimedOutExitCode {
-            return (false, "remote unreachable: timed out after \(Int(remoteProbeTimeout))s")
+            return (false, false, "remote unreachable: timed out after \(Int(remoteProbeTimeout))s")
         }
         if let summary = rcloneFailureSummary(stderr: stderr) {
-            return (false, "remote unreachable: \(summary)")
+            return (false, false, "remote unreachable: \(summary)")
         }
-        return (false, "remote unreachable: rclone exited \(exit)")
+        return (false, false, "remote unreachable: rclone exited \(exit)")
     }
 
     /// Picks the single most useful line from rclone's plain-text stderr: the last ERROR/
@@ -857,7 +861,7 @@ enum SyncTrayCLI {
         // (see `runMeasured`), never a remote name, path, or profile name.
         let probe = remoteProbe(for: profile, env: env)
         if probe.reachable {
-            env.stdout("reachable: \(profile.fullRemotePath)\n")
+            env.stdout("reachable: \(profile.fullRemotePath)\(probe.pathMissing ? " (path not found)" : "")\n")
             return 0
         } else {
             let detail = probe.detail.hasPrefix("remote unreachable: ")

@@ -3971,7 +3971,7 @@ enum ConfigSelfTest {
         var capturedArgs: [String] = []
         let okEnv = fakeCLIEnvironment(runRclone: { args, _ in capturedArgs = args; return (0, "{}", "") })
         let okProbe = SyncTrayCLI.remoteProbe(for: profile, env: okEnv)
-        guard okProbe.reachable, okProbe.detail == "remote reachable",
+        guard okProbe.reachable, !okProbe.pathMissing, okProbe.detail == "remote reachable",
               capturedArgs.contains("lsjson"), capturedArgs.contains("--stat"),
               capturedArgs.contains("myremote:Some Path"), !capturedArgs.contains("lsd") else {
             return report(name, slug, false, "(exit 0 did not probe with lsjson --stat: \(capturedArgs))")
@@ -3979,8 +3979,13 @@ enum ConfigSelfTest {
 
         for exit: Int32 in [3, 4] {
             let env = fakeCLIEnvironment(runRclone: { _, _ in (exit, "", "") })
-            guard SyncTrayCLI.remoteProbe(for: profile, env: env).reachable else {
+            let probe = SyncTrayCLI.remoteProbe(for: profile, env: env)
+            guard probe.reachable else {
                 return report(name, slug, false, "(exit \(exit) was not treated as reachable)")
+            }
+            // A missing path stays visible: doctor renders `pathMissing` as a warning, not "ok".
+            guard probe.pathMissing, probe.detail == "remote reachable, but path not found: Some Path" else {
+                return report(name, slug, false, "(exit \(exit) did not flag the missing path: \(probe))")
             }
         }
 
@@ -4029,6 +4034,9 @@ enum ConfigSelfTest {
         // doctor and test-remote both route through the one probe — same args, never `lsd`.
         guard let cliSource = readSourceFile("CLI/SyncTrayCLI.swift"), !cliSource.contains("\"lsd\"") else {
             return report(name, slug, false, "(SyncTrayCLI.swift still references the old lsd probe)")
+        }
+        guard cliSource.contains("!probe.reachable ? .fail : (probe.pathMissing ? .warn : .ok)") else {
+            return report(name, slug, false, "(doctor no longer reports a missing remote path as a warning)")
         }
         return report(name, slug, true)
     }
