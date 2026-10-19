@@ -3004,3 +3004,56 @@ final class TelemetryService {
 
 }
 
+// MARK: - Diagnostic reports (shared OTLP configuration)
+
+/// Read-only views of the exporter configuration, so `DiagnosticReportUploader` posts a
+/// user-sent diagnostic report to the same endpoint, with the same headers and resource
+/// attributes, as usage telemetry — without changing how telemetry itself is set up.
+/// Unlike every `record…` method, these are NOT gated on `telemetryEnabled`: a diagnostic
+/// report is its own per-send consent (see CLAUDE.md "Diagnostic reports").
+extension TelemetryService {
+    /// OTLP/HTTP base endpoint (env > `~/.config/synctray/.env` > Info.plist > default).
+    static var diagnosticExportEndpoint: String { endpoint }
+
+    /// The exporter's auth headers (`OTEL_EXPORTER_OTLP_HEADERS` or `DASH0_AUTH_TOKEN`).
+    static var diagnosticExportHeaders: [(String, String)] { authHeaders }
+
+    /// Whether this build can upload at all — the same condition `setupOTel` uses.
+    static var isDiagnosticExportConfigured: Bool { !authHeaders.isEmpty }
+
+    /// The resource attributes every telemetry signal carries (`service.name`,
+    /// `service.version`, `service.instance.id`, `enduser.id`, `host.arch`,
+    /// `deployment.environment.name`, …), as strings.
+    static func diagnosticResourceAttributes() -> [String: String] {
+        var result: [String: String] = [:]
+        for (key, value) in shared.buildResource().attributes {
+            if case let .string(text) = value {
+                result[key] = text
+            }
+        }
+        return result
+    }
+
+    /// The deployment-precise `service.version`, for the report header.
+    static var diagnosticServiceVersion: String { shared.appVersion() }
+
+    /// Record that the user sent (or tried to send) a diagnostic report. Bounded — the
+    /// report code, where it was sent from (`app`/`cli`), the result and the line count;
+    /// never any report content. Gated on the usage-data opt-in like every other event.
+    func recordDiagnosticReport(reportId: String, sourceUI: String, succeeded: Bool, lineCount: Int) {
+        guard SyncTraySettings.telemetryEnabled else { return }
+        ensureSetup()
+
+        emitLog(
+            severity: succeeded ? .info : .warn,
+            body: succeeded ? "Diagnostic report sent" : "Diagnostic report failed",
+            attributes: [
+                "diagnostics.report_id": .string(reportId),
+                "diagnostics.source_ui": .string(sourceUI),
+                "diagnostics.result": .string(succeeded ? "sent" : "failed"),
+                "diagnostics.line_count": .int(lineCount),
+            ]
+        )
+    }
+}
+
