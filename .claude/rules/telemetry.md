@@ -174,12 +174,12 @@ Go's "directory not empty" moved from `critical` to `directory_not_empty`.
 | Bucket | Matches (lowercased) |
 |--------|----------------------|
 | `disk_full` | "no space left on device" |
-| `rate_limited` | "ratelimitexceeded", "userratelimitexceeded", "rate limit", "too many requests" — before `quota_exceeded`, since Google's per-minute limit says "Quota exceeded … rateLimitExceeded" |
+| `rate_limited` | "ratelimitexceeded", "userratelimitexceeded", "rate limit exceeded", "too many requests" — before `quota_exceeded`, since Google's per-minute limit says "Quota exceeded … rateLimitExceeded" |
 | `quota_exceeded` | "storagequotaexceeded", "quotaexceeded", "quota exceeded", "insufficient storage" |
 | `network` | "no such host" (ahead of the generic "no such" → `file_not_found`), "connection reset", "connection refused", "network is unreachable", "broken pipe" — plus the generic "network"/"connection" |
 | `timeout` | "context deadline exceeded", "deadline exceeded", "i/o timeout", "timed out", "handshake timeout" — ahead of `auth_failed`, so "oauth2: cannot fetch token: … i/o timeout" stays a timeout; plus the generic "timeout" |
 | `tls_certificate` | " x509:", " tls:", "certificate signed by", "certificate has expired", "certificate verify failed", "bad certificate" (Go's error prefixes, not the bare words "x509" / "certificate", which would claim errors about a file named "x509.pem" or "…Certificate.pdf"; the two prefixes carry a leading space and are matched against the message with one leading space added, so a message starting with Go's prefix still matches while a path segment named `tls`/`x509` — "…/certs/tls: permission denied" — isn't claimed) |
-| `auth_failed` | "invalid_grant", "token expired", "expired token", "oauth2:", "unauthorized", "authentication failed", "couldn't fetch token", "failed to refresh token" — after `network`/`timeout`/`tls_certificate`, so a token refresh that failed on DNS, TLS or a timeout keeps that cause |
+| `auth_failed` | "invalid_grant", "token expired", "expired token", "oauth2:", "401 unauthorized", "authentication failed", "couldn't fetch token", "failed to refresh token" — after `network`/`timeout`/`tls_certificate`, so a token refresh that failed on DNS, TLS or a timeout keeps that cause |
 | `name_too_long` | "file name too long", "name too long", "path too long" |
 | `invalid_name` | "illegal character", "invalid characters", "invalid name", "invalid file name", "invalid filename" (plural "characters": Go's JSON decoder says "invalid character '<' looking for beginning of value" when a proxy returns HTML, which stays `other`) |
 | `checksum_mismatch` | "corrupted on transfer", "hash differ", "hashes differ", "md5 differ", "sizes differ" |

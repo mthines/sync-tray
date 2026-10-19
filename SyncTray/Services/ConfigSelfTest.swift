@@ -7964,6 +7964,9 @@ enum ConfigSelfTest {
             // A path segment named tls or x509 is not a TLS error either ("/" precedes it, not a space)…
             ("open /Users/me/Sync/certs/tls: permission denied", "permission_denied"),
             ("open /Users/me/Sync/certs/x509: no such file or directory", "file_not_found"),
+            // Nor is a file whose name merely contains an HTTP status phrase.
+            ("open /Users/me/Sync/Unauthorized.pdf: permission denied", "permission_denied"),
+            ("open /Users/me/Sync/rate limit notes.txt: no such file or directory", "file_not_found"),
             // …while Go's prefixes still match mid-message and at the very start of the message.
             ("tls: first record does not look like a TLS handshake", "tls_certificate"),
             ("x509: certificate is valid for nas.local, not nas.example.com", "tls_certificate"),

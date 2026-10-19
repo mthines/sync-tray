@@ -3168,20 +3168,22 @@ final class TelemetryService {
     /// prefixes are matched with a leading space (" x509:", " tls:"), against the message
     /// padded with one leading space by `categorizeError`, so a path segment named `tls` or
     /// `x509` followed by `: <error>` ("…/certs/tls: permission denied") is not claimed
-    /// either; and
+    /// either; the HTTP-status needles are matched with their code or full phrase ("401
+    /// unauthorized", "rate limit exceeded") rather than the bare words, which a file named
+    /// e.g. "Unauthorized.pdf" or "rate limit notes.txt" would match; and
     /// `invalid_name` takes "invalid characters" (plural), not "invalid character", which is
     /// how Go's JSON decoder reports an HTML page where JSON was expected ("invalid character
     /// '<' looking for beginning of value"). The values are bounded labels; the message
     /// itself never leaves the machine.
     static let specificErrorBuckets: [(bucket: String, needles: [String])] = [
         ("disk_full", ["no space left on device"]),
-        ("rate_limited", ["ratelimitexceeded", "userratelimitexceeded", "rate limit", "too many requests"]),
+        ("rate_limited", ["ratelimitexceeded", "userratelimitexceeded", "rate limit exceeded", "too many requests"]),
         ("quota_exceeded", ["storagequotaexceeded", "quotaexceeded", "quota exceeded", "insufficient storage"]),
         ("network", ["no such host", "connection reset", "connection refused", "network is unreachable", "broken pipe"]),
         ("timeout", ["context deadline exceeded", "deadline exceeded", "i/o timeout", "timed out", "handshake timeout"]),
         ("tls_certificate", [" x509:", " tls:", "certificate signed by", "certificate has expired",
                              "certificate verify failed", "bad certificate"]),
-        ("auth_failed", ["invalid_grant", "token expired", "expired token", "oauth2:", "unauthorized",
+        ("auth_failed", ["invalid_grant", "token expired", "expired token", "oauth2:", "401 unauthorized",
                          "authentication failed", "couldn't fetch token", "failed to refresh token"]),
         ("name_too_long", ["file name too long", "name too long", "path too long"]),
         ("invalid_name", ["illegal character", "invalid characters", "invalid name", "invalid file name",
