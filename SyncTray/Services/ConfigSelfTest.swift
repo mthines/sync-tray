@@ -8974,14 +8974,17 @@ enum ConfigSelfTest {
         var requested: [String] = []
         let profileJSON = "{\n  \"additionalRcloneFlags\" : \"--sftp-pass hunter2\",\n  \"name\" : \"DR Bisync\"\n}\n"
         // 101/102: this profile's script and its rclone child (named by parent, not args).
-        // 104: another profile's script; 105: the user's own unrelated rclone job. Neither may
-        // enter a report about these profiles.
+        // 104: another profile's script; 105: the user's own unrelated rclone job; 106: a
+        // nested remote path and a sibling folder that only share a prefix. None may enter a
+        // report about these profiles. 107 names the profile's remote path exactly, so it does.
         let psOutput = """
               101     1 01:02:03 /bin/bash /Users/x/.local/bin/synctray-sync.sh \(bisync.configPath)
               102   101    00:10 /opt/homebrew/bin/rclone bisync /a b: --sftp-pass hunter2
               103     1    00:05 /usr/bin/vim notes.txt
               104     1    00:07 /bin/bash /Users/x/.local/bin/synctray-sync.sh /Users/x/.config/synctray/profiles/other.json
               105     1    00:09 /opt/homebrew/bin/rclone copy /Users/x/Private secret:vault
+              106     1    00:11 /opt/homebrew/bin/rclone sync \(bisync.fullRemotePath)/Nested \(bisync.localSyncPath)2
+              107     1    00:12 /opt/homebrew/bin/rclone nfsmount \(bisync.fullRemotePath) /Users/x/Mount
 
             """
         let env = DiagnosticReportEnvironment(
@@ -9049,8 +9052,11 @@ enum ConfigSelfTest {
         let rendered = built.render()
         guard !rendered.contains("hunter2"),
               built.sections[5].lines.contains(where: { $0.contains("--sftp-pass [REDACTED]") }),
-              built.sections[3].lines.count == 2,
-              built.sections[3].lines.allSatisfy({ !$0.contains("vim") && !$0.contains("other.json") && !$0.contains("vault") }),
+              built.sections[3].lines.count == 3,
+              built.sections[3].lines.allSatisfy({ !$0.contains("vim") && !$0.contains("other.json") && !$0.contains("vault") && !$0.contains("Nested") }),
+              built.sections[3].lines.contains(where: { $0.hasPrefix("pid=107 ") }),
+              DiagnosticReportBuilder.containsArgument("rclone sync /Users/x/My Work remote:a", "/Users/x/My Work"),
+              !DiagnosticReportBuilder.containsArgument("rclone sync /Users/x/My Work2 remote:a", "/Users/x/My Work"),
               built.sections[3].lines.contains(where: { $0.contains("--sftp-pass [REDACTED]") && $0.hasPrefix("pid=102 ppid=101 elapsed=00:10 ") }),
               built.sections[4].lines.contains(where: { $0.contains(bisync.launchdLabel) }),
               !built.sections[4].lines.contains(where: { $0.contains("com.apple.other") || $0.contains("otherjob") }) else {

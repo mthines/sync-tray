@@ -552,17 +552,40 @@ enum DiagnosticReportBuilder {
     /// unrelated jobs — never enters the report.
     static func syncProcessLines(fromPS output: String, profiles: [SyncProfile]) -> [String] {
         let markers = profiles.flatMap { profile -> [String] in
-            [profile.configPath, (profile.localSyncPath as NSString).expandingTildeInPath, profile.fullRemotePath]
-        }.filter { $0.count > 2 }  // an empty field (":" for a blank remote) would match anything
+            var markers = [profile.configPath]
+            let local = (profile.localSyncPath as NSString).expandingTildeInPath
+            if !local.isEmpty { markers.append(local) }
+            // A bare `remote:` (no path) names every job on that remote, not this profile's.
+            if !profile.rcloneRemote.isEmpty, !profile.remotePath.isEmpty { markers.append(profile.fullRemotePath) }
+            return markers
+        }
         let candidates = splitLines(output).compactMap { line -> (pid: String, ppid: String, etime: String, args: String)? in
             guard let fields = parsePSLine(line), isSyncProcess(args: fields.args) else { return nil }
             return fields
         }
-        let owned = Set(candidates.filter { fields in markers.contains { fields.args.contains($0) } }.map(\.pid))
+        let owned = Set(candidates.filter { fields in
+            markers.contains { containsArgument(fields.args, $0) }
+        }.map(\.pid))
         return candidates.compactMap { fields -> String? in
             guard owned.contains(fields.pid) || owned.contains(fields.ppid) else { return nil }
             return "pid=\(fields.pid) ppid=\(fields.ppid) elapsed=\(fields.etime) args=\(fields.args)"
         }
+    }
+
+    /// Whether `argument` appears in `args` as a whole argument: preceded by the start or a
+    /// space and followed by the end or a space. A plain substring match would let a profile on
+    /// `nas:Work` claim `nas:Work/Sub`'s process, or `/Users/x/Work` claim `/Users/x/Work2`'s.
+    /// A path containing spaces still matches, since only its two ends are checked. Pure.
+    static func containsArgument(_ args: String, _ argument: String) -> Bool {
+        guard !argument.isEmpty else { return false }
+        var searchStart = args.startIndex
+        while let range = args.range(of: argument, range: searchStart..<args.endIndex) {
+            let startsClean = range.lowerBound == args.startIndex || args[args.index(before: range.lowerBound)] == " "
+            let endsClean = range.upperBound == args.endIndex || args[range.upperBound] == " "
+            if startsClean && endsClean { return true }
+            searchStart = args.index(after: range.lowerBound)
+        }
+        return false
     }
 
     /// `launchctl list` output filtered to SyncTray: the agents of `profiles`, plus SyncTray's

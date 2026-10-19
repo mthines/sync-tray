@@ -1873,7 +1873,8 @@ who finds the report in Dash0 by `diagnostics.report_id`.
   `profile.logPath`, the `.profile.json`, the `{shortId}-exclude.txt` filter, the `/tmp` run lock
   and (bisync) the session `.lck` with whether each holder PID is alive (`SyncRunLock`); globally,
   the reported profiles' `synctray-sync.sh`/rclone processes from `ps -axww -o pid=,ppid=,etime=,args=`
-  (`syncProcessLines`: args naming a profile's config file, local folder or remote path, or a child
+  (`syncProcessLines`: args naming a profile's config file, local folder or remote path as a whole
+  argument (`containsArgument`, so a nested remote path or a sibling folder never matches), or a child
   of such a process — never another profile's or the user's own rclone jobs), `launchctl list`
   lines naming synctray minus other profiles' sync agents (`launchdAgentLines`), the CLI's own `status --json` (`SyncTrayCLI.statusReport`) and
   `doctor` (`SyncTrayCLI.doctorChecks`), and the app, rclone and macOS versions plus whether usage
