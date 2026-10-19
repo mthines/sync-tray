@@ -7951,6 +7951,8 @@ enum ConfigSelfTest {
             ("Failed to copy: read tcp 10.0.0.2:52311->142.250.0.1:443: read: connection reset by peer", "network"),
             ("Failed to copy: write tcp 10.0.0.2:52311->10.0.0.5:445: write: broken pipe", "network"),
             ("Failed to copy: Get \"https://www.googleapis.com/drive/v3/files\": context deadline exceeded (Client.Timeout exceeded while awaiting headers)", "timeout"),
+            // Moved by this PR: a bare "no such host" was file_not_found (via "no such").
+            ("no such host", "network"),
             // A token refresh that timed out is a timeout, not an auth failure ("oauth2:" /
             // "failed to refresh token" must not win over the timeout wording).
             ("oauth2: cannot fetch token: Post \"https://oauth2.googleapis.com/token\": dial tcp 1.2.3.4:443: i/o timeout", "timeout"),
@@ -7975,7 +7977,6 @@ enum ConfigSelfTest {
             (photosDenial, "permission_denied"),
             ("Failed to sync with 2 errors: last error was: not deleting files as there were IO errors", "io_errors_blocked_deletes"),
             ("file not found", "file_not_found"),
-            ("no such host", "network"),
             ("Failed to copy: permission denied", "permission_denied"),
             // A file name that merely mentions a certificate is not a TLS error.
             ("open /Users/me/Sync/Birth Certificate.pdf: permission denied", "permission_denied"),
