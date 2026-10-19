@@ -210,11 +210,23 @@ Log/span only — never a metric label.
   a span status description): it routinely carries paths and remote names, and the in-app
   privacy disclosure (`TelemetryDetailsSheet`) promises "never the raw message". See
   [Error categories](#error-categories) for the buckets
+- A `permission_denied` failure also carries bounded `error.access_denial`
+  (`operation_not_permitted` = EPERM/macOS privacy, `permission_denied` = EACCES/file
+  permissions), `error.blocked_path.kind` (`volume_system_folder` / `photos_library` / `other`)
+  and `error.blocked_path.in_sync_folder` from `TelemetryService.accessDenialAttributes` —
+  derived from the message, never the path itself
 - **Carve-out:** `vcs.repository.url.full` (the *source code* repository's origin
   remote, e.g. `https://github.com/mthines/sync-tray`) is exempt from the remote-URL
   ban above. It identifies the codebase the binary was built from, not a user's sync
   destination, carries no user data, and has embedded credentials stripped at build
   time (see Source correlation below) before it ever reaches telemetry.
+- **Carve-out — user-sent diagnostic reports only:** the records a diagnostic report
+  uploads (see [Diagnostic reports](#diagnostic-reports-user-sent) below) may carry log
+  lines with paths, file and folder names, remote names and raw error text. They are
+  exempt from the no-paths rule ONLY because the user explicitly sends each report after
+  reading the disclosure (per-send consent, independent of `telemetryEnabled`). Never emit
+  report content from any automatic code path, and never add these attributes to an
+  automatic event.
 
 ### Naming
 - Metric names: `synctray.<domain>.<measurement>` (e.g., `synctray.sync.duration`)
@@ -296,7 +308,7 @@ rollout. No event is emitted on a fresh install.
 | `synctray.sync.duration` | Histogram | Duration of sync operations (seconds) |
 | `synctray.sync.completed` | Counter | Sync operations completed (by mode + result) |
 | `synctray.sync.files_changed` | Counter | Files changed during sync |
-| `synctray.sync.errors` | Counter | Sync errors by type |
+| `synctray.sync.errors` | Counter | Sync errors by type (`error.type`); a `permission_denied` failure also carries `error.access_denial` (`operation_not_permitted`/`permission_denied`) — the only access-denial attribute on the counter |
 | `synctray.app.profiles.active` | UpDownCounter | Number of active profiles |
 | `synctray.app.launch` | Counter | App launches |
 | `synctray.mount.operations` | Counter | Mount/unmount operations |
@@ -326,7 +338,7 @@ rollout. No event is emitted on a fresh install.
 | `synctray.mount.reinstall_detach` | Counter | Pre-uninstall volume detach attempts for mount-mode profiles, reached on every `SyncSetupService.uninstall` (including the settings-save reinstall path) — `mount.result`: `not_mounted`/`success`/`success_forced`/`failure` |
 | `synctray.mount.reinstall_detach.duration` | Histogram | Time taken to gracefully detach a mounted volume before reinstall (seconds) — regression signal for the "settings change freezes an active Stream mount" failure mode; only recorded when the profile was actually mounted |
 | `synctray.mount.cache_only_fallback` | Counter | Cache Only was requested (`streamCacheOnly`) but the mount settled on streaming — the silent script fallback when the partial-file exclude list can't be built. The "I enabled Cache Only but it's still streaming/downloading" case; invisible without this. Emitted once at the mode-change edge by `SyncManager.reconcileMountStatesOffMain`, guarded by `resumingFromCacheOnly` so a legitimate drain-and-resume flip isn't counted |
-| `synctray.cli.invoked` | Counter | Headless `synctray` CLI invocations (`cli.command`: bounded verb — doctor/status/offline-status/profiles/logs/test-remote/listremotes/remote-folders/telemetry-status/telemetry-on/telemetry-off/sync/mount/unmount/reinstall/install/cache-move/profile-create/profile-show/profile-set/profile-enable/profile-disable/profile-delete/profile-list/help, or `(other)`; `cli.result`: ok/error). Never carries args, paths, profile names, or remotes. Recorded once per run by `runMeasured`, then flushed via `flushForExit` before the process exits |
+| `synctray.cli.invoked` | Counter | Headless `synctray` CLI invocations (`cli.command`: bounded verb — doctor/status/offline-status/profiles/logs/test-remote/listremotes/remote-folders/telemetry-status/telemetry-on/telemetry-off/sync/mount/unmount/reinstall/install/cache-move/profile-create/profile-show/profile-set/profile-enable/profile-disable/profile-delete/profile-list/report/report-send/help, or `(other)`; `cli.result`: ok/error). Never carries args, paths, profile names, or remotes. Recorded once per run by `runMeasured`, then flushed via `flushForExit` before the process exits |
 | `synctray.offline.warm.duration` | Histogram | Duration of an offline-file warming run, seconds (`warm.trigger`: manual/startup/finder_pin; `warm.outcome`: completed/cancelled) |
 | `synctray.offline.warm.throughput` | Histogram | Average read throughput of a warming run, MB/s — the primary signal for slow-fallback diagnosis (the SFTP fallback caps aggregate throughput) |
 | `synctray.offline.warm.files` | Counter | Files warmed into the VFS content cache (`warm.outcome`: completed/cancelled) |
@@ -412,7 +424,46 @@ All key lifecycle events are emitted as structured OTel logs:
 - Mount listing warm: `Mount listing warm` once per streaming mount session (`listing_warm.outcome`, `listing_warm.directories_warmed`, `listing_warm.directories_failed`) — info when `completed`, warn on `failed`/`aborted`/`skipped` (`aborted` = the descent backed off after consecutive failures to avoid flooding a failing backend). A per-subtree descent of `/vfs/refresh` (recursive where rclone can walk a subtree, non-recursive + `operations/list` descend where it can't — rclone's recursive refresh returns `directory not found` on large SMB trees) that populates the directory-*listing* cache so first-browse of every folder is instant instead of a live SMB round trip (the "Loading…" spinner). Metadata only — downloads no file bytes; a `failed`/partial outcome is non-fatal, the mount stays fully usable and folders warm lazily on first browse. Never a path or remote name.
 - Mount read health: `Mount read health` after each probe (info when `healthy`, warn otherwise) with `mount.read_health`, `cache.fs_type`, `cache.volume`, `mount.backend`, `vfs.cache_files`, `probe.bytes`, `probe.duration_seconds`, `probe.first_byte_seconds`, `probe.throughput_mbps`, `probe.remote_bytes`; `Mount read health probe skipped` (warn) when no fully-cached ≥16 MB file exists (`no_candidate`) or the read failed. Probed from the 5-minute heartbeat, at most once per 30 min per mounted **streaming** profile, never during an offline warm, and only when telemetry is enabled (the probe does no I/O otherwise). Never a file name or path — the probed file is random and unrecorded.
 - Mount interrupted / Mount interruption ended: WARN `Mount interrupted` when the mount monitor detects a stall or a drop (`mount.interruption_kind`, `mount.backend`, `mount.mode`), so an interruption that never recovers is still visible; `Mount interruption ended` when it ends (`mount.interruption_outcome`, `mount.interruption_duration_s`) — info when `recovered`, warn when `dropped` or `unmounted`. Paired with `synctray.mount.interruptions` and `synctray.mount.interruption.duration`. Never a path — profile id/name only.
+- Diagnostic report sent / failed: one `Diagnostic report sent` (info) or `Diagnostic report failed` (warn) record when the user sends a diagnostic report, with `diagnostics.report_id` (the `ST-XXXXXX` code), `diagnostics.source_ui` (`app`/`cli`), `diagnostics.result` (`sent`/`failed`), `diagnostics.line_count`. Gated on the usage-data opt-in like every other event; never any report content (`TelemetryService.recordDiagnosticReport`). The report itself is a separate upload — see below
 - Cache migration started/completed: `Cache migration started` when a Stream profile's cache-directory move begins; `Cache migration completed` (outcome `completed`) or `Cache migration ended` (any other outcome — `cancelled`, a `CacheMigrationFailure` value, optionally `_rolled_back`-suffixed, or `preflight_rejected`) when it ends, carrying `cache_migration.outcome`, `cache_migration.same_volume`, `cache_migration.files`, `cache_migration.bytes`, `cache_migration.duration_seconds`, `cache_migration.throughput_mbps`. Never a cache path, directory, or remote name.
+
+## Diagnostic reports (user-sent)
+
+A diagnostic report (`DiagnosticReport.swift`, CLAUDE.md "Diagnostic reports") is NOT usage
+telemetry: it is uploaded only when the user presses **Send** (or runs `synctray report --send`
+and confirms), whether or not `telemetryEnabled` is on, and it does not go through the OTel SDK.
+`DiagnosticReportUploader` POSTs OTLP/HTTP JSON (`ExportLogsServiceRequest`: resourceLogs →
+scopeLogs (scope `synctray.diagnostics`) → logRecords) to `<endpoint>/v1/logs` with
+`Content-Type: application/json` and the exporter's own headers, ≤ 200 records and about
+1 MB per request (`DiagnosticOTLPEncoder.batches`; a single oversize record goes alone).
+
+**Resource:** the same attributes as every telemetry signal (`TelemetryService.diagnosticResourceAttributes(includeInstallIdentity:)`
+— `service.name`, `service.namespace`, `service.version`, `os.type`, `os.version`, `host.arch`,
+`deployment.environment.name`, `vcs.*`), with `synctray.process.kind` = `diagnostics`. The
+install identity (`service.instance.id`, `enduser.id`) is included ONLY when usage data is on;
+with it off both are omitted and `SyncTraySettings.installationId` is never read, so sending a
+report never creates an install ID (`DiagnosticReportUploader.resourceAttributes(base:telemetryEnabled:)`).
+
+**Records** (`DiagnosticOTLPEncoder`, pure, AC-DR4):
+
+| Record | Body | Attributes |
+|--------|------|------------|
+| Summary (first) | `Diagnostic report` | `diagnostics.report_id`, `diagnostics.profile_count` (int), `diagnostics.line_count` (int), `diagnostics.truncated` (bool) |
+| One per report line | the redacted line | `diagnostics.report_id`, `diagnostics.source` (`log`/`status`/`doctor`/`config`/`filter`/`locks`/`processes`/`launchd`/`system`), `diagnostics.line` (1-based within its section), `synctray.profile.id` + `synctray.profile.name` for per-profile sections; for an rclone `--use-json-log` line also `rclone.level`, `rclone.msg`, `rclone.object`, `rclone.time` (rclone's own timestamp, as written) when present |
+
+`timeUnixNano` is the report's creation time plus the record's ordinal in nanoseconds — 0 for
+the summary, then 1, 2, … in report order — for EVERY record, so a report sits together at send
+time and its order survives in a time-sorted view. rclone's own line time is never used as the
+timestamp; it is kept as the `rclone.time` string attribute.
+`severityNumber`/`severityText` come from rclone's `level`: error/critical → ERROR (17),
+warning → WARN (13), notice/info → INFO (9), debug → DEBUG (5); anything else, and every
+non-JSON line, INFO. Every line is redacted (`DiagnosticRedactor`) before it is stored, so
+these bodies don't carry the passwords, tokens or credentials it recognizes — but they DO carry
+paths and file names, which is why this is the only exempt path (see the Privacy carve-out
+above).
+
+To find a report: filter logs on `diagnostics.report_id = ST-XXXXXX` (and
+`synctray.process.kind = diagnostics`).
 
 ## Swift SDK Gotcha: Wildcard View Required
 

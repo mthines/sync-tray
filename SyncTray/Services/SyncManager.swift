@@ -3024,7 +3024,8 @@ final class SyncManager: ObservableObject {
                 duration: failedDuration,
                 filesChanged: currentSyncChanges[profileId]?.count ?? 0,
                 exitCode: exitCode,
-                errorMessage: profileErrors[profileId] ?? message
+                errorMessage: profileErrors[profileId] ?? message,
+                localSyncPath: profile?.localSyncPath
             )
             // Only use the syncFailed message if we don't already have a more specific error
             if profileErrors[profileId] == nil, let msg = message {
@@ -3037,8 +3038,12 @@ final class SyncManager: ObservableObject {
                 let blockedSummary = profile.flatMap {
                     SyncLogPatterns.macOSBlockedAccessSummary(for: errorDescription, localSyncPath: $0.localSyncPath)
                 }
+                // Full Disk Access only helps a privacy denial, so only that one mentions access.
+                let blockedAction = SyncLogPatterns.blockedAccess(in: errorDescription)?.kind == .filePermissions
+                    ? "Open SyncTray to exclude it."
+                    : "Open SyncTray to exclude it or allow access."
                 let notificationText = blockedSummary
-                    .map { "\($0) Open SyncTray to exclude it or allow access." }
+                    .map { "\($0) \(blockedAction)" }
                     ?? "Sync failed: \(errorDescription)"
                 notificationService.notifySyncError(
                     notificationText,
@@ -3120,7 +3125,8 @@ final class SyncManager: ObservableObject {
             TelemetryService.shared.recordSyncError(
                 profileId: profileId,
                 profileName: profileName,
-                errorMessage: message
+                errorMessage: message,
+                localSyncPath: profile?.localSyncPath
             )
 
             // Prefer critical/actionable errors over file-level errors

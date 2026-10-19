@@ -917,6 +917,7 @@ the warmer reads as before — safe degradation.
 | `CacheMigrationService.swift` | The cache-move engine — injected `CacheMigrationFileSystem`, free-space preflight, copy → verify → delete per file with a same-volume rename fast path, cancellation, resume, rollback |
 | `OverlaySyncService.swift` | Cache-only overlay sync-back engine — scans the overlay, plans per-file upload/conflict decisions (`plan`), uploads with verify-then-delete (`run`, `.drain`/`.keep` modes), conflict-copy naming, and the manifest read/write "Upload Now" relies on |
 | `LegacyOfflineLink.swift` | Cleans up the retired "(Offline)" sibling browse point left behind by an upgrading install; never creates anything |
+| `DiagnosticReport.swift` | User-sent diagnostic reports (see "Diagnostic reports" under Telemetry) — `DiagnosticReport` model + `render()`, `DiagnosticReportCode` (`ST-XXXXXX`), `DiagnosticRedactor`, `DiagnosticReportBuilder` (injected `DiagnosticReportEnvironment`, never-read list), `DiagnosticOTLPEncoder` (pure OTLP/HTTP JSON), `DiagnosticReportUploader` |
 
 ### CLI/
 
@@ -1046,7 +1047,7 @@ server's EPERM is not):
   file-by-file copy can break while Photos/Photo Booth has it open). They are plain user
   content, not a managed block — deleting one is how a user who has granted access syncs
   that library. Existing files get the Photos rule once from migration v5, and the Photo
-  Booth rule once from `MigrationV6PhotoBoothLibraryExclude` (below) — both built on the
+  Booth rule once from `MigrationV7PhotoBoothLibraryExclude` (below) — both built on the
   same shared `DefaultExcludeMigration` body, so they apply it identically (filter written
   before any resync-pending marker, rolled back if the marker write fails).
 - **Banner stages, Save applies (plan: staged "Don't Sync" / stop-and-apply).**
@@ -1074,6 +1075,31 @@ server's EPERM is not):
   `io_errors_blocked_deletes`. The banner action itself records `recovery.result = "staged"`
   (not `"started"`) since it starts no run.
 Covered by `ConfigSelfTest` AC-PL1–AC-PL6.
+
+**"Permission denied" (EACCES) gets the same handling, and volume system folders are excluded
+by default.** rclone reports a local folder whose POSIX permissions it can't read as
+`… open /Volumes/Drive/.Spotlight-V100: permission denied` — EACCES, not EPERM. The local
+backend logs it, keeps going, and still exits non-zero (`backend/local/local.go` `List`), so one
+unreadable folder fails every run. `SyncLogPatterns.blockedAccess(in:)` matches both errnos and
+returns a `BlockedAccessKind` (`macOSPrivacy` / `filePermissions`); `macOSBlockedPath`,
+`LogParser`'s truncation exemption, the banner's **Exclude from Sync** and the notification all
+use it. The banner offers **Open Privacy Settings** only for `macOSPrivacy` — Full Disk Access
+does nothing for EACCES — and its copy names a volume system folder as such. The typical source
+is the root-owned folders macOS keeps at every volume root (`SyncExcludeFilter.volumeSystemFolderNames`:
+`.fseventsd`, `.Spotlight-V100`, `.Trashes`, `.DocumentRevisions-V100`, `.TemporaryItems`): a
+profile whose local folder is an external drive's root used to be protected only by the "Sync
+Only These Folders" block's trailing `- **`, so removing the last include folder made every run
+fail (observed in production, `error.type=permission_denied`). `defaultExcludeFilter` now carries
+`SyncExcludeFilter.volumeSystemFoldersSection`, one `- <name>/**` rule per folder. The `/**` is
+load-bearing: in rclone a bare name (the old `- .fseventsd`) is a FILE rule (`fs/filter/filter.go`
+`Filter.Add`) and rclone still descends into — and fails to list — the folder. Existing files
+get the section from migration v6 (below). Telemetry keeps `error.type=permission_denied` for
+both errnos and adds bounded `error.access_denial` (`operation_not_permitted` /
+`permission_denied`, also a label on `synctray.sync.errors`), `error.blocked_path.kind`
+(`volume_system_folder` / `photos_library` / `other`) and `error.blocked_path.in_sync_folder`
+(`TelemetryService.accessDenialAttributes`) — never the path. Covered by `ConfigSelfTest`
+AC-VS1–AC-VS4 (AC-VS3 runs the real rclone against unreadable folders, with the old default as
+the failing control).
 
 **"Sync Only These Folders" (`syncIncludeFolders`) — selective folder sync for
 Two-Way and One-Way profiles.** A per-profile allowlist (profile editor's "Sync
@@ -1189,8 +1215,17 @@ at once and, holding over half the files, stop every run at `--max-delete`. Per-
 failures are logged, never thrown, so one bad file can't pin the schema version.
 Covered by `ConfigSelfTest` AC-PL2.
 
-**Migration v6 — Photo Booth libraries excluded from existing profiles.**
-`MigrationV6PhotoBoothLibraryExclude` adds `- Photo Booth Library/**` to every existing
+**Migration v6 — volume system folders excluded from existing profiles.**
+`MigrationV6VolumeSystemFoldersExclude` adds `SyncExcludeFilter.volumeSystemFoldersSection` to
+every existing Two-Way and One-Way filter with the same placement, skips and failure handling
+as v5 (`addingVolumeSystemFolderDefaults` returns nil once every rule is present). It writes the
+resync-pending marker only for a Two-Way profile with one of the folders at its local root that
+the user can READ (`containsReadableSystemFolder`): only such a folder can be in bisync's
+listings, where excluding it would count as deletions. An unreadable one never reached them —
+every run that tried to list it failed. Covered by `ConfigSelfTest` AC-VS2.
+
+**Migration v7 — Photo Booth libraries excluded from existing profiles.**
+`MigrationV7PhotoBoothLibraryExclude` adds `- Photo Booth Library/**` to every existing
 Two-Way and One-Way `{shortId}-exclude.txt` the same way v5 adds the Photos rule — both
 are now thin wrappers over a single shared `DefaultExcludeMigration` body
 (`apply(_:in:hasEntry:logTag:)` for the filter-then-marker write with rollback on marker
@@ -1230,7 +1265,8 @@ is the separate, fail-closed schema-drift gate.
 | `SyncProgressDetailView.swift` | Detailed per-file transfer progress during sync |
 | `RecentChangesView.swift` | List of recently synced files |
 | `TelemetryOptInBanner.swift` | Dismissable banner prompting telemetry opt-in (consent-versioned) |
-| `TelemetryDetailsSheet.swift` | Full privacy disclosure sheet — reachable from wizard, banner, and settings |
+| `TelemetryDetailsSheet.swift` | Full privacy disclosure sheet — reachable from wizard, banner, and settings; its "Diagnostic reports — only when you send one" section explains the manual-report carve-out |
+| `DiagnosticReportSheet.swift` | "Send Diagnostic Report" sheet — scope picker, disclosure, Preview / Save to Desktop / Send, then the report code with Copy. Opened from the "Last sync error" banner and footer of `ProfileDetailView` and from App Settings → Help & Feedback |
 | `SetupWizardView.swift` | New-profile creation wizard, including optional `.helpImprove` epilogue step |
 
 ## Agent-Editable Configuration & CLI
@@ -1309,6 +1345,12 @@ Covered by `ConfigSelfTest` AC-CLI4 and AC-SEC3.
 | `synctray mount <name\|shortId> [--timeout s]` | Mount a Stream (mount-mode) profile now — `loadAgent` + `startAgent` (`launchctl kickstart -k`, the same pair the app's `mountProfile` uses) — then BLOCK until it attaches, up to `--timeout` (default 600s: the startup VFS cache scan alone takes minutes on a ~100 GB cache, so the old fixed 60s reported failure on a mount that was merely still scanning). Exit 0 on a confirmed mount (or if already mounted). On timeout it distinguishes *still mounting* (rclone running — resume with `status --wait mounted`) from a mount that never came up; if rclone isn't running for 60 consecutive seconds it fails early with the tail of the sync log so the real reason (auth, unreachable remote, unwritable cache dir) is visible. The wait loop lives in the pure core over `probeMount`, covered by AC-CLI10. Refuses a non-mount profile. |
 | `synctray unmount <name\|shortId>` | Unmount a mounted Stream profile — graceful+forced `diskutil unmount` then unload the agent so `rclone nfsmount` actually exits (`SyncSetupService.unmount`). Refuses a non-mount profile. |
 | `synctray cache move <name\|shortId> --to <path> [--include-overlapping]` | Relocate a Stream profile's rclone VFS cache (both the `vfs` content tree and the `vfsMeta` byte-range-list tree) to `<path>` and BLOCK until it finishes, returning non-zero on rejection or failure. Detaches/reinstalls around the move like the app does. Refuses a non-mount profile, and refuses an overlapping sibling profile (same on-disk bytes) unless `--include-overlapping` is passed — there's nobody to prompt non-interactively. See "Cache Directory Migration" above. |
+
+**Support:**
+
+| Command | Purpose |
+|---------|---------|
+| `synctray report [name\|shortId] [--lines N] [--output <path>] [--send] [--yes] [--json]` | Build a diagnostic report (all profiles when no target; see "Diagnostic reports" under Telemetry) via the injected `CLIEnvironment.buildDiagnosticReport`. Without `--send`: print the rendered report (or write it to `--output` and print the path) and say `Nothing was sent.` on stderr. With `--send`: print `DiagnosticReportCopy.disclosure` on stderr, then ask `Send this report? [y/N]` (default No, EOF = No) unless `--yes`/`-y`; a non-interactive `--send` without `--yes` (stdin or stderr not a terminal, or `CI` set) exits `64` before building anything. `--send --output` saves a copy, then sends; `--json` without `--send` is a usage error. On success prints `Report code: ST-XXXXXX` (or `{"code":"ST-XXXXXX"}` with `--json`) and exits 0; on failure prints the error and exits 1. Telemetry verbs `report` / `report-send`. Covered by `ConfigSelfTest` AC-DR5/AC-DR6. |
 
 `<name|shortId>` resolution tries an exact `shortId` match first, then a
 case-insensitive `name` match; an unmatched (or ambiguous) target exits
@@ -1826,7 +1868,8 @@ open ~/Library/Developer/Xcode/DerivedData/SyncTray-*/Build/Products/Debug/SyncT
 | `SettingsView.swift` | Main settings UI with profile editing |
 | `ProfileStore.swift` | File-backed profile persistence — authoritative `{shortId}.profile.json` per profile, write-only blob mirror (see "File-Backed Configuration") |
 | `ConfigFileWatcher.swift` | Live-apply watcher for `~/.config/synctray` (profiles + settings); routes an unknown-id `.profile.json` to create-via-file |
-| `SyncTrayCLI.swift` | Headless `synctray` CLI: inspect (`doctor`/`status`/`profiles`/`profile show`/`logs`/`test-remote`/`listremotes`/`remote folders`/`telemetry`), configure (`profile create`/`set`/`enable`/`disable`/`delete`, `install`/`reinstall`), operate (`sync`/`mount`/`unmount`/`cache move`); dispatched from `SyncTrayApp.init` (see "Agent-Editable Configuration & CLI") |
+| `SyncTrayCLI.swift` | Headless `synctray` CLI: inspect (`doctor`/`status`/`profiles`/`profile show`/`logs`/`test-remote`/`listremotes`/`remote folders`/`telemetry`), configure (`profile create`/`set`/`enable`/`disable`/`delete`, `install`/`reinstall`), operate (`sync`/`mount`/`unmount`/`cache move`), support (`report`); dispatched from `SyncTrayApp.init` (see "Agent-Editable Configuration & CLI") |
+| `DiagnosticReport.swift` | User-sent diagnostic report: build, redact, render, OTLP-encode and upload (see "Diagnostic reports") |
 | `CLIShimInstaller.swift` | Installs the `~/.local/bin/synctray` shim (`~/.local/bin` must be on `PATH`) |
 | `SyncLogPatterns` | Centralized log message pattern matching (includes `isOutOfSyncError`) |
 | `TelemetryService.swift` | OTel singleton — traces, metrics, logs via OTLP/HTTP |
@@ -1899,10 +1942,86 @@ lock files, rclone.conf and `ps` read off the main actor, only when telemetry is
 - `host.arch` — `arm64` / `amd64`, resolved at compile time so a universal binary reports the executing slice; omitted entirely on any other architecture rather than sending an undocumented value.
 
 ### Privacy
-No file paths, sync remote names, or credentials in telemetry. File operations tracked by normalized extension only. Error messages categorized into low-cardinality types. Local folders and remotes are described only by bounded kinds (`config.local_path_kind`, `config.remote_type`), sync progress only by counts. Profile names are user-chosen display names, not paths. Carve-out: `vcs.repository.url.full` (the source repo's origin URL, credentials stripped at build time) is exempt — it identifies the codebase, not a user's sync destination.
+No file paths, sync remote names, or credentials in telemetry. File operations tracked by normalized extension only. Error messages categorized into low-cardinality types. Local folders and remotes are described only by bounded kinds (`config.local_path_kind`, `config.remote_type`), sync progress only by counts. Profile names are user-chosen display names, not paths. Carve-out: `vcs.repository.url.full` (the source repo's origin URL, credentials stripped at build time) is exempt — it identifies the codebase, not a user's sync destination. These rules govern automatic usage data; a diagnostic report the user explicitly sends is the one exception (see "Diagnostic reports" below).
 
 ### Configuration
 Priority: process env vars > `~/.config/synctray/.env` > Info.plist. Key vars: `OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_EXPORTER_OTLP_HEADERS`, `DASH0_AUTH_TOKEN`.
+
+### Diagnostic reports (manual, per-send consent)
+When a sync misbehaves, the user can send a **diagnostic report** instead of digging log files
+out of `~/.local/log` by hand: **Send Report…** on a profile's "Last sync error" banner or footer,
+**Send Diagnostic Report…** in App Settings → Help & Feedback (`DiagnosticReportSheet`), or
+`synctray report --send`. They get a code (`ST-` + 6 characters from
+`23456789ABCDEFGHJKMNPQRSTUVWXYZ`, no 0/O/1/I/L — `DiagnosticReportCode`) to hand the maintainer,
+who finds the report in Dash0 by `diagnostics.report_id`.
+
+- **The privacy carve-out.** A report is the ONE thing SyncTray sends that may carry file and
+  folder names, paths (including the home folder, so the username), remote names and full error
+  text — everything the Privacy rules above forbid in automatic telemetry. That is allowed only
+  because the user chooses to send each report, after reading `DiagnosticReportCopy.disclosure`
+  (shown verbatim by the sheet, the CLI and `TelemetryDetailsSheet`). It is independent of
+  `telemetryEnabled`: a report can be sent with usage data off, and nothing about a report is
+  ever sent automatically. Keep it that way — never attach report content to an automatic event.
+- **Contents** (`DiagnosticReportBuilder.build(profiles:environment:lineLimit:)`, all I/O injected
+  through `DiagnosticReportEnvironment`): per profile, the last `lineLimit` (default 500) lines of
+  `profile.logPath`, the `.profile.json`, the `{shortId}-exclude.txt` filter, the `/tmp` run lock
+  and (bisync) the session `.lck` with whether each holder PID is alive (`SyncRunLock`); globally,
+  the reported profiles' `synctray-sync.sh`/rclone processes from `ps -axww -o pid=,ppid=,etime=,args=`
+  (`syncProcessLines`: args naming a profile's config file, local folder or remote path as a whole
+  argument (`containsArgument`, so a nested remote path or a sibling folder never matches), or a child
+  of such a process — never another profile's or the user's own rclone jobs), `launchctl list`
+  lines naming synctray minus other profiles' sync agents (`launchdAgentLines`), the CLI's own `status --json` (`SyncTrayCLI.statusReport`) and
+  `doctor` (`SyncTrayCLI.doctorChecks`), and the app, rclone and macOS versions plus whether usage
+  data is on. `render()` is the plain text used by Preview, Save and the CLI.
+- **Never read**, by construction: `rclone.conf` (and any `*.rclone.conf`, including
+  `{shortId}.cacheonly.rclone.conf`), `~/.config/synctray/.env`, and the RC API secrets
+  `~/.local/state/synctray/rc/*.auth`. Every read is checked against
+  `DiagnosticReportBuilder.isNeverRead` before the injected reader runs — including the reads the
+  CLI's status/doctor helpers make — and `plannedReads(for:)` lists everything a build reads.
+- **Redaction.** `DiagnosticRedactor.redact` runs on every line of every section BEFORE the 8 KB
+  per-line cap (so a cut can't leave half a secret). It replaces values with `[REDACTED]` and keeps
+  the key/flag name: JSON `"password": "…"`-style keys (also `secret_access_key`, `private_key`,
+  `account_key`, `sas_url`), `key=value`/`key: value` for
+  password/passwd/pass/token/access_token/refresh_token/client_secret/secret_access_key/
+  private_key/account_key/sas_url/secret/api_key/api-key/apikey/auth_token/session_token/cookie
+  (so `X-Api-Key:` and rclone connection strings like `:s3,…,secret_access_key=…:bucket` too),
+  `Authorization:`/`Cookie:` headers and `Bearer` tokens, rclone flags ending in
+  `-pass`/`-password`/`-token`/`-secret`/`-key`/`-sas-url` (`--x value` and `--x=value`), URL
+  userinfo (`scheme://[REDACTED]@host`), signed-URL query values (`?sig=`/`&sig=`,
+  `signature=`, `X-Amz-Signature=`), and `RCLONE_…_PASS/_TOKEN/_SECRET/_KEY`,
+  `RCLONE_RC_PASS`, `DASH0_AUTH_TOKEN`, `OTEL_EXPORTER_OTLP_HEADERS` assignments. Every rule needs
+  that context, so ordinary file names (`Keynote.key`, `passport.pdf`, `Design sig=draft.txt`)
+  survive. It only removes what it recognizes — the disclosure says so ("SyncTray removes the
+  passwords and tokens it recognizes").
+- **Limits.** Lines are capped at 8 KB (`…[truncated]`); the whole report at ~5 MB, dropping the
+  oldest log lines first (round-robin across profiles, never touching a profile's "(no sync log
+  at …)" placeholder) and saying so (`notes`, `diagnostics.truncated`).
+- **Transport.** `DiagnosticReportUploader.send` POSTs OTLP/HTTP JSON (`ExportLogsServiceRequest`,
+  built by the pure `DiagnosticOTLPEncoder`) to `<endpoint>/v1/logs` with the telemetry exporter's
+  own headers and resource attributes (read through `TelemetryService.diagnosticExportEndpoint` /
+  `diagnosticExportHeaders` / `diagnosticResourceAttributes(includeInstallIdentity:)`, which don't
+  change how telemetry is set up), plus `synctray.process.kind=diagnostics`, in batches of ≤ 200
+  records and about 1 MB (`DiagnosticOTLPEncoder.batches`; one oversize record goes alone); a
+  non-2xx response throws with its status. A failed send drops the sheet's cached report, so a
+  retry builds a new one under a new code instead of re-sending the batches that already landed. One record per line, after a leading `Diagnostic
+  report` summary record. Every record is stamped with the report's creation time plus its
+  ordinal in nanoseconds — never rclone's own line time, which travels as `rclone.time` — so a
+  report sits together at send time and keeps its order in a time-sorted view. Record and
+  attribute details are in `.claude/rules/telemetry.md`.
+- **Install identity only with usage data on.** With usage data off, the resource omits
+  `enduser.id` and `service.instance.id` (`DiagnosticReportUploader.resourceAttributes(base:telemetryEnabled:)`)
+  and `SyncTraySettings.installationId` is never read — reading it creates and persists an ID for
+  someone who never opted in. With usage data on, the report is linked to the anonymous install
+  and device IDs (`service.instance.id`, `enduser.id`), and the disclosure says so. A build with
+  no OTLP auth headers throws "Diagnostic upload isn't configured in this build" and the sheet
+  keeps **Save to Desktop** available (`SyncTray-report-<code>.txt`, written 0600).
+- **Usage telemetry about it** — only when usage data is on — is one bounded `Diagnostic report
+  sent`/`failed` log (`TelemetryService.recordDiagnosticReport`), never report content.
+
+Covered by `ConfigSelfTest` AC-DR1 (code), AC-DR2 (redaction table), AC-DR3 (builder, limits,
+never-read), AC-DR4 (OTLP encoding, timestamps, batching, install identity), AC-DR5 (CLI parse),
+AC-DR6 (CLI consent, send routing, 0600 saved copy) and AC-DR7 (the sheet: Cancel while
+collecting never sends, a retry after a failed send never re-sends).
 
 ## Generated Files (per profile)
 
@@ -1910,7 +2029,7 @@ Priority: process env vars > `~/.config/synctray/.env` > Info.plist. Key vars: `
 |------|---------|
 | `~/.config/synctray/profiles/{shortId}.json` | Profile config |
 | `~/.config/synctray/profiles/{shortId}-exclude.txt` | Exclude filter (user-editable; SyncTray owns two managed blocks — the "Don't Sync" exclude block at the TOP and, when `syncIncludeFolders` is non-empty, the "Sync Only These Folders" include block at the BOTTOM) |
-| `~/.config/synctray/profiles/{shortId}.resync-pending` | Two-Way (bisync) profiles only, created only when `syncIncludeFolders` changes (or once by migration v5, for a profile whose folder holds a Photos library, or once by migration v6, for one holding a Photo Booth library) — a UUID token the sync script reads to schedule a safe `--resync --resync-mode newer` instead of a plain bisync, removed only after every required bisync session (see `.resync-pending.consumed`) has consumed it with an unchanged token |
+| `~/.config/synctray/profiles/{shortId}.resync-pending` | Two-Way (bisync) profiles only, created only when `syncIncludeFolders` changes (or once by migration v5, for a profile whose folder holds a Photos library, by migration v6, for one with a readable volume system folder at its root, or by migration v7, for one holding a Photo Booth library) — a UUID token the sync script reads to schedule a safe `--resync --resync-mode newer` instead of a plain bisync, removed only after every required bisync session (see `.resync-pending.consumed`) has consumed it with an unchanged token |
 | `~/.config/synctray/profiles/{shortId}.resync-pending.consumed` | Two-Way (bisync) profiles only — per-token record of which bisync session(s) have already run their one-time resync for the current `.resync-pending` token; deleted together with the marker once every required session (primary, and the fallback's own session on a full remote swap) has consumed it |
 | `~/.local/bin/synctray-sync.sh` | Shared sync script (all profiles) |
 | `~/Library/LaunchAgents/com.synctray.sync.{shortId}.plist` | launchd schedule |

@@ -61,6 +61,8 @@
 		FS000000000000000000B002 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = FS000000000000000000A002 /* Assets.xcassets */; };
 		FS000000000000000000B003 /* SyncTrayFinderSync.appex in Embed App Extensions */ = {isa = PBXBuildFile; fileRef = FS000000000000000000A003 /* SyncTrayFinderSync.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
 		OT00000000000000000000B1 /* TelemetryService.swift in Sources */ = {isa = PBXBuildFile; fileRef = OT00000000000000000000A1 /* TelemetryService.swift */; };
+		D1A6E0A1B2C3D4E5F6A70002 /* DiagnosticReport.swift in Sources */ = {isa = PBXBuildFile; fileRef = D1A6E0A1B2C3D4E5F6A70001 /* DiagnosticReport.swift */; };
+		D1A6E0A1B2C3D4E5F6A70004 /* DiagnosticReportSheet.swift in Sources */ = {isa = PBXBuildFile; fileRef = D1A6E0A1B2C3D4E5F6A70003 /* DiagnosticReportSheet.swift */; };
 		OT00000000000000000000C1 /* OpenTelemetryApi in Frameworks */ = {isa = PBXBuildFile; productRef = OT00000000000000000000D1 /* OpenTelemetryApi */; };
 		OT00000000000000000000C2 /* OpenTelemetrySdk in Frameworks */ = {isa = PBXBuildFile; productRef = OT00000000000000000000D2 /* OpenTelemetrySdk */; };
 		OT00000000000000000000C3 /* OpenTelemetryProtocolExporterHTTP in Frameworks */ = {isa = PBXBuildFile; productRef = OT00000000000000000000D3 /* OpenTelemetryProtocolExporterHTTP */; };
@@ -151,6 +153,8 @@
 		FS000000000000000000A005 /* SyncTrayFinderSync.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = SyncTrayFinderSync.entitlements; sourceTree = "<group>"; };
 		FSCFG00000000000000000001 /* Signing.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; path = Config/Signing.xcconfig; sourceTree = SOURCE_ROOT; };
 		OT00000000000000000000A1 /* TelemetryService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TelemetryService.swift; sourceTree = "<group>"; };
+		D1A6E0A1B2C3D4E5F6A70001 /* DiagnosticReport.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DiagnosticReport.swift; sourceTree = "<group>"; };
+		D1A6E0A1B2C3D4E5F6A70003 /* DiagnosticReportSheet.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DiagnosticReportSheet.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -269,6 +273,7 @@
 				CE2089D1111CD3C727D2BF40 /* CacheMigrationService.swift */,
 				532A120C93CFCEE102D10EE1 /* LegacyOfflineLink.swift */,
 				AE35199A9337B234D7074DB5 /* OverlaySyncService.swift */,
+				D1A6E0A1B2C3D4E5F6A70001 /* DiagnosticReport.swift */,
 			);
 			path = Services;
 			sourceTree = "<group>";
@@ -314,6 +319,7 @@
 				E1A0B1C2D3E4F56789AB0006 /* TelemetryOptInBanner.swift */,
 				E1A0B1C2D3E4F56789AB0008 /* TelemetryDetailsSheet.swift */,
 				0E078DEC9D7F0C241D48DD14 /* CacheMoveSheet.swift */,
+				D1A6E0A1B2C3D4E5F6A70003 /* DiagnosticReportSheet.swift */,
 			);
 			path = Settings;
 			sourceTree = "<group>";
@@ -519,6 +525,8 @@
 				80A56C81D9C62272D0FBA2F6 /* CacheMoveSheet.swift in Sources */,
 				CA638D516735D24FDD977BF3 /* LegacyOfflineLink.swift in Sources */,
 				A51CBF53E91F977FA626228B /* OverlaySyncService.swift in Sources */,
+				D1A6E0A1B2C3D4E5F6A70002 /* DiagnosticReport.swift in Sources */,
+				D1A6E0A1B2C3D4E5F6A70004 /* DiagnosticReportSheet.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

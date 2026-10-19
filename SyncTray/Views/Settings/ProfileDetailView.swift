@@ -162,6 +162,9 @@ struct ProfileDetailView: View {
     // leaves those other fields un-applied (finding 12).
     @State private var cacheMoveOtherFieldsNeedReinstall = false
 
+    // "Send Diagnostic Report" sheet (banner "Send Report…" and the footer button)
+    @State private var showingDiagnosticReport: Bool = false
+
     private let setupService = SyncSetupService.shared
 
     // MARK: - Computed Properties
@@ -528,6 +531,12 @@ struct ProfileDetailView: View {
                     onDismiss: { showingCacheMoveSheet = false }
                 )
             }
+        }
+        .sheet(isPresented: $showingDiagnosticReport) {
+            DiagnosticReportSheet(
+                allProfiles: profileStore.profiles,
+                focusProfile: profileStore.profile(for: profile.id) ?? profile
+            )
         }
         .alert("Delete Remote?", isPresented: $showingDeleteRemoteConfirm) {
             Button("Cancel", role: .cancel) {
@@ -1427,6 +1436,16 @@ struct ProfileDetailView: View {
                         }
                     }
 
+                    // Manual diagnostic report — the user chooses to send this error's
+                    // context (log lines, settings, status) to the developer.
+                    Button {
+                        showingDiagnosticReport = true
+                    } label: {
+                        Label("Send Report…", systemImage: "paperplane")
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .help("Send a diagnostic report about this error to the SyncTray developer")
                 }
             }
 
@@ -2208,6 +2227,13 @@ struct ProfileDetailView: View {
 
     private var actionButtons: some View {
         HStack {
+            Button {
+                showingDiagnosticReport = true
+            } label: {
+                Label("Send Report…", systemImage: "paperplane")
+            }
+            .help("Send a diagnostic report for this profile to the SyncTray developer")
+
             if hasChanges {
                 Text("You have unsaved changes")
                     .font(.caption)
@@ -4036,11 +4062,14 @@ struct ProfileDetailView: View {
 
     // MARK: - macOS Blocked Access
 
-    /// Recovery for an rclone error naming a local path macOS privacy controls wouldn't let it
-    /// read (`SyncLogPatterns.operationNotPermittedPath`) — typically an Apple Photos or Photo
-    /// Booth library inside the synced folder. Two ways out: exclude the path from this profile
-    /// (staged into the "Don't Sync" list below, where the user can see, edit, or undo it before
-    /// Save applies it — D9), or allow access in System Settings. Which process needs that
+    /// Recovery for an rclone error naming a local path it wasn't allowed to read
+    /// (`SyncLogPatterns.macOSBlockedAccess`): either macOS privacy controls (EPERM) —
+    /// typically an Apple Photos or Photo Booth library inside the synced folder — or file
+    /// permissions (EACCES) — typically a root-owned system folder at the root of an external
+    /// drive. Ways out: exclude the path from this profile (staged into the "Don't Sync" list
+    /// below, where the user can see, edit, or undo it before Save applies it), or, for a
+    /// privacy denial only, allow access in System Settings — Full Disk Access does nothing for
+    /// a permissions denial, so that button is not offered there. Which process needs that
     /// access for a scheduled sync is deliberately not named: launchd runs the sync script
     /// directly, not as a child of SyncTray.
     @ViewBuilder
@@ -4054,12 +4083,13 @@ struct ProfileDetailView: View {
             syncExcludePatterns.contains($0) && !profile.syncExcludePatterns.contains($0)
         } ?? false
         let name = (blockedPath as NSString).lastPathComponent
+        let kind = SyncLogPatterns.blockedAccess(in: error)?.kind ?? .macOSPrivacy
         VStack(alignment: .leading, spacing: 6) {
             if let summary = SyncLogPatterns.macOSBlockedAccessSummary(for: error, localSyncPath: profile.localSyncPath) {
                 Text(summary)
                     .font(.caption.weight(.medium))
             }
-            Text(blockedAccessExplanation(itemName: name, canExclude: excludePattern != nil))
+            Text(blockedAccessExplanation(itemName: name, kind: kind, canExclude: excludePattern != nil))
                 .font(.caption)
                 .foregroundColor(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -4078,21 +4108,38 @@ struct ProfileDetailView: View {
                     .disabled(alreadyStaged)
                     .help(ErrorAction.excludeBlockedPath.helpText)
                 }
-                Button(action: { handleErrorAction(.openPrivacySettings) }) {
-                    Label(ErrorAction.openPrivacySettings.buttonText,
-                          systemImage: ErrorAction.openPrivacySettings.icon)
+                if kind == .macOSPrivacy {
+                    Button(action: { handleErrorAction(.openPrivacySettings) }) {
+                        Label(ErrorAction.openPrivacySettings.buttonText,
+                              systemImage: ErrorAction.openPrivacySettings.icon)
+                    }
+                    .buttonStyle(.bordered)
+                    .help(ErrorAction.openPrivacySettings.helpText)
                 }
-                .buttonStyle(.bordered)
-                .help(ErrorAction.openPrivacySettings.helpText)
             }
         }
     }
 
-    private func blockedAccessExplanation(itemName: String, canExclude: Bool) -> String {
-        var text = canExclude
-            ? "Exclude it from this profile to finish syncing, or allow access under System Settings › "
-                + "Privacy & Security › Full Disk Access."
-            : "Allow access under System Settings › Privacy & Security › Full Disk Access, then sync again."
+    private func blockedAccessExplanation(itemName: String, kind: SyncLogPatterns.BlockedAccessKind, canExclude: Bool) -> String {
+        var text: String
+        switch kind {
+        case .macOSPrivacy:
+            text = canExclude
+                ? "Exclude it from this profile to finish syncing, or allow access under System Settings › "
+                    + "Privacy & Security › Full Disk Access."
+                : "Allow access under System Settings › Privacy & Security › Full Disk Access, then sync again."
+        case .filePermissions:
+            if SyncExcludeFilter.volumeSystemFolderNames.contains(itemName) {
+                text = "It's a folder macOS keeps at the root of the drive, owned by the system — it never "
+                    + "holds your files. Exclude it from this profile to finish syncing."
+            } else {
+                text = canExclude
+                    ? "Its permissions don't let SyncTray access it. Exclude it from this profile to finish syncing, "
+                        + "or give yourself Read & Write access in Finder › Get Info › Sharing & Permissions."
+                    : "Its permissions don't let SyncTray access it. Give yourself Read & Write access in Finder › Get Info › "
+                        + "Sharing & Permissions, then sync again."
+            }
+        }
         text += " Until then, files deleted on one side aren't deleted on the other."
         if itemName.lowercased().hasSuffix(".photoslibrary") {
             text += " Apple Photos libraries are best excluded: copying one while Photos is open can "

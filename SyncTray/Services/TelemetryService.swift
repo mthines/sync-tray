@@ -756,7 +756,8 @@ final class TelemetryService {
         duration: TimeInterval,
         filesChanged: Int,
         exitCode: Int,
-        errorMessage: String?
+        errorMessage: String?,
+        localSyncPath: String? = nil
     ) {
         guard SyncTraySettings.telemetryEnabled else { return }
         ensureSetup()
@@ -782,11 +783,18 @@ final class TelemetryService {
 
         // Categorize error for the error counter
         let errorType = Self.categorizeError(errorMessage)
-        syncErrorCounter?.add(value: 1, attribute: [
+        let accessDenial = Self.accessDenialAttributes(for: errorMessage, localSyncPath: localSyncPath)
+        var errorCounterLabels: [String: AttributeValue] = [
             "sync.mode": .string(mode.rawValue),
             "synctray.profile.name": .string(profileName),
             "error.type": .string(errorType),
-        ])
+        ]
+        // Only the two-valued denial kind joins the counter's labels; the rest stays on the
+        // span and log, which have no cardinality budget to protect.
+        if let denial = accessDenial["error.access_denial"] {
+            errorCounterLabels["error.access_denial"] = denial
+        }
+        syncErrorCounter?.add(value: 1, attribute: errorCounterLabels)
 
         // End the active span with error
         let errorOperation = Self.categorizeErrorOperation(errorMessage)
@@ -796,6 +804,9 @@ final class TelemetryService {
             span.setAttribute(key: "sync.duration_s", value: .double(duration))
             span.setAttribute(key: "sync.exit_code", value: .int(exitCode))
             span.setAttribute(key: "error.type", value: .string(errorType))
+            for (key, value) in accessDenial {
+                span.setAttribute(key: key, value: value)
+            }
             span.setAttribute(key: "error.operation", value: .string(errorOperation))
             // Category only — the raw message can carry paths and remote names, and the
             // privacy disclosure promises "never the raw message".
@@ -814,7 +825,7 @@ final class TelemetryService {
                     "sync.duration_s": .double(duration),
                     "error.type": .string(errorType),
                     "error.operation": .string(errorOperation),
-                ],
+                ].merging(accessDenial) { current, _ in current },
                 spanContext: span.context
             )
         }
@@ -1009,12 +1020,14 @@ final class TelemetryService {
     func recordSyncError(
         profileId: UUID,
         profileName: String,
-        errorMessage: String
+        errorMessage: String,
+        localSyncPath: String? = nil
     ) {
         guard SyncTraySettings.telemetryEnabled else { return }
         ensureSetup()
 
         let errorType = Self.categorizeError(errorMessage)
+        let accessDenial = Self.accessDenialAttributes(for: errorMessage, localSyncPath: localSyncPath)
 
         // Emit a log correlated to the active sync span if one exists
         let spanContext = activeSyncSpans[profileId]?.context
@@ -1027,7 +1040,7 @@ final class TelemetryService {
                 "synctray.profile.name": .string(profileName),
                 "error.type": .string(errorType),
                 "error.operation": .string(Self.categorizeErrorOperation(errorMessage)),
-            ],
+            ].merging(accessDenial) { current, _ in current },
             spanContext: spanContext
         )
     }
@@ -2357,6 +2370,14 @@ final class TelemetryService {
     // MARK: - Private Helpers
 
     private func buildResource() -> Resource {
+        Resource(attributes: resourceAttributes(includeInstallIdentity: true))
+    }
+
+    /// The resource attributes every signal carries. `includeInstallIdentity` is always true
+    /// for telemetry; a diagnostic report sent with usage data off passes false, which omits
+    /// `service.instance.id` and `enduser.id` and never reads `SyncTraySettings.installationId`
+    /// (reading it creates and persists an ID).
+    private func resourceAttributes(includeInstallIdentity: Bool) -> [String: AttributeValue] {
         let version = appVersion()
         let osVersion = ProcessInfo.processInfo.operatingSystemVersionString
 
@@ -2364,12 +2385,14 @@ final class TelemetryService {
             ResourceAttributes.serviceName.rawValue: .string(Self.serviceName),
             ResourceAttributes.serviceNamespace.rawValue: .string("synctray"),
             ResourceAttributes.serviceVersion.rawValue: .string(version),
-            "service.instance.id": .string(SyncTraySettings.installationId),
-            "enduser.id": .string(SyncTraySettings.anonymousUserId),
             "synctray.process.kind": .string(Self.processKind),
             ResourceAttributes.osType.rawValue: .string("darwin"),
             ResourceAttributes.osVersion.rawValue: .string(osVersion),
         ]
+        if includeInstallIdentity {
+            attrs["service.instance.id"] = .string(SyncTraySettings.installationId)
+            attrs["enduser.id"] = .string(SyncTraySettings.anonymousUserId)
+        }
 
         if let hostArch = hostArch() {
             attrs["host.arch"] = .string(hostArch)
@@ -2410,8 +2433,13 @@ final class TelemetryService {
                 attrs[key] = .string(value)
             }
         }
+        if !includeInstallIdentity {
+            // Not even through an OTEL_RESOURCE_ATTRIBUTES override.
+            attrs.removeValue(forKey: "service.instance.id")
+            attrs.removeValue(forKey: "enduser.id")
+        }
 
-        return Resource(attributes: attrs)
+        return attrs
     }
 
     /// Deployment-precise version string for Dash0 correlation.
@@ -3139,6 +3167,51 @@ final class TelemetryService {
         }
     }
 
+    /// Bounded attributes that tell apart the failures `categorizeError` files under
+    /// `permission_denied`. Empty for any other error. Never the path or the message.
+    /// - `error.access_denial`: `operation_not_permitted` (EPERM — macOS privacy controls;
+    ///   Full Disk Access can fix it) or `permission_denied` (EACCES — file ownership or mode
+    ///   bits, e.g. a root-owned folder at a volume root; it can't).
+    /// - `error.blocked_path.in_sync_folder`: whether the refused path is the profile's local
+    ///   folder or inside it — the case the error banner offers to exclude. Only when the
+    ///   message names an absolute path and the caller passed the local folder.
+    /// - `error.blocked_path.kind`: `volume_system_folder` (`SyncExcludeFilter.volumeSystemFolderNames`),
+    ///   `photos_library`, or `other` — only when the message names an absolute path.
+    static func accessDenialAttributes(for message: String?, localSyncPath: String?) -> [String: AttributeValue] {
+        guard let message else { return [:] }
+        guard let blocked = SyncLogPatterns.blockedAccess(in: message) else {
+            if SyncLogPatterns.isOperationNotPermitted(message) {
+                return ["error.access_denial": .string(SyncLogPatterns.BlockedAccessKind.macOSPrivacy.rawValue)]
+            }
+            if SyncLogPatterns.isPermissionDenied(message) {
+                return ["error.access_denial": .string(SyncLogPatterns.BlockedAccessKind.filePermissions.rawValue)]
+            }
+            return [:]
+        }
+        var attributes: [String: AttributeValue] = [
+            "error.access_denial": .string(blocked.kind.rawValue),
+            "error.blocked_path.kind": .string(blockedPathKind(blocked.path)),
+        ]
+        if let localSyncPath, !localSyncPath.isEmpty {
+            attributes["error.blocked_path.in_sync_folder"] = .bool(
+                SyncExcludeFilter.isWithinSyncFolder(blocked.path, localSyncPath: localSyncPath))
+        }
+        return attributes
+    }
+
+    /// The bounded `error.blocked_path.kind` of a refused path: whether any of its components
+    /// is a macOS volume system folder or an Apple Photos library.
+    static func blockedPathKind(_ path: String) -> String {
+        let components = (path as NSString).pathComponents
+        if components.contains(where: { SyncExcludeFilter.volumeSystemFolderNames.contains($0) }) {
+            return "volume_system_folder"
+        }
+        if components.contains(where: { $0.lowercased().hasSuffix(".photoslibrary") }) {
+            return "photos_library"
+        }
+        return "other"
+    }
+
     /// Categorize an error message into a low-cardinality type for metrics/attributes.
     /// Static and internal (pure — it only consults `SyncLogPatterns`) so `ConfigSelfTest`
     /// can assert the buckets directly.
@@ -3334,6 +3407,60 @@ final class TelemetryService {
         return result
     }
 
+}
+
+// MARK: - Diagnostic reports (shared OTLP configuration)
+
+/// Read-only views of the exporter configuration, so `DiagnosticReportUploader` posts a
+/// user-sent diagnostic report to the same endpoint, with the same headers and resource
+/// attributes, as usage telemetry — without changing how telemetry itself is set up.
+/// Unlike every `record…` method, these are NOT gated on `telemetryEnabled`: a diagnostic
+/// report is its own per-send consent (see CLAUDE.md "Diagnostic reports").
+extension TelemetryService {
+    /// OTLP/HTTP base endpoint (env > `~/.config/synctray/.env` > Info.plist > default).
+    static var diagnosticExportEndpoint: String { endpoint }
+
+    /// The exporter's auth headers (`OTEL_EXPORTER_OTLP_HEADERS` or `DASH0_AUTH_TOKEN`).
+    static var diagnosticExportHeaders: [(String, String)] { authHeaders }
+
+    /// Whether this build can upload at all — the same condition `setupOTel` uses.
+    static var isDiagnosticExportConfigured: Bool { !authHeaders.isEmpty }
+
+    /// The resource attributes every telemetry signal carries (`service.name`,
+    /// `service.version`, `host.arch`, `deployment.environment.name`, …), as strings — plus
+    /// `service.instance.id` and `enduser.id` only when `includeInstallIdentity` is true.
+    /// With it false, `SyncTraySettings.installationId` is never read.
+    static func diagnosticResourceAttributes(includeInstallIdentity: Bool) -> [String: String] {
+        var result: [String: String] = [:]
+        for (key, value) in shared.resourceAttributes(includeInstallIdentity: includeInstallIdentity) {
+            if case let .string(text) = value {
+                result[key] = text
+            }
+        }
+        return result
+    }
+
+    /// The deployment-precise `service.version`, for the report header.
+    static var diagnosticServiceVersion: String { shared.appVersion() }
+
+    /// Record that the user sent (or tried to send) a diagnostic report. Bounded — the
+    /// report code, where it was sent from (`app`/`cli`), the result and the line count;
+    /// never any report content. Gated on the usage-data opt-in like every other event.
+    func recordDiagnosticReport(reportId: String, sourceUI: String, succeeded: Bool, lineCount: Int) {
+        guard SyncTraySettings.telemetryEnabled else { return }
+        ensureSetup()
+
+        emitLog(
+            severity: succeeded ? .info : .warn,
+            body: succeeded ? "Diagnostic report sent" : "Diagnostic report failed",
+            attributes: [
+                "diagnostics.report_id": .string(reportId),
+                "diagnostics.source_ui": .string(sourceUI),
+                "diagnostics.result": .string(succeeded ? "sent" : "failed"),
+                "diagnostics.line_count": .int(lineCount),
+            ]
+        )
+    }
 }
 
 // MARK: - Bounded profile descriptors (never a path or a remote name)
