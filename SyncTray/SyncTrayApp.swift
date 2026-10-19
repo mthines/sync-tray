@@ -5,6 +5,16 @@ import UserNotifications
 struct SyncTrayApp: App {
     @StateObject private var syncManager: SyncManager
 
+    // Menu bar icon appearance (App Settings → Menu Bar Icon). Read here rather than
+    // inside `MenuBarIcon` so a change redraws the label through the App body, the same
+    // path a sync-state change takes.
+    @AppStorage(MenuBarIconAppearance.styleKey)
+    private var menuBarIconStyle: MenuBarIconStyle = MenuBarIconAppearance.defaultStyle
+    @AppStorage(MenuBarIconAppearance.syncingColorKey)
+    private var menuBarIconSyncingColor: String = ""
+    @AppStorage(MenuBarIconAppearance.idleColorKey)
+    private var menuBarIconIdleColor: String = ""
+
     @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
 
     init() {
@@ -61,7 +71,12 @@ struct SyncTrayApp: App {
         } label: {
             MenuBarIcon(
                 state: syncManager.currentState,
-                progress: syncManager.syncProgress?.percentage
+                progress: syncManager.syncProgress?.percentage,
+                appearance: MenuBarIconAppearance.resolve(
+                    style: menuBarIconStyle,
+                    syncingHex: menuBarIconSyncingColor,
+                    idleHex: menuBarIconIdleColor
+                )
             )
         }
         .menuBarExtraStyle(.window)
@@ -72,17 +87,62 @@ struct SyncTrayApp: App {
 struct MenuBarIcon: View {
     let state: SyncState
     let progress: Double?  // 0-100, nil when not syncing
+    var appearance: MenuBarIconAppearance = .standard
 
     var body: some View {
+        icon
+            .accessibilityLabel(Self.voiceOverLabel(for: state, progress: progress))
+    }
+
+    @ViewBuilder
+    private var icon: some View {
         switch state {
         case .syncing:
-            CircularProgressIcon(percentage: progress ?? 0, color: .systemBlue)
+            CircularProgressIcon(
+                percentage: progress ?? 0,
+                color: appearance.syncingColor,
+                trackColor: appearance.trackColor,
+                isTemplate: appearance.isTemplate
+            )
         case .idle:
-            CircularProgressIcon(percentage: 100, color: .gray)
+            CircularProgressIcon(
+                percentage: 100,
+                color: appearance.idleColor,
+                trackColor: appearance.trackColor,
+                isTemplate: appearance.isTemplate
+            )
         default:
-            Image(systemName: state.iconName)
-                .symbolRenderingMode(.palette)
-                .foregroundStyle(state.iconColor)
+            if appearance.usesStatusColors {
+                Image(systemName: state.iconName)
+                    .symbolRenderingMode(.palette)
+                    .foregroundStyle(state.iconColor)
+            } else {
+                // Monochrome: no status color, so the menu bar draws the symbol in its
+                // own text color, like the ring.
+                Image(systemName: state.iconName)
+                    .renderingMode(.template)
+            }
+        }
+    }
+
+    /// What VoiceOver reads for the menu bar icon. Without it the status item is read
+    /// as an unlabeled image.
+    static func voiceOverLabel(for state: SyncState, progress: Double?) -> String {
+        switch state {
+        case .syncing:
+            guard let progress, progress.isFinite else { return "SyncTray, syncing" }
+            let percent = Int(min(max(progress, 0), 100).rounded())
+            return "SyncTray, syncing \(percent) percent"
+        case .idle:
+            return "SyncTray, up to date"
+        case .paused:
+            return "SyncTray, paused"
+        case .error:
+            return "SyncTray, sync error"
+        case .driveNotMounted:
+            return "SyncTray, drive not connected"
+        case .notConfigured:
+            return "SyncTray, setup required"
         }
     }
 }
@@ -90,12 +150,20 @@ struct MenuBarIcon: View {
 struct CircularProgressIcon: View {
     let percentage: Double  // 0-100
     let color: NSColor      // Progress arc color
+    var trackColor: NSColor = NSColor.gray.withAlphaComponent(MenuBarIconAppearance.trackOpacity)
+    var isTemplate: Bool = false
 
     var body: some View {
-        Image(nsImage: createProgressImage(percentage: percentage, color: color))
+        Image(nsImage: Self.makeImage(
+            percentage: percentage, color: color, trackColor: trackColor, isTemplate: isTemplate
+        ))
+        // nil keeps a colored image as drawn; .template lets the menu bar supply the color.
+        .renderingMode(isTemplate ? .template : nil)
     }
 
-    private func createProgressImage(percentage: Double, color: NSColor) -> NSImage {
+    /// The 14-pt ring as an `NSImage`. `static` so the self-test (AC-MB2) can check the
+    /// template flag without a view.
+    static func makeImage(percentage: Double, color: NSColor, trackColor: NSColor, isTemplate: Bool) -> NSImage {
         let size: CGFloat = 14
         let lineWidth: CGFloat = 2
         let imageSize = NSSize(width: size, height: size)
@@ -104,9 +172,9 @@ struct CircularProgressIcon: View {
             let inset = lineWidth / 2
             let circleRect = rect.insetBy(dx: inset, dy: inset)
 
-            // Background circle (gray)
+            // Track: the unfilled part of the ring
             let backgroundPath = NSBezierPath(ovalIn: circleRect)
-            NSColor.gray.withAlphaComponent(0.4).setStroke()
+            trackColor.setStroke()
             backgroundPath.lineWidth = lineWidth
             backgroundPath.stroke()
 
@@ -133,7 +201,9 @@ struct CircularProgressIcon: View {
 
             return true
         }
-        image.isTemplate = false  // Keep colors (don't use template rendering)
+        // false keeps the drawn colors; true (Monochrome) makes the menu bar draw the
+        // ring in its own text color, using only the alpha drawn above.
+        image.isTemplate = isTemplate
         return image
     }
 }

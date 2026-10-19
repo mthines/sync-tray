@@ -10,6 +10,15 @@ struct AppSettingsView: View {
     @State private var showingDiagnosticReport: Bool = false
     @State private var rcloneVersion: String?
 
+    // Menu bar icon appearance — the same UserDefaults keys `SyncTrayApp` reads, so the
+    // menu bar icon redraws as soon as one changes.
+    @AppStorage(MenuBarIconAppearance.styleKey)
+    private var menuBarIconStyle: MenuBarIconStyle = MenuBarIconAppearance.defaultStyle
+    @AppStorage(MenuBarIconAppearance.syncingColorKey)
+    private var menuBarIconSyncingColor: String = ""
+    @AppStorage(MenuBarIconAppearance.idleColorKey)
+    private var menuBarIconIdleColor: String = ""
+
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 24) {
@@ -18,6 +27,14 @@ struct AppSettingsView: View {
                 GroupBox("General") {
                     VStack(alignment: .leading, spacing: 12) {
                         launchAtLoginToggle
+                    }
+                    .padding(4)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+
+                GroupBox("Menu Bar Icon") {
+                    VStack(alignment: .leading, spacing: 12) {
+                        menuBarIconSettings
                     }
                     .padding(4)
                     .frame(maxWidth: .infinity, alignment: .leading)
@@ -97,6 +114,114 @@ struct AppSettingsView: View {
                     .foregroundStyle(.secondary)
             }
         }
+    }
+
+    // MARK: - Menu Bar Icon
+
+    private var menuBarIconAppearance: MenuBarIconAppearance {
+        MenuBarIconAppearance.resolve(
+            style: menuBarIconStyle,
+            syncingHex: menuBarIconSyncingColor,
+            idleHex: menuBarIconIdleColor
+        )
+    }
+
+    private var menuBarIconSettings: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .top, spacing: 16) {
+                VStack(alignment: .leading, spacing: 4) {
+                    Picker("Style", selection: $menuBarIconStyle) {
+                        ForEach(MenuBarIconStyle.allCases) { style in
+                            Text(style.displayName).tag(style)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                    .fixedSize()
+
+                    Text(menuBarIconStyle.caption)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+
+                Spacer(minLength: 0)
+
+                menuBarIconPreview
+            }
+
+            if menuBarIconStyle == .custom {
+                HStack(spacing: 20) {
+                    ColorPicker(
+                        "Syncing",
+                        selection: colorBinding(
+                            for: $menuBarIconSyncingColor,
+                            fallback: MenuBarIconAppearance.defaultSyncingColor
+                        ),
+                        supportsOpacity: false
+                    )
+                    ColorPicker(
+                        "Idle",
+                        selection: colorBinding(
+                            for: $menuBarIconIdleColor,
+                            fallback: MenuBarIconAppearance.defaultIdleColor
+                        ),
+                        supportsOpacity: false
+                    )
+                    Button("Reset Colors") {
+                        menuBarIconSyncingColor = ""
+                        menuBarIconIdleColor = ""
+                    }
+                    .controlSize(.small)
+                    .disabled(menuBarIconSyncingColor.isEmpty && menuBarIconIdleColor.isEmpty)
+                }
+            }
+        }
+        .onChange(of: menuBarIconStyle) { newValue in
+            // Bounded: menu_bar_icon_color | menu_bar_icon_monochrome | menu_bar_icon_custom.
+            // The chosen colors are never sent.
+            TelemetryService.shared.recordSettingChanged(
+                name: "menu_bar_icon_\(newValue.rawValue)", enabled: true
+            )
+        }
+    }
+
+    /// The idle ring and a sync in progress, drawn by the same code as the menu bar icon.
+    /// The window background is not the menu bar, so this shows the colors, not the contrast.
+    private var menuBarIconPreview: some View {
+        let appearance = menuBarIconAppearance
+        return HStack(spacing: 10) {
+            CircularProgressIcon(
+                percentage: 100,
+                color: appearance.idleColor,
+                trackColor: appearance.trackColor,
+                isTemplate: appearance.isTemplate
+            )
+            CircularProgressIcon(
+                percentage: 65,
+                color: appearance.syncingColor,
+                trackColor: appearance.trackColor,
+                isTemplate: appearance.isTemplate
+            )
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 6)
+        .background(.quaternary, in: RoundedRectangle(cornerRadius: 6))
+        .help("Preview: idle, and a sync in progress")
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("Preview of the menu bar icon, idle and syncing")
+    }
+
+    /// Bridges a stored `#RRGGBB` string to a `ColorPicker`. An unset or unreadable value
+    /// shows `fallback`, the color the icon is drawn in until one is picked.
+    private func colorBinding(for hex: Binding<String>, fallback: NSColor) -> Binding<Color> {
+        Binding(
+            get: { Color(nsColor: MenuBarIconAppearance.color(fromHex: hex.wrappedValue) ?? fallback) },
+            set: { newColor in
+                if let value = MenuBarIconAppearance.hexString(from: NSColor(newColor)) {
+                    hex.wrappedValue = value
+                }
+            }
+        )
     }
 
     // MARK: - Privacy

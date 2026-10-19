@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 import OpenTelemetryApi
 
@@ -197,6 +198,8 @@ enum ConfigSelfTest {
             testCLIReportParsing,
             testCLIReportExecute,
             testReportSheetCancelStopsSend,
+            testMenuBarIconAppearance,
+            testMenuBarIconRendering,
         ]
 
         for check in checks {
@@ -10547,6 +10550,206 @@ enum ConfigSelfTest {
             return report(name, slug, false, "(writePrivately replaced a directory at the output path)")
         }
         return report(name, slug, true)
+    }
+
+    // MARK: - AC-MB1 — menu bar icon appearance resolves to the right colors
+
+    /// App Settings → Menu Bar Icon, an accessibility setting: the default blue ring has
+    /// little contrast on a blue-tinted menu bar. The default must stay exactly the look
+    /// it replaced, Monochrome must be a template image without status colors, and Custom
+    /// must use the picked colors, falling back to the defaults for an unset or malformed
+    /// one. The stored raw values are a contract (users' UserDefaults hold them).
+    private static func testMenuBarIconAppearance() -> Bool {
+        let name = "AC-MB1", slug = "menu-bar-icon-appearance"
+
+        // Default (and an unset preference): the look before the setting existed.
+        let standard = MenuBarIconAppearance.standard
+        guard MenuBarIconAppearance.defaultStyle == .color,
+              menuBarColorsMatch(standard.syncingColor, .systemBlue),
+              menuBarColorsMatch(standard.idleColor, .gray),
+              menuBarColorsMatch(standard.trackColor, NSColor.gray.withAlphaComponent(0.4)),
+              !standard.isTemplate,
+              standard.usesStatusColors else {
+            return report(name, slug, false, "(the default style changed the original look)")
+        }
+
+        // A stored custom color only applies to the Custom style.
+        let colorStyle = MenuBarIconAppearance.resolve(style: .color, syncingHex: "#FFFFFF", idleHex: "#FFFFFF")
+        guard menuBarColorsMatch(colorStyle.syncingColor, .systemBlue),
+              menuBarColorsMatch(colorStyle.idleColor, .gray) else {
+            return report(name, slug, false, "(Color style used a stored custom color)")
+        }
+
+        // Monochrome: a template image, no status colors, the track fainter than the ring.
+        let mono = MenuBarIconAppearance.resolve(style: .monochrome, syncingHex: "#FF0000", idleHex: "#00FF00")
+        guard mono.isTemplate,
+              !mono.usesStatusColors,
+              mono.syncingColor.alphaComponent == 1,
+              mono.idleColor.alphaComponent == 1,
+              mono.trackColor.alphaComponent < mono.syncingColor.alphaComponent else {
+            return report(name, slug, false, "(Monochrome isn't an opaque template ring with a fainter track)")
+        }
+
+        // Custom: the picked colors, and a track derived from the syncing color.
+        let custom = MenuBarIconAppearance.resolve(style: .custom, syncingHex: "#ffd60a", idleHex: "#FFFFFF")
+        guard !custom.isTemplate,
+              custom.usesStatusColors,
+              menuBarRGBA(custom.syncingColor) == [255, 214, 10, 255],
+              menuBarRGBA(custom.idleColor) == [255, 255, 255, 255],
+              menuBarRGBA(custom.trackColor) == [255, 214, 10, 102] else {
+            return report(name, slug, false, "(Custom didn't use the picked colors: \(String(describing: menuBarRGBA(custom.syncingColor))))")
+        }
+
+        // Custom with an unset or malformed color falls back to the defaults.
+        let fallback = MenuBarIconAppearance.resolve(style: .custom, syncingHex: "", idleHex: "not-a-color")
+        guard menuBarColorsMatch(fallback.syncingColor, .systemBlue),
+              menuBarColorsMatch(fallback.idleColor, .gray) else {
+            return report(name, slug, false, "(Custom didn't fall back to the default colors)")
+        }
+
+        // Hex parsing: what's accepted and what isn't.
+        for accepted in ["#0A84FF", "0a84ff", "  #0A84FF\n"] {
+            guard menuBarRGBA(MenuBarIconAppearance.color(fromHex: accepted)) == [10, 132, 255, 255] else {
+                return report(name, slug, false, "(rejected \(accepted.debugDescription))")
+            }
+        }
+        for rejected in ["", "#", "#FFF", "#GGGGGG", "#0A84FF00", "+0A84F", "#-A84FF", "##0A84F"] {
+            guard MenuBarIconAppearance.color(fromHex: rejected) == nil else {
+                return report(name, slug, false, "(accepted \(rejected.debugDescription))")
+            }
+        }
+
+        // Formatting: sRGB, uppercase, opacity dropped, and a stable round trip.
+        guard MenuBarIconAppearance.hexString(from: NSColor(srgbRed: 1, green: 0.5, blue: 0, alpha: 0.3)) == "#FF8000" else {
+            return report(name, slug, false, "(hexString didn't format #FF8000)")
+        }
+        for hex in ["#000000", "#FFFFFF", "#0A84FF", "#FFD60A"] {
+            guard let parsed = MenuBarIconAppearance.color(fromHex: hex),
+                  MenuBarIconAppearance.hexString(from: parsed) == hex else {
+                return report(name, slug, false, "(\(hex) didn't round-trip)")
+            }
+        }
+
+        // Stored values.
+        guard MenuBarIconStyle.allCases.map(\.rawValue) == ["color", "monochrome", "custom"],
+              MenuBarIconStyle(rawValue: "neon") == nil,
+              MenuBarIconAppearance.styleKey == "menuBarIconStyle",
+              MenuBarIconAppearance.syncingColorKey == "menuBarIconSyncingColor",
+              MenuBarIconAppearance.idleColorKey == "menuBarIconIdleColor" else {
+            return report(name, slug, false, "(stored style values or keys changed)")
+        }
+        return report(name, slug, true)
+    }
+
+    // MARK: - AC-MB2 — the menu bar icon is drawn the way the appearance says
+
+    /// The drawn ring: the template flag (which decides whether the menu bar keeps the
+    /// drawn colors or draws the ring in its own text color), the color actually drawn
+    /// (so a hard-coded color can't return), the VoiceOver label, and the wiring from
+    /// the stored preference to the menu bar label and the settings screen.
+    private static func testMenuBarIconRendering() -> Bool {
+        let name = "AC-MB2", slug = "menu-bar-icon-rendering"
+
+        for style in MenuBarIconStyle.allCases {
+            let appearance = MenuBarIconAppearance.resolve(style: style, syncingHex: "#FFD60A", idleHex: "")
+            let image = CircularProgressIcon.makeImage(
+                percentage: 40, color: appearance.syncingColor,
+                trackColor: appearance.trackColor, isTemplate: appearance.isTemplate
+            )
+            guard image.isTemplate == (style == .monochrome) else {
+                return report(name, slug, false, "(\(style.rawValue): image isTemplate=\(image.isTemplate))")
+            }
+        }
+
+        // Pixels: (7, 1) sits on the arc just past its start at the top; (1, 7) on the
+        // left, which a 40% arc doesn't reach, so only the track is drawn there.
+        let custom = MenuBarIconAppearance.resolve(style: .custom, syncingHex: "#FFD60A", idleHex: "")
+        guard let customPixels = menuBarIconPixels(custom, percentage: 40),
+              let arc = customPixels.arc, let track = customPixels.track,
+              arc.redComponent > 0.75, arc.blueComponent < 0.35, arc.alphaComponent > 0.8,
+              track.alphaComponent > 0.15, track.alphaComponent < 0.65 else {
+            return report(name, slug, false, "(Custom ring wasn't drawn in the picked color)")
+        }
+        guard let standardPixels = menuBarIconPixels(.standard, percentage: 40),
+              let standardArc = standardPixels.arc,
+              standardArc.blueComponent > 0.7, standardArc.redComponent < 0.3 else {
+            return report(name, slug, false, "(default ring isn't blue)")
+        }
+
+        // VoiceOver.
+        let labels: [(SyncState, Double?, String)] = [
+            (.syncing, 41.6, "SyncTray, syncing 42 percent"),
+            (.syncing, 140, "SyncTray, syncing 100 percent"),
+            (.syncing, nil, "SyncTray, syncing"),
+            (.syncing, Double.nan, "SyncTray, syncing"),
+            (.idle, nil, "SyncTray, up to date"),
+            (.paused, nil, "SyncTray, paused"),
+            (.error("rclone exited 1"), nil, "SyncTray, sync error"),
+            (.driveNotMounted, nil, "SyncTray, drive not connected"),
+            (.notConfigured, nil, "SyncTray, setup required"),
+        ]
+        for (state, progress, expected) in labels {
+            let label = MenuBarIcon.voiceOverLabel(for: state, progress: progress)
+            guard label == expected else {
+                return report(name, slug, false, "(VoiceOver label \(label.debugDescription), expected \(expected.debugDescription))")
+            }
+        }
+
+        // Wiring: the menu bar label and the settings screen read the same keys, and the
+        // label no longer hard-codes the ring's colors.
+        guard let app = readSourceFile("SyncTrayApp.swift"),
+              let settings = readSourceFile("Views/AppSettingsView.swift") else {
+            return report(name, slug, false, "(couldn't read SyncTrayApp.swift / AppSettingsView.swift)")
+        }
+        let keys = ["@AppStorage(MenuBarIconAppearance.styleKey)",
+                    "@AppStorage(MenuBarIconAppearance.syncingColorKey)",
+                    "@AppStorage(MenuBarIconAppearance.idleColorKey)"]
+        guard keys.allSatisfy({ app.contains($0) && settings.contains($0) }),
+              app.contains("appearance: MenuBarIconAppearance.resolve("),
+              !app.contains("color: .systemBlue)"),
+              !app.contains("color: .gray)"),
+              app.contains("image.isTemplate = isTemplate") else {
+            return report(name, slug, false, "(menu bar icon isn't wired to the stored appearance)")
+        }
+        return report(name, slug, true)
+    }
+
+    /// sRGB components as 0–255 integers, or nil.
+    private static func menuBarRGBA(_ color: NSColor?) -> [Int]? {
+        guard let srgb = color?.usingColorSpace(.sRGB) else { return nil }
+        return [srgb.redComponent, srgb.greenComponent, srgb.blueComponent, srgb.alphaComponent]
+            .map { Int(($0 * 255).rounded()) }
+    }
+
+    /// Equal colors, or the same within one step per channel in sRGB.
+    private static func menuBarColorsMatch(_ a: NSColor, _ b: NSColor) -> Bool {
+        if a == b { return true }
+        guard let x = menuBarRGBA(a), let y = menuBarRGBA(b) else { return false }
+        return zip(x, y).allSatisfy { abs($0 - $1) <= 1 }
+    }
+
+    /// Draws the 14-pt ring into a 14×14 bitmap and returns two pixels: one on the arc
+    /// near its start at the top, and one on the left of the track.
+    private static func menuBarIconPixels(
+        _ appearance: MenuBarIconAppearance, percentage: Double
+    ) -> (arc: NSColor?, track: NSColor?)? {
+        let image = CircularProgressIcon.makeImage(
+            percentage: percentage, color: appearance.syncingColor,
+            trackColor: appearance.trackColor, isTemplate: appearance.isTemplate
+        )
+        guard let rep = NSBitmapImageRep(
+            bitmapDataPlanes: nil, pixelsWide: 14, pixelsHigh: 14,
+            bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
+            colorSpaceName: .calibratedRGB, bytesPerRow: 0, bitsPerPixel: 0
+        ), let context = NSGraphicsContext(bitmapImageRep: rep) else { return nil }
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = context
+        image.draw(in: NSRect(x: 0, y: 0, width: 14, height: 14))
+        context.flushGraphics()
+        NSGraphicsContext.restoreGraphicsState()
+        // colorAt's y counts from the top row.
+        return (rep.colorAt(x: 7, y: 1)?.usingColorSpace(.sRGB),
+                rep.colorAt(x: 1, y: 7)?.usingColorSpace(.sRGB))
     }
 }
 

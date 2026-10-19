@@ -893,7 +893,7 @@ the warmer reads as before — safe degradation.
 | `SyncProfile.swift` | Profile model with sync paths, remote config, fallback remote config, computed file paths |
 | `SyncState.swift` | Sync state enum, progress struct, file change model, `ActiveTransport`, `MountMode` (the four Cache-only-aware mount states), `SyncLogPatterns` for log parsing |
 | `RcloneLogEntry.swift` | JSON models for parsing rclone `--use-json-log` output |
-| `Settings.swift` | Global app settings (debug logging toggle, auto-fix sync issues toggle) |
+| `Settings.swift` | Global app settings (debug logging toggle, auto-fix sync issues toggle), plus `MenuBarIconStyle` / `MenuBarIconAppearance` — the menu bar icon's look (see "Menu bar icon appearance" below) |
 | `CacheMigrationProgress.swift` | Published per-profile progress for a cache-directory move (`CacheMigrationProgress`, shared `TransferFormat` byte/rate/elapsed helpers) |
 
 ### Services/
@@ -1272,7 +1272,7 @@ is the separate, fail-closed schema-drift gate.
 |------|---------|
 | `MenuBarView.swift` | Menu bar dropdown with profile status, recent changes, quick actions |
 | `SettingsView.swift` | Settings window with profile list and detail editor |
-| `AppSettingsView.swift` | Global app settings — launch at login, telemetry toggle, debug logging; About shows the exact release version (`SyncTrayReleaseVersion`, falling back to `CFBundleShortVersionString`) with a **Beta** tag on `/beta` builds (`SyncTrayReleaseChannel`) or a **Development** tag on a local debug build (`#if DEBUG`, purple vs the beta's orange) — the latter is how you tell a `.dev`-id dev instance apart from the installed production app when both run at once. Version keys are build-time Info.plist keys, because a beta never bumps `CFBundleShortVersionString`; see DEVELOPMENT.md "Release Channel and Version" |
+| `AppSettingsView.swift` | Global app settings — launch at login, Menu Bar Icon style (with a live preview), telemetry toggle, debug logging; About shows the exact release version (`SyncTrayReleaseVersion`, falling back to `CFBundleShortVersionString`) with a **Beta** tag on `/beta` builds (`SyncTrayReleaseChannel`) or a **Development** tag on a local debug build (`#if DEBUG`, purple vs the beta's orange) — the latter is how you tell a `.dev`-id dev instance apart from the installed production app when both run at once. Version keys are build-time Info.plist keys, because a beta never bumps `CFBundleShortVersionString`; see DEVELOPMENT.md "Release Channel and Version" |
 | `ProfileListView.swift` | Sidebar list of profiles with add/delete controls |
 | `StatusHeaderView.swift` | Header showing current sync state and progress |
 | `SyncProgressDetailView.swift` | Detailed per-file transfer progress during sync |
@@ -1281,6 +1281,24 @@ is the separate, fail-closed schema-drift gate.
 | `TelemetryDetailsSheet.swift` | Full privacy disclosure sheet — reachable from wizard, banner, and settings; its "Diagnostic reports — only when you send one" section explains the manual-report carve-out |
 | `DiagnosticReportSheet.swift` | "Send Diagnostic Report" sheet — scope picker, disclosure, Preview / Save to Desktop / Send, then the report code with Copy. Opened from the "Last sync error" banner and footer of `ProfileDetailView` and from App Settings → Help & Feedback |
 | `SetupWizardView.swift` | New-profile creation wizard, including optional `.helpImprove` epilogue step |
+
+**Menu bar icon appearance (App Settings → Menu Bar Icon) — an accessibility setting.**
+The default ring (a `systemBlue` arc over a 40%-opacity gray track) has little contrast on a
+blue-tinted menu bar: macOS tints a translucent menu bar with the wallpaper. `MenuBarIconStyle`
+(`Settings.swift`) offers `color` (default — exactly the look before the setting existed),
+`monochrome` (the ring is a **template** image and the status symbols drop their colors, so
+macOS draws everything in the menu bar's own text color, like Apple's icons), and `custom`
+(user-picked syncing and idle colors; the track follows the syncing color). The pure
+`MenuBarIconAppearance.resolve(style:syncingHex:idleHex:)` turns the stored preference into
+what `MenuBarIcon` / `CircularProgressIcon` draw; an unset or malformed `#RRGGBB` falls back to
+the default colors. Stored in `UserDefaults.standard` under `menuBarIconStyle`,
+`menuBarIconSyncingColor` and `menuBarIconIdleColor`, read with `@AppStorage` in `SyncTrayApp`
+(so a change redraws the label through the App body, like a state change) and written by
+`AppSettingsView`. Deliberately **not** in `settings.json`: `AppSettingsFileStore` is a
+Bool-only safe-key mirror, and these are display preferences. The icon also carries a
+VoiceOver label (`MenuBarIcon.voiceOverLabel`, e.g. "SyncTray, syncing 42 percent"). Covered
+by `ConfigSelfTest` AC-MB1 (resolution, hex parsing, stored values) and AC-MB2 (template flag,
+drawn pixels, VoiceOver labels, wiring).
 
 ## Agent-Editable Configuration & CLI
 

@@ -1606,7 +1606,8 @@ final class TelemetryService {
     /// telemetry opt-out). `name` is a bounded setting id; capturing the telemetry opt-out here
     /// is the only way to see it, since no telemetry is emitted after it's disabled.
     func recordSettingChanged(
-        name: String,     // bounded: auto_fix | launch_at_login | debug_logging | telemetry
+        name: String,     // bounded: auto_fix | launch_at_login | debug_logging | telemetry |
+                          // menu_bar_icon_color | menu_bar_icon_monochrome | menu_bar_icon_custom
         enabled: Bool
     ) {
         guard SyncTraySettings.telemetryEnabled else { return }
