@@ -124,6 +124,8 @@ enum ConfigSelfTest {
             testRemoteFolderListingKeepsSpaces,
             testCLIRemoteFolders,
             testCLITelemetryConsent,
+            testDoctorLockLiveness,
+            testRemoteProbePathScopedAndSummarized,
             testCacheOnlyUnionConfig,
             testCacheOnlyUnionBehaviour,
             testMountModeSelection,
@@ -1590,6 +1592,7 @@ enum ConfigSelfTest {
         unmountProfile: @escaping (SyncProfile) -> String? = { _ in nil },
         readStdin: @escaping () -> String? = { nil },
         readFile: @escaping (String) -> String? = { _ in nil },
+        processIsAlive: @escaping (Int32) -> Bool = { _ in false },
         probeMount: @escaping (SyncProfile) -> MountProbe = { _ in
             MountProbe(mounted: false, processRunning: false, pendingUploads: 0)
         },
@@ -1628,6 +1631,7 @@ enum ConfigSelfTest {
             migrateCache: migrateCache,
             readStdin: readStdin,
             readFile: readFile,
+            processIsAlive: processIsAlive,
             probeMount: probeMount,
             warmEstimate: warmEstimate,
             remoteSkipsCertCheck: remoteSkipsCertCheck,
@@ -3810,6 +3814,149 @@ enum ConfigSelfTest {
               let banner = readSourceFile("Views/Settings/TelemetryOptInBanner.swift"),
               banner.contains("SyncTraySettings.telemetryConsentSummary") else {
             return report(name, slug, false, "(prompt not before execute, process kind unset, or banner copy not shared)")
+        }
+        return report(name, slug, true)
+    }
+
+    // MARK: - AC-CLI14 — doctor judges a lock file by its holder's liveness
+
+    /// `doctor`'s lock check (plan D4) must report a live holder as `ok` "sync running (PID n)"
+    /// (or "mount running" for a Stream profile), a dead holder as `warn` "stale lock file (PID
+    /// n not running)" while still exiting 0, `.pending` as `ok` "sync starting", an unparseable
+    /// present lock as `warn` "stale lock file (no PID recorded)", and no lock file at all as
+    /// `ok` "no stale lock" — never the old existence-only "stale lock file present".
+    private static func testDoctorLockLiveness() -> Bool {
+        let name = "AC-CLI14", slug = "doctor-lock-liveness"
+        let alwaysAlive: (Int32) -> Bool = { _ in true }
+        let neverAlive: (Int32) -> Bool = { _ in false }
+
+        let live = SyncTrayCLI.lockCheck(label: "p", exists: true, contents: "4242", isMount: false, isAlive: alwaysAlive)
+        guard live.status == .ok, live.detail == "sync running (PID 4242)" else {
+            return report(name, slug, false, "(live PID did not report ok sync running: \(live))")
+        }
+        let liveMount = SyncTrayCLI.lockCheck(label: "p", exists: true, contents: "4242", isMount: true, isAlive: alwaysAlive)
+        guard liveMount.status == .ok, liveMount.detail == "mount running (PID 4242)" else {
+            return report(name, slug, false, "(live PID on a mount profile did not say mount running: \(liveMount))")
+        }
+        let dead = SyncTrayCLI.lockCheck(label: "p", exists: true, contents: "4242", isMount: false, isAlive: neverAlive)
+        guard dead.status == .warn, dead.detail == "stale lock file (PID 4242 not running)" else {
+            return report(name, slug, false, "(dead PID did not report warn stale: \(dead))")
+        }
+        let pending = SyncTrayCLI.lockCheck(label: "p", exists: true, contents: "pending", isMount: false, isAlive: neverAlive)
+        guard pending.status == .ok, pending.detail == "sync starting" else {
+            return report(name, slug, false, "(.pending did not report ok sync starting: \(pending))")
+        }
+        let unreadable = SyncTrayCLI.lockCheck(label: "p", exists: true, contents: "garbage", isMount: false, isAlive: neverAlive)
+        guard unreadable.status == .warn, unreadable.detail == "stale lock file (no PID recorded)" else {
+            return report(name, slug, false, "(unreadable holder did not report warn no PID: \(unreadable))")
+        }
+        let emptyContents = SyncTrayCLI.lockCheck(label: "p", exists: true, contents: nil, isMount: false, isAlive: neverAlive)
+        guard emptyContents.status == .warn, emptyContents.detail == "stale lock file (no PID recorded)" else {
+            return report(name, slug, false, "(present-but-unreadable lock did not report warn no PID: \(emptyContents))")
+        }
+        let absent = SyncTrayCLI.lockCheck(label: "p", exists: false, contents: nil, isMount: false, isAlive: alwaysAlive)
+        guard absent.status == .ok, absent.detail == "no stale lock" else {
+            return report(name, slug, false, "(absent lock did not report ok no stale lock: \(absent))")
+        }
+
+        // Full doctor run: a dead-holder lock is a .warn, never a .fail, and exits 0.
+        let profile = sampleProfile(isEnabled: false)
+        let doctorEnv = fakeCLIEnvironment(
+            runRclone: { args, _ in args.first == "version" ? (0, "rclone v1.66.0", "") : (0, "", "") },
+            readProfiles: { [profile] },
+            fileExists: { path in path == profile.configPath || path == profile.lockFilePath },
+            schemaFilesPresent: { true },
+            readFile: { path in path == profile.lockFilePath ? "99999999" : nil },
+            processIsAlive: { _ in false }
+        )
+        let doctorChecks = SyncTrayCLI.doctorChecks(env: doctorEnv)
+        guard doctorChecks.contains(where: { $0.status == .warn && $0.detail.contains("not running") }) else {
+            return report(name, slug, false, "(a dead-PID lock did not surface as a warn in the full doctor report)")
+        }
+        guard SyncTrayCLI.run(.doctor, env: doctorEnv) == 0 else {
+            return report(name, slug, false, "(a stale-but-dead lock should not fail the doctor run)")
+        }
+
+        guard let cliSource = readSourceFile("CLI/SyncTrayCLI.swift"),
+              !cliSource.contains("\"stale lock file present\"") else {
+            return report(name, slug, false, "(the old existence-only lock message is still present)")
+        }
+        return report(name, slug, true)
+    }
+
+    // MARK: - AC-CLI15 — doctor/test-remote probe with lsjson --stat, never lsd
+
+    /// `remoteProbe` runs `lsjson --stat <remote>:<path>` (never `lsd`), treats exits 0/3/4 as
+    /// reachable, reports the CLI's own watchdog-timeout sentinel as "timed out after 15s", and
+    /// `rcloneFailureSummary` prefers an ERROR/CRITICAL stderr line over a NOTICE line (rclone's
+    /// shared-client_id notice was previously echoed as "the error").
+    private static func testRemoteProbePathScopedAndSummarized() -> Bool {
+        let name = "AC-CLI15", slug = "remote-probe-path-scoped"
+        var profile = sampleProfile()
+        profile.rcloneRemote = "myremote:"
+        profile.remotePath = "Some Path"
+
+        var capturedArgs: [String] = []
+        let okEnv = fakeCLIEnvironment(runRclone: { args, _ in capturedArgs = args; return (0, "{}", "") })
+        let okProbe = SyncTrayCLI.remoteProbe(for: profile, env: okEnv)
+        guard okProbe.reachable, okProbe.detail == "remote reachable",
+              capturedArgs.contains("lsjson"), capturedArgs.contains("--stat"),
+              capturedArgs.contains("myremote:Some Path"), !capturedArgs.contains("lsd") else {
+            return report(name, slug, false, "(exit 0 did not probe with lsjson --stat: \(capturedArgs))")
+        }
+
+        for exit: Int32 in [3, 4] {
+            let env = fakeCLIEnvironment(runRclone: { _, _ in (exit, "", "") })
+            guard SyncTrayCLI.remoteProbe(for: profile, env: env).reachable else {
+                return report(name, slug, false, "(exit \(exit) was not treated as reachable)")
+            }
+        }
+
+        let timeoutEnv = fakeCLIEnvironment(runRclone: { _, _ in (CLIEnvironment.rcloneTimedOutExitCode, "", "") })
+        let timeoutProbe = SyncTrayCLI.remoteProbe(for: profile, env: timeoutEnv)
+        guard !timeoutProbe.reachable, timeoutProbe.detail == "remote unreachable: timed out after 15s" else {
+            return report(name, slug, false, "(a watchdog timeout was not reported by name: \(timeoutProbe))")
+        }
+
+        let noticeAndError = """
+            2026/10/19 09:00:00 NOTICE: Google drive root '': Auto set your own client_id
+            2026/10/19 09:00:01 ERROR : : error listing: directory not found
+            """
+        let errorEnv = fakeCLIEnvironment(runRclone: { _, _ in (1, "", noticeAndError) })
+        let errorProbe = SyncTrayCLI.remoteProbe(for: profile, env: errorEnv)
+        guard !errorProbe.reachable, errorProbe.detail == "remote unreachable: ERROR : : error listing: directory not found" else {
+            return report(name, slug, false, "(the NOTICE line was echoed instead of the ERROR line: \(errorProbe))")
+        }
+
+        let noticeOnly = "2026/10/19 09:00:00 NOTICE: Google drive root '': Auto set your own client_id"
+        guard SyncTrayCLI.rcloneFailureSummary(stderr: noticeOnly) == nil else {
+            return report(name, slug, false, "(a NOTICE-only stderr should summarize to nil)")
+        }
+        let noticeOnlyEnv = fakeCLIEnvironment(runRclone: { _, _ in (1, "", noticeOnly) })
+        guard SyncTrayCLI.remoteProbe(for: profile, env: noticeOnlyEnv).detail == "remote unreachable: rclone exited 1" else {
+            return report(name, slug, false, "(a NOTICE-only failure did not fall back to 'rclone exited N')")
+        }
+
+        var certArgs: [String] = []
+        let certEnv = fakeCLIEnvironment(
+            runRclone: { args, _ in certArgs = args; return (0, "", "") },
+            remoteSkipsCertCheck: { $0 == "myremote:" }
+        )
+        _ = SyncTrayCLI.remoteProbe(for: profile, env: certEnv)
+        guard certArgs.contains("--no-check-certificate") else {
+            return report(name, slug, false, "(remoteSkipsCertCheck was not honoured: \(certArgs))")
+        }
+
+        var emptyRemote = profile
+        emptyRemote.rcloneRemote = ""
+        let noRemoteProbe = SyncTrayCLI.remoteProbe(for: emptyRemote, env: fakeCLIEnvironment())
+        guard !noRemoteProbe.reachable, noRemoteProbe.detail.contains("no remote configured") else {
+            return report(name, slug, false, "(an empty remote did not report 'no remote configured': \(noRemoteProbe))")
+        }
+
+        // doctor and test-remote both route through the one probe — same args, never `lsd`.
+        guard let cliSource = readSourceFile("CLI/SyncTrayCLI.swift"), !cliSource.contains("\"lsd\"") else {
+            return report(name, slug, false, "(SyncTrayCLI.swift still references the old lsd probe)")
         }
         return report(name, slug, true)
     }
