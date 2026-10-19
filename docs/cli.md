@@ -44,7 +44,7 @@ These commands are read-only.
 | `synctray logs <name\|id> [--follow]`      | Print the profile's sync log, or follow it like `tail -f`.                                             |
 | `synctray test-remote <name\|id>`          | Probe the profile's remote path with a hard timeout. A path that doesn't exist yet prints `(path not found)`. |
 | `synctray listremotes`                     | Pass-through to `rclone listremotes`.                                                                  |
-| `synctray settings [show] [--json]`        | Every app-wide setting from `settings.json`, as `key=value` lines or a JSON object.                   |
+| `synctray settings [show] [--json]`        | The value the app uses for every app-wide setting (the same keys as `settings.json`), as `key=value` lines or a JSON object. |
 | `synctray settings get <key>`              | One app-wide setting's value.                                                                          |
 | `synctray help`                            | Print the usage summary.                                                                               |
 

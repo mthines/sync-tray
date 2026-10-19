@@ -290,7 +290,7 @@ enum SyncTrayCLI {
                                    List the folders the app's folder chooser shows for a remote
       telemetry [status|on|off] [--json]
                                    Show or change usage-data sharing (shared with the app)
-      settings [show] [--json]     Show every app-wide setting (settings.json)
+      settings [show] [--json]     Show the values the app uses (the keys of settings.json)
       settings get <key>           Print one app-wide setting
 
     Support:
