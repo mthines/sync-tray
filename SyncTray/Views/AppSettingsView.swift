@@ -182,7 +182,10 @@ struct AppSettingsView: View {
             TelemetryService.shared.recordSettingChanged(
                 name: "menu_bar_icon_\(newValue.rawValue)", enabled: true
             )
+            syncManager.refreshSettingsFile()
         }
+        .onChange(of: menuBarIconSyncingColor) { _ in syncManager.refreshSettingsFile() }
+        .onChange(of: menuBarIconIdleColor) { _ in syncManager.refreshSettingsFile() }
     }
 
     /// The idle ring and a sync in progress, drawn by the same code as the menu bar icon.

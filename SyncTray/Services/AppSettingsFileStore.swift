@@ -5,8 +5,8 @@ import Foundation
 /// external agent or human, the same way `{shortId}.profile.json` mirrors a
 /// profile.
 ///
-/// Only the four keys in `SafeKey` are ever written. Adding a new key is an
-/// explicit, reviewable opt-in — never derived automatically from
+/// Only the keys in `SafeKey` (on/off) and `StringKey` (validated strings) are
+/// ever written. Adding a new key is an explicit, reviewable opt-in — never derived automatically from
 /// `SyncTraySettings`' full key set — so secrets (`installationId`,
 /// `anonymousUserId`) and any other sensitive key can never leak into the file
 /// just because someone added a property to `SyncTraySettings`.
@@ -17,6 +17,54 @@ enum AppSettingsFileStore {
         case autoFixSyncIssues
         case telemetryEnabled
         case launchAtLogin
+    }
+
+    /// String-valued keys, each validated by `normalize` before it is stored or
+    /// applied. The raw value is also the `UserDefaults` key the app reads
+    /// (`MenuBarIconAppearance`'s `@AppStorage` keys).
+    enum StringKey: String, CaseIterable {
+        case menuBarIconStyle
+        case menuBarIconSyncingColor
+        case menuBarIconIdleColor
+
+        /// Values the CLI lists in its help and errors.
+        var allowedValues: String {
+            switch self {
+            case .menuBarIconStyle:
+                return MenuBarIconStyle.allCases.map(\.rawValue).joined(separator: "|")
+            case .menuBarIconSyncingColor, .menuBarIconIdleColor:
+                return "#RRGGBB, or '' for the default color"
+            }
+        }
+
+        /// The canonical stored form of `raw`, or nil when it isn't a valid value.
+        /// A style must be one of `MenuBarIconStyle`; a color is `#RRGGBB`
+        /// (uppercased, `#` added) or empty for "use the default color".
+        func normalize(_ raw: String) -> String? {
+            let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            switch self {
+            case .menuBarIconStyle:
+                return MenuBarIconStyle(rawValue: trimmed.lowercased())?.rawValue
+            case .menuBarIconSyncingColor, .menuBarIconIdleColor:
+                if trimmed.isEmpty { return "" }
+                guard let color = MenuBarIconAppearance.color(fromHex: trimmed) else { return nil }
+                return MenuBarIconAppearance.hexString(from: color)
+            }
+        }
+
+        /// The value an unset preference resolves to.
+        var defaultValue: String {
+            switch self {
+            case .menuBarIconStyle: return MenuBarIconAppearance.defaultStyle.rawValue
+            case .menuBarIconSyncingColor, .menuBarIconIdleColor: return ""
+            }
+        }
+    }
+
+    /// Every key `settings.json` may carry, in file order (`$schema` aside).
+    /// `schema/settings.schema.json`'s properties must match it exactly — AC-ST1.
+    static var allKeyNames: [String] {
+        SafeKey.allCases.map(\.rawValue) + StringKey.allCases.map(\.rawValue)
     }
 
     /// Relative `$schema` reference from `settings.json` (which lives directly
@@ -43,14 +91,38 @@ enum AppSettingsFileStore {
         ]
     }
 
+    /// Snapshot the current string settings from `defaults` (the store the
+    /// app's `@AppStorage` reads). An unset or invalid stored value reports
+    /// its default, so the file never mirrors a value the app wouldn't use.
+    static func currentStringSettings(defaults: UserDefaults = .standard) -> [StringKey: String] {
+        var result: [StringKey: String] = [:]
+        for key in StringKey.allCases {
+            let stored = defaults.string(forKey: key.rawValue) ?? key.defaultValue
+            result[key] = key.normalize(stored) ?? key.defaultValue
+        }
+        return result
+    }
+
     /// Set one key in `settings.json`, keeping every other key as the file has it.
     /// For a writer outside the app (the CLI): rewriting the whole file from its own
     /// view could flip `launchAtLogin`, which the running app applies on any change.
-    /// A missing file is created from `currentSafeSettings`.
+    /// A missing file is created from the current settings.
     @discardableResult
     static func updateSettingsFile(
         _ key: SafeKey,
         to value: Bool,
+        isLoginItemEnabled: Bool,
+        directory: String = AppSettingsFileStore.defaultDirectory
+    ) -> Bool {
+        updateSettingsFile(values: [key.rawValue: value], isLoginItemEnabled: isLoginItemEnabled, directory: directory)
+    }
+
+    /// Set several keys at once (values already validated: `Bool` for a `SafeKey`,
+    /// a normalized `String` for a `StringKey`), keeping every other key as the
+    /// file has it. One write, so the running app reconciles the change once.
+    @discardableResult
+    static func updateSettingsFile(
+        values: [String: Any],
         isLoginItemEnabled: Bool,
         directory: String = AppSettingsFileStore.defaultDirectory
     ) -> Bool {
@@ -60,12 +132,9 @@ enum AppSettingsFileStore {
            let existing = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] {
             payload = existing
         } else {
-            payload = ["$schema": schemaRef]
-            for (k, v) in currentSafeSettings(isLoginItemEnabled: isLoginItemEnabled) {
-                payload[k.rawValue] = v
-            }
+            payload = currentPayload(isLoginItemEnabled: isLoginItemEnabled)
         }
-        payload[key.rawValue] = value
+        for (key, value) in values { payload[key] = value }
         guard let data = try? JSONSerialization.data(withJSONObject: payload, options: [.prettyPrinted, .sortedKeys]) else {
             return false
         }
@@ -78,7 +147,19 @@ enum AppSettingsFileStore {
         }
     }
 
-    /// Write `settings.json` (safe keys + `$schema`) into `directory` (defaults
+    /// The whole file as the app would write it: `$schema` plus every key.
+    private static func currentPayload(isLoginItemEnabled: Bool) -> [String: Any] {
+        var payload: [String: Any] = ["$schema": schemaRef]
+        for (key, value) in currentSafeSettings(isLoginItemEnabled: isLoginItemEnabled) {
+            payload[key.rawValue] = value
+        }
+        for (key, value) in currentStringSettings() {
+            payload[key.rawValue] = value
+        }
+        return payload
+    }
+
+    /// Write `settings.json` (every key + `$schema`) into `directory` (defaults
     /// to the real config directory; overridable for self-test isolation).
     /// Notes the write's content hash in `ConfigSelfWriteRegistry` so
     /// `ConfigFileWatcher` ignores the FSEvent this write produces.
@@ -88,10 +169,7 @@ enum AppSettingsFileStore {
         isLoginItemEnabled: Bool,
         directory: String = AppSettingsFileStore.defaultDirectory
     ) -> String? {
-        var payload: [String: Any] = ["$schema": schemaRef]
-        for (key, value) in currentSafeSettings(isLoginItemEnabled: isLoginItemEnabled) {
-            payload[key.rawValue] = value
-        }
+        let payload = currentPayload(isLoginItemEnabled: isLoginItemEnabled)
 
         guard let data = try? JSONSerialization.data(
             withJSONObject: payload, options: [.prettyPrinted, .sortedKeys]) else {
@@ -123,6 +201,24 @@ enum AppSettingsFileStore {
         var result: [SafeKey: Bool] = [:]
         for key in SafeKey.allCases {
             if let value = json[key.rawValue] as? Bool {
+                result[key] = value
+            }
+        }
+        return result
+    }
+
+    /// Read the string keys present in the `settings.json` at `path`, normalized.
+    /// A key that is absent, not a string, or not a valid value is left out —
+    /// "leave unchanged", the same rule as `readSafeSettings`.
+    static func readStringSettings(at path: String = AppSettingsFileStore.settingsFilePath) -> [StringKey: String] {
+        guard let data = FileManager.default.contents(atPath: path),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return [:]
+        }
+
+        var result: [StringKey: String] = [:]
+        for key in StringKey.allCases {
+            if let raw = json[key.rawValue] as? String, let value = key.normalize(raw) {
                 result[key] = value
             }
         }

@@ -470,6 +470,11 @@ final class SyncManager: ObservableObject {
         removeAllLegacyOfflineLinks()  // Clean up any (Offline) symlink left by the retired feature
         setupFinderSyncIPC()
         updateAppGroupMountPaths()
+        // Apply edits made to settings.json while the app wasn't running BEFORE
+        // rewriting the file from the app's state — otherwise the rewrite would
+        // silently discard them. Not launchAtLogin: a stale file must not undo a
+        // login-item change made in System Settings while the app was closed.
+        applySettingsFile(includeLoginItem: false)
         refreshSettingsFile()
         startConfigWatcher()
     }
@@ -1161,7 +1166,24 @@ final class SyncManager: ObservableObject {
     /// `launchAtLogin` goes through `SettingsReconciler`'s ISOLATED path so an
     /// `SMAppService` failure can never corrupt anything else.
     func applyExternalSettingsEdit() {
-        let safeSettings = AppSettingsFileStore.readSafeSettings()
+        applySettingsFile(includeLoginItem: true)
+        TelemetryService.shared.recordExternalConfigEdit(kind: "settings")
+    }
+
+    /// Apply every valid key in `settings.json` to the app's settings. Keys that
+    /// are absent or invalid are left unchanged.
+    private func applySettingsFile(includeLoginItem: Bool) {
+        var safeSettings = AppSettingsFileStore.readSafeSettings()
+        if !includeLoginItem { safeSettings[.launchAtLogin] = nil }
+
+        // String keys are the `@AppStorage` keys `SyncTrayApp` and
+        // `AppSettingsView` read, so writing them redraws the menu bar icon.
+        // Set even when the value looks unchanged: the CLI writes UserDefaults
+        // from its own process, and this in-process write is what notifies
+        // `@AppStorage`.
+        for (key, value) in AppSettingsFileStore.readStringSettings() {
+            UserDefaults.standard.set(value, forKey: key.rawValue)
+        }
 
         SettingsReconciler.apply(
             safeSettings: safeSettings,
@@ -1190,8 +1212,6 @@ final class SyncManager: ObservableObject {
                 self.objectWillChange.send()
             }
         )
-
-        TelemetryService.shared.recordExternalConfigEdit(kind: "settings")
     }
 
     /// Get state for a specific profile

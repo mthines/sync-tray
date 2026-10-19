@@ -34,6 +34,36 @@ enum TelemetryAction: Equatable {
     case set(enabled: Bool)
 }
 
+/// One app-wide setting's value, typed by its key: a `SafeKey` is on/off, a
+/// `StringKey` a validated string (`AppSettingsFileStore`).
+enum AppSettingValue: Equatable {
+    case bool(Bool)
+    case string(String)
+
+    /// The CLI's `key=value` rendering.
+    var text: String {
+        switch self {
+        case .bool(let value): return value ? "true" : "false"
+        case .string(let value): return value
+        }
+    }
+
+    /// The `settings.json` / `--json` value.
+    var jsonValue: Any {
+        switch self {
+        case .bool(let value): return value
+        case .string(let value): return value
+        }
+    }
+}
+
+/// `settings [show] [--json]` | `settings get <key>` | `settings set <key> <value> [...]`.
+enum SettingsAction: Equatable {
+    case show(json: Bool)
+    case get(key: String)
+    case set([ProfileAssignment])
+}
+
 /// Parsed CLI subcommand — the pure, testable result of `SyncTrayCLI.parse`.
 enum CLICommand: Equatable {
     case doctor
@@ -42,6 +72,7 @@ enum CLICommand: Equatable {
     case listRemotes
     case remoteFolders(target: String, json: Bool)
     case telemetry(TelemetryAction)
+    case settings(SettingsAction)
     case profiles
     case status(target: String?, json: Bool, wait: StatusWait?)
     case offlineStatus(target: String?, json: Bool)
@@ -191,6 +222,15 @@ struct CLIEnvironment {
     /// setting, the consent version (so the app's banner doesn't ask again) and
     /// `settings.json` (so a running app applies it live).
     var setTelemetryEnabled: (Bool) -> Void
+    /// Every app-wide setting (`AppSettingsFileStore.allKeyNames`) with its
+    /// current value — the values the app uses, not just what the file says.
+    var readAppSettings: () -> [String: AppSettingValue] = { [:] }
+    /// Apply already-validated settings everywhere the app reads them and to
+    /// `settings.json` (so a running app applies them live). `nil` on success,
+    /// otherwise the error message.
+    var writeAppSettings: ([String: AppSettingValue]) -> String? = { _ in
+        "settings aren't available here"
+    }
     /// Whether a person is at the keyboard: stdin and stderr are terminals and `CI`
     /// is unset. The first-run telemetry question is only ever asked then.
     var isInteractiveTerminal: () -> Bool
@@ -250,6 +290,8 @@ enum SyncTrayCLI {
                                    List the folders the app's folder chooser shows for a remote
       telemetry [status|on|off] [--json]
                                    Show or change usage-data sharing (shared with the app)
+      settings [show] [--json]     Show every app-wide setting (settings.json)
+      settings get <key>           Print one app-wide setting
 
     Support:
       report [name|id] [--lines N] [--output <path>]
@@ -271,6 +313,8 @@ enum SyncTrayCLI {
                                    Edit fields on an existing profile and reconcile
       install <name|id>            Install an enabled profile's launchd agent (idempotent)
       reinstall <name|id>          Regenerate script+plist and reinstall the agent
+      settings set <key> <value> [<key> <value> ...]
+                                   Change app-wide settings; a running app applies them live
 
     Operate:
       sync <name|id>                          Run a sync now and wait for it to finish
@@ -295,6 +339,11 @@ enum SyncTrayCLI {
       localSyncPath — when non-empty, only these folders sync; an entry with
       a '.' or '..' segment is rejected).
       Use enable/disable for isEnabled.
+
+    settings keys: debugLoggingEnabled, autoFixSyncIssues, telemetryEnabled,
+      launchAtLogin (true|false), menuBarIconStyle (color|monochrome|custom),
+      menuBarIconSyncingColor, menuBarIconIdleColor (#RRGGBB, or '' for the
+      default color; used by the custom style).
 
     Profiles author JSON against schema/profile.schema.json under the config
     directory; the same file an agent can drop in or edit directly.
@@ -392,6 +441,10 @@ enum SyncTrayCLI {
             let sub = argv.dropFirst().first(where: { !$0.hasPrefix("-") }) ?? ""
             return sub == "folders" ? "remote-folders" : "(other)"
         }
+        if first == "settings" {
+            let sub = argv.dropFirst().first(where: { !$0.hasPrefix("-") }) ?? "show"
+            return ["show", "get", "set"].contains(sub) ? "settings-\(sub)" : "(other)"
+        }
         if first == "offline" {
             let sub = argv.dropFirst().first(where: { !$0.hasPrefix("-") }) ?? ""
             return sub == "status" ? "offline-status" : "(other)"
@@ -444,6 +497,9 @@ enum SyncTrayCLI {
                 break
             }
             return .failure(CLIUsageError(message: "usage: synctray telemetry [status|on|off] [--json]"))
+
+        case "settings":
+            return parseSettings(rest)
 
         case "remote":
             let flags = parseFlags(rest, valueFlags: [])
@@ -646,6 +702,52 @@ enum SyncTrayCLI {
         return .success(.cacheMove(target: target, destination: destination, includeOverlapping: includeOverlapping))
     }
 
+    static let settingsUsage = "usage: synctray settings [show] [--json] | settings get <key> | settings set <key> <value> [<key> <value> ...]"
+
+    /// Parse `settings`. `set` takes raw positional pairs (like `profile set`) so a
+    /// value may be empty (`''` resets a color) or start with `#`.
+    private static func parseSettings(_ rest: [String]) -> Result<CLICommand, CLIUsageError> {
+        let usageError = CLIUsageError(message: settingsUsage)
+        switch rest.first {
+        case nil, "show", "--json":
+            let flags = rest.first == "show" ? Array(rest.dropFirst()) : rest
+            guard flags.allSatisfy({ $0 == "--json" }), flags.count <= 1 else { return .failure(usageError) }
+            return .success(.settings(.show(json: flags.contains("--json"))))
+        case "get":
+            guard rest.count == 2 else { return .failure(usageError) }
+            return .success(.settings(.get(key: rest[1])))
+        case "set":
+            let pairs = Array(rest.dropFirst())
+            guard !pairs.isEmpty, pairs.count % 2 == 0 else { return .failure(usageError) }
+            let assignments = stride(from: 0, to: pairs.count, by: 2).map {
+                ProfileAssignment(key: pairs[$0], value: pairs[$0 + 1])
+            }
+            return .success(.settings(.set(assignments)))
+        default:
+            return .failure(usageError)
+        }
+    }
+
+    /// Validate one `settings set` value for `key`. Pure — the self-test drives it.
+    static func parseAppSetting(key: String, value: String) -> Result<AppSettingValue, CLIUsageError> {
+        if AppSettingsFileStore.SafeKey(rawValue: key) != nil {
+            switch value.lowercased() {
+            case "true", "1", "yes", "on": return .success(.bool(true))
+            case "false", "0", "no", "off": return .success(.bool(false))
+            default: return .failure(CLIUsageError(message: "\(key) must be true or false, got \"\(value)\""))
+            }
+        }
+        if let stringKey = AppSettingsFileStore.StringKey(rawValue: key) {
+            guard let normalized = stringKey.normalize(value) else {
+                return .failure(CLIUsageError(
+                    message: "\(key) must be \(stringKey.allowedValues), got \"\(value)\""))
+            }
+            return .success(.string(normalized))
+        }
+        return .failure(CLIUsageError(
+            message: "unknown setting \"\(key)\" (keys: \(AppSettingsFileStore.allKeyNames.joined(separator: ", ")))"))
+    }
+
     static let reportUsage = "usage: synctray report [<name|shortId>] [--lines N] [--output <path>] [--send [--yes|-y] [--json]]"
 
     /// Parse `report`. Strict about flags (an unknown one is a usage error rather than
@@ -711,6 +813,8 @@ enum SyncTrayCLI {
             return runRemoteFolders(target, json: json, env: env)
         case .telemetry(let action):
             return runTelemetry(action, env: env)
+        case .settings(let action):
+            return runSettings(action, env: env)
         case .profiles:
             return runProfiles(env: env)
         case .status(let target, let json, let wait):
@@ -1037,6 +1141,56 @@ enum SyncTrayCLI {
             env.stdout("Usage data: \(enabled ? "on" : "off"). The SyncTray app uses the same setting.\n")
         }
         return 0
+    }
+
+    // MARK: - settings
+
+    private static func runSettings(_ action: SettingsAction, env: CLIEnvironment) -> Int32 {
+        switch action {
+        case .show(let json):
+            let current = env.readAppSettings()
+            if json {
+                var object: [String: Any] = [:]
+                for (key, value) in current { object[key] = value.jsonValue }
+                guard let data = try? JSONSerialization.data(
+                    withJSONObject: object, options: [.prettyPrinted, .sortedKeys]) else { return 1 }
+                env.stdout(String(decoding: data, as: UTF8.self) + "\n")
+            } else {
+                for key in AppSettingsFileStore.allKeyNames {
+                    if let value = current[key] { env.stdout("\(key)=\(value.text)\n") }
+                }
+            }
+            return 0
+
+        case .get(let key):
+            guard AppSettingsFileStore.allKeyNames.contains(key) else {
+                env.stderr("error: unknown setting \"\(key)\" (keys: \(AppSettingsFileStore.allKeyNames.joined(separator: ", ")))\n")
+                return 65  // EX_DATAERR
+            }
+            guard let value = env.readAppSettings()[key] else { return 1 }
+            env.stdout(value.text + "\n")
+            return 0
+
+        case .set(let assignments):
+            // Validate everything first — one bad value writes nothing.
+            var values: [String: AppSettingValue] = [:]
+            for assignment in assignments {
+                switch parseAppSetting(key: assignment.key, value: assignment.value) {
+                case .success(let value): values[assignment.key] = value
+                case .failure(let error):
+                    env.stderr("error: \(error.message)\n")
+                    return 65  // EX_DATAERR
+                }
+            }
+            if let error = env.writeAppSettings(values) {
+                env.stderr("error: \(error)\n")
+                return 1
+            }
+            for key in AppSettingsFileStore.allKeyNames {
+                if let value = values[key] { env.stdout("\(key)=\(value.text)\n") }
+            }
+            return 0
+        }
     }
 
     // MARK: - profiles
@@ -2071,6 +2225,8 @@ extension CLIEnvironment {
                 )
             },
             setTelemetryEnabled: { enabled in CLIEnvironment.setTelemetryEnabledProcess(enabled) },
+            readAppSettings: { CLIEnvironment.readAppSettingsProcess() },
+            writeAppSettings: { values in CLIEnvironment.writeAppSettingsProcess(values) },
             isInteractiveTerminal: {
                 isatty(STDIN_FILENO) == 1 && isatty(STDERR_FILENO) == 1
                     && (ProcessInfo.processInfo.environment["CI"] ?? "").isEmpty
@@ -2121,6 +2277,57 @@ extension CLIEnvironment {
         if enabled, changed {
             TelemetryService.shared.recordSettingChanged(name: "telemetry", enabled: true)
         }
+    }
+
+    /// Real implementation of `readAppSettings`: the values the app uses
+    /// (UserDefaults, and SMAppService for launch at login).
+    fileprivate static func readAppSettingsProcess() -> [String: AppSettingValue] {
+        var result: [String: AppSettingValue] = [:]
+        let loginItem = SMAppService.mainApp.status == .enabled
+        for (key, value) in AppSettingsFileStore.currentSafeSettings(isLoginItemEnabled: loginItem) {
+            result[key.rawValue] = .bool(value)
+        }
+        for (key, value) in AppSettingsFileStore.currentStringSettings() {
+            result[key.rawValue] = .string(value)
+        }
+        return result
+    }
+
+    /// Real implementation of `writeAppSettings`: the same writes the app's
+    /// settings window makes, then `settings.json` so a running app applies them
+    /// live. Telemetry goes through `setTelemetryEnabledProcess` (consent version,
+    /// opt-out event); launch at login registers the login item directly, so it
+    /// also takes effect when the app isn't running.
+    fileprivate static func writeAppSettingsProcess(_ values: [String: AppSettingValue]) -> String? {
+        var fileValues: [String: Any] = [:]
+        for (key, value) in values {
+            switch (AppSettingsFileStore.SafeKey(rawValue: key), value) {
+            case (.telemetryEnabled?, .bool(let enabled)):
+                setTelemetryEnabledProcess(enabled)  // writes settings.json itself
+                continue
+            case (.launchAtLogin?, .bool(let enabled)):
+                do {
+                    if enabled { try SMAppService.mainApp.register() } else { try SMAppService.mainApp.unregister() }
+                } catch {
+                    return "couldn't \(enabled ? "enable" : "disable") launch at login: \(error.localizedDescription)"
+                }
+            case (.debugLoggingEnabled?, .bool(let enabled)):
+                SyncTraySettings.debugLoggingEnabled = enabled
+            case (.autoFixSyncIssues?, .bool(let enabled)):
+                SyncTraySettings.autoFixSyncIssues = enabled
+            case (nil, .string(let text)) where AppSettingsFileStore.StringKey(rawValue: key) != nil:
+                UserDefaults.standard.set(text, forKey: key)
+            default:
+                return "invalid value for \(key)"
+            }
+            fileValues[key] = value.jsonValue
+        }
+        guard !fileValues.isEmpty else { return nil }
+        let written = AppSettingsFileStore.updateSettingsFile(
+            values: fileValues,
+            isLoginItemEnabled: SMAppService.mainApp.status == .enabled
+        )
+        return written ? nil : "couldn't write \(AppSettingsFileStore.settingsFilePath)"
     }
 
     /// Real implementation of `probeMount`. The process check matches `ps` output

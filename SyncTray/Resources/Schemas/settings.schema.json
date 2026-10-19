@@ -2,7 +2,7 @@
   "$id": "https://raw.githubusercontent.com/mthines/sync-tray/main/SyncTray/Resources/Schemas/settings.schema.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "SyncTray global settings file",
-  "description": "Global app settings (~/.config/synctray/settings.json). Mirrors ONLY the safe, enumerated subset of SyncTraySettings — see AppSettingsFileStore.SafeKey. Never contains secrets or telemetry identifiers (installationId, anonymousUserId).",
+  "description": "Global app settings (~/.config/synctray/settings.json). Mirrors ONLY the enumerated keys of AppSettingsFileStore.SafeKey (on/off) and AppSettingsFileStore.StringKey (validated strings). Never contains secrets or telemetry identifiers (installationId, anonymousUserId). A running app applies an edit live; an edit made while the app is closed is applied at its next launch (except launchAtLogin). Also editable with `synctray settings set <key> <value>`.",
   "type": "object",
   "properties": {
     "$schema": {
@@ -24,6 +24,25 @@
     "launchAtLogin": {
       "type": "boolean",
       "description": "Whether SyncTray starts automatically at login (SMAppService login item)."
+    },
+    "menuBarIconStyle": {
+      "type": "string",
+      "enum": [
+        "color",
+        "monochrome",
+        "custom"
+      ],
+      "description": "How the menu bar icon is drawn: color (blue while syncing, gray when idle), monochrome (the menu bar's own text color, highest contrast), or custom (the two colors below)."
+    },
+    "menuBarIconSyncingColor": {
+      "type": "string",
+      "pattern": "^(#?[0-9A-Fa-f]{6})?$",
+      "description": "The custom style's ring color while syncing, as #RRGGBB. Empty uses the default (system blue)."
+    },
+    "menuBarIconIdleColor": {
+      "type": "string",
+      "pattern": "^(#?[0-9A-Fa-f]{6})?$",
+      "description": "The custom style's ring color when idle, as #RRGGBB. Empty uses the default (gray)."
     }
   },
   "additionalProperties": false

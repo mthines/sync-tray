@@ -126,6 +126,7 @@ enum ConfigSelfTest {
             testRemoteFolderListingKeepsSpaces,
             testCLIRemoteFolders,
             testCLITelemetryConsent,
+            testAppSettingsCLIAndFile,
             testDoctorLockLiveness,
             testRemoteProbePathScopedAndSummarized,
             testCLITelemetryFlushWaitsForSend,
@@ -3800,6 +3801,135 @@ enum ConfigSelfTest {
         guard exporterSessions == 3, flush.contains("waitUntilIdle("), quit.contains("waitUntilIdle(") else {
             return report(name, slug, false, "(exporters on the watched session: \(exporterSessions)/3; flushForExit waits: \(flush.contains("waitUntilIdle(")); shutdown waits: \(quit.contains("waitUntilIdle(")))")
         }
+        return report(name, slug, true)
+    }
+
+    // MARK: - AC-ST1 — every app-wide setting is file- and CLI-controllable
+
+    /// Every app-wide setting must be readable and writable through `settings.json`
+    /// and `synctray settings`: the schema lists exactly the store's keys; string
+    /// values are validated and normalized; an invalid file value is ignored, never
+    /// applied; `settings set` validates every pair before writing any; and launch
+    /// applies the file before rewriting it, so an edit made while the app was
+    /// closed isn't discarded.
+    private static func testAppSettingsCLIAndFile() -> Bool {
+        let name = "AC-ST1", slug = "app-settings-cli-and-file"
+
+        guard let schemaText = readSourceFile("Resources/Schemas/settings.schema.json"),
+              let schema = (try? JSONSerialization.jsonObject(with: Data(schemaText.utf8))) as? [String: Any],
+              let properties = schema["properties"] as? [String: Any],
+              Set(properties.keys).subtracting(["$schema"]) == Set(AppSettingsFileStore.allKeyNames) else {
+            return report(name, slug, false, "(settings.schema.json properties differ from AppSettingsFileStore keys)")
+        }
+
+        typealias Key = AppSettingsFileStore.StringKey
+        let cases: [(Key, String, String?)] = [
+            (.menuBarIconStyle, "Monochrome", "monochrome"),
+            (.menuBarIconStyle, " custom ", "custom"),
+            (.menuBarIconStyle, "neon", nil),
+            (.menuBarIconStyle, "", nil),
+            (.menuBarIconSyncingColor, "ff8800", "#FF8800"),
+            (.menuBarIconSyncingColor, "#00aaFF", "#00AAFF"),
+            (.menuBarIconIdleColor, "", ""),
+            (.menuBarIconIdleColor, "#12345", nil),
+            (.menuBarIconIdleColor, "blue", nil),
+        ]
+        for (key, raw, expected) in cases where key.normalize(raw) != expected {
+            return report(name, slug, false, "(\(key.rawValue) normalize(\(raw.debugDescription)) = \(key.normalize(raw).debugDescription), want \(expected.debugDescription))")
+        }
+
+        let suiteName = "synctray.selftest.appsettings"
+        guard let suite = UserDefaults(suiteName: suiteName) else {
+            return report(name, slug, false, "(couldn't create a UserDefaults suite)")
+        }
+        suite.removePersistentDomain(forName: suiteName)
+        suite.set("bogus", forKey: Key.menuBarIconStyle.rawValue)
+        suite.set("#abcdef", forKey: Key.menuBarIconIdleColor.rawValue)
+        let current = AppSettingsFileStore.currentStringSettings(defaults: suite)
+        suite.removePersistentDomain(forName: suiteName)
+        guard current == [.menuBarIconStyle: "color", .menuBarIconSyncingColor: "", .menuBarIconIdleColor: "#ABCDEF"] else {
+            return report(name, slug, false, "(currentStringSettings didn't fall back / normalize: \(current))")
+        }
+
+        let dir = "\(selfTestRoot)/app-settings"
+        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        let path = "\(dir)/settings.json"
+        let seed = #"{"debugLoggingEnabled":true,"launchAtLogin":true,"menuBarIconStyle":"neon","menuBarIconIdleColor":"00ff00","menuBarIconSyncingColor":7}"#
+        FileManager.default.createFile(atPath: path, contents: Data(seed.utf8))
+        guard AppSettingsFileStore.readStringSettings(at: path) == [.menuBarIconIdleColor: "#00FF00"] else {
+            return report(name, slug, false, "(readStringSettings applied an invalid value: \(AppSettingsFileStore.readStringSettings(at: path)))")
+        }
+        guard AppSettingsFileStore.updateSettingsFile(
+                values: ["menuBarIconStyle": "custom", "autoFixSyncIssues": false], isLoginItemEnabled: false, directory: dir),
+              let written = FileManager.default.contents(atPath: path),
+              let json = (try? JSONSerialization.jsonObject(with: written)) as? [String: Any],
+              json["menuBarIconStyle"] as? String == "custom", json["autoFixSyncIssues"] as? Bool == false,
+              json["launchAtLogin"] as? Bool == true, json["debugLoggingEnabled"] as? Bool == true,
+              json["menuBarIconIdleColor"] as? String == "00ff00" else {
+            return report(name, slug, false, "(updateSettingsFile(values:) didn't keep the other keys)")
+        }
+
+        guard case .success(.settings(.show(json: false))) = SyncTrayCLI.parse(["settings"]),
+              case .success(.settings(.show(json: true))) = SyncTrayCLI.parse(["settings", "--json"]),
+              case .success(.settings(.show(json: true))) = SyncTrayCLI.parse(["settings", "show", "--json"]),
+              case .success(.settings(.get(key: "menuBarIconStyle"))) = SyncTrayCLI.parse(["settings", "get", "menuBarIconStyle"]),
+              case .success(.settings(.set(let pairs))) = SyncTrayCLI.parse(["settings", "set", "menuBarIconIdleColor", "", "debugLoggingEnabled", "on"]),
+              pairs == [ProfileAssignment(key: "menuBarIconIdleColor", value: ""), ProfileAssignment(key: "debugLoggingEnabled", value: "on")],
+              case .failure = SyncTrayCLI.parse(["settings", "set", "menuBarIconStyle"]),
+              case .failure = SyncTrayCLI.parse(["settings", "get"]),
+              case .failure = SyncTrayCLI.parse(["settings", "frob"]),
+              SyncTrayCLI.telemetryVerb(for: ["settings"]) == "settings-show",
+              SyncTrayCLI.telemetryVerb(for: ["settings", "set", "x", "y"]) == "settings-set",
+              SyncTrayCLI.telemetryVerb(for: ["settings", "frob"]) == "(other)" else {
+            return report(name, slug, false, "(settings parse or telemetry verb wrong)")
+        }
+
+        var writes: [[String: AppSettingValue]] = []
+        var out = "", err = ""
+        var env = fakeCLIEnvironment(stdout: { out += $0 }, stderr: { err += $0 })
+        env.readAppSettings = {
+            ["debugLoggingEnabled": .bool(false), "menuBarIconStyle": .string("color"), "menuBarIconIdleColor": .string("")]
+        }
+        env.writeAppSettings = { writes.append($0); return nil }
+
+        let bad = SyncTrayCLI.execute(["settings", "set", "debugLoggingEnabled", "true", "menuBarIconStyle", "neon"], env: env)
+        guard bad == 65, writes.isEmpty, err.contains("color|monochrome|custom") else {
+            return report(name, slug, false, "(a bad value didn't refuse before writing: exit \(bad), writes \(writes), err \(err.debugDescription))")
+        }
+        err = ""
+        guard SyncTrayCLI.execute(["settings", "set", "nope", "1"], env: env) == 65, writes.isEmpty, err.contains("unknown setting") else {
+            return report(name, slug, false, "(an unknown key wasn't refused)")
+        }
+        out = ""
+        let ok = SyncTrayCLI.execute(["settings", "set", "menuBarIconSyncingColor", "ff8800", "debugLoggingEnabled", "yes"], env: env)
+        guard ok == 0, writes == [["menuBarIconSyncingColor": .string("#FF8800"), "debugLoggingEnabled": .bool(true)]],
+              out == "debugLoggingEnabled=true\nmenuBarIconSyncingColor=#FF8800\n" else {
+            return report(name, slug, false, "(settings set wrote \(writes) / printed \(out.debugDescription))")
+        }
+        out = ""
+        guard SyncTrayCLI.execute(["settings"], env: env) == 0,
+              out == "debugLoggingEnabled=false\nmenuBarIconStyle=color\nmenuBarIconIdleColor=\n" else {
+            return report(name, slug, false, "(settings show printed \(out.debugDescription))")
+        }
+        out = ""
+        guard SyncTrayCLI.execute(["settings", "--json"], env: env) == 0,
+              let shown = (try? JSONSerialization.jsonObject(with: Data(out.utf8))) as? [String: Any],
+              shown["debugLoggingEnabled"] as? Bool == false, shown["menuBarIconStyle"] as? String == "color" else {
+            return report(name, slug, false, "(settings --json printed \(out.debugDescription))")
+        }
+        out = ""
+        guard SyncTrayCLI.execute(["settings", "get", "menuBarIconStyle"], env: env) == 0, out == "color\n",
+              SyncTrayCLI.execute(["settings", "get", "nope"], env: env) == 65 else {
+            return report(name, slug, false, "(settings get wrong: \(out.debugDescription))")
+        }
+
+        guard let managerSource = readSourceFile("Services/SyncManager.swift"),
+              let applyAt = managerSource.range(of: "applySettingsFile(includeLoginItem: false)"),
+              let rewriteAt = managerSource.range(of: "refreshSettingsFile()", range: applyAt.upperBound..<managerSource.endIndex),
+              !managerSource[applyAt.upperBound..<rewriteAt.lowerBound].contains("func ") else {
+            return report(name, slug, false, "(launch doesn't apply settings.json before rewriting it)")
+        }
+
         return report(name, slug, true)
     }
 

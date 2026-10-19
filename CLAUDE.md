@@ -908,7 +908,7 @@ the warmer reads as before — safe degradation.
 | `DirectoryWatcher.swift` | FSEvents-based directory monitoring with debouncing |
 | `ConfigFileWatcher.swift` | FSEvents watcher on `~/.config/synctray` for external profile/settings edits; self-write suppression via `ConfigSelfWriteRegistry` |
 | `ConfigReconciler.swift` | `SyncManager.reconcileAction` (shared launchd install/uninstall/reinstall delta logic), `SyncManager.applyExternalCreateIfNeeded`/`ExternalCreateOutcome` (create-from-file decision), `warmReconcileNeeded`/`applyWarmReconcileIfNeeded` (orthogonal app-side warm delta — pinned dirs / warm-exclude globs), and `SettingsReconciler` (isolated launch-at-login apply) |
-| `AppSettingsFileStore.swift` | Reads/writes `~/.config/synctray/settings.json` — an enumerated safe-key mirror of `SyncTraySettings` (no secrets, no telemetry IDs) |
+| `AppSettingsFileStore.swift` | Reads/writes `~/.config/synctray/settings.json` — an enumerated mirror of the app-wide settings: on/off `SafeKey`s and validated `StringKey`s (the menu bar icon); no secrets, no telemetry IDs |
 | `ConfigSchemaInstaller.swift` | Copies the committed JSON Schemas into `~/.config/synctray/schema/` at launch |
 | `ConfigSelfTest.swift` | `#if DEBUG` host self-test suite (`SyncTray --self-test`) — round-trip (incl. `warmExcludePatterns`), migration + migration-integrity, reconcile-delta, warm-reconcile-trigger, warm-skips-cached, self-write, isolated-login, external-create, and CLI assertions |
 | `NotificationService.swift` | Batched macOS notifications with action support |
@@ -936,7 +936,7 @@ running app applies the change live, without a restart.
 |------|----------|-------|
 | `profiles/{shortId}.profile.json` | Full `SyncProfile`, including `isEnabled`, `isMuted`, `mountAtStartup`, and the app-side warm fields `pinnedDirectories` / `warmExcludePatterns` | NEW authoritative file. Written by `ProfileStore.save()` (encodes the whole model, so any new `SyncProfile` field flows in automatically); read by `ProfileStore.load()` (file-authoritative). References `../schema/profile.schema.json` via `$schema`. |
 | `profiles/{shortId}.json` | Derived, script-only subset (frozen key set) | Unchanged, byte-for-byte — this is `SyncSetupService.generateProfileConfig`'s output, consumed only by the sync shell script. The app never reads it back, except to rewrite a stale `mountModePath` at launch (`SyncSetupService.refreshMountModePathIfChanged`). |
-| `settings.json` | Enumerated safe subset of `SyncTraySettings` (`debugLoggingEnabled`, `autoFixSyncIssues`, `telemetryEnabled`, `launchAtLogin`) | Written by `AppSettingsFileStore`. Never contains secrets or telemetry identifiers (`installationId`, `anonymousUserId`). |
+| `settings.json` | Every app-wide setting: the on/off `SafeKey`s (`debugLoggingEnabled`, `autoFixSyncIssues`, `telemetryEnabled`, `launchAtLogin`) and the validated `StringKey`s (`menuBarIconStyle`, `menuBarIconSyncingColor`, `menuBarIconIdleColor`) | Written by `AppSettingsFileStore`. Never contains secrets or telemetry identifiers (`installationId`, `anonymousUserId`). An invalid value is ignored (key left unchanged). Launch applies the file BEFORE rewriting it from the app's state (`SyncManager.applySettingsFile(includeLoginItem: false)`), so an edit made while the app was closed isn't discarded — every key but `launchAtLogin`, which a stale file must not use to undo a System Settings change. The schema's properties must equal `AppSettingsFileStore.allKeyNames` (AC-ST1). |
 | `schema/profile.schema.json`, `schema/settings.schema.json` | Committed JSON Schemas | Copied out of the app bundle by `ConfigSchemaInstaller` at every launch. Kept in lockstep with `SyncProfile.CodingKeys` by the fail-closed `scripts/check-schema-in-sync.sh`, run locally and in CI. |
 
 **Live apply, not a struct swap.** A single `ConfigFileWatcher` (FSEvents,
@@ -1294,8 +1294,11 @@ what `MenuBarIcon` / `CircularProgressIcon` draw; an unset or malformed `#RRGGBB
 the default colors. Stored in `UserDefaults.standard` under `menuBarIconStyle`,
 `menuBarIconSyncingColor` and `menuBarIconIdleColor`, read with `@AppStorage` in `SyncTrayApp`
 (so a change redraws the label through the App body, like a state change) and written by
-`AppSettingsView`. Deliberately **not** in `settings.json`: `AppSettingsFileStore` is a
-Bool-only safe-key mirror, and these are display preferences. The icon also carries a
+`AppSettingsView`. Mirrored to `settings.json` as `AppSettingsFileStore.StringKey`s (validated by
+`StringKey.normalize`: a known style, `#RRGGBB` uppercased, or `""` for the default color) and
+settable with `synctray settings set`; an external edit is applied by writing the same
+`UserDefaults` keys in-process, which is what notifies `@AppStorage` (so the CLI's own
+cross-process write isn't relied on to redraw). The icon also carries a
 VoiceOver label (`MenuBarIcon.voiceOverLabel`, e.g. "SyncTray, syncing 42 percent"). Covered
 by `ConfigSelfTest` AC-MB1 (resolution, hex parsing, stored values) and AC-MB2 (template flag,
 drawn pixels, VoiceOver labels, wiring).
@@ -1354,6 +1357,7 @@ Covered by `ConfigSelfTest` AC-CLI4 and AC-SEC3.
 | `synctray test-remote <name\|shortId>` | Probe one profile's remote with the same path-scoped `rclone lsjson --stat <remote>:<path>` probe `doctor` uses (never `lsd`) under a hard timeout; prints `reachable: <remote>` (with ` (path not found)` appended, still exit 0, when the remote answered but the path doesn't exist) or the real rclone stderr (ERROR/CRITICAL preferred over a NOTICE line). |
 | `synctray listremotes` | `rclone listremotes`, passthrough. |
 | `synctray remote folders <remote>[:path] [--json]` | List a remote's folders exactly as the profile editor's folder chooser and the setup wizard show them — same `rclone lsf --dirs-only` arguments (`RcloneConfigService.folderListingArguments`, including the remote's `no_check_certificate`) and the same parser (`parseDirectoryListing`), so names with spaces come out verbatim. Needs no profile. `--json` prints a JSON array, which makes leading/trailing spaces visible. Covered by `ConfigSelfTest` AC-CLI12 (and AC-RF1 for the parser). |
+| `synctray settings [show\|get <key>] [--json]` | Every app-wide setting (`AppSettingsFileStore.allKeyNames`) with the value the app actually uses (UserDefaults, `SMAppService` for launch at login) — `key=value` lines, or a sorted-key object with `--json`. |
 | `synctray telemetry [status\|on\|off] [--json]` | Show or change whether usage data is shared — the same setting as the app's telemetry toggle (see "Privacy and consent" below). `status --json` prints `{"asked":…,"enabled":…}`. `on`/`off` count as answering the first-run question. |
 
 **Configure** (mutating — headless-capable, no running app required):
@@ -1367,6 +1371,7 @@ Covered by `ConfigSelfTest` AC-CLI4 and AC-SEC3.
 | `synctray profile delete <name\|shortId>` | Uninstall the agent (detaching a mounted volume first) and remove the `.profile.json`. |
 | `synctray install <name\|shortId>` | Install an already-enabled profile's launchd agent (idempotent; runs `SyncSetupService.install`). Complements `profile enable`, which early-returns without installing when the profile is ALREADY enabled — so `install` re-creates an agent that went missing. Refuses a disabled or incomplete profile. Never flips `isEnabled`. |
 | `synctray reinstall <name\|shortId>` | Regenerate script+plist and reinstall the agent (uninstall → install), i.e. the settings-save reinstall path; for a mounted Stream profile this detaches then remounts. Works for any sync mode. Refuses a disabled profile. |
+| `synctray settings set <key> <value> [<key> <value> …]` | Change app-wide settings. Every pair is validated first (`SyncTrayCLI.parseAppSetting`; a bad key or value exits `65` and writes nothing), then applied where the app reads it — `SyncTraySettings`/`UserDefaults`, `SMAppService` for `launchAtLogin`, `setTelemetryEnabledProcess` for `telemetryEnabled` (consent version + opt-out event) — and to `settings.json` in one `updateSettingsFile(values:)` write that keeps the other keys, so a running app applies it live and a stopped one already has it. Covered by `ConfigSelfTest` AC-ST1. |
 
 **Operate:**
 
