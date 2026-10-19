@@ -195,7 +195,7 @@ enum DiagnosticRedactor {
     /// Each rule skips a value that is already `[REDACTED]`, so `redact` is idempotent.
     private static let ruleSpecs: [(pattern: String, template: String)] = [
         // 1. JSON `"<key>": "<value>"` for a secret key (exact key match).
-        (#"(?i)("(?:password|passwd|pass|token|access[_-]?token|refresh[_-]?token|auth[_-]?token|session[_-]?token|client[_-]?secret|secret|api[_-]?key|cookie|set-cookie|authorization|proxy-authorization)"\s*:\s*")(?:[^"\\]|\\.)*(")"#,
+        (#"(?i)("(?:password|passwd|pass|token|access[_\-]?token|refresh[_\-]?token|auth[_\-]?token|session[_\-]?token|client[_\-]?secret|secret|api[_\-]?key|cookie|set-cookie|authorization|proxy-authorization)"\s*:\s*")(?:[^"\\]|\\.)*(")"#,
          "$1[REDACTED]$2"),
         // 2. `Authorization: …` / `Cookie: …` header values, up to a quote or end of line.
         (#"(?i)(\b(?:proxy-)?authorization\s*+[:=]\s*+|\b(?:set-)?cookie\s*+:\s*+)(?!\[REDACTED\])[^"\r\n]+"#,
@@ -205,15 +205,15 @@ enum DiagnosticRedactor {
          "$1 [REDACTED]"),
         // 4. Secret env assignments: RCLONE_…_PASS/_TOKEN/_SECRET/_KEY (incl. RCLONE_RC_PASS),
         //    DASH0_AUTH_TOKEN, OTEL_EXPORTER_OTLP[_<SIGNAL>]_HEADERS.
-        (#"(?i)(?<![A-Za-z0-9_])((?:RCLONE_[A-Z0-9_]*_(?:PASS|PASSWORD|TOKEN|SECRET|KEY)[0-9]?)|DASH0_AUTH_TOKEN|OTEL_EXPORTER_OTLP(?:_[A-Z]+)?_HEADERS)(\s*+=\s*+)(?!\[REDACTED\])(?:"[^"]*"|'[^']*'|[^\s"]+)"#,
+        (#"(?i)(?<![A-Za-z0-9_])((?:RCLONE_[A-Z0-9_]*_(?:PASS|PASSWORD|TOKEN|SECRET|KEY)[0-9]?)|DASH0_AUTH_TOKEN|OTEL_EXPORTER_OTLP(?:_[A-Z]+)?_HEADERS)(\s*+=\s*+)(?!\[REDACTED\])(?:\{[^\{\}\r\n]*\}|"[^"]*"|'[^']*'|[^\s"]+)"#,
          "$1$2[REDACTED]"),
         // 5. CLI flags whose name ends in -pass/-password/-token/-secret/-key (so also
         //    -client-secret, -secret-access-key), `--flag value` and `--flag=value`. The flag
         //    must start a word, so a path like `a-b-token notes` is not a flag.
-        (#"(?i)(?<![^\s"'])(--?(?:[a-z0-9][a-z0-9_-]*-)?(?:pass|password|token|secret|key|key-pem|credentials)[0-9]?)(=|\s++)(?!\[REDACTED\])(?!--[a-z])(?:\\".*?\\"|"[^"]*"|'[^']*'|[^\s"]+)"#,
+        (#"(?i)(?<![^\s"'])(--?(?:[a-z0-9][a-z0-9_\-]*-)?(?:pass|password|token|secret|key|key-pem|credentials)[0-9]?)(=|\s++)(?!\[REDACTED\])(?!--[a-z])(?:\{[^\{\}\r\n]*\}|\\".*?\\"|"[^"]*"|'[^']*'|[^\s"]+)"#,
          "$1$2[REDACTED]"),
         // 6. `key=value`, `key: value`, `key = value` for a known secret key.
-        (#"(?i)(?<![a-z0-9])(password|passwd|pass|access_token|refresh_token|auth_token|session_token|client_secret|secret|api_key|apikey|cookie|token)(\s*+[=:]\s*+)(?!\[REDACTED\])("[^"]*"|'[^']*'|[^\s,;&"'}\]]+)"#,
+        (#"(?i)(?<![a-z0-9])(password|passwd|pass|access_token|refresh_token|auth_token|session_token|client_secret|secret|api_key|apikey|cookie|token)(\s*+[=:]\s*+)(?!\[REDACTED\])("[^"]*"|'[^']*'|[^\s,;\&"'\}\]]+)"#,
          "$1$2[REDACTED]"),
         // 7. URL userinfo: scheme://user:pass@host → scheme://[REDACTED]@host.
         (#"(?i)\b([a-z][a-z0-9+.\-]*://)(?!\[REDACTED\]@)[^/\s@"']+@"#,
@@ -952,9 +952,19 @@ enum DiagnosticReportUploader {
               let url = URL(string: "\(TelemetryService.diagnosticExportEndpoint)/v1/logs") else {
             return nil
         }
-        var resource = TelemetryService.diagnosticResourceAttributes()
+        return Configuration(
+            endpoint: url,
+            headers: TelemetryService.diagnosticExportHeaders,
+            resource: resourceAttributes(base: TelemetryService.diagnosticResourceAttributes())
+        )
+    }
+
+    /// The telemetry resource attributes with `synctray.process.kind` = `diagnostics`, so a
+    /// report's records are told apart from the app's and the CLI's own telemetry. Pure.
+    static func resourceAttributes(base: [String: String]) -> [String: String] {
+        var resource = base
         resource["synctray.process.kind"] = "diagnostics"
-        return Configuration(endpoint: url, headers: TelemetryService.diagnosticExportHeaders, resource: resource)
+        return resource
     }
 
     private static let session: URLSession = {
