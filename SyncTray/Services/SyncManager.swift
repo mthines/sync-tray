@@ -470,13 +470,9 @@ final class SyncManager: ObservableObject {
         removeAllLegacyOfflineLinks()  // Clean up any (Offline) symlink left by the retired feature
         setupFinderSyncIPC()
         updateAppGroupMountPaths()
-        // Apply edits made to settings.json while the app wasn't running BEFORE
-        // rewriting the file from the app's state — otherwise the rewrite would
-        // silently discard them. Only keys changed outside the app since it last
-        // wrote the file: a setting the app changed without rewriting the file
-        // (the telemetry banner, the setup wizard) must not be reverted by the
-        // stale value. Not launchAtLogin: a stale file must not undo a
-        // login-item change made in System Settings while the app was closed.
+        // Apply settings.json keys edited outside the app while it was closed, before the
+        // rewrite below discards them — never a key the app changed itself (the telemetry
+        // banner), and never launchAtLogin, which System Settings may have changed since.
         let changedOutsideApp = AppSettingsFileStore.keysChangedSinceLastWrite(
             file: AppSettingsFileStore.readSettingsFileJSON() ?? [:],
             snapshot: AppSettingsFileStore.lastWrittenSnapshot()

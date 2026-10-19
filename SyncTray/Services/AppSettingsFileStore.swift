@@ -263,10 +263,7 @@ enum AppSettingsFileStore {
     /// A key that is absent, not a string, or not a valid value is left out —
     /// "leave unchanged", the same rule as `readSafeSettings`.
     static func readStringSettings(at path: String = AppSettingsFileStore.settingsFilePath) -> [StringKey: String] {
-        guard let data = FileManager.default.contents(atPath: path),
-              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            return [:]
-        }
+        guard let json = readSettingsFileJSON(at: path) else { return [:] }
 
         var result: [StringKey: String] = [:]
         for key in StringKey.allCases {
