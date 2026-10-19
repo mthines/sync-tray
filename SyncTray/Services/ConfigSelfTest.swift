@@ -7961,6 +7961,13 @@ enum ConfigSelfTest {
             ("failed to get StartPageToken: invalid character '<' looking for beginning of value", "other"),
             // A file merely named x509 is not a TLS error.
             ("open /Users/me/Sync/certs/x509.pem: no such file or directory", "file_not_found"),
+            // A path segment named tls or x509 is not a TLS error either ("/" precedes it, not a space)…
+            ("open /Users/me/Sync/certs/tls: permission denied", "permission_denied"),
+            ("open /Users/me/Sync/certs/x509: no such file or directory", "file_not_found"),
+            // …while Go's prefixes still match mid-message and at the very start of the message.
+            ("tls: first record does not look like a TLS handshake", "tls_certificate"),
+            ("x509: certificate is valid for nas.local, not nas.example.com", "tls_certificate"),
+            ("remote error: tls: bad certificate", "tls_certificate"),
             // Unchanged buckets.
             (photosDenial, "permission_denied"),
             ("Failed to sync with 2 errors: last error was: not deleting files as there were IO errors", "io_errors_blocked_deletes"),

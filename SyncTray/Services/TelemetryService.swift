@@ -3125,7 +3125,12 @@ final class TelemetryService {
         if SyncLogPatterns.isIOErrorsBlockedDeletes(msg) {
             return "io_errors_blocked_deletes"
         }
-        for (bucket, needles) in specificErrorBuckets where needles.contains(where: { lower.contains($0) }) {
+        // Matched against the message with one leading space, so the space-prefixed TLS
+        // needles (" x509:", " tls:") also catch a message that STARTS with Go's prefix,
+        // while a path segment that merely ends in tls or x509 ("…/certs/tls: permission
+        // denied", where a "/" precedes it) never matches. Every other needle is unaffected.
+        let padded = " " + lower
+        for (bucket, needles) in specificErrorBuckets where needles.contains(where: { padded.contains($0) }) {
             return bucket
         }
         if msg.contains("not found") || msg.contains("no such") {
@@ -3159,7 +3164,11 @@ final class TelemetryService {
     /// Needles are phrases rclone and the Go runtime actually print, kept narrow because the
     /// message usually also carries a file path: TLS is matched by Go's `x509:` / `tls:`
     /// error prefixes rather than the bare words "x509" or "certificate", which would claim
-    /// any error about a file named e.g. "x509.pem" or "Birth Certificate.pdf"; and
+    /// any error about a file named e.g. "x509.pem" or "Birth Certificate.pdf"; those two
+    /// prefixes are matched with a leading space (" x509:", " tls:"), against the message
+    /// padded with one leading space by `categorizeError`, so a path segment named `tls` or
+    /// `x509` followed by `: <error>` ("…/certs/tls: permission denied") is not claimed
+    /// either; and
     /// `invalid_name` takes "invalid characters" (plural), not "invalid character", which is
     /// how Go's JSON decoder reports an HTML page where JSON was expected ("invalid character
     /// '<' looking for beginning of value"). The values are bounded labels; the message
@@ -3170,7 +3179,7 @@ final class TelemetryService {
         ("quota_exceeded", ["storagequotaexceeded", "quotaexceeded", "quota exceeded", "insufficient storage"]),
         ("network", ["no such host", "connection reset", "connection refused", "network is unreachable", "broken pipe"]),
         ("timeout", ["context deadline exceeded", "deadline exceeded", "i/o timeout", "timed out", "handshake timeout"]),
-        ("tls_certificate", ["x509:", "tls:", "certificate signed by", "certificate has expired",
+        ("tls_certificate", [" x509:", " tls:", "certificate signed by", "certificate has expired",
                              "certificate verify failed", "bad certificate"]),
         ("auth_failed", ["invalid_grant", "token expired", "expired token", "oauth2:", "unauthorized",
                          "authentication failed", "couldn't fetch token", "failed to refresh token"]),
