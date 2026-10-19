@@ -140,7 +140,7 @@ struct DiagnosticReport: Equatable {
 /// The disclosure and follow-up copy, shared by the app's sheet and the CLI so the two
 /// always say the same thing.
 enum DiagnosticReportCopy {
-    static let disclosure = "This report includes recent sync log lines, your profile settings and their status. Unlike usage data, it can include file and folder names, paths in your home folder (including your username), remote names and full error messages. SyncTray removes the passwords and tokens it recognizes before anything is sent. If usage data is on, the report is linked to SyncTray's anonymous install ID. It goes to the SyncTray developer, and nothing is sent until you press Send."
+    static let disclosure = "This report includes recent sync log lines, your profile settings and their status. Unlike usage data, it can include file and folder names, paths in your home folder (including your username), remote names and full error messages. SyncTray removes the passwords and tokens it recognizes before anything is sent. If usage data is on, the report is linked to SyncTray's anonymous install ID. It goes to the SyncTray developer, and nothing is sent until you choose to send it."
 
     static let shareCode = "Send this code to the developer so they can find your report."
 }
