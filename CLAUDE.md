@@ -1842,30 +1842,46 @@ who finds the report in Dash0 by `diagnostics.report_id`.
   CLI's status/doctor helpers make — and `plannedReads(for:)` lists everything a build reads.
 - **Redaction.** `DiagnosticRedactor.redact` runs on every line of every section BEFORE the 8 KB
   per-line cap (so a cut can't leave half a secret). It replaces values with `[REDACTED]` and keeps
-  the key/flag name: JSON `"password": "…"`-style keys, `key=value`/`key: value` for
-  password/passwd/pass/token/access_token/refresh_token/client_secret/secret/api_key/apikey/
-  auth_token/session_token/cookie, `Authorization:`/`Cookie:` headers and `Bearer` tokens, rclone
-  flags ending in `-pass`/`-password`/`-token`/`-secret`/`-key` (`--x value` and `--x=value`), URL
-  userinfo (`scheme://[REDACTED]@host`), and `RCLONE_…_PASS/_TOKEN/_SECRET/_KEY`,
+  the key/flag name: JSON `"password": "…"`-style keys (also `secret_access_key`, `private_key`,
+  `account_key`, `sas_url`), `key=value`/`key: value` for
+  password/passwd/pass/token/access_token/refresh_token/client_secret/secret_access_key/
+  private_key/account_key/sas_url/secret/api_key/api-key/apikey/auth_token/session_token/cookie
+  (so `X-Api-Key:` and rclone connection strings like `:s3,…,secret_access_key=…:bucket` too),
+  `Authorization:`/`Cookie:` headers and `Bearer` tokens, rclone flags ending in
+  `-pass`/`-password`/`-token`/`-secret`/`-key`/`-sas-url` (`--x value` and `--x=value`), URL
+  userinfo (`scheme://[REDACTED]@host`), signed-URL query values (`?sig=`/`&sig=`,
+  `signature=`, `X-Amz-Signature=`), and `RCLONE_…_PASS/_TOKEN/_SECRET/_KEY`,
   `RCLONE_RC_PASS`, `DASH0_AUTH_TOKEN`, `OTEL_EXPORTER_OTLP_HEADERS` assignments. Every rule needs
-  that context, so ordinary file names (`Keynote.key`, `passport.pdf`) survive.
+  that context, so ordinary file names (`Keynote.key`, `passport.pdf`, `Design sig=draft.txt`)
+  survive. It only removes what it recognizes — the disclosure says so ("SyncTray removes the
+  passwords and tokens it recognizes").
 - **Limits.** Lines are capped at 8 KB (`…[truncated]`); the whole report at ~5 MB, dropping the
-  oldest log lines first and saying so (`notes`, `diagnostics.truncated`).
+  oldest log lines first (round-robin across profiles, never touching a profile's "(no sync log
+  at …)" placeholder) and saying so (`notes`, `diagnostics.truncated`).
 - **Transport.** `DiagnosticReportUploader.send` POSTs OTLP/HTTP JSON (`ExportLogsServiceRequest`,
   built by the pure `DiagnosticOTLPEncoder`) to `<endpoint>/v1/logs` with the telemetry exporter's
   own headers and resource attributes (read through `TelemetryService.diagnosticExportEndpoint` /
-  `diagnosticExportHeaders` / `diagnosticResourceAttributes()`, which don't change how telemetry
-  is set up), plus `synctray.process.kind=diagnostics`, in batches of ≤ 200 records; a non-2xx
-  response throws with its status. One record per line, after a leading `Diagnostic report`
-  summary record; record and attribute details are in `.claude/rules/telemetry.md`. A build with
+  `diagnosticExportHeaders` / `diagnosticResourceAttributes(includeInstallIdentity:)`, which don't
+  change how telemetry is set up), plus `synctray.process.kind=diagnostics`, in batches of ≤ 200
+  records and about 1 MB (`DiagnosticOTLPEncoder.batches`; one oversize record goes alone); a
+  non-2xx response throws with its status. One record per line, after a leading `Diagnostic
+  report` summary record. Every record is stamped with the report's creation time plus its
+  ordinal in nanoseconds — never rclone's own line time, which travels as `rclone.time` — so a
+  report sits together at send time and keeps its order in a time-sorted view. Record and
+  attribute details are in `.claude/rules/telemetry.md`.
+- **Install identity only with usage data on.** With usage data off, the resource omits
+  `enduser.id` and `service.instance.id` (`DiagnosticReportUploader.resourceAttributes(base:telemetryEnabled:)`)
+  and `SyncTraySettings.installationId` is never read — reading it creates and persists an ID for
+  someone who never opted in. With usage data on, the report is linked to the anonymous install
+  ID, and the disclosure says so. A build with
   no OTLP auth headers throws "Diagnostic upload isn't configured in this build" and the sheet
   keeps **Save to Desktop** available (`SyncTray-report-<code>.txt`, written 0600).
 - **Usage telemetry about it** — only when usage data is on — is one bounded `Diagnostic report
   sent`/`failed` log (`TelemetryService.recordDiagnosticReport`), never report content.
 
 Covered by `ConfigSelfTest` AC-DR1 (code), AC-DR2 (redaction table), AC-DR3 (builder, limits,
-never-read), AC-DR4 (OTLP encoding and batching), AC-DR5 (CLI parse) and AC-DR6 (CLI consent and
-send routing).
+never-read), AC-DR4 (OTLP encoding, timestamps, batching, install identity), AC-DR5 (CLI parse)
+and AC-DR6 (CLI consent, send routing, 0600 saved copy).
 
 ## Generated Files (per profile)
 

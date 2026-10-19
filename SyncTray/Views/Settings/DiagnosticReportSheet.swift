@@ -29,6 +29,12 @@ struct DiagnosticReportSheet: View {
         case failed(String)
     }
 
+    /// A report and its rendered text, both produced off the main thread.
+    private struct BuiltReport {
+        let report: DiagnosticReport
+        let text: String
+    }
+
     let allProfiles: [SyncProfile]
     let focusProfile: SyncProfile?
 
@@ -150,6 +156,9 @@ struct DiagnosticReportSheet: View {
                     dismiss()
                 }
                 .keyboardShortcut(.cancelAction)
+                // Dismissing mid-send would leave the upload running, and a retry would
+                // upload the same report again under the same code.
+                .disabled(phase == .sending)
 
                 Button("Send") {
                     send()
@@ -203,8 +212,8 @@ struct DiagnosticReportSheet: View {
 
     // MARK: - Actions
 
-    /// Run `action` with a report for the current scope, building one off the main thread
-    /// first if needed.
+    /// Run `action` with a report for the current scope, building (and rendering) one off the
+    /// main thread first if needed.
     private func withReport(_ action: @escaping (DiagnosticReport) -> Void) {
         if let report, reportScope == scope {
             action(report)
@@ -216,14 +225,15 @@ struct DiagnosticReportSheet: View {
         phase = .building
         saveMessage = nil
         Task { @MainActor in
-            let built = await Task.detached(priority: .userInitiated) {
-                DiagnosticReportBuilder.build(profiles: profiles, environment: .production())
+            let built = await Task.detached(priority: .userInitiated) { () -> BuiltReport in
+                let fresh = DiagnosticReportBuilder.build(profiles: profiles, environment: .production())
+                return BuiltReport(report: fresh, text: fresh.render())
             }.value
-            report = built
+            report = built.report
             reportScope = requestedScope
-            previewText = nil
+            previewText = built.text
             phase = .idle
-            action(built)
+            action(built.report)
         }
     }
 
@@ -232,10 +242,8 @@ struct DiagnosticReportSheet: View {
             showingPreview = false
             return
         }
-        withReport { built in
-            if previewText == nil {
-                previewText = built.render()
-            }
+        // `withReport` sets `previewText` together with the report (rendered off main).
+        withReport { _ in
             showingPreview = true
         }
     }
@@ -301,6 +309,8 @@ private struct DiagnosticReportTextView: NSViewRepresentable {
             textView.isSelectable = true
             textView.isRichText = false
             textView.textContainerInset = NSSize(width: 6, height: 6)
+            // Lay out only what's visible — a report can run to megabytes.
+            textView.layoutManager?.allowsNonContiguousLayout = true
             textView.string = text
             textView.font = NSFont.monospacedSystemFont(ofSize: 11, weight: .regular)
         }

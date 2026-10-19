@@ -334,27 +334,33 @@ telemetry: it is uploaded only when the user presses **Send** (or runs `synctray
 and confirms), whether or not `telemetryEnabled` is on, and it does not go through the OTel SDK.
 `DiagnosticReportUploader` POSTs OTLP/HTTP JSON (`ExportLogsServiceRequest`: resourceLogs →
 scopeLogs (scope `synctray.diagnostics`) → logRecords) to `<endpoint>/v1/logs` with
-`Content-Type: application/json` and the exporter's own headers, ≤ 200 records per request.
+`Content-Type: application/json` and the exporter's own headers, ≤ 200 records and about
+1 MB per request (`DiagnosticOTLPEncoder.batches`; a single oversize record goes alone).
 
-**Resource:** the same attributes as every telemetry signal (`TelemetryService.diagnosticResourceAttributes()`
-— `service.name`, `service.namespace`, `service.version`, `service.instance.id`, `enduser.id`,
-`os.type`, `os.version`, `host.arch`, `deployment.environment.name`, `vcs.*`), with
-`synctray.process.kind` = `diagnostics`.
+**Resource:** the same attributes as every telemetry signal (`TelemetryService.diagnosticResourceAttributes(includeInstallIdentity:)`
+— `service.name`, `service.namespace`, `service.version`, `os.type`, `os.version`, `host.arch`,
+`deployment.environment.name`, `vcs.*`), with `synctray.process.kind` = `diagnostics`. The
+install identity (`service.instance.id`, `enduser.id`) is included ONLY when usage data is on;
+with it off both are omitted and `SyncTraySettings.installationId` is never read, so sending a
+report never creates an install ID (`DiagnosticReportUploader.resourceAttributes(base:telemetryEnabled:)`).
 
 **Records** (`DiagnosticOTLPEncoder`, pure, AC-DR4):
 
 | Record | Body | Attributes |
 |--------|------|------------|
 | Summary (first) | `Diagnostic report` | `diagnostics.report_id`, `diagnostics.profile_count` (int), `diagnostics.line_count` (int), `diagnostics.truncated` (bool) |
-| One per report line | the redacted line | `diagnostics.report_id`, `diagnostics.source` (`log`/`status`/`doctor`/`config`/`filter`/`locks`/`processes`/`launchd`/`system`), `diagnostics.line` (1-based within its section), `synctray.profile.id` + `synctray.profile.name` for per-profile sections; for an rclone `--use-json-log` line also `rclone.level`, `rclone.msg`, `rclone.object` when present |
+| One per report line | the redacted line | `diagnostics.report_id`, `diagnostics.source` (`log`/`status`/`doctor`/`config`/`filter`/`locks`/`processes`/`launchd`/`system`), `diagnostics.line` (1-based within its section), `synctray.profile.id` + `synctray.profile.name` for per-profile sections; for an rclone `--use-json-log` line also `rclone.level`, `rclone.msg`, `rclone.object`, `rclone.time` (rclone's own timestamp, as written) when present |
 
-`timeUnixNano` is the rclone line's own `time` when the line is rclone JSON, otherwise the
-report's creation time plus the line's ordinal in nanoseconds (so order survives).
+`timeUnixNano` is the report's creation time plus the record's ordinal in nanoseconds — 0 for
+the summary, then 1, 2, … in report order — for EVERY record, so a report sits together at send
+time and its order survives in a time-sorted view. rclone's own line time is never used as the
+timestamp; it is kept as the `rclone.time` string attribute.
 `severityNumber`/`severityText` come from rclone's `level`: error/critical → ERROR (17),
 warning → WARN (13), notice/info → INFO (9), debug → DEBUG (5); anything else, and every
 non-JSON line, INFO. Every line is redacted (`DiagnosticRedactor`) before it is stored, so
-these bodies never carry a password, token or credential — but they DO carry paths and file
-names, which is why this is the only exempt path (see the Privacy carve-out above).
+these bodies don't carry the passwords, tokens or credentials it recognizes — but they DO carry
+paths and file names, which is why this is the only exempt path (see the Privacy carve-out
+above).
 
 To find a report: filter logs on `diagnostics.report_id = ST-XXXXXX` (and
 `synctray.process.kind = diagnostics`).

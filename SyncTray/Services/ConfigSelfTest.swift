@@ -8617,15 +8617,21 @@ enum ConfigSelfTest {
               capped.notes.contains(where: { $0.contains("left out") }) else {
             return report(name, slug, false, "(total cap not applied oldest-first: \(cappedBytes) bytes, first \(cappedLog.first ?? "-"))")
         }
+        // A profile with no log keeps its "(no sync log at …)" line — the cap never turns it
+        // into a misleading "…[1 older log line(s) left out]".
+        guard capped.sections[12].lines == ["(no sync log at \(stream.logPath))"] else {
+            return report(name, slug, false, "(cap dropped the missing-log placeholder: \(capped.sections[12].lines))")
+        }
         return report(name, slug, true)
     }
 
     // MARK: - AC-DR4 — diagnostic report OTLP encoding
 
-    /// Summary record first; every record carries `diagnostics.report_id`; an rclone JSON
-    /// line maps to severity, its own timestamp and `rclone.*` attributes; a plain line is
-    /// INFO at createdAt + ordinal; batches split at 200; the resource carries
-    /// `synctray.process.kind=diagnostics`.
+    /// Summary record first; every record carries `diagnostics.report_id` and is stamped
+    /// createdAt + its ordinal (strictly increasing, report order); an rclone JSON line maps to
+    /// severity and `rclone.*` attributes, its own time kept as `rclone.time`; a plain line is
+    /// INFO; batches split at 200 records and at ~1 MB; the resource carries
+    /// `synctray.process.kind=diagnostics` and, with usage data off, no install identity.
     private static func testDiagnosticOTLPEncoding() -> Bool {
         let name = "AC-DR4", slug = "diagnostic-otlp-encoding"
         let profileId = UUID()
@@ -8657,19 +8663,25 @@ enum ConfigSelfTest {
         guard records.allSatisfy({ $0.attributes["diagnostics.report_id"] == .string("ST-ABCDEF") }) else {
             return report(name, slug, false, "(a record lacks diagnostics.report_id)")
         }
+        let times = records.map { $0.timeUnixNano }
+        guard times == (0..<UInt64(records.count)).map({ 1_791_868_000_000_000_000 + $0 }) else {
+            return report(name, slug, false, "(records not stamped createdAt + ordinal in report order: \(times))")
+        }
         let system = records[1], plain = records[2], error = records[3], warn = records[4]
         guard system.attributes["synctray.profile.id"] == nil,
               system.attributes["diagnostics.source"] == .string("system"),
               plain.severityNumber == 9, plain.severityText == "INFO",
               plain.timeUnixNano == 1_791_868_000_000_000_002,
               plain.attributes["rclone.level"] == nil,
+              plain.attributes["rclone.time"] == nil,
               plain.attributes["diagnostics.line"] == .int(1),
               plain.attributes["synctray.profile.id"] == .string(profileId.uuidString),
               plain.attributes["synctray.profile.name"] == .string("Work") else {
             return report(name, slug, false, "(plain line record wrong: \(plain))")
         }
         guard error.severityNumber == 17, error.severityText == "ERROR",
-              error.timeUnixNano == 1_791_868_420_943_947_000,
+              error.timeUnixNano == 1_791_868_000_000_000_003,
+              error.attributes["rclone.time"] == .string("2026-10-13T07:13:40.943947+02:00"),
               error.body == errorLine,
               error.attributes["rclone.level"] == .string("error"),
               error.attributes["rclone.msg"] == .string("Failed to copy: quota exceeded"),
@@ -8679,7 +8691,8 @@ enum ConfigSelfTest {
             return report(name, slug, false, "(rclone error line record wrong: \(error))")
         }
         guard warn.severityNumber == 13, warn.severityText == "WARN",
-              warn.timeUnixNano == 1_791_868_421_000_000_000,
+              warn.timeUnixNano == 1_791_868_000_000_000_004,
+              warn.attributes["rclone.time"] == .string("2026-10-13T07:13:41Z"),
               warn.attributes["rclone.object"] == nil else {
             return report(name, slug, false, "(rclone warning line record wrong: \(warn))")
         }
@@ -8699,9 +8712,38 @@ enum ConfigSelfTest {
         guard batches.map({ $0.count }) == [200, 200, 51] else {
             return report(name, slug, false, "(batch sizes \(batches.map { $0.count }))")
         }
-        let resource = DiagnosticReportUploader.resourceAttributes(base: ["service.name": "synctray", "synctray.process.kind": "app"])
-        guard resource["synctray.process.kind"] == "diagnostics", resource["service.name"] == "synctray" else {
-            return report(name, slug, false, "(resource process kind not overridden: \(resource))")
+        // Byte cap: well under 200 records, but ~100 KB each, so requests split near 1 MB;
+        // a single record bigger than the cap still goes, alone.
+        let heavy = DiagnosticReport(
+            code: "ST-ABCDEF",
+            createdAt: Date(timeIntervalSince1970: 1_791_868_000),
+            sections: [DiagnosticReport.Section(source: .log, profileId: profileId, profileName: "Work",
+                                                lines: Array(repeating: String(repeating: "x", count: 100_000), count: 30)
+                                                    + [String(repeating: "y", count: 1_200_000)])]
+        )
+        let heavyRecords = DiagnosticOTLPEncoder.records(for: heavy)
+        let heavyBatches = DiagnosticOTLPEncoder.batches(heavyRecords)
+        let withinCap = heavyBatches.allSatisfy { batch -> Bool in
+            let bytes = batch.reduce(0) { $0 + DiagnosticOTLPEncoder.estimatedSize($1) }
+            return batch.count == 1 || bytes <= DiagnosticOTLPEncoder.maxBatchBytes
+        }
+        guard heavyBatches.count > 1, withinCap,
+              heavyBatches.allSatisfy({ $0.count <= DiagnosticOTLPEncoder.maxRecordsPerBatch }),
+              Array(heavyBatches.joined()) == heavyRecords,
+              heavyBatches.last?.count == 1,
+              heavyBatches.last?.first?.body.utf8.count == 1_200_000 else {
+            return report(name, slug, false, "(byte cap not applied: batch sizes \(heavyBatches.map { $0.count }))")
+        }
+
+        let identityBase = ["service.name": "synctray", "synctray.process.kind": "app",
+                            "enduser.id": "hash", "service.instance.id": "install"]
+        let resource = DiagnosticReportUploader.resourceAttributes(base: identityBase, telemetryEnabled: false)
+        let resourceWithUsage = DiagnosticReportUploader.resourceAttributes(base: identityBase, telemetryEnabled: true)
+        guard resource["synctray.process.kind"] == "diagnostics", resource["service.name"] == "synctray",
+              resource["enduser.id"] == nil, resource["service.instance.id"] == nil,
+              resourceWithUsage["synctray.process.kind"] == "diagnostics",
+              resourceWithUsage["enduser.id"] == "hash", resourceWithUsage["service.instance.id"] == "install" else {
+            return report(name, slug, false, "(resource process kind or install identity wrong: off=\(resource) on=\(resourceWithUsage))")
         }
         let bodies = DiagnosticOTLPEncoder.encodeBatches(for: big, resource: resource)
         guard bodies.count == 3,
@@ -8850,6 +8892,14 @@ enum ConfigSelfTest {
         }
         reset()
         interactive = true
+        answer = nil
+        guard SyncTrayCLI.execute(["report", "DR Work", "--send"], env: env) == 1, sent == 0,
+              err.contains("Preview it first with: synctray report 'DR Work'"),
+              SyncTrayCLI.shellQuoted("Bob's Work") == #"'Bob'\''s Work'"# else {
+            return report(name, slug, false, "(preview hint not shell-quoted: \(err.debugDescription))")
+        }
+        reset()
+        interactive = true
         answer = "y"
         guard SyncTrayCLI.execute(["report", "--send"], env: env) == 0, sent == 1,
               out == "Report code: ST-ABCDEF\n" else {
@@ -8876,6 +8926,23 @@ enum ConfigSelfTest {
         guard SyncTrayCLI.execute(["report", "--send", "--yes"], env: env) == 1,
               sent == 1, out.isEmpty, err.contains("isn't configured") else {
             return report(name, slug, false, "(a failed send did not exit 1 with the error)")
+        }
+
+        // The saved copy (`--output`, Save to Desktop) is owner-only, including when it
+        // replaces an existing world-readable file.
+        let privatePath = "\(selfTestRoot)/dr6-report.txt"
+        FileManager.default.createFile(atPath: privatePath, contents: Data("old".utf8),
+                                       attributes: [.posixPermissions: 0o644])
+        do {
+            try DiagnosticReportFile.writePrivately("report body", toPath: privatePath)
+        } catch {
+            return report(name, slug, false, "(writePrivately threw: \(error))")
+        }
+        let attributes = (try? FileManager.default.attributesOfItem(atPath: privatePath)) ?? [:]
+        let permissions = (attributes[.posixPermissions] as? NSNumber)?.intValue
+        guard permissions == 0o600,
+              (try? String(contentsOfFile: privatePath, encoding: .utf8)) == "report body" else {
+            return report(name, slug, false, "(saved report not 0600 or content wrong: \(String(describing: permissions)))")
         }
         return report(name, slug, true)
     }

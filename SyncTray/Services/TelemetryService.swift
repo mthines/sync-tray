@@ -2137,6 +2137,14 @@ final class TelemetryService {
     // MARK: - Private Helpers
 
     private func buildResource() -> Resource {
+        Resource(attributes: resourceAttributes(includeInstallIdentity: true))
+    }
+
+    /// The resource attributes every signal carries. `includeInstallIdentity` is always true
+    /// for telemetry; a diagnostic report sent with usage data off passes false, which omits
+    /// `service.instance.id` and `enduser.id` and never reads `SyncTraySettings.installationId`
+    /// (reading it creates and persists an ID).
+    private func resourceAttributes(includeInstallIdentity: Bool) -> [String: AttributeValue] {
         let version = appVersion()
         let osVersion = ProcessInfo.processInfo.operatingSystemVersionString
 
@@ -2144,12 +2152,14 @@ final class TelemetryService {
             ResourceAttributes.serviceName.rawValue: .string(Self.serviceName),
             ResourceAttributes.serviceNamespace.rawValue: .string("synctray"),
             ResourceAttributes.serviceVersion.rawValue: .string(version),
-            "service.instance.id": .string(SyncTraySettings.installationId),
-            "enduser.id": .string(SyncTraySettings.anonymousUserId),
             "synctray.process.kind": .string(Self.processKind),
             ResourceAttributes.osType.rawValue: .string("darwin"),
             ResourceAttributes.osVersion.rawValue: .string(osVersion),
         ]
+        if includeInstallIdentity {
+            attrs["service.instance.id"] = .string(SyncTraySettings.installationId)
+            attrs["enduser.id"] = .string(SyncTraySettings.anonymousUserId)
+        }
 
         if let hostArch = hostArch() {
             attrs["host.arch"] = .string(hostArch)
@@ -2190,8 +2200,13 @@ final class TelemetryService {
                 attrs[key] = .string(value)
             }
         }
+        if !includeInstallIdentity {
+            // Not even through an OTEL_RESOURCE_ATTRIBUTES override.
+            attrs.removeValue(forKey: "service.instance.id")
+            attrs.removeValue(forKey: "enduser.id")
+        }
 
-        return Resource(attributes: attrs)
+        return attrs
     }
 
     /// Deployment-precise version string for Dash0 correlation.
@@ -3022,11 +3037,12 @@ extension TelemetryService {
     static var isDiagnosticExportConfigured: Bool { !authHeaders.isEmpty }
 
     /// The resource attributes every telemetry signal carries (`service.name`,
-    /// `service.version`, `service.instance.id`, `enduser.id`, `host.arch`,
-    /// `deployment.environment.name`, …), as strings.
-    static func diagnosticResourceAttributes() -> [String: String] {
+    /// `service.version`, `host.arch`, `deployment.environment.name`, …), as strings — plus
+    /// `service.instance.id` and `enduser.id` only when `includeInstallIdentity` is true.
+    /// With it false, `SyncTraySettings.installationId` is never read.
+    static func diagnosticResourceAttributes(includeInstallIdentity: Bool) -> [String: String] {
         var result: [String: String] = [:]
-        for (key, value) in shared.buildResource().attributes {
+        for (key, value) in shared.resourceAttributes(includeInstallIdentity: includeInstallIdentity) {
             if case let .string(text) = value {
                 result[key] = text
             }

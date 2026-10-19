@@ -1855,8 +1855,9 @@ enum SyncTrayCLI {
         }
 
         if !yes {
+            let previewCommand = "synctray report" + (target.map { " " + SyncTrayCLI.shellQuoted($0) } ?? "")
             env.stderr("Report \(report.code): \(report.lineCount) lines from \(report.profileCount) profile(s). "
-                + "Preview it first with: synctray report\(target.map { " \($0)" } ?? "")\n")
+                + "Preview it first with: \(previewCommand)\n")
             env.stderr("Send this report? [y/N] ")
             let answer = env.readLine()?.trimmingCharacters(in: .whitespaces).lowercased()
             guard answer == "y" || answer == "yes" else {
@@ -1877,6 +1878,12 @@ enum SyncTrayCLI {
             env.stderr(DiagnosticReportCopy.shareCode + "\n")
         }
         return 0
+    }
+
+    /// `value` single-quoted for a POSIX shell (`'` written as `'\''`), so a hint like
+    /// `synctray report 'My Work'` can be pasted back as-is. Pure.
+    static func shellQuoted(_ value: String) -> String {
+        "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
     }
 }
 
@@ -1985,11 +1992,11 @@ extension CLIEnvironment {
                 return error
             },
             writeTextFile: { path, contents in
+                // The report can name personal paths and files: create the file owner-only
+                // (0600) from the start, never world-readable even for a moment.
                 let expanded = (path as NSString).expandingTildeInPath
                 do {
-                    try contents.write(toFile: expanded, atomically: true, encoding: .utf8)
-                    // The report can name personal paths and files — keep the copy owner-only.
-                    try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: expanded)
+                    try DiagnosticReportFile.writePrivately(contents, toPath: expanded)
                     return true
                 } catch {
                     return false

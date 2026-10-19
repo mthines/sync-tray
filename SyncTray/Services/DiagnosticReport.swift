@@ -288,6 +288,8 @@ enum DiagnosticReportBuilder {
     /// 8 KB cap applied after redaction is what the report keeps.
     static let preRedactionLimit = 64 * 1024
     static let truncationMarker = "…[truncated]"
+    /// Prefix of the single line a log section holds when the profile has no log file yet.
+    static let missingLogPrefix = "(no sync log at "
 
     /// Files the builder must never read, enforced by construction: every read is checked
     /// against this before the injected reader is called. rclone.conf (any `*.rclone.conf`,
@@ -423,7 +425,7 @@ enum DiagnosticReportBuilder {
             sections.append(DiagnosticReport.Section(source: .locks, profileId: id, profileName: name, lines: clean(lockLines)))
 
             let logLines = tailGuarded(profile.logPath, limit).map { Array($0.suffix(limit)) }
-                ?? ["(no sync log at \(profile.logPath))"]
+                ?? ["\(missingLogPrefix)\(profile.logPath))"]
             sections.append(DiagnosticReport.Section(source: .log, profileId: id, profileName: name, lines: clean(logLines)))
         }
 
@@ -483,7 +485,10 @@ enum DiagnosticReportBuilder {
     }
 
     /// Drop the oldest log lines (round-robin across profiles) until the report fits in
-    /// `maxBytes`, marking each shortened log section. Returns how many lines were dropped.
+    /// `maxBytes`, marking each shortened log section. A log section that only holds the
+    /// "(no sync log at …)" placeholder is never touched — there is no log to shorten, and
+    /// replacing it with "…[1 older log line(s) left out]" would mislead. Returns how many
+    /// lines were dropped.
     static func enforceTotalCap(_ sections: inout [DiagnosticReport.Section], maxBytes: Int) -> Int {
         func size(_ line: String) -> Int { line.utf8.count + 1 }
         var total = sections.reduce(0) { sum, section in
@@ -491,7 +496,9 @@ enum DiagnosticReportBuilder {
         }
         guard total > maxBytes else { return 0 }
 
-        let logIndices = sections.indices.filter { sections[$0].source == .log }
+        let logIndices = sections.indices.filter { index in
+            sections[index].source == .log && !isMissingLogPlaceholder(sections[index].lines)
+        }
         var droppedPerSection = [Int](repeating: 0, count: sections.count)
         var progressed = true
         while total > maxBytes && progressed {
@@ -512,6 +519,11 @@ enum DiagnosticReportBuilder {
             droppedTotal += count
         }
         return droppedTotal
+    }
+
+    /// Whether a log section holds only the "(no sync log at …)" placeholder.
+    static func isMissingLogPlaceholder(_ lines: [String]) -> Bool {
+        lines.count == 1 && lines[0].hasPrefix(missingLogPrefix)
     }
 
     /// One line describing a lock file and whether its holder is alive.
@@ -702,19 +714,41 @@ enum DiagnosticReportFile {
             ?? FileManager.default.urls(for: .desktopDirectory, in: .userDomainMask).first
             ?? URL(fileURLWithPath: NSHomeDirectory())
         let url = folder.appendingPathComponent(fileName)
-        try text.write(to: url, atomically: true, encoding: .utf8)
-        try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+        try writePrivately(text, toPath: url.path)
         return url
+    }
+
+    /// Write `text` to `path` so the file is owner-only (0600) from the moment it exists —
+    /// a report can name personal paths and files, so it is never briefly world-readable the
+    /// way an atomic write followed by a chmod is. An existing file (or symlink) at `path` is
+    /// removed first, then the file is created with `O_CREAT | O_EXCL | O_NOFOLLOW`.
+    static func writePrivately(_ text: String, toPath path: String) throws {
+        let fileManager = FileManager.default
+        if (try? fileManager.attributesOfItem(atPath: path)) != nil {
+            try fileManager.removeItem(atPath: path)
+        }
+        let descriptor = open(path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0o600)
+        guard descriptor >= 0 else {
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno), userInfo: [NSFilePathErrorKey: path])
+        }
+        let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
+        try handle.write(contentsOf: Data(text.utf8))
+        try handle.close()
     }
 }
 
 // MARK: - OTLP encoding
 
 /// Turns a report into OTLP/HTTP JSON `ExportLogsServiceRequest` bodies: one leading
-/// summary record, then one record per line, in batches of `maxRecordsPerBatch`. Pure —
-/// covered by `ConfigSelfTest` AC-DR4.
+/// summary record, then one record per line, in batches of at most `maxRecordsPerBatch`
+/// records and about `maxBatchBytes`. Every record is stamped with the report's creation time
+/// plus its ordinal in nanoseconds, so a report sits together at send time and keeps its order
+/// in a time-sorted view; an rclone line's own time travels as `rclone.time`. Pure — covered
+/// by `ConfigSelfTest` AC-DR4.
 enum DiagnosticOTLPEncoder {
     static let maxRecordsPerBatch = 200
+    /// Soft byte cap per request, estimated from record bodies and attribute strings.
+    static let maxBatchBytes = 1_000_000
     static let scopeName = "synctray.diagnostics"
     static let summaryBody = "Diagnostic report"
 
@@ -771,7 +805,6 @@ enum DiagnosticOTLPEncoder {
                 if let profileName = section.profileName {
                     attributes["synctray.profile.name"] = .string(profileName)
                 }
-                var time = base + ordinal
                 var severity = (number: 9, text: "INFO")
                 if let fields = rcloneFields(line) {
                     if let level = fields.level {
@@ -784,12 +817,12 @@ enum DiagnosticOTLPEncoder {
                     if let object = fields.object {
                         attributes["rclone.object"] = .string(object)
                     }
-                    if let raw = fields.time, let parsed = unixNano(fromRFC3339: raw) {
-                        time = parsed
+                    if let time = fields.time {
+                        attributes["rclone.time"] = .string(time)
                     }
                 }
                 records.append(Record(
-                    timeUnixNano: time,
+                    timeUnixNano: base + ordinal,
                     severityNumber: severity.number,
                     severityText: severity.text,
                     body: line,
@@ -800,10 +833,46 @@ enum DiagnosticOTLPEncoder {
         return records
     }
 
-    static func batches(_ records: [Record]) -> [[Record]] {
-        stride(from: 0, to: records.count, by: maxRecordsPerBatch).map { start in
-            Array(records[start..<min(start + maxRecordsPerBatch, records.count)])
+    /// Split records into request-sized batches: at most `maxRecords` records and about
+    /// `maxBytes` (`estimatedSize`) each. A new batch starts when the next record would go
+    /// over either limit; a single record bigger than `maxBytes` still goes, alone.
+    static func batches(
+        _ records: [Record],
+        maxRecords: Int = DiagnosticOTLPEncoder.maxRecordsPerBatch,
+        maxBytes: Int = DiagnosticOTLPEncoder.maxBatchBytes
+    ) -> [[Record]] {
+        var result: [[Record]] = []
+        var current: [Record] = []
+        var currentBytes = 0
+        for record in records {
+            let size = estimatedSize(record)
+            if !current.isEmpty && (current.count >= maxRecords || currentBytes + size > maxBytes) {
+                result.append(current)
+                current = []
+                currentBytes = 0
+            }
+            current.append(record)
+            currentBytes += size
         }
+        if !current.isEmpty {
+            result.append(current)
+        }
+        return result
+    }
+
+    /// Rough encoded size of a record: its body plus every attribute key and string value
+    /// (ints and bools count as a few bytes). Used only to keep requests near `maxBatchBytes`.
+    static func estimatedSize(_ record: Record) -> Int {
+        var size = record.body.utf8.count
+        for (key, value) in record.attributes {
+            size += key.utf8.count
+            switch value {
+            case .string(let text): size += text.utf8.count
+            case .int: size += 20
+            case .bool: size += 5
+            }
+        }
+        return size
     }
 
     /// One `ExportLogsServiceRequest` as a JSON object.
@@ -885,35 +954,6 @@ enum DiagnosticOTLPEncoder {
         }
     }
 
-    private static let rfc3339Regex: NSRegularExpression? = try? NSRegularExpression(
-        pattern: #"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.(\d{1,9}))?(Z|[+-]\d{2}:\d{2})$"#)
-
-    private static let wholeSecondFormatter: ISO8601DateFormatter = {
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withInternetDateTime]
-        return formatter
-    }()
-
-    /// Nanoseconds since the epoch for an RFC 3339 time with up to 9 fractional digits
-    /// (rclone writes 6, e.g. `2026-10-13T07:13:40.943947+02:00`).
-    static func unixNano(fromRFC3339 raw: String) -> UInt64? {
-        guard let regex = rfc3339Regex,
-              let match = regex.firstMatch(in: raw, options: [], range: NSRange(raw.startIndex..<raw.endIndex, in: raw)),
-              let wholeRange = Range(match.range(at: 1), in: raw),
-              let zoneRange = Range(match.range(at: 3), in: raw),
-              let date = wholeSecondFormatter.date(from: String(raw[wholeRange]) + String(raw[zoneRange])) else {
-            return nil
-        }
-        let seconds = date.timeIntervalSince1970
-        guard seconds >= 0 else { return nil }
-        var nanos: UInt64 = 0
-        if let fractionRange = Range(match.range(at: 2), in: raw) {
-            let digits = String(raw[fractionRange]).padding(toLength: 9, withPad: "0", startingAt: 0)
-            nanos = UInt64(digits) ?? 0
-        }
-        return UInt64(seconds) * 1_000_000_000 + nanos
-    }
-
     /// The report's creation time in nanoseconds, at millisecond precision so it is exact.
     static func baseUnixNano(_ date: Date) -> UInt64 {
         let millis = (date.timeIntervalSince1970 * 1000).rounded()
@@ -950,24 +990,34 @@ enum DiagnosticReportUploader {
         let resource: [String: String]
     }
 
-    /// The upload target, or nil when this build has no OTLP credentials.
+    /// The upload target, or nil when this build has no OTLP credentials. With usage data
+    /// off, the resource carries no install identity and `SyncTraySettings.installationId` is
+    /// never read (reading it would create and persist an ID for someone who never opted in).
     static func configuration() -> Configuration? {
         guard TelemetryService.isDiagnosticExportConfigured,
               let url = URL(string: "\(TelemetryService.diagnosticExportEndpoint)/v1/logs") else {
             return nil
         }
+        let telemetryEnabled = SyncTraySettings.telemetryEnabled
+        let base = TelemetryService.diagnosticResourceAttributes(includeInstallIdentity: telemetryEnabled)
         return Configuration(
             endpoint: url,
             headers: TelemetryService.diagnosticExportHeaders,
-            resource: resourceAttributes(base: TelemetryService.diagnosticResourceAttributes())
+            resource: resourceAttributes(base: base, telemetryEnabled: telemetryEnabled)
         )
     }
 
-    /// The telemetry resource attributes with `synctray.process.kind` = `diagnostics`, so a
-    /// report's records are told apart from the app's and the CLI's own telemetry. Pure.
-    static func resourceAttributes(base: [String: String]) -> [String: String] {
+    /// The resource attributes a report's records carry: the telemetry resource with
+    /// `synctray.process.kind` = `diagnostics` (so they're told apart from the app's and the
+    /// CLI's own telemetry), and — unless usage data is on — without the stable install
+    /// identity (`enduser.id`, `service.instance.id`). Pure.
+    static func resourceAttributes(base: [String: String], telemetryEnabled: Bool) -> [String: String] {
         var resource = base
         resource["synctray.process.kind"] = "diagnostics"
+        if !telemetryEnabled {
+            resource.removeValue(forKey: "enduser.id")
+            resource.removeValue(forKey: "service.instance.id")
+        }
         return resource
     }
 
@@ -978,7 +1028,8 @@ enum DiagnosticReportUploader {
         return URLSession(configuration: configuration)
     }()
 
-    /// POST the report as OTLP JSON to `<endpoint>/v1/logs`, ≤ 200 records per request.
+    /// POST the report as OTLP JSON to `<endpoint>/v1/logs`, ≤ 200 records and about 1 MB
+    /// per request.
     /// Throws `DiagnosticUploadError.notConfigured` when there is no endpoint, and
     /// `.httpStatus` on a non-2xx response.
     static func send(_ report: DiagnosticReport) async throws {
@@ -1015,7 +1066,7 @@ enum DiagnosticReportUploader {
 
     /// Blocking bridge for the headless CLI: waits for `send` (bounded by `timeout`).
     /// Returns nil on success or a user-facing error message.
-    static func sendBlocking(_ report: DiagnosticReport, timeout: TimeInterval = 180) -> String? {
+    static func sendBlocking(_ report: DiagnosticReport, timeout: TimeInterval = 600) -> String? {
         let outcome = Outcome()
         let done = DispatchSemaphore(value: 0)
         Task.detached(priority: .userInitiated) {
