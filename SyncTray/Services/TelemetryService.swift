@@ -753,7 +753,8 @@ final class TelemetryService {
         duration: TimeInterval,
         filesChanged: Int,
         exitCode: Int,
-        errorMessage: String?
+        errorMessage: String?,
+        localSyncPath: String? = nil
     ) {
         guard SyncTraySettings.telemetryEnabled else { return }
         ensureSetup()
@@ -779,11 +780,18 @@ final class TelemetryService {
 
         // Categorize error for the error counter
         let errorType = Self.categorizeError(errorMessage)
-        syncErrorCounter?.add(value: 1, attribute: [
+        let accessDenial = Self.accessDenialAttributes(for: errorMessage, localSyncPath: localSyncPath)
+        var errorCounterLabels: [String: AttributeValue] = [
             "sync.mode": .string(mode.rawValue),
             "synctray.profile.name": .string(profileName),
             "error.type": .string(errorType),
-        ])
+        ]
+        // Only the two-valued denial kind joins the counter's labels; the rest stays on the
+        // span and log, which have no cardinality budget to protect.
+        if let denial = accessDenial["error.access_denial"] {
+            errorCounterLabels["error.access_denial"] = denial
+        }
+        syncErrorCounter?.add(value: 1, attribute: errorCounterLabels)
 
         // End the active span with error
         if let span = activeSyncSpans.removeValue(forKey: profileId) {
@@ -792,6 +800,9 @@ final class TelemetryService {
             span.setAttribute(key: "sync.duration_s", value: .double(duration))
             span.setAttribute(key: "sync.exit_code", value: .int(exitCode))
             span.setAttribute(key: "error.type", value: .string(errorType))
+            for (key, value) in accessDenial {
+                span.setAttribute(key: key, value: value)
+            }
             // Category only — the raw message can carry paths and remote names, and the
             // privacy disclosure promises "never the raw message".
             span.status = .error(description: errorType)
@@ -808,7 +819,7 @@ final class TelemetryService {
                     "sync.exit_code": .int(exitCode),
                     "sync.duration_s": .double(duration),
                     "error.type": .string(errorType),
-                ],
+                ].merging(accessDenial) { current, _ in current },
                 spanContext: span.context
             )
         }
@@ -1003,12 +1014,14 @@ final class TelemetryService {
     func recordSyncError(
         profileId: UUID,
         profileName: String,
-        errorMessage: String
+        errorMessage: String,
+        localSyncPath: String? = nil
     ) {
         guard SyncTraySettings.telemetryEnabled else { return }
         ensureSetup()
 
         let errorType = Self.categorizeError(errorMessage)
+        let accessDenial = Self.accessDenialAttributes(for: errorMessage, localSyncPath: localSyncPath)
 
         // Emit a log correlated to the active sync span if one exists
         let spanContext = activeSyncSpans[profileId]?.context
@@ -1020,7 +1033,7 @@ final class TelemetryService {
                 "synctray.profile.id": .string(profileId.uuidString),
                 "synctray.profile.name": .string(profileName),
                 "error.type": .string(errorType),
-            ],
+            ].merging(accessDenial) { current, _ in current },
             spanContext: spanContext
         )
     }
@@ -2917,6 +2930,51 @@ final class TelemetryService {
         case 31...60: return "31-60min"
         default: return ">60min"
         }
+    }
+
+    /// Bounded attributes that tell apart the failures `categorizeError` files under
+    /// `permission_denied`. Empty for any other error. Never the path or the message.
+    /// - `error.access_denial`: `operation_not_permitted` (EPERM — macOS privacy controls;
+    ///   Full Disk Access can fix it) or `permission_denied` (EACCES — file ownership or mode
+    ///   bits, e.g. a root-owned folder at a volume root; it can't).
+    /// - `error.blocked_path.in_sync_folder`: whether the refused path is the profile's local
+    ///   folder or inside it — the case the error banner offers to exclude. Only when the
+    ///   message names an absolute path and the caller passed the local folder.
+    /// - `error.blocked_path.kind`: `volume_system_folder` (`SyncExcludeFilter.volumeSystemFolderNames`),
+    ///   `photos_library`, or `other` — only when the message names an absolute path.
+    static func accessDenialAttributes(for message: String?, localSyncPath: String?) -> [String: AttributeValue] {
+        guard let message else { return [:] }
+        guard let blocked = SyncLogPatterns.blockedAccess(in: message) else {
+            if SyncLogPatterns.isOperationNotPermitted(message) {
+                return ["error.access_denial": .string(SyncLogPatterns.BlockedAccessKind.macOSPrivacy.rawValue)]
+            }
+            if SyncLogPatterns.isPermissionDenied(message) {
+                return ["error.access_denial": .string(SyncLogPatterns.BlockedAccessKind.filePermissions.rawValue)]
+            }
+            return [:]
+        }
+        var attributes: [String: AttributeValue] = [
+            "error.access_denial": .string(blocked.kind.rawValue),
+            "error.blocked_path.kind": .string(blockedPathKind(blocked.path)),
+        ]
+        if let localSyncPath, !localSyncPath.isEmpty {
+            attributes["error.blocked_path.in_sync_folder"] = .bool(
+                SyncExcludeFilter.isWithinSyncFolder(blocked.path, localSyncPath: localSyncPath))
+        }
+        return attributes
+    }
+
+    /// The bounded `error.blocked_path.kind` of a refused path: whether any of its components
+    /// is a macOS volume system folder or an Apple Photos library.
+    static func blockedPathKind(_ path: String) -> String {
+        let components = (path as NSString).pathComponents
+        if components.contains(where: { SyncExcludeFilter.volumeSystemFolderNames.contains($0) }) {
+            return "volume_system_folder"
+        }
+        if components.contains(where: { $0.lowercased().hasSuffix(".photoslibrary") }) {
+            return "photos_library"
+        }
+        return "other"
     }
 
     /// Categorize an error message into a low-cardinality type for metrics/attributes.

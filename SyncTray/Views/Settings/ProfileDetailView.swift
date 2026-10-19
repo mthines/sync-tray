@@ -3930,22 +3930,26 @@ struct ProfileDetailView: View {
 
     // MARK: - macOS Blocked Access
 
-    /// Recovery for an rclone error naming a local path macOS privacy controls wouldn't let it
-    /// read (`SyncLogPatterns.operationNotPermittedPath`) — typically an Apple Photos library
-    /// inside the synced folder. Two ways out: exclude the path from this profile (through the
-    /// "Don't Sync" list, where the user can see and undo it), or allow access in System
-    /// Settings. Which process needs that access for a scheduled sync is deliberately not
-    /// named: launchd runs the sync script directly, not as a child of SyncTray.
+    /// Recovery for an rclone error naming a local path it wasn't allowed to read
+    /// (`SyncLogPatterns.macOSBlockedAccess`): either macOS privacy controls (EPERM) —
+    /// typically an Apple Photos library inside the synced folder — or file permissions
+    /// (EACCES) — typically a root-owned system folder at the root of an external drive.
+    /// Ways out: exclude the path from this profile (through the "Don't Sync" list, where the
+    /// user can see and undo it), or, for a privacy denial only, allow access in System
+    /// Settings — Full Disk Access does nothing for a permissions denial, so that button is
+    /// not offered there. Which process needs that access for a scheduled sync is deliberately
+    /// not named: launchd runs the sync script directly, not as a child of SyncTray.
     @ViewBuilder
     private func macOSBlockedAccessActions(blockedPath: String, error: String) -> some View {
         let excludePattern = blockedAccessExcludePattern(blockedPath: blockedPath, error: error)
         let name = (blockedPath as NSString).lastPathComponent
+        let kind = SyncLogPatterns.blockedAccess(in: error)?.kind ?? .macOSPrivacy
         VStack(alignment: .leading, spacing: 6) {
             if let summary = SyncLogPatterns.macOSBlockedAccessSummary(for: error, localSyncPath: profile.localSyncPath) {
                 Text(summary)
                     .font(.caption.weight(.medium))
             }
-            Text(blockedAccessExplanation(itemName: name, canExclude: excludePattern != nil))
+            Text(blockedAccessExplanation(itemName: name, kind: kind, canExclude: excludePattern != nil))
                 .font(.caption)
                 .foregroundColor(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -3965,21 +3969,38 @@ struct ProfileDetailView: View {
                     .disabled(isSyncRunningForProfile)
                     .help(ErrorAction.excludeBlockedPath.helpText)
                 }
-                Button(action: { handleErrorAction(.openPrivacySettings) }) {
-                    Label(ErrorAction.openPrivacySettings.buttonText,
-                          systemImage: ErrorAction.openPrivacySettings.icon)
+                if kind == .macOSPrivacy {
+                    Button(action: { handleErrorAction(.openPrivacySettings) }) {
+                        Label(ErrorAction.openPrivacySettings.buttonText,
+                              systemImage: ErrorAction.openPrivacySettings.icon)
+                    }
+                    .buttonStyle(.bordered)
+                    .help(ErrorAction.openPrivacySettings.helpText)
                 }
-                .buttonStyle(.bordered)
-                .help(ErrorAction.openPrivacySettings.helpText)
             }
         }
     }
 
-    private func blockedAccessExplanation(itemName: String, canExclude: Bool) -> String {
-        var text = canExclude
-            ? "Exclude it from this profile to finish syncing, or allow access under System Settings › "
-                + "Privacy & Security › Full Disk Access."
-            : "Allow access under System Settings › Privacy & Security › Full Disk Access, then sync again."
+    private func blockedAccessExplanation(itemName: String, kind: SyncLogPatterns.BlockedAccessKind, canExclude: Bool) -> String {
+        var text: String
+        switch kind {
+        case .macOSPrivacy:
+            text = canExclude
+                ? "Exclude it from this profile to finish syncing, or allow access under System Settings › "
+                    + "Privacy & Security › Full Disk Access."
+                : "Allow access under System Settings › Privacy & Security › Full Disk Access, then sync again."
+        case .filePermissions:
+            if SyncExcludeFilter.volumeSystemFolderNames.contains(itemName) {
+                text = "It's a folder macOS keeps at the root of the drive, owned by the system — it never "
+                    + "holds your files. Exclude it from this profile to finish syncing."
+            } else {
+                text = canExclude
+                    ? "Its permissions don't let you read it. Exclude it from this profile to finish syncing, "
+                        + "or give yourself read access in Finder › Get Info › Sharing & Permissions."
+                    : "Its permissions don't let you read it. Give yourself read access in Finder › Get Info › "
+                        + "Sharing & Permissions, then sync again."
+            }
+        }
         text += " Until then, files deleted on one side aren't deleted on the other."
         if itemName.lowercased().hasSuffix(".photoslibrary") {
             text += " Apple Photos libraries are best excluded: copying one while Photos is open can "

@@ -1,4 +1,5 @@
 import Foundation
+import OpenTelemetryApi
 
 #if DEBUG
 
@@ -155,6 +156,10 @@ enum ConfigSelfTest {
             testMigrationV5PhotosLibraryExclude,
             testMacOSBlockedAccessPatterns,
             testMacOSBlockedAccessWiringPinned,
+            testVolumeSystemFolderDefaultExclude,
+            testMigrationV6VolumeSystemFolders,
+            testVolumeSystemFoldersRealRclone,
+            testPermissionDeniedBlockedAccess,
             testRunLivenessMountMode,
             testExclusiveRunRegistryStaleGrace,
             testSyncRunLockAcquire,
@@ -7789,6 +7794,323 @@ enum ConfigSelfTest {
         }
         guard migrationSource.contains("MigrationV4Retired(),\n        MigrationV5PhotosLibraryExclude(),") else {
             return report(name, slug, false, "(migration v5 is not registered after v4)")
+        }
+        return report(name, slug, true)
+    }
+
+    // MARK: - AC-VS1 — macOS volume system folders are excluded by default, as directory rules
+
+    /// A new filter file carries one `- <name>/**` directory rule per volume system folder and
+    /// no longer the file-only `- .fseventsd`; `addingVolumeSystemFolderDefaults` inserts the
+    /// section below the managed "Don't Sync" block and above the user's own rules, is stable
+    /// under a later `merged`, and changes nothing once every rule is present.
+    private static func testVolumeSystemFolderDefaultExclude() -> Bool {
+        let name = "AC-VS1", slug = "volume-system-folder-default-exclude"
+        let rules = SyncExcludeFilter.volumeSystemFolderRules
+        guard rules.count == SyncExcludeFilter.volumeSystemFolderNames.count,
+              rules.allSatisfy({ $0.hasPrefix("- .") && $0.hasSuffix("/**") }) else {
+            return report(name, slug, false, "(a volume-system-folder rule is not a directory rule: \(rules))")
+        }
+
+        // 1. Defaults written on first create carry every rule, and not the old file-only rule.
+        let dir = "\(selfTestRoot)/vs1"
+        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        let path = "\(dir)/exclude.txt"
+        try? FileManager.default.removeItem(atPath: path)
+        var profile = sampleProfile()
+        profile.syncMode = .sync
+        do {
+            try SyncSetupService.shared.writeExcludeFilter(for: profile, at: path)
+        } catch {
+            return report(name, slug, false, "(first write threw: \(error))")
+        }
+        guard let fresh = try? String(contentsOfFile: path, encoding: .utf8) else {
+            return report(name, slug, false, "(could not read the new filter file)")
+        }
+        let freshLines = Set(fresh.components(separatedBy: "\n"))
+        guard rules.allSatisfy({ freshLines.contains($0) }), !freshLines.contains("- .fseventsd"),
+              freshLines.contains(SyncExcludeFilter.photosLibraryRule) else {
+            return report(name, slug, false, "(a new filter file lacks the directory rules or still has `- .fseventsd`)")
+        }
+
+        // 2. Inserted below the managed block, above the user's own rules; stable under merge.
+        let patterns = ["*.bak"]
+        let existing = SyncExcludeFilter.merged(existing: "- .fseventsd\n+ keep/**\n", patterns: patterns)
+        guard let migrated = SyncExcludeFilter.addingVolumeSystemFolderDefaults(to: existing),
+              migrated.hasPrefix(SyncExcludeFilter.beginMarker),
+              let endRange = migrated.range(of: SyncExcludeFilter.endMarker),
+              let ruleRange = migrated.range(of: rules[0]),
+              let includeRange = migrated.range(of: "+ keep/**"),
+              endRange.upperBound <= ruleRange.lowerBound,
+              ruleRange.upperBound <= includeRange.lowerBound,
+              migrated.contains("- *.bak") else {
+            return report(name, slug, false, "(section not placed between the managed block and the user's rules)")
+        }
+        guard SyncExcludeFilter.merged(existing: migrated, patterns: patterns) == migrated else {
+            return report(name, slug, false, "(a later merge with the same patterns rewrote the migrated file)")
+        }
+
+        // 3. Already complete: left alone. Partly present (a user's own rule): completed.
+        guard SyncExcludeFilter.addingVolumeSystemFolderDefaults(to: fresh) == nil,
+              SyncExcludeFilter.addingVolumeSystemFolderDefaults(to: migrated) == nil,
+              SyncExcludeFilter.addingVolumeSystemFolderDefaults(to: "- .Trashes/**\n") != nil,
+              SyncExcludeFilter.addingVolumeSystemFolderDefaults(to: "")
+                == SyncExcludeFilter.volumeSystemFoldersSection + "\n" else {
+            return report(name, slug, false, "(wrong idempotence or empty-file output)")
+        }
+        return report(name, slug, true)
+    }
+
+    // MARK: - AC-VS2 — migration v6 adds the rules to existing profiles, once
+
+    /// Every Two-Way and One-Way profile's filter gains the section; only a Two-Way profile with
+    /// a READABLE system folder at its root gets the resync marker; Stream profiles, missing
+    /// filters and complete filters are untouched; a second pass changes nothing.
+    private static func testMigrationV6VolumeSystemFolders() -> Bool {
+        let name = "AC-VS2", slug = "migration-v6-volume-system-folders"
+        let fm = FileManager.default
+        let dir = "\(selfTestRoot)/vs2"
+        try? fm.removeItem(atPath: dir)
+        try? fm.createDirectory(atPath: dir, withIntermediateDirectories: true)
+
+        struct Fixture {
+            let id = UUID()
+            let syncMode: String?
+            let localPath: String
+            let filter: String?
+            var shortId: String { String(id.uuidString.prefix(8)).lowercased() }
+        }
+        let readableRoot = "/tmp/synctray-selftest-vs2-readable-root"
+        let complete = SyncExcludeFilter.volumeSystemFoldersSection + "\n- .DS_Store\n"
+        let fixtures: [String: Fixture] = [
+            "bisyncReadable": Fixture(syncMode: "bisync", localPath: readableRoot, filter: "- .DS_Store\n"),
+            "oneWayReadable": Fixture(syncMode: "sync", localPath: readableRoot, filter: "- .DS_Store\n"),
+            "bisyncPlain": Fixture(syncMode: "bisync", localPath: "/tmp/synctray-selftest-vs2-plain", filter: "- .DS_Store\n"),
+            "legacyNoMode": Fixture(syncMode: nil, localPath: readableRoot, filter: "- .DS_Store\n"),
+            "mount": Fixture(syncMode: "mount", localPath: readableRoot, filter: "- .DS_Store\n"),
+            "complete": Fixture(syncMode: "bisync", localPath: readableRoot, filter: complete),
+            "noFilter": Fixture(syncMode: "bisync", localPath: readableRoot, filter: nil),
+        ]
+        for fixture in fixtures.values {
+            var dict: [String: Any] = ["id": fixture.id.uuidString, "name": "VS2", "localSyncPath": fixture.localPath]
+            if let mode = fixture.syncMode { dict["syncMode"] = mode }
+            guard let data = try? JSONSerialization.data(withJSONObject: dict),
+                  (try? data.write(to: URL(fileURLWithPath: "\(dir)/\(fixture.shortId).profile.json"))) != nil else {
+                return report(name, slug, false, "(failed to seed a profile file)")
+            }
+            if let filter = fixture.filter {
+                try? filter.write(toFile: "\(dir)/\(fixture.shortId)-exclude.txt", atomically: true, encoding: .utf8)
+            }
+        }
+        func filter(_ key: String) -> String? {
+            try? String(contentsOfFile: "\(dir)/\(fixtures[key]!.shortId)-exclude.txt", encoding: .utf8)
+        }
+        func hasMarker(_ key: String) -> Bool {
+            fm.fileExists(atPath: "\(dir)/\(fixtures[key]!.shortId).resync-pending")
+        }
+
+        let outcome = MigrationV6VolumeSystemFoldersExclude.addVolumeSystemFoldersExclude(in: dir) { $0 == readableRoot }
+        let updatedKeys = ["bisyncReadable", "oneWayReadable", "bisyncPlain", "legacyNoMode"]
+        guard outcome.updated.sorted() == updatedKeys.map({ fixtures[$0]!.shortId }).sorted(),
+              outcome.resyncScheduled.sorted() == ["bisyncReadable", "legacyNoMode"].map({ fixtures[$0]!.shortId }).sorted(),
+              outcome.failed.isEmpty else {
+            return report(name, slug, false, "(unexpected outcome: \(outcome))")
+        }
+        for key in updatedKeys {
+            guard let text = filter(key), text.contains(SyncExcludeFilter.volumeSystemFoldersSection),
+                  text.hasSuffix("- .DS_Store\n") else {
+                return report(name, slug, false, "(\(key) filter did not gain the section above its own content)")
+            }
+        }
+        guard hasMarker("bisyncReadable"), hasMarker("legacyNoMode"),
+              !hasMarker("oneWayReadable"), !hasMarker("bisyncPlain"),
+              filter("mount") == "- .DS_Store\n", !hasMarker("mount"),
+              filter("complete") == complete, !hasMarker("complete"),
+              filter("noFilter") == nil else {
+            return report(name, slug, false, "(a marker or filter changed for the wrong profile)")
+        }
+
+        let filtersBefore = fixtures.keys.sorted().map { filter($0) }
+        let second = MigrationV6VolumeSystemFoldersExclude.addVolumeSystemFoldersExclude(in: dir) { $0 == readableRoot }
+        guard second == MigrationV6VolumeSystemFoldersExclude.Outcome(),
+              fixtures.keys.sorted().map({ filter($0) }) == filtersBefore else {
+            return report(name, slug, false, "(a second pass changed something)")
+        }
+
+        // The real check: a readable system folder at the root counts, an unreadable one and a
+        // nested one don't (skipped as root, who can read anything).
+        let tree = "\(selfTestRoot)/vs2-tree"
+        try? fm.removeItem(atPath: tree)
+        try? fm.createDirectory(atPath: "\(tree)/readable/.TemporaryItems", withIntermediateDirectories: true)
+        try? fm.createDirectory(atPath: "\(tree)/unreadable/.Spotlight-V100", withIntermediateDirectories: true)
+        try? fm.createDirectory(atPath: "\(tree)/nested/sub/.Trashes", withIntermediateDirectories: true)
+        try? fm.setAttributes([.posixPermissions: 0o000], ofItemAtPath: "\(tree)/unreadable/.Spotlight-V100")
+        defer { try? fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: "\(tree)/unreadable/.Spotlight-V100") }
+        guard MigrationV6VolumeSystemFoldersExclude.containsReadableSystemFolder(at: "\(tree)/readable"),
+              getuid() == 0 || !MigrationV6VolumeSystemFoldersExclude.containsReadableSystemFolder(at: "\(tree)/unreadable"),
+              !MigrationV6VolumeSystemFoldersExclude.containsReadableSystemFolder(at: "\(tree)/nested"),
+              !MigrationV6VolumeSystemFoldersExclude.containsReadableSystemFolder(at: "\(tree)/missing") else {
+            return report(name, slug, false, "(containsReadableSystemFolder gave a wrong answer)")
+        }
+        return report(name, slug, true)
+    }
+
+    // MARK: - AC-VS3 — real rclone: the defaults keep it out of unreadable system folders
+
+    /// A sync folder shaped like an external volume root, with UNREADABLE `.fseventsd`,
+    /// `.Spotlight-V100` and `.Trashes`, and no "Sync Only These Folders" entries. With the
+    /// default filter the REAL `rclone lsf` lists the user's files and exits 0; with the old
+    /// default's file-only `- .fseventsd` it exits non-zero on "permission denied" — the
+    /// control that proves the folders really were unreadable (skipped as root).
+    private static func testVolumeSystemFoldersRealRclone() -> Bool {
+        let name = "AC-VS3", slug = "volume-system-folders-real-rclone"
+        guard let rclone = RcloneLocator.resolve() else {
+            return report(name, slug, false, "(rclone not found on PATH)")
+        }
+        let fm = FileManager.default
+        let dir = "\(selfTestRoot)/vs3-\(UUID().uuidString)"
+        let systemFolders = [".fseventsd", ".Spotlight-V100", ".Trashes"]
+        for rel in ["Docs/a.txt"] + systemFolders.map({ "\($0)/inside" }) {
+            let full = "\(dir)/\(rel)"
+            try? fm.createDirectory(atPath: (full as NSString).deletingLastPathComponent, withIntermediateDirectories: true)
+            try? "x".write(toFile: full, atomically: true, encoding: .utf8)
+        }
+        for folder in systemFolders {
+            try? fm.setAttributes([.posixPermissions: 0o000], ofItemAtPath: "\(dir)/\(folder)")
+        }
+        defer {
+            for folder in systemFolders {
+                try? fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: "\(dir)/\(folder)")
+            }
+        }
+
+        func lsf(filterPath: String) -> (status: Int32, listed: Set<String>)? {
+            let proc = Process()
+            proc.executableURL = URL(fileURLWithPath: rclone)
+            proc.arguments = ["lsf", "-R", "--files-only", "--filter-from", filterPath, dir]
+            let pipe = Pipe()
+            proc.standardOutput = pipe
+            proc.standardError = FileHandle.nullDevice
+            guard (try? proc.run()) != nil else { return nil }
+            proc.waitUntilExit()
+            let output = String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+            return (proc.terminationStatus, Set(output.split(separator: "\n").map(String.init)))
+        }
+
+        let filterPath = "\(dir)-exclude.txt"
+        var profile = sampleProfile(name: "VS3")
+        profile.syncMode = .sync
+        do {
+            try SyncSetupService.shared.writeExcludeFilter(for: profile, at: filterPath)
+        } catch {
+            return report(name, slug, false, "(writeExcludeFilter threw: \(error))")
+        }
+        guard let fixed = lsf(filterPath: filterPath) else {
+            return report(name, slug, false, "(could not run rclone lsf)")
+        }
+        guard fixed.status == 0, fixed.listed == ["Docs/a.txt"] else {
+            return report(name, slug, false, "(default filter: rclone lsf exited \(fixed.status), listed \(fixed.listed))")
+        }
+
+        if getuid() != 0 {
+            let oldFilterPath = "\(dir)-old-exclude.txt"
+            try? "- ._*\n- .DS_Store\n- .fseventsd\n".write(toFile: oldFilterPath, atomically: true, encoding: .utf8)
+            guard let old = lsf(filterPath: oldFilterPath), old.status != 0 else {
+                return report(name, slug, false, "(control: the old `- .fseventsd` default did not fail — folders not unreadable?)")
+            }
+        }
+        return report(name, slug, true)
+    }
+
+    // MARK: - AC-VS4 — "permission denied" on a local path gets the blocked-access handling
+
+    /// rclone's real EACCES line for a root-owned system folder is recognized as a LOCAL
+    /// permissions denial inside the sync folder (kept whole by `LogParser`, summarized without
+    /// promising privacy settings, excludable), stays `error.type=permission_denied`, and gets
+    /// bounded `error.access_denial` / `error.blocked_path.*` attributes, never the path. The
+    /// banner offers Open Privacy Settings only for an EPERM denial, and migration v6 is
+    /// registered after v5.
+    private static func testPermissionDeniedBlockedAccess() -> Bool {
+        let name = "AC-VS4", slug = "permission-denied-blocked-access"
+        let root = "/Volumes/Some Drive"
+        let folder = "\(root)/.Spotlight-V100"
+        let message = "failed to open directory \".Spotlight-V100\": open \(folder): permission denied"
+
+        guard let blocked = SyncLogPatterns.blockedAccess(in: message),
+              blocked.path == folder, blocked.kind == .filePermissions,
+              SyncLogPatterns.isPermissionDenied(message),
+              SyncLogPatterns.operationNotPermittedPath(in: message) == nil,
+              SyncLogPatterns.macOSBlockedPath(in: message, localSyncPath: root) == folder,
+              SyncLogPatterns.macOSBlockedPath(in: message, localSyncPath: "/Volumes/Other") == nil,
+              SyncLogPatterns.macOSBlockedAccessSummary(for: message, localSyncPath: root)
+                == "SyncTray isn't allowed to read “.Spotlight-V100”.",
+              SyncExcludeFilter.excludePattern(forBlockedPath: folder, localSyncPath: root, isDirectory: true)
+                == "/.Spotlight-V100/" else {
+            return report(name, slug, false, "(the EACCES line was not recognized as a local permissions denial)")
+        }
+        let eperm = "failed to open directory \"P.photoslibrary\": open \(root)/P.photoslibrary: operation not permitted"
+        guard SyncLogPatterns.blockedAccess(in: eperm)?.kind == .macOSPrivacy,
+              SyncLogPatterns.macOSBlockedAccessSummary(for: eperm, localSyncPath: root)
+                == "macOS blocked access to “P.photoslibrary”." else {
+            return report(name, slug, false, "(the EPERM case changed)")
+        }
+
+        // LogParser keeps a deep EACCES path whole.
+        let deepFolder = root + "/" + String(repeating: "A Very Long Folder Name/", count: 10) + "Locked"
+        let deepMessage = "failed to open directory \"Locked\": open \(deepFolder): permission denied"
+        let dict: [String: Any] = ["level": "error", "msg": deepMessage, "source": "local/local.go:689",
+                                   "time": "2026-10-19T07:12:38.48317+02:00"]
+        guard let lineData = try? JSONSerialization.data(withJSONObject: dict),
+              let event = LogParser().parse(line: String(decoding: lineData, as: UTF8.self)),
+              case .errorMessage(let kept) = event.type,
+              SyncLogPatterns.macOSBlockedPath(in: kept, localSyncPath: root) == deepFolder else {
+            return report(name, slug, false, "(LogParser cut the path off a long permissions denial)")
+        }
+
+        // Telemetry: the bucket is unchanged; the attributes are bounded and carry no path.
+        guard TelemetryService.categorizeError(message) == "permission_denied",
+              TelemetryService.categorizeError(eperm) == "permission_denied" else {
+            return report(name, slug, false, "(error.type changed for a permission error)")
+        }
+        let attrs = TelemetryService.accessDenialAttributes(for: message, localSyncPath: root)
+        guard attrs["error.access_denial"] == .string("permission_denied"),
+              attrs["error.blocked_path.kind"] == .string("volume_system_folder"),
+              attrs["error.blocked_path.in_sync_folder"] == .bool(true),
+              TelemetryService.accessDenialAttributes(for: eperm, localSyncPath: root)["error.access_denial"]
+                == .string("operation_not_permitted"),
+              TelemetryService.accessDenialAttributes(for: eperm, localSyncPath: root)["error.blocked_path.kind"]
+                == .string("photos_library"),
+              TelemetryService.accessDenialAttributes(for: message, localSyncPath: "/Users/me/Elsewhere")["error.blocked_path.in_sync_folder"]
+                == .bool(false),
+              TelemetryService.accessDenialAttributes(for: "Failed to copy: permission denied", localSyncPath: root)
+                == ["error.access_denial": .string("permission_denied")],
+              TelemetryService.accessDenialAttributes(for: "something unexpected happened", localSyncPath: root).isEmpty,
+              TelemetryService.accessDenialAttributes(for: nil, localSyncPath: root).isEmpty else {
+            return report(name, slug, false, "(wrong access-denial attributes)")
+        }
+        let allValues = (attrs.values.map { "\($0)" }).joined(separator: " ")
+        guard !allValues.contains("/Volumes"), !allValues.contains("Some Drive") else {
+            return report(name, slug, false, "(an access-denial attribute carried the path)")
+        }
+
+        // Source pins.
+        guard let viewSource = readSourceFile("Views/Settings/ProfileDetailView.swift"),
+              let migrationSource = readSourceFile("Services/MigrationRunner.swift"),
+              let managerSource = readSourceFile("Services/SyncManager.swift") else {
+            return report(name, slug, false, "(could not read source files)")
+        }
+        guard let actions = extractFunctionBody(startingAt: "private func macOSBlockedAccessActions(", in: viewSource),
+              let gate = actions.range(of: "if kind == .macOSPrivacy {"),
+              let privacy = actions.range(of: "handleErrorAction(.openPrivacySettings)"),
+              gate.upperBound <= privacy.lowerBound else {
+            return report(name, slug, false, "(Open Privacy Settings is offered for a permissions denial)")
+        }
+        guard migrationSource.contains("MigrationV5PhotosLibraryExclude(),\n        MigrationV6VolumeSystemFoldersExclude(),") else {
+            return report(name, slug, false, "(migration v6 is not registered after v5)")
+        }
+        guard managerSource.contains("errorMessage: profileErrors[profileId] ?? message,\n                localSyncPath: profile?.localSyncPath"),
+              managerSource.contains("errorMessage: message,\n                localSyncPath: profile?.localSyncPath") else {
+            return report(name, slug, false, "(telemetry is not given the profile's local folder)")
         }
         return report(name, slug, true)
     }

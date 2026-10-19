@@ -1039,6 +1039,31 @@ local folder or inside it — a remote server's EPERM is not):
   `io_errors_blocked_deletes`.
 Covered by `ConfigSelfTest` AC-PL1–AC-PL4.
 
+**"Permission denied" (EACCES) gets the same handling, and volume system folders are excluded
+by default.** rclone reports a local folder whose POSIX permissions it can't read as
+`… open /Volumes/Drive/.Spotlight-V100: permission denied` — EACCES, not EPERM. The local
+backend logs it, keeps going, and still exits non-zero (`backend/local/local.go` `List`), so one
+unreadable folder fails every run. `SyncLogPatterns.blockedAccess(in:)` matches both errnos and
+returns a `BlockedAccessKind` (`macOSPrivacy` / `filePermissions`); `macOSBlockedPath`,
+`LogParser`'s truncation exemption, the banner's **Exclude from Sync** and the notification all
+use it. The banner offers **Open Privacy Settings** only for `macOSPrivacy` — Full Disk Access
+does nothing for EACCES — and its copy names a volume system folder as such. The typical source
+is the root-owned folders macOS keeps at every volume root (`SyncExcludeFilter.volumeSystemFolderNames`:
+`.fseventsd`, `.Spotlight-V100`, `.Trashes`, `.DocumentRevisions-V100`, `.TemporaryItems`): a
+profile whose local folder is an external drive's root used to be protected only by the "Sync
+Only These Folders" block's trailing `- **`, so removing the last include folder made every run
+fail (observed in production, `error.type=permission_denied`). `defaultExcludeFilter` now carries
+`SyncExcludeFilter.volumeSystemFoldersSection`, one `- <name>/**` rule per folder. The `/**` is
+load-bearing: in rclone a bare name (the old `- .fseventsd`) is a FILE rule (`fs/filter/filter.go`
+`Filter.Add`) and rclone still descends into — and fails to list — the folder. Existing files
+get the section from migration v6 (below). Telemetry keeps `error.type=permission_denied` for
+both errnos and adds bounded `error.access_denial` (`operation_not_permitted` /
+`permission_denied`, also a label on `synctray.sync.errors`), `error.blocked_path.kind`
+(`volume_system_folder` / `photos_library` / `other`) and `error.blocked_path.in_sync_folder`
+(`TelemetryService.accessDenialAttributes`) — never the path. Covered by `ConfigSelfTest`
+AC-VS1–AC-VS4 (AC-VS3 runs the real rclone against unreadable folders, with the old default as
+the failing control).
+
 **"Sync Only These Folders" (`syncIncludeFolders`) — selective folder sync for
 Two-Way and One-Way profiles.** A per-profile allowlist (profile editor's "Sync
 Only These Folders" section, sharing `ExcludePatternListEditor`'s row chrome
@@ -1152,6 +1177,15 @@ fails — a library the profile used to sync would otherwise vanish from bisync'
 at once and, holding over half the files, stop every run at `--max-delete`. Per-profile
 failures are logged, never thrown, so one bad file can't pin the schema version.
 Covered by `ConfigSelfTest` AC-PL2.
+
+**Migration v6 — volume system folders excluded from existing profiles.**
+`MigrationV6VolumeSystemFoldersExclude` adds `SyncExcludeFilter.volumeSystemFoldersSection` to
+every existing Two-Way and One-Way filter with the same placement, skips and failure handling
+as v5 (`addingVolumeSystemFolderDefaults` returns nil once every rule is present). It writes the
+resync-pending marker only for a Two-Way profile with one of the folders at its local root that
+the user can READ (`containsReadableSystemFolder`): only such a folder can be in bisync's
+listings, where excluding it would count as deletions. An unreadable one never reached them —
+every run that tried to list it failed. Covered by `ConfigSelfTest` AC-VS2.
 
 **Migration.** `MigrationV3BlobToPerProfileFiles` (`MigrationRunner.swift`)
 moves the legacy `syncProfiles` UserDefaults blob to per-profile files on
@@ -1809,7 +1843,7 @@ Priority: process env vars > `~/.config/synctray/.env` > Info.plist. Key vars: `
 |------|---------|
 | `~/.config/synctray/profiles/{shortId}.json` | Profile config |
 | `~/.config/synctray/profiles/{shortId}-exclude.txt` | Exclude filter (user-editable; SyncTray owns two managed blocks — the "Don't Sync" exclude block at the TOP and, when `syncIncludeFolders` is non-empty, the "Sync Only These Folders" include block at the BOTTOM) |
-| `~/.config/synctray/profiles/{shortId}.resync-pending` | Two-Way (bisync) profiles only, created only when `syncIncludeFolders` changes (or once by migration v5, for a profile whose folder holds a Photos library) — a UUID token the sync script reads to schedule a safe `--resync --resync-mode newer` instead of a plain bisync, removed only after every required bisync session (see `.resync-pending.consumed`) has consumed it with an unchanged token |
+| `~/.config/synctray/profiles/{shortId}.resync-pending` | Two-Way (bisync) profiles only, created only when `syncIncludeFolders` changes (or once by migration v5, for a profile whose folder holds a Photos library, or by migration v6, for one with a readable volume system folder at its root) — a UUID token the sync script reads to schedule a safe `--resync --resync-mode newer` instead of a plain bisync, removed only after every required bisync session (see `.resync-pending.consumed`) has consumed it with an unchanged token |
 | `~/.config/synctray/profiles/{shortId}.resync-pending.consumed` | Two-Way (bisync) profiles only — per-token record of which bisync session(s) have already run their one-time resync for the current `.resync-pending` token; deleted together with the marker once every required session (primary, and the fallback's own session on a full remote swap) has consumed it |
 | `~/.local/bin/synctray-sync.sh` | Shared sync script (all profiles) |
 | `~/Library/LaunchAgents/com.synctray.sync.{shortId}.plist` | launchd schedule |

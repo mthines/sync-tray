@@ -118,6 +118,11 @@ For operations with real duration (like syncs), use the `activeSyncSpans` patter
   via `categorizeError()` — the raw message is **never** sent (not as an attribute, not as
   a span status description): it routinely carries paths and remote names, and the in-app
   privacy disclosure (`TelemetryDetailsSheet`) promises "never the raw message"
+- A `permission_denied` failure also carries bounded `error.access_denial`
+  (`operation_not_permitted` = EPERM/macOS privacy, `permission_denied` = EACCES/file
+  permissions), `error.blocked_path.kind` (`volume_system_folder` / `photos_library` / `other`)
+  and `error.blocked_path.in_sync_folder` from `TelemetryService.accessDenialAttributes` —
+  derived from the message, never the path itself
 - **Carve-out:** `vcs.repository.url.full` (the *source code* repository's origin
   remote, e.g. `https://github.com/mthines/sync-tray`) is exempt from the remote-URL
   ban above. It identifies the codebase the binary was built from, not a user's sync

@@ -614,43 +614,87 @@ enum SyncLogPatterns {
         message.lowercased().contains("operation not permitted")
     }
 
-    /// The absolute local path an "operation not permitted" error names (the path after
-    /// Go's `open`/`lstat`/… prefix), or nil when the message names none — e.g. a remote
-    /// backend's EPERM, which carries no absolute local path. Paths may contain spaces.
+    /// EACCES, which Go prints as "permission denied": POSIX ownership or mode bits refusing a
+    /// path — e.g. the root-owned folders macOS keeps at a volume root:
+    /// `failed to open directory ".Spotlight-V100": open /Volumes/Drive/.Spotlight-V100:
+    /// permission denied`. Full Disk Access can't fix it; excluding the path (or changing its
+    /// permissions, when the user owns it) can.
+    static func isPermissionDenied(_ message: String) -> Bool {
+        message.lowercased().contains("permission denied")
+    }
+
+    /// Why the operating system refused a local path rclone tried to read. The raw values are
+    /// the bounded `error.access_denial` telemetry values.
+    enum BlockedAccessKind: String {
+        /// EPERM ("operation not permitted"): macOS privacy controls (TCC). Granting Full Disk
+        /// Access can fix it.
+        case macOSPrivacy = "operation_not_permitted"
+        /// EACCES ("permission denied"): POSIX ownership or permissions. Privacy settings can't.
+        case filePermissions = "permission_denied"
+    }
+
+    /// The absolute path an "operation not permitted" or "permission denied" error names (the
+    /// path after Go's `open`/`lstat`/… prefix) and which of the two it is, or nil when the
+    /// message names no absolute path — e.g. a remote backend's error. Paths may contain spaces.
     ///
-    /// Single source for the "macOS blocked access" case: `LogParser` keeps such messages
-    /// whole (the path is what the recovery actions act on), the sync-failure notification
-    /// summarizes them (`macOSBlockedAccessSummary`), and `ProfileDetailView` offers
-    /// Exclude / Open Privacy Settings.
-    static func operationNotPermittedPath(in message: String) -> String? {
-        let pattern = #"(?:^|[\s:])(?:open|lstat|stat|opendir|readlink|mkdir|remove|rename|chmod|chtimes) (/.+?): operation not permitted"#
+    /// Single source for the "blocked access" case: `LogParser` keeps such messages whole (the
+    /// path is what the recovery actions act on), the sync-failure notification summarizes them
+    /// (`macOSBlockedAccessSummary`), `ProfileDetailView` offers Exclude (and, for a privacy
+    /// denial, Open Privacy Settings), and telemetry records the kind, never the path.
+    static func blockedAccess(in message: String) -> (path: String, kind: BlockedAccessKind)? {
+        let pattern = #"(?:^|[\s:])(?:open|lstat|stat|opendir|readlink|mkdir|remove|rename|chmod|chtimes) (/.+?): (operation not permitted|permission denied)"#
         guard let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]),
               let match = regex.firstMatch(in: message, range: NSRange(message.startIndex..., in: message)),
-              let range = Range(match.range(at: 1), in: message) else {
+              let pathRange = Range(match.range(at: 1), in: message),
+              let reasonRange = Range(match.range(at: 2), in: message) else {
             return nil
         }
-        return String(message[range])
+        let kind: BlockedAccessKind = message[reasonRange].lowercased() == "permission denied"
+            ? .filePermissions : .macOSPrivacy
+        return (String(message[pathRange]), kind)
     }
 
-    /// The path of a macOS privacy denial in `message`: an "operation not permitted" path that
-    /// is the profile's local folder or inside it. nil otherwise — including a remote server's
-    /// EPERM, whose absolute path is on the remote, where macOS settings can't help.
+    /// The path of `blockedAccess(in:)`, whichever kind it is.
+    static func blockedAccessPath(in message: String) -> String? {
+        blockedAccess(in: message)?.path
+    }
+
+    /// The absolute path an "operation not permitted" (EPERM) error names, or nil — including
+    /// for a "permission denied" error (see `blockedAccess(in:)` for both).
+    static func operationNotPermittedPath(in message: String) -> String? {
+        guard let blocked = blockedAccess(in: message), blocked.kind == .macOSPrivacy else { return nil }
+        return blocked.path
+    }
+
+    /// The path of a local access denial in `message` — EPERM or EACCES — that is the profile's
+    /// local folder or inside it. nil otherwise, including a remote server's error, whose
+    /// absolute path is on the remote, where nothing on this Mac can help.
     static func macOSBlockedPath(in message: String, localSyncPath: String) -> String? {
-        guard let path = operationNotPermittedPath(in: message),
-              SyncExcludeFilter.isWithinSyncFolder(path, localSyncPath: localSyncPath) else {
-            return nil
-        }
-        return path
+        macOSBlockedAccess(in: message, localSyncPath: localSyncPath)?.path
     }
 
-    /// One-line user-facing summary of a macOS privacy denial — "macOS blocked access to
-    /// “Photos Library.photoslibrary”." — or nil when `message` isn't one (see
+    /// `blockedAccess(in:)`, but only for a path that is the profile's local folder or inside it.
+    static func macOSBlockedAccess(in message: String, localSyncPath: String) -> (path: String, kind: BlockedAccessKind)? {
+        guard let blocked = blockedAccess(in: message),
+              SyncExcludeFilter.isWithinSyncFolder(blocked.path, localSyncPath: localSyncPath) else {
+            return nil
+        }
+        return blocked
+    }
+
+    /// One-line user-facing summary of a local access denial — "macOS blocked access to
+    /// “Photos Library.photoslibrary”." for a privacy denial, "SyncTray isn't allowed to read
+    /// “.Spotlight-V100”." for a permissions one — or nil when `message` isn't one (see
     /// `macOSBlockedPath`). Names only the last path component, which is what the user
     /// recognizes.
     static func macOSBlockedAccessSummary(for message: String, localSyncPath: String) -> String? {
-        guard let path = macOSBlockedPath(in: message, localSyncPath: localSyncPath) else { return nil }
-        let name = (path as NSString).lastPathComponent
-        return "macOS blocked access to “\(name.isEmpty ? path : name)”."
+        guard let blocked = macOSBlockedAccess(in: message, localSyncPath: localSyncPath) else { return nil }
+        let name = (blocked.path as NSString).lastPathComponent
+        let shown = name.isEmpty ? blocked.path : name
+        switch blocked.kind {
+        case .macOSPrivacy: return "macOS blocked access to “\(shown)”."
+        case .filePermissions: return "SyncTray isn't allowed to read “\(shown)”."
+        }
     }
 
     /// True when rclone failed to open a DIRECTORY (the local backend's listing error), as

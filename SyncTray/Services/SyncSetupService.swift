@@ -22,7 +22,8 @@ final class SyncSetupService {
         # macOS metadata
         - ._*
         - .DS_Store
-        - .fseventsd
+
+        \(SyncExcludeFilter.volumeSystemFoldersSection)
 
         \(SyncExcludeFilter.photosLibrarySection)
 
@@ -2801,7 +2802,50 @@ enum SyncExcludeFilter {
     /// with the same patterns returns this output unchanged.
     static func addingPhotosLibraryDefault(to existing: String) -> String? {
         guard !existing.lowercased().contains(".photoslibrary") else { return nil }
+        return insertingDefaultSection(photosLibrarySection, into: existing)
+    }
 
+    /// The folders macOS creates at the root of every volume it mounts (an external drive, a
+    /// disk image): the Spotlight index, the FSEvents log, the per-volume Trash, document
+    /// versions and temporary items. They are owned by root and most are unreadable to the
+    /// user, so when a Two-Way or One-Way profile's local folder is a volume root and nothing
+    /// else keeps rclone out of them, listing them fails with "permission denied" — every
+    /// run exits non-zero and rclone stops propagating deletions. Before this default, only
+    /// the "Sync Only These Folders" tail block's trailing `- **` kept them out, so removing
+    /// the last include folder broke such a profile. They never hold user data.
+    static let volumeSystemFolderNames = [
+        ".fseventsd", ".Spotlight-V100", ".Trashes", ".DocumentRevisions-V100", ".TemporaryItems",
+    ]
+
+    /// One rule per folder. Each ends in `/**`, which makes it an rclone DIRECTORY rule, so
+    /// rclone never opens the folder at all. A bare name (the old default `- .fseventsd`) is a
+    /// file-only rule in rclone (`fs/filter/filter.go` `Filter.Add`): it matches a file of
+    /// that name and still lets rclone descend into — and fail to list — the folder.
+    /// Unanchored, so a nested volume root (a mounted image inside the folder) is covered too.
+    static let volumeSystemFolderRules = volumeSystemFolderNames.map { "- \($0)/**" }
+
+    /// Written into every new filter file as part of `SyncSetupService.defaultExcludeFilter`,
+    /// and added once to existing ones by `MigrationV6VolumeSystemFoldersExclude`
+    /// (`addingVolumeSystemFolderDefaults(to:)`). Ordinary user content, like the Photos rule.
+    static let volumeSystemFoldersSection = (
+        ["# macOS volume system folders: root-owned, unreadable, never user data"] + volumeSystemFolderRules
+    ).joined(separator: "\n")
+
+    /// `existing` with `volumeSystemFoldersSection` added where `addingPhotosLibraryDefault`
+    /// puts its rule (below the managed "Don't Sync" block, above the user's own rules). Nil
+    /// when every rule is already present as written, so a second pass changes nothing; a
+    /// user's own rule for one of the folders is left alone (a duplicate rule is harmless).
+    static func addingVolumeSystemFolderDefaults(to existing: String) -> String? {
+        let lines = Set(existing.components(separatedBy: "\n").map { $0.trimmingCharacters(in: .whitespaces) })
+        guard !volumeSystemFolderRules.allSatisfy({ lines.contains($0) }) else { return nil }
+        return insertingDefaultSection(volumeSystemFoldersSection, into: existing)
+    }
+
+    /// `existing` with `section` inserted at the top of the user's own rules — right below the
+    /// managed "Don't Sync" head block and above any hand-written `+` include, since rclone
+    /// applies the first rule that matches. The head block is re-emitted exactly as found, so a
+    /// later `merged(existing:patterns:)` with the same patterns returns this output unchanged.
+    private static func insertingDefaultSection(_ section: String, into existing: String) -> String {
         var headBlock = ""
         let lines = existing.components(separatedBy: "\n")
         if let start = lines.firstIndex(where: { $0.trimmingCharacters(in: .whitespacesAndNewlines) == beginMarker }) {
@@ -2815,7 +2859,7 @@ enum SyncExcludeFilter {
 
         let userContent = droppingLeadingBlankLines(strippingManagedBlock(from: existing))
         var output = headBlock.isEmpty ? "" : headBlock + "\n\n"
-        output += photosLibrarySection
+        output += section
         if userContent.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             return output + "\n"
         }
@@ -2823,7 +2867,7 @@ enum SyncExcludeFilter {
     }
 
     /// The "Don't Sync" pattern that excludes exactly `blockedPath` — a local path rclone
-    /// reported macOS wouldn't let it read (`SyncLogPatterns.operationNotPermittedPath`) —
+    /// reported it couldn't read (`SyncLogPatterns.blockedAccessPath`) —
     /// from a profile synced at `localSyncPath`: anchored to the sync folder's root with a
     /// leading `/`, and, for a folder, ending in `/` ("this folder and everything in it").
     /// nil when the path is the sync folder itself or isn't inside it (neither can be
