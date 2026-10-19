@@ -1176,8 +1176,11 @@ final class SyncManager: ObservableObject {
     /// corrupt anything else. The file and snapshot are then rewritten to match
     /// (a self-noted write, so the watcher ignores it).
     func applyExternalSettingsEdit() {
+        // An unreadable or half-written file applies nothing — and isn't
+        // overwritten, so a hand edit with a typo is never lost.
+        guard let file = AppSettingsFileStore.readSettingsFileJSON() else { return }
         let changed = AppSettingsFileStore.keysChangedSinceLastWrite(
-            file: AppSettingsFileStore.readSettingsFileJSON() ?? [:],
+            file: file,
             snapshot: AppSettingsFileStore.lastWrittenSnapshot() ?? [:]
         )
         applySettingsFile(includeLoginItem: true, onlyKeys: changed)
