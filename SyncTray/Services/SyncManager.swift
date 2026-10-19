@@ -1989,8 +1989,10 @@ final class SyncManager: ObservableObject {
     /// next run. Re-reads the profile from the store since it may have changed (disabled,
     /// deleted, edited again) while the abort was in flight.
     private func resumeAfterStopRunThenSync(for profile: SyncProfile) {
-        let latest = profileStore.profile(for: profile.id) ?? profile
-        guard !isAborting(for: profile.id), !isRunLive(for: latest) else {
+        // Short-circuits on the lookup, so a deleted profile never reaches `isEnabled`/
+        // `isRunLive` with a stale snapshot — matches this function's own doc comment.
+        guard let latest = profileStore.profile(for: profile.id), latest.isEnabled,
+              !isAborting(for: profile.id), !isRunLive(for: latest) else {
             TelemetryService.shared.recordProfileLifecycleOperation(
                 profileId: profile.id, profileName: profile.name,
                 operation: "apply_sync_filter", syncMode: profile.syncMode.rawValue, result: "not_restarted"

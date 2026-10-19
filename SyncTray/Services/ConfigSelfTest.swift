@@ -8277,8 +8277,10 @@ enum ConfigSelfTest {
     /// Pins plan D7's Save flow: `applyFilterSaveAndFollowUp` writes the filter and clears the
     /// error BEFORE the follow-up switch (so "saved == applied on disk" even if an abort gives
     /// up), `.confirmStopThenSync` goes through `stopRunThenSync` (never a raw `abortSync` call
-    /// from the view), and `stopRunThenSync` itself reuses `abortSync`/`abortTasks` with no new
-    /// pause, agent-load/unload, or lock touch (CLAUDE.md Rule 9).
+    /// from the view), `stopRunThenSync` itself reuses `abortSync`/`abortTasks` with no new
+    /// pause, agent-load/unload, or lock touch (CLAUDE.md Rule 9), and `resumeAfterStopRunThenSync`
+    /// actually honors its own doc comment's claim of re-reading the profile (deleted/disabled
+    /// mid-abort never restarts a sync — pr-reviewer PR #118 finding).
     private static func testStopThenSyncWiringPinned() -> Bool {
         let name = "AC-DS8", slug = "stop-then-sync-wiring-pinned"
         guard let viewSource = readSourceFile("Views/Settings/ProfileDetailView.swift"),
@@ -8307,6 +8309,19 @@ enum ConfigSelfTest {
               !stopFn.contains("pause("), !stopFn.contains("loadAgent"), !stopFn.contains("unloadAgent"),
               !stopFn.contains("removeStaleLocks"), !stopFn.contains("removeItem") else {
             return report(name, slug, false, "(stopRunThenSync does more than reuse abortSync/abortTasks)")
+        }
+        guard let resumeFn = extractFunctionBody(
+            startingAt: "private func resumeAfterStopRunThenSync(for profile: SyncProfile) {", in: managerSource
+        ) else {
+            return report(name, slug, false, "(resumeAfterStopRunThenSync not found)")
+        }
+        // The restart must come from a guard that requires BOTH a live lookup (not the stale
+        // `?? profile` fallback) and `isEnabled` — a profile deleted or disabled mid-abort must
+        // never reach `triggerManualSync`.
+        guard resumeFn.contains("guard let latest = profileStore.profile(for: profile.id)"),
+              resumeFn.contains("latest.isEnabled"),
+              !resumeFn.contains("?? profile") else {
+            return report(name, slug, false, "(resumeAfterStopRunThenSync does not guard on a live, enabled profile)")
         }
         return report(name, slug, true)
     }
