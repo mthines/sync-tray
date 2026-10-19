@@ -8029,12 +8029,12 @@ enum ConfigSelfTest {
         guard SyncPathKind.classify(localPath: "/Users/Me/Pictures", homeDirectory: "/Users/Me/") == "pictures" else {
             return report(name, slug, false, "(a trailing slash on the home directory broke classification)")
         }
-        let protected: Set<String> = ["desktop", "documents", "downloads", "icloud_drive", "library", "external_volume"]
-        let open: [String] = ["pictures", "music", "movies", "public", "cloud_storage", "home_root", "home_other", "other", "unknown"]
-        for kind in protected where !SyncPathKind.isPrivacyProtected(kind) {
+        let protectedKinds: [String] = ["desktop", "documents", "downloads", "icloud_drive", "library", "external_volume"]
+        let unprotectedKinds: [String] = ["pictures", "music", "movies", "public", "cloud_storage", "home_root", "home_other", "other", "unknown"]
+        for kind in protectedKinds where !SyncPathKind.isPrivacyProtected(kind) {
             return report(name, slug, false, "(\(kind) should be privacy-protected)")
         }
-        for kind in open where SyncPathKind.isPrivacyProtected(kind) {
+        for kind in unprotectedKinds where SyncPathKind.isPrivacyProtected(kind) {
             return report(name, slug, false, "(\(kind) should not be privacy-protected)")
         }
         return report(name, slug, true)
@@ -8053,8 +8053,8 @@ enum ConfigSelfTest {
               RemoteBackendType.bucket(nil) == "unknown" else {
             return report(name, slug, false, "(bucket mapped a known, unknown or missing type wrongly)")
         }
-        for type in RemoteBackendType.knownTypes where RemoteBackendType.bucket(type) != type {
-            return report(name, slug, false, "(known type \(type) was not reported as itself)")
+        for knownType in RemoteBackendType.knownTypes where RemoteBackendType.bucket(knownType) != knownType {
+            return report(name, slug, false, "(known type \(knownType) was not reported as itself)")
         }
 
         let config = """
