@@ -162,6 +162,11 @@ enum ConfigSelfTest {
             testFilterSaveFollowUpMatrix,
             testStagedDontSyncSourcePins,
             testStopThenSyncWiringPinned,
+            testTelemetryLockState,
+            testTelemetryErrorCategories,
+            testSyncPathKind,
+            testRemoteBackendType,
+            testSyncProgressAttributes,
             testRunLivenessMountMode,
             testExclusiveRunRegistryStaleGrace,
             testSyncRunLockAcquire,
@@ -8322,6 +8327,486 @@ enum ConfigSelfTest {
               resumeFn.contains("latest.isEnabled"),
               !resumeFn.contains("?? profile") else {
             return report(name, slug, false, "(resumeAfterStopRunThenSync does not guard on a live, enabled profile)")
+        }
+        return report(name, slug, true)
+    }
+
+    // MARK: - AC-TS1 — telemetry lock state tells a verified run from a reused PID
+
+    /// `SyncRunLock.lockState` maps every holder to its bounded `sync.lock_state` label, and
+    /// only a live PID that `SyncAbort.isProfileProcess` recognises as this profile's run is
+    /// `live_verified` — a PID reused by another profile's script is `live_unverified`, the
+    /// stuck-lock signature `kill(pid, 0)` alone can't see. `isProfileProcess` accepts the
+    /// script by its config path and an rclone by its local folder (raw or `~`-expanded,
+    /// whatever its parent), and nothing without a command line.
+    private static func testTelemetryLockState() -> Bool {
+        let name = "AC-TS1", slug = "telemetry-lock-state"
+        let appPID: Int32 = 500
+        let alivePIDs: Set<Int32> = [500, 700, 701, 900, 950]
+        let isAlive: (Int32) -> Bool = { alivePIDs.contains($0) }
+        let configPath = "/Users/me/.config/synctray/profiles/c6169dcc.json"
+        let otherConfigPath = "/Users/me/.config/synctray/profiles/0badf00d.json"
+        let localSyncPath = "/Users/me/Sync"
+        let bash700 = SyncAbort.ProcessEntry(pid: 700, ppid: 1, name: "/bin/bash")
+        let rclone701 = SyncAbort.ProcessEntry(pid: 701, ppid: 700, name: "/opt/homebrew/bin/rclone")
+        let bash900 = SyncAbort.ProcessEntry(pid: 900, ppid: 1, name: "/bin/bash")
+        let table: [Int32: SyncAbort.ProcessEntry] = [700: bash700, 701: rclone701, 900: bash900]
+        let arguments: [Int32: String] = [
+            700: "/bin/bash /Users/me/.local/bin/synctray-sync.sh \(configPath)",
+            701: "/opt/homebrew/bin/rclone bisync remote:Sync \(localSyncPath) --verbose --use-json-log",
+            // The lock's PID was reused by ANOTHER profile's sync script.
+            900: "/bin/bash /Users/me/.local/bin/synctray-sync.sh \(otherConfigPath)",
+        ]
+        let identify: (Int32) -> Bool = { pid in
+            guard let entry = table[pid] else { return false }
+            return SyncAbort.isProfileProcess(
+                entry, arguments: arguments[pid], configPath: configPath, localSyncPath: localSyncPath)
+        }
+        func state(_ holder: SyncRunLock.Holder) -> String {
+            SyncRunLock.lockState(holder: holder, appPID: appPID, isAlive: isAlive, identify: identify)
+        }
+        let cases: [(SyncRunLock.Holder, String)] = [
+            (SyncRunLock.Holder.none, "none"),
+            (SyncRunLock.parseHolder(nil), "none"),
+            (SyncRunLock.parseHolder("  \n"), "none"),
+            (SyncRunLock.Holder.pending, "pending"),
+            (SyncRunLock.parseHolder("pending"), "pending"),
+            (SyncRunLock.Holder.unreadable, "unreadable"),
+            (SyncRunLock.parseHolder("not a pid"), "unreadable"),
+            (SyncRunLock.Holder.pid(0), "unreadable"),
+            (SyncRunLock.Holder.pid(4242), "stale"),
+            (SyncRunLock.Holder.pid(500), "live_app"),
+            (SyncRunLock.Holder.pid(700), "live_verified"),
+            (SyncRunLock.parseHolder(#"{"Session":"x","PID":"701"}"#), "live_verified"),
+            (SyncRunLock.Holder.pid(900), "live_unverified"),
+            // Alive, but not in the process table (or ps failed): never verified.
+            (SyncRunLock.Holder.pid(950), "live_unverified"),
+        ]
+        for (holder, expected) in cases {
+            let got = state(holder)
+            guard got == expected else {
+                return report(name, slug, false, "(lockState(\(holder)) = \(got), expected \(expected))")
+            }
+        }
+        // `identify` decides only between the two live labels: never for the app's own
+        // placeholder, never for a dead PID.
+        let alwaysYes: (Int32) -> Bool = { _ in true }
+        guard SyncRunLock.lockState(holder: .pid(500), appPID: appPID, isAlive: isAlive, identify: alwaysYes) == "live_app",
+              SyncRunLock.lockState(holder: .pid(4242), appPID: appPID, isAlive: isAlive, identify: alwaysYes) == "stale" else {
+            return report(name, slug, false, "(identify overrode live_app or stale)")
+        }
+
+        // isProfileProcess positives.
+        let scriptEntry = SyncAbort.ProcessEntry(pid: 710, ppid: 1, name: "/Users/me/.local/bin/synctray-sync.sh")
+        let tildeLocal = "~/SelfTestTS1Sync"
+        let expandedLocal = (tildeLocal as NSString).expandingTildeInPath
+        guard SyncAbort.isProfileProcess(bash700, arguments: arguments[700], configPath: configPath, localSyncPath: localSyncPath),
+              SyncAbort.isProfileProcess(scriptEntry, arguments: "synctray-sync.sh \(configPath)",
+                                         configPath: configPath, localSyncPath: localSyncPath),
+              SyncAbort.isProfileProcess(rclone701, arguments: arguments[701], configPath: configPath, localSyncPath: localSyncPath),
+              SyncAbort.isProfileProcess(rclone701, arguments: "rclone sync \(expandedLocal) remote:x",
+                                         configPath: configPath, localSyncPath: tildeLocal),
+              SyncAbort.isProfileProcess(rclone701, arguments: "rclone sync \(tildeLocal) remote:x",
+                                         configPath: configPath, localSyncPath: tildeLocal),
+              SyncAbort.isProfileProcess(rclone701, arguments: arguments[701], configPath: configPath,
+                                         localSyncPath: localSyncPath + "/") else {
+            return report(name, slug, false, "(isProfileProcess rejected one of this profile's run processes)")
+        }
+        // Unlike isRunRoot, a script run's rclone (parent = bash, not the app) still qualifies.
+        guard !SyncAbort.isRunRoot(rclone701, arguments: arguments[701], appPID: appPID,
+                                   configPath: configPath, localSyncPath: localSyncPath) else {
+            return report(name, slug, false, "(fixture assumption broken: isRunRoot accepted a non-app-child rclone)")
+        }
+
+        // isProfileProcess negatives.
+        let zsh = SyncAbort.ProcessEntry(pid: 720, ppid: 1, name: "/bin/zsh")
+        guard !SyncAbort.isProfileProcess(bash900, arguments: arguments[900], configPath: configPath, localSyncPath: localSyncPath),
+              !SyncAbort.isProfileProcess(zsh, arguments: "zsh -c synctray-sync.sh \(configPath)",
+                                          configPath: configPath, localSyncPath: localSyncPath),
+              !SyncAbort.isProfileProcess(rclone701, arguments: "rclone bisync remote:Other /Users/me/Other --verbose",
+                                          configPath: configPath, localSyncPath: localSyncPath),
+              !SyncAbort.isProfileProcess(rclone701, arguments: "rclone bisync remote:Sync2 /Users/me/Sync2 --verbose",
+                                          configPath: configPath, localSyncPath: localSyncPath),
+              !SyncAbort.isProfileProcess(rclone701, arguments: nil, configPath: configPath, localSyncPath: localSyncPath),
+              !SyncAbort.isProfileProcess(bash700, arguments: nil, configPath: configPath, localSyncPath: localSyncPath),
+              !SyncAbort.isProfileProcess(rclone701, arguments: arguments[701], configPath: configPath, localSyncPath: "") else {
+            return report(name, slug, false, "(isProfileProcess accepted a process that is not this profile's run)")
+        }
+
+        // The folder must be a whole argument: another profile's rclone syncing a folder INSIDE
+        // this one, or — for a profile syncing the home folder — any SyncTray rclone, whose
+        // `--filter-from ~/.config/synctray/profiles/…` starts with the home path, is not ours.
+        let homeProfileFolder = "/Users/me"
+        let otherProfileRclone = "rclone bisync /Users/me/Pictures gdrive:Pictures --filter-from /Users/me/.config/synctray/profiles/abcd1234-exclude.txt"
+        guard !SyncAbort.isProfileProcess(rclone701, arguments: "rclone bisync remote:Photos /Users/me/Sync/Photos --verbose",
+                                          configPath: configPath, localSyncPath: localSyncPath),
+              !SyncAbort.isProfileProcess(rclone701, arguments: otherProfileRclone,
+                                          configPath: configPath, localSyncPath: homeProfileFolder) else {
+            return report(name, slug, false, "(isProfileProcess accepted an rclone for a folder inside or under this profile's)")
+        }
+        guard SyncAbort.isProfileProcess(rclone701, arguments: "rclone bisync gdrive:Home /Users/me --verbose --filter-from /Users/me/.config/synctray/profiles/c6169dcc-exclude.txt",
+                                         configPath: configPath, localSyncPath: homeProfileFolder),
+              SyncAbort.isProfileProcess(rclone701, arguments: "rclone sync /Users/me/ gdrive:Home",
+                                         configPath: configPath, localSyncPath: homeProfileFolder) else {
+            return report(name, slug, false, "(isProfileProcess rejected an rclone whose argument is exactly this profile's home folder)")
+        }
+        return report(name, slug, true)
+    }
+
+    // MARK: - AC-TS2 — error categories: the new buckets, the old ones unchanged, and error.operation
+
+    private static func testTelemetryErrorCategories() -> Bool {
+        let name = "AC-TS2", slug = "telemetry-error-categories"
+        let photosDenial = "failed to open directory \"Photos Library.photoslibrary\": open /Users/someone/Pictures/Photos Library.photoslibrary: operation not permitted"
+        let checks: [(String?, String)] = [
+            // New buckets, from real rclone / Google Drive / Go runtime wording.
+            ("Failed to copy: googleapi: Error 403: User Rate Limit Exceeded. Rate of requests for user exceed configured project quota., userRateLimitExceeded", "rate_limited"),
+            ("googleapi: Error 403: Quota exceeded for quota metric 'Queries' and limit 'Queries per minute per user', rateLimitExceeded", "rate_limited"),
+            ("HTTP error 429 (429 Too Many Requests) returned body: \"slow down\"", "rate_limited"),
+            ("Failed to copy: googleapi: Error 403: The user's Drive storage quota has been exceeded., storageQuotaExceeded", "quota_exceeded"),
+            ("Failed to copy: 507 Insufficient Storage", "quota_exceeded"),
+            ("Failed to copy: write /Users/me/Sync/big.mov: no space left on device", "disk_full"),
+            ("Failed to create file system for \"gdrive:\": couldn't fetch token: invalid_grant: maybe token expired? - try refreshing with \"rclone config reconnect gdrive:\"", "auth_failed"),
+            ("oauth2: cannot fetch token: 400 Bad Request", "auth_failed"),
+            ("Failed to copy: HTTP 401 Unauthorized", "auth_failed"),
+            ("Get \"https://nas.local:5006/\": tls: failed to verify certificate: x509: certificate signed by unknown authority", "tls_certificate"),
+            ("Failed to copy: open /Users/me/Sync/aaaaaaaa: file name too long", "name_too_long"),
+            ("Failed to copy: invalidRequest: The provided name contains invalid characters", "invalid_name"),
+            ("Failed to copy: corrupted on transfer: md5 hash differ \"0cc1\" vs \"9f2e\"", "checksum_mismatch"),
+            ("Failed to copy: corrupted on transfer: sizes differ 1024 vs 2048", "checksum_mismatch"),
+            ("Failed to copy: can't copy - source file is being updated (size changed from 1024 to 2048)", "file_changed_during_transfer"),
+            ("Failed to copy: open /Users/me/Sync/library.sqlite: resource busy", "file_busy"),
+            ("Duplicate object found in source - ignoring", "duplicate_object"),
+            ("Duplicate directory found in destination - ignoring", "duplicate_object"),
+            ("Failed to rmdir: remove /Users/me/Sync/old: directory not empty", "directory_not_empty"),
+            // More network / timeout phrasings.
+            ("Failed to copy: Post \"https://www.googleapis.com/upload\": dial tcp: lookup www.googleapis.com: no such host", "network"),
+            ("Failed to copy: read tcp 10.0.0.2:52311->142.250.0.1:443: read: connection reset by peer", "network"),
+            ("Failed to copy: write tcp 10.0.0.2:52311->10.0.0.5:445: write: broken pipe", "network"),
+            ("Failed to copy: Get \"https://www.googleapis.com/drive/v3/files\": context deadline exceeded (Client.Timeout exceeded while awaiting headers)", "timeout"),
+            // Moved by this PR: a bare "no such host" was file_not_found (via "no such").
+            ("no such host", "network"),
+            // A token refresh that timed out is a timeout, not an auth failure ("oauth2:" /
+            // "failed to refresh token" must not win over the timeout wording).
+            ("oauth2: cannot fetch token: Post \"https://oauth2.googleapis.com/token\": dial tcp 1.2.3.4:443: i/o timeout", "timeout"),
+            ("oauth2: cannot fetch token: Post \"https://oauth2.googleapis.com/token\": net/http: TLS handshake timeout", "timeout"),
+            ("failed to refresh token: Post \"https://api.proton.me/auth/refresh\": dial tcp 1.2.3.4:443: connect: operation timed out", "timeout"),
+            // Go's JSON decoder on an HTML reply (e.g. a captive portal or proxy) is not a bad
+            // file name.
+            ("failed to get StartPageToken: invalid character '<' looking for beginning of value", "other"),
+            // A file merely named x509 is not a TLS error.
+            ("open /Users/me/Sync/certs/x509.pem: no such file or directory", "file_not_found"),
+            // A path segment named tls or x509 is not a TLS error either ("/" precedes it, not a space)…
+            ("open /Users/me/Sync/certs/tls: permission denied", "permission_denied"),
+            ("open /Users/me/Sync/certs/x509: no such file or directory", "file_not_found"),
+            ("open /Users/me/Sync/x/oauth2: permission denied", "permission_denied"),
+            ("open /Users/me/Sync/Duplicate Files/a.jpg: permission denied", "permission_denied"),
+            ("open /Users/me/Sync/Bad Certificate.pdf: permission denied", "permission_denied"),
+            // Nor is a file whose name merely contains an HTTP status phrase.
+            ("open /Users/me/Sync/Unauthorized.pdf: permission denied", "permission_denied"),
+            ("open /Users/me/Sync/rate limit notes.txt: no such file or directory", "file_not_found"),
+            // …while Go's prefixes still match mid-message and at the very start of the message.
+            ("tls: first record does not look like a TLS handshake", "tls_certificate"),
+            ("x509: certificate is valid for nas.local, not nas.example.com", "tls_certificate"),
+            ("remote error: tls: bad certificate", "tls_certificate"),
+            // Unchanged buckets.
+            (photosDenial, "permission_denied"),
+            ("Failed to sync with 2 errors: last error was: not deleting files as there were IO errors", "io_errors_blocked_deletes"),
+            ("file not found", "file_not_found"),
+            ("Failed to copy: permission denied", "permission_denied"),
+            // A file name that merely mentions a certificate is not a TLS error.
+            ("open /Users/me/Sync/Birth Certificate.pdf: permission denied", "permission_denied"),
+            ("dial tcp 10.0.0.5:445: i/o timeout", "timeout"),
+            ("network error", "network"),
+            ("Bisync critical error: out of sync - must run --resync", "out_of_sync"),
+            // rclone mount's mount-point error stays critical; only Go's ENOTEMPTY is split out.
+            ("Fatal error: Directory is not empty: /Users/me/Mount If you want to mount it anyway use: --allow-non-empty option", "critical"),
+            ("something unexpected happened", "other"),
+            (nil, "unknown"),
+        ]
+        for (input, expected) in checks {
+            let got = TelemetryService.categorizeError(input)
+            guard got == expected else {
+                return report(name, slug, false, "(categorizeError(\(input.debugDescription)) = \(got), expected \(expected))")
+            }
+        }
+        // Every specific bucket is reachable by the table above.
+        let covered = Set(checks.map { $0.1 })
+        for bucket in TelemetryService.specificErrorBuckets.map({ $0.bucket }) where !covered.contains(bucket) {
+            return report(name, slug, false, "(no case covers the \(bucket) bucket)")
+        }
+
+        let operations: [(String?, String)] = [
+            ("Failed to copy: corrupted on transfer: sizes differ 1024 vs 2048", "copy"),
+            ("Failed to copy: mkdir /Users/me/Sync/new: operation not permitted", "copy"),
+            ("Couldn't delete: remove /Users/me/Sync/old.txt: permission denied", "delete"),
+            ("Failed to move: object not found", "move"),
+            ("Failed to rename: duplicate file", "move"),
+            ("error listing: directory not found", "list"),
+            ("failed to list directory: context deadline exceeded", "list"),
+            ("mkdir /Users/me/Sync/new: operation not permitted", "mkdir"),
+            ("failed to make directory: permission denied", "mkdir"),
+            ("can't copy - source file is being updated", "copy"),
+            ("Couldn't move: rename /Users/me/Sync/a.txt /Users/me/Sync/b.txt: permission denied", "move"),
+            ("error reading source directory: open /Users/me/Sync/Delete Me: permission denied", "list"),
+            ("error reading source root directory: directory not found", "list"),
+            ("error reading destination directory: googleapi: Error 403: rateLimitExceeded", "list"),
+            ("Failed to rmdir: remove /Users/me/Sync/old: directory not empty", "delete"),
+            ("failed to rmdirs: directory not found", "delete"),
+            ("Failed to Rmdir: directory not empty", "delete"),
+            ("open /Users/me/Sync/rmdir.sh: permission denied", "other"),
+            ("Failed to rmdir: remove /Users/me/Sync/mkdir-old: directory not empty", "delete"),
+            ("open /Users/me/Sync/mkdir.sh: permission denied", "other"),
+            ("RenameDir mkdir: permission denied", "mkdir"),
+            ("mkdir metadata: failed make directory: permission denied", "mkdir"),
+            ("something unexpected happened", "other"),
+            (nil, "other"),
+        ]
+        for (input, expected) in operations {
+            let got = TelemetryService.categorizeErrorOperation(input)
+            guard got == expected else {
+                return report(name, slug, false, "(categorizeErrorOperation(\(input.debugDescription)) = \(got), expected \(expected))")
+            }
+        }
+        return report(name, slug, true)
+    }
+
+    // MARK: - AC-TS3 — config.local_path_kind buckets a folder, never sends it
+
+    private static func testSyncPathKind() -> Bool {
+        let name = "AC-TS3", slug = "sync-path-kind"
+        let home = "/Users/Me"
+        let cases: [(String, String)] = [
+            ("/Users/Me/Pictures", "pictures"),
+            ("/users/me/PICTURES/", "pictures"),
+            ("~/Pictures/Holiday/2024", "pictures"),
+            ("//Users//Me//Pictures//", "pictures"),
+            ("/Users/Me/Documents/../Pictures", "pictures"),
+            ("~/Desktop", "desktop"),
+            ("~/Documents/Work/Reports", "documents"),
+            ("~/Downloads", "downloads"),
+            ("~/Music/Logic", "music"),
+            ("~/Movies", "movies"),
+            ("~/Public/Drop Box", "public"),
+            ("~/Library/Mobile Documents/com~apple~CloudDocs/Notes", "icloud_drive"),
+            ("~/Library/CloudStorage/GoogleDrive-me@example.com/My Drive", "cloud_storage"),
+            ("~/Library/Mail", "library"),
+            ("/Users/Me/Library", "library"),
+            ("~", "home_root"),
+            ("/Users/Me", "home_root"),
+            ("/users/me/", "home_root"),
+            ("~/Code/project", "home_other"),
+            ("~/PicturesArchive", "home_other"),
+            ("/Volumes/SeagateHD/Kaiju", "external_volume"),
+            ("/volumes/usb", "external_volume"),
+            ("/Volumes", "other"),
+            ("/Users/MeToo/Pictures", "other"),
+            ("/tmp/sync", "other"),
+            ("relative/folder", "other"),
+            ("", "unknown"),
+            ("   ", "unknown"),
+        ]
+        for (path, expected) in cases {
+            let got = SyncPathKind.classify(localPath: path, homeDirectory: home)
+            guard got == expected else {
+                return report(name, slug, false, "(classify(\(path.debugDescription)) = \(got), expected \(expected))")
+            }
+        }
+        // A trailing slash on the home directory itself changes nothing.
+        guard SyncPathKind.classify(localPath: "/Users/Me/Pictures", homeDirectory: "/Users/Me/") == "pictures" else {
+            return report(name, slug, false, "(a trailing slash on the home directory broke classification)")
+        }
+        let protectedKinds: [String] = ["desktop", "documents", "downloads", "icloud_drive", "library", "external_volume"]
+        let unprotectedKinds: [String] = ["pictures", "music", "movies", "public", "cloud_storage", "home_root", "home_other", "other", "unknown"]
+        for kind in protectedKinds where !SyncPathKind.isPrivacyProtected(kind) {
+            return report(name, slug, false, "(\(kind) should be privacy-protected)")
+        }
+        for kind in unprotectedKinds where SyncPathKind.isPrivacyProtected(kind) {
+            return report(name, slug, false, "(\(kind) should not be privacy-protected)")
+        }
+        return report(name, slug, true)
+    }
+
+    // MARK: - AC-TS4 — config.remote_type comes from rclone.conf, bucketed by an allowlist
+
+    private static func testRemoteBackendType() -> Bool {
+        let name = "AC-TS4", slug = "remote-backend-type"
+        guard RemoteBackendType.bucket("drive") == "drive",
+              RemoteBackendType.bucket("protondrive") == "protondrive",
+              RemoteBackendType.bucket("SMB") == "smb",
+              RemoteBackendType.bucket(" s3 ") == "s3",
+              RemoteBackendType.bucket("my-private-backend") == "other",
+              RemoteBackendType.bucket("") == "unknown",
+              RemoteBackendType.bucket(nil) == "unknown" else {
+            return report(name, slug, false, "(bucket mapped a known, unknown or missing type wrongly)")
+        }
+        for knownType in RemoteBackendType.knownTypes where RemoteBackendType.bucket(knownType) != knownType {
+            return report(name, slug, false, "(known type \(knownType) was not reported as itself)")
+        }
+
+        let config = """
+            # rclone.conf
+            [gdrive]
+            type = drive
+            scope = drive
+            token = {"access_token":"x","expiry":"2026-10-19T10:00:00Z"}
+
+            [proton]
+            client_id = abc
+            type=protondrive
+
+            [notype]
+            user = me
+
+            [future]
+            type = some-future-backend
+
+            [commented]
+            # type = drive
+            ; type = s3
+
+            [nas-smb]
+            host = nas.local
+            type = smb
+            """
+        let reads: [(String, String?)] = [
+            ("gdrive", "drive"),
+            ("proton", "protondrive"),
+            ("notype", nil),
+            ("future", "some-future-backend"),
+            ("commented", nil),
+            ("nas-smb", "smb"),
+            ("missing", nil),
+            ("", nil),
+        ]
+        for (remote, expected) in reads {
+            let got = RcloneConfigService.remoteType(named: remote, inConfig: config)
+            guard got == expected else {
+                return report(name, slug, false, "(remoteType(named: \(remote)) = \(String(describing: got)), expected \(String(describing: expected)))")
+            }
+        }
+
+        var profile = sampleProfile()
+        func types(_ rcloneConfig: String?) -> [String] {
+            let pair = RemoteBackendType.types(for: profile, rcloneConfig: rcloneConfig)
+            return [pair.primary, pair.fallback]
+        }
+        profile.rcloneRemote = "gdrive:"
+        profile.fallbackRemote = ""
+        let noFallback = types(config)
+        profile.fallbackRemote = "nas-smb"
+        let withFallback = types(config)
+        profile.fallbackRemote = "nas-smb:"
+        let withColonFallback = types(config)
+        let unreadable = types(nil)
+        profile.rcloneRemote = "future:"
+        profile.fallbackRemote = "missing"
+        let unknownTypes = types(config)
+        guard noFallback == ["drive", "none"],
+              withFallback == ["drive", "smb"],
+              withColonFallback == ["drive", "smb"],
+              unreadable == ["unknown", "unknown"],
+              unknownTypes == ["other", "unknown"] else {
+            return report(name, slug, false,
+                          "(types(for:) gave \(noFallback) / \(withFallback) / \(withColonFallback) / \(unreadable) / \(unknownTypes))")
+        }
+        return report(name, slug, true)
+    }
+
+    // MARK: - AC-TS5 — the Sync progress attributes carry counts, never file names
+
+    private static func testSyncProgressAttributes() -> Bool {
+        let name = "AC-TS5", slug = "sync-progress-attributes"
+        let profileId = UUID()
+        let secretFile = "Projects/Top Secret/zz-ts5-distinctive-file-name.mov"
+        let progress = SyncProgress(
+            bytesTransferred: 123_456_789,
+            totalBytes: 987_654_321,
+            eta: 3_600,
+            speed: 2_500_000.5,
+            transfersDone: 41,
+            totalTransfers: 977,
+            checksDone: 1_234,
+            totalChecks: 5_678,
+            elapsedTime: 42.5,
+            errors: 3,
+            transferringFiles: [
+                TransferringFile(name: secretFile, size: 1_000, bytes: 500, percentage: 50,
+                                 speed: 10, speedAvg: nil, eta: 50),
+            ],
+            listedCount: 9_999
+        )
+        let attrs = TelemetryService.syncProgressAttributes(
+            profileId: profileId, profileName: "Work", syncMode: .bisync,
+            progress: progress, runAgeSeconds: 7_200)
+        let values = attrs.mapValues { "\($0)" }
+        let expected: [String: String] = [
+            "synctray.profile.id": profileId.uuidString,
+            "synctray.profile.name": "Work",
+            "sync.mode": "bisync",
+            "sync.progress.has_stats": "true",
+            "sync.run_age_s": "7200.0",
+            "sync.progress.bytes_transferred": "123456789",
+            "sync.progress.bytes_total": "987654321",
+            "sync.progress.transfers_done": "41",
+            "sync.progress.transfers_total": "977",
+            "sync.progress.checks_done": "1234",
+            "sync.progress.checks_total": "5678",
+            "sync.progress.errors": "3",
+            "sync.progress.speed_bps": "2500000.5",
+            "sync.progress.eta_s": "3600",
+            "sync.progress.elapsed_s": "42.5",
+            "sync.progress.listed": "9999",
+        ]
+        guard values == expected else {
+            return report(name, slug, false, "(attributes were \(values.sorted(by: { $0.key < $1.key })))")
+        }
+        // No value is, or contains, a file being transferred — whole path or base name.
+        let baseName = (secretFile as NSString).lastPathComponent
+        guard !values.values.contains(where: { $0 == secretFile || $0.contains(baseName) || $0.contains("Top Secret") }) else {
+            return report(name, slug, false, "(an attribute carried a transferring file's name)")
+        }
+
+        // Before rclone's first stats line: has_stats false, no counts, no run age when unknown.
+        let bare = TelemetryService.syncProgressAttributes(
+            profileId: profileId, profileName: "Work", syncMode: .sync,
+            progress: nil, runAgeSeconds: nil).mapValues { "\($0)" }
+        guard bare == [
+            "synctray.profile.id": profileId.uuidString,
+            "synctray.profile.name": "Work",
+            "sync.mode": "sync",
+            "sync.progress.has_stats": "false",
+        ] else {
+            return report(name, slug, false, "(attributes without stats were \(bare.sorted(by: { $0.key < $1.key })))")
+        }
+
+        // Optional fields rclone hasn't reported yet are left out, not zero-filled.
+        let partial = SyncProgress(bytesTransferred: 1, totalBytes: 2, eta: nil, speed: nil,
+                                   transfersDone: 0, totalTransfers: 0)
+        let partialKeys = Set(TelemetryService.syncProgressAttributes(
+            profileId: profileId, profileName: "Work", syncMode: .bisync,
+            progress: partial, runAgeSeconds: nil).keys)
+        guard partialKeys.isDisjoint(with: ["sync.progress.speed_bps", "sync.progress.eta_s",
+                                            "sync.progress.elapsed_s", "sync.progress.listed", "sync.run_age_s"]),
+              partialKeys.contains("sync.progress.bytes_total") else {
+            return report(name, slug, false, "(nil optional progress fields were emitted: \(partialKeys.sorted()))")
+        }
+
+        // Every profile state has a bounded label; a paused profile is "paused" whatever its state.
+        let labels: [(SyncState, Bool, String)] = [
+            (.idle, false, "idle"),
+            (.syncing, false, "syncing"),
+            (.paused, false, "paused"),
+            (.error("Exit code 1: /Users/me/Sync/x"), false, "error"),
+            (.driveNotMounted, false, "drive_not_mounted"),
+            (.notConfigured, false, "not_configured"),
+            (.error("boom"), true, "paused"),
+        ]
+        for (syncState, paused, label) in labels {
+            let got = TelemetryService.profileStateLabel(syncState, isPaused: paused)
+            guard got == label else {
+                return report(name, slug, false, "(profileStateLabel(\(syncState), \(paused)) = \(got), expected \(label))")
+            }
         }
         return report(name, slug, true)
     }

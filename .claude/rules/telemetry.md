@@ -94,6 +94,10 @@ On app launch and every profile save, a structured log captures the user's chose
 - `config.has_fallback`, `config.has_external_drive`, `config.is_enabled`, `config.is_muted`
 - Mount-specific: `config.mount_backend` (nfs/macfuse), `config.mount_at_startup` (true/false), `config.stream_cache_only` (true/false; `n/a` for non-mount — the union-overlay Cache-only mount toggle), `config.vfs_cache_mode`, `config.has_pinned_directories`, `config.pinned_directory_count`, `config.download_connections` (parallel `--transfers`/warm concurrency, 1–16; `0` for non-mount profiles), `config.has_bandwidth_limit` (bool — whether an rclone `--bwlimit` cap is set; presence only, never the rate value; all modes), `config.mount_resilient` (true/false — the bounded rclone `--timeout` hard mount that stops a stalled backend freezing Finder without the soft-mount sticky-EPERM downside; `n/a` for non-mount), `config.cache_fs_type` (bucketed filesystem of the VFS cache volume: apfs/hfs/exfat/fat/ntfs/network/other/unknown; `n/a` for non-mount), `config.cache_volume` (internal/external/unknown; `n/a` for non-mount)
 - Two-Way / One-Way: `config.sync_exclude_pattern_count` (number of "Don't Sync" patterns; `0` for mount profiles — the patterns themselves are never sent), `config.sync_include_folder_count` (number of "Sync Only These Folders" selective-folder entries; `0` for mount profiles — the folder names themselves are never sent)
+- Folder kind and storage backend (all modes), never the path or the remote's name:
+  - `config.local_path_kind` — `SyncPathKind.classify` of the local folder: `desktop`/`documents`/`downloads`/`pictures`/`music`/`movies`/`public` (`~/<Folder>` or below), `icloud_drive` (`~/Library/Mobile Documents`), `cloud_storage` (`~/Library/CloudStorage`), `library` (anything else under `~/Library`), `home_root` (the home folder itself), `home_other`, `external_volume` (`/Volumes/<name>/…`), `other`, `unknown` (empty). Case-insensitive, `~`-expanding, trailing-slash tolerant
+  - `config.local_path_privacy_protected` (bool) — true for `desktop`, `documents`, `downloads`, `icloud_drive`, `library`, `external_volume`: folders macOS privacy controls (TCC) can refuse a launchd-run script
+  - `config.remote_type` / `config.fallback_remote_type` — the remote's `type = …` from rclone.conf (`RcloneConfigService.remoteType(named:inConfig:)`), bucketed by `RemoteBackendType.bucket` through an allowlist of rclone backend names (`drive`, `protondrive`, `smb`, `s3`, …): a known type is itself, any other type `other`, a missing section / no rclone.conf `unknown`; the fallback is `none` when no fallback is configured. rclone.conf is read once per launch snapshot (and once per profile save), on a background `.utility` queue — the `Profile configuration` logs are emitted on main once it has been read
 - A summary log with `config.total_profiles`, `config.enabled_profiles`, mode breakdown
 
 This lets you understand feature adoption and preference patterns across installations.
@@ -107,6 +111,93 @@ For operations with real duration (like syncs), use the `activeSyncSpans` patter
 2. `recordSyncCompleted()` or `recordSyncFailed()` retrieves and ends the span
 3. On `shutdown()`, any orphaned spans are ended with `sync.result=app_shutdown`
 
+The span exports only when it ends, so a long run is otherwise invisible until it finishes —
+the heartbeat's `Sync progress` log (below) covers the time in between and carries the open
+span's context.
+
+## Per-profile Heartbeat Logs
+
+The 5-minute session heartbeat (`SyncManager.startSessionHeartbeat`) emits the aggregate
+`Session heartbeat` log (unchanged — dashboards depend on it) and then, via
+`SyncManager.recordProfileHeartbeatTelemetry`, two per-profile logs. State is captured on the
+main actor; lock files, rclone.conf and `ps` are read on a background queue
+(`SyncManager.profileHeartbeatReports`) and only when telemetry is on, so an opted-out user
+gets no extra process spawns. `ps -A` runs at most once per heartbeat, plus one `ps -o args=`
+per live lock-holder PID that isn't the app's own.
+
+**`Sync progress`** (info) — one per Two-Way / One-Way profile whose run is live (`isRunLive`'s
+rule: registry token or a live lock holder) or whose state is `.syncing`. Correlated to the
+open `synctray sync` span. Attributes (`TelemetryService.syncProgressAttributes`, pure):
+`synctray.profile.id`, `synctray.profile.name`, `sync.mode`, `sync.progress.has_stats` (false
+until rclone's first stats line has been parsed), `sync.run_age_s` (when the app saw the run
+start), and with stats: `sync.progress.bytes_transferred`, `sync.progress.bytes_total`,
+`sync.progress.transfers_done`, `sync.progress.transfers_total`, `sync.progress.checks_done`,
+`sync.progress.checks_total`, `sync.progress.errors`, plus `sync.progress.speed_bps`,
+`sync.progress.eta_s`, `sync.progress.elapsed_s`, `sync.progress.listed` when rclone reported
+them. **Never** the names of the files in flight (`SyncProgress.transferringFiles`).
+
+**`Profile status`** (info) — one per enabled profile (`TelemetryService.profileStatusAttributes`):
+`synctray.profile.id`, `synctray.profile.name`, `sync.mode`, `profile.state`
+(`idle`/`syncing`/`paused`/`error`/`drive_not_mounted`/`not_configured`; a profile in
+`pausedProfiles` is `paused`), `profile.run_live` (bool, `SyncManager.runLiveness`),
+`sync.lock_state`, `sync.session_lock_state`, `error.type` (only in an error state, from the
+stored error, or the state's own message when none was stored — "Script not found" / "Config
+not found" never store one), `config.local_path_kind`, `config.remote_type`,
+`config.fallback_remote_type`.
+
+`sync.lock_state` describes the `/tmp` run lock and `sync.session_lock_state` the rclone bisync
+session `.lck` (`SyncRunLock.lockState`, pure):
+
+| Value | Meaning |
+|-------|---------|
+| `none` | No lock file, or an empty one |
+| `pending` | The legacy `"pending"` sentinel (the guard treats it as live) |
+| `unreadable` | Neither a PID nor rclone's lock JSON |
+| `stale` | The PID is no longer running |
+| `live_app` | The PID is the app's own — the launch-gap placeholder |
+| `live_verified` | The PID is alive and identified as this profile's run (`SyncAbort.isProfileProcess`: `bash`/the script naming this profile's `configPath`, or an rclone with its `localSyncPath` as a whole argument — not a folder inside it, not a `--filter-from` path under it — whatever its parent) |
+| `live_unverified` | The PID is alive but NOT identifiable as this profile's run — the signature of a stale lock whose PID was reused, which `kill(pid, 0)` alone counts as live |
+| `n/a` | Both values for a Stream profile (its `/tmp` lock is the mount daemon's for the mount's whole life — Critical Rule 8 / R7); the session value for a One-Way profile (only bisync has a session lock) |
+
+## Error categories
+
+`error.type` (`TelemetryService.categorizeError`, pure) is a bounded bucket of an error
+message; the message itself never leaves the machine. Order: the `SyncLogPatterns` checks
+(`out_of_sync`/`critical`, `transient_all_files_changed`, `exclusive_mode_unsupported`,
+`permission_denied` for EPERM, `io_errors_blocked_deletes`), then the specific buckets of
+`TelemetryService.specificErrorBuckets` (lowercased, first match wins), then the original
+generic checks (`file_not_found`, `permission_denied`, `timeout`, `network`), else `other`;
+`unknown` for no message. A message the old buckets matched keeps its bucket unless it also
+names a more specific cause (e.g. a rate-limit or auth phrase), which now wins; besides that,
+Go's "directory not empty" moved from `critical` to `directory_not_empty`.
+
+| Bucket | Matches (lowercased) |
+|--------|----------------------|
+| `disk_full` | "no space left on device" |
+| `rate_limited` | "ratelimitexceeded", "userratelimitexceeded", "rate limit exceeded", "too many requests" — before `quota_exceeded`, since Google's per-minute limit says "Quota exceeded … rateLimitExceeded" |
+| `quota_exceeded` | "storagequotaexceeded", "quotaexceeded", "quota exceeded", "insufficient storage" |
+| `network` | "no such host" (ahead of the generic "no such" → `file_not_found`), "connection reset", "connection refused", "network is unreachable", "broken pipe" — plus the generic "network"/"connection" |
+| `timeout` | "context deadline exceeded", "deadline exceeded", "i/o timeout", "timed out", "handshake timeout" — ahead of `auth_failed`, so "oauth2: cannot fetch token: … i/o timeout" stays a timeout; plus the generic "timeout" |
+| `tls_certificate` | " x509:", " tls:", "certificate signed by", "certificate has expired", "certificate verify failed" (Go's error prefixes, not the bare words "x509" / "certificate", which would claim errors about a file named "x509.pem" or "…Certificate.pdf"; the two prefixes carry a leading space and are matched against the message with one leading space added, so a message starting with Go's prefix still matches while a path segment named `tls`/`x509` — "…/certs/tls: permission denied" — isn't claimed). Go's TLS alert "tls: bad certificate" is covered by " tls:", so there is no separate "bad certificate" needle, which a file named "Bad Certificate.pdf" would match |
+| `auth_failed` | "invalid_grant", "token expired", "expired token", " oauth2:", "401 unauthorized", "authentication failed", "couldn't fetch token", "failed to refresh token" — after `network`/`timeout`/`tls_certificate`, so a token refresh that failed on DNS, TLS or a timeout keeps that cause; the oauth2 prefix carries a leading space like the TLS prefixes, so a folder named `oauth2` — "…/x/oauth2: permission denied" — isn't claimed |
+| `name_too_long` | "file name too long", "name too long", "path too long" |
+| `invalid_name` | "illegal character", "invalid characters", "invalid name", "invalid file name", "invalid filename" (plural "characters": Go's JSON decoder says "invalid character '<' looking for beginning of value" when a proxy returns HTML, which stays `other`) |
+| `checksum_mismatch` | "corrupted on transfer", "hash differ", "hashes differ", "md5 differ", "sizes differ" |
+| `file_changed_during_transfer` | "source file is being updated", "changed size during" |
+| `file_busy` | "resource busy", "text file busy", "file is locked", "being used by another process" |
+| `duplicate_object` | "duplicate object found", "duplicate directory found" — rclone's own sync log phrases ("Duplicate object found in source - ignoring", "Duplicate directory found in destination - ignoring", from fs/march), so a folder or file named e.g. "Duplicate Files" isn't claimed |
+| `directory_not_empty` | Go's ENOTEMPTY "directory not empty" — split out of `critical`, whose "not empty" is there for rclone mount's "Directory is not empty" mount-point error (still `critical`) |
+
+`error.operation` (`TelemetryService.categorizeErrorOperation`, pure) on the `Sync error` log and
+the `Sync failed` log and span says which rclone operation failed: `copy` | `delete` | `move`
+(move or rename) | `list` | `mkdir` | `other`. Conservative: rclone's own prefixes first ("Failed
+to copy", "Couldn't delete", "Failed to move"/"Couldn't move"/"Failed to rename", "error
+listing"/"failed to list"/"error reading source/destination directory" (rclone's march listing
+errors, root directory included), "failed to rmdir" (rclone's rmdir/rmdirs failures, labelled
+`delete`), "mkdir" as a word (Go's "mkdir <path>:", rclone's "… mkdir:") or "make directory"), the
+bare words "copy"/"delete"/"listing" last, since a file path in the message can contain them.
+Log/span only — never a metric label.
+
 ## Rules
 
 ### Privacy
@@ -117,7 +208,8 @@ For operations with real duration (like syncs), use the `activeSyncSpans` patter
 - Error messages are categorized into types (e.g., "network", "timeout", "permission_denied")
   via `categorizeError()` — the raw message is **never** sent (not as an attribute, not as
   a span status description): it routinely carries paths and remote names, and the in-app
-  privacy disclosure (`TelemetryDetailsSheet`) promises "never the raw message"
+  privacy disclosure (`TelemetryDetailsSheet`) promises "never the raw message". See
+  [Error categories](#error-categories) for the buckets
 - **Carve-out:** `vcs.repository.url.full` (the *source code* repository's origin
   remote, e.g. `https://github.com/mthines/sync-tray`) is exempt from the remote-URL
   ban above. It identifies the codebase the binary was built from, not a user's sync
@@ -272,11 +364,11 @@ rollout. No event is emitted on a fresh install.
 
 ### Logs
 All key lifecycle events are emitted as structured OTel logs:
-- Sync started/completed/failed (with profile context, duration, files changed; started carries `sync.trigger`: manual/directory_watch/scheduled/startup)
+- Sync started/completed/failed (with profile context, duration, files changed; started carries `sync.trigger`: manual/directory_watch/scheduled/startup; failed — log and span — carries `error.type` and `error.operation`)
 - Mount/unmount success/failure
 - Directory watch triggers
 - Transport changes (primary ↔ fallback)
-- Sync errors (with categorized error type)
+- Sync errors (with categorized error type and `error.operation` — see [Error categories](#error-categories))
 - Drive not mounted warnings
 - Profile state changes (paused/resumed)
 - App launch
@@ -294,6 +386,8 @@ All key lifecycle events are emitted as structured OTel logs:
 - Stale lock cleanup: count and type of stale locks cleaned at startup (crash detection)
 - Check phase duration: bisync listing/comparison phase timing (bottleneck analysis)
 - Session heartbeat: periodic (5min) alive signal with profile state summary (availability)
+- Sync progress: one per live Two-Way / One-Way run on each heartbeat — byte/file/check counts, speed, ETA, `sync.run_age_s`; never file names (see [Per-profile Heartbeat Logs](#per-profile-heartbeat-logs))
+- Profile status: one per enabled profile on each heartbeat — `profile.state`, `profile.run_live`, `sync.lock_state` / `sync.session_lock_state` (a `live_unverified` lock is the reused-PID stuck-lock signature), `error.type`, `config.local_path_kind`, `config.remote_type`, `config.fallback_remote_type`
 - Volume events: external drive mount/unmount with affected profile count (drive workflow RUM)
 - Sync precondition failures: script_not_found, config_not_found (setup issue detection)
 - Resumed external syncs: syncs detected running at startup (launchd overlap detection)

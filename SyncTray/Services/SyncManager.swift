@@ -107,6 +107,29 @@ struct ExclusiveRunRegistry {
     }
 }
 
+/// What the 5-minute heartbeat needs to know about one profile, captured on the main actor
+/// so the lock reads and `ps` can run off it (`SyncManager.profileHeartbeatReports`).
+struct ProfileHeartbeatSnapshot {
+    let profile: SyncProfile
+    let state: SyncState
+    let isPaused: Bool
+    /// `ExclusiveRunRegistry.isActive` — main-actor state, so captured rather than read later.
+    let registryActive: Bool
+    /// The profile's stored error (`profileErrors`), categorized only — never sent as text.
+    let storedError: String?
+    let progress: SyncProgress?
+    /// When the app processed this run's `.syncStarted` (`syncStartTimes`), if it did.
+    let runStartedAt: Date?
+}
+
+/// The heartbeat's per-profile telemetry, computed off the main actor and emitted on it.
+struct ProfileHeartbeatReports {
+    /// Live Two-Way / One-Way runs — one `Sync progress` log each.
+    var progress: [ProfileHeartbeatSnapshot] = []
+    /// Enabled profiles — one `Profile status` log each.
+    var statuses: [ProfileStatusReport] = []
+}
+
 @MainActor
 final class SyncManager: ObservableObject {
     @Published private(set) var currentState: SyncState = .idle
@@ -5270,12 +5293,170 @@ final class SyncManager: ObservableObject {
                     pausedProfiles: paused,
                     errorProfiles: errors
                 )
+                self.recordProfileHeartbeatTelemetry()
                 self.probeMountReadHealth()
                 self.refreshCacheOnlyExcludeLists()
             }
         }
         heartbeatTimer = timer
         timer.resume()
+    }
+
+    /// Per-profile heartbeat telemetry, next to the aggregate `Session heartbeat`: one
+    /// `Sync progress` log per live Two-Way / One-Way run, and one `Profile status` log per
+    /// enabled profile. State is captured here on the main actor; the lock files, rclone.conf
+    /// and the process table are read on a background queue (`profileHeartbeatReports`), and
+    /// the logs are emitted back on main (`recordSyncProgress` reads the open span's context,
+    /// which is main-thread state). Telemetry-gated, so an opted-out user gets no extra file
+    /// reads or `ps` spawns.
+    private func recordProfileHeartbeatTelemetry() {
+        guard SyncTraySettings.telemetryEnabled else { return }
+        let snapshots = profileStore.profiles.map { profile in
+            ProfileHeartbeatSnapshot(
+                profile: profile,
+                state: profileStates[profile.id] ?? .idle,
+                isPaused: pausedProfiles.contains(profile.id),
+                registryActive: exclusiveRunRegistry.isActive(profile.id),
+                storedError: profileErrors[profile.id],
+                progress: profileProgress[profile.id],
+                runStartedAt: syncStartTimes[profile.id]
+            )
+        }
+        guard !snapshots.isEmpty else { return }
+        let appPID = getpid()
+        let homeDirectory = NSHomeDirectory()
+        DispatchQueue.global(qos: .utility).async {
+            let reports = SyncManager.profileHeartbeatReports(
+                snapshots, appPID: appPID, homeDirectory: homeDirectory)
+            DispatchQueue.main.async {
+                let now = Date()
+                for snapshot in reports.progress {
+                    TelemetryService.shared.recordSyncProgress(
+                        profileId: snapshot.profile.id,
+                        profileName: snapshot.profile.name,
+                        syncMode: snapshot.profile.syncMode,
+                        progress: snapshot.progress,
+                        runAgeSeconds: snapshot.runStartedAt.map { now.timeIntervalSince($0) }
+                    )
+                }
+                for status in reports.statuses {
+                    TelemetryService.shared.recordProfileStatus(status)
+                }
+            }
+        }
+    }
+
+    /// Build the heartbeat's per-profile reports from main-actor snapshots. Blocking — it
+    /// reads lock files and rclone.conf and may run `ps` — so call it off the main actor.
+    ///
+    /// - `Sync progress`: every non-mount profile whose run is live by the same rule as
+    ///   `isRunLive` (`runLiveness`: registry token, or a live `/tmp` / session lock holder),
+    ///   or whose state is `.syncing`. Enabled or not — a run outlives a disable.
+    /// - `Profile status`: every enabled profile. The lock states come from
+    ///   `SyncRunLock.lockState`, identifying a live holder with `SyncAbort.isProfileProcess`.
+    ///   A Stream profile reports `n/a` for both (its `/tmp` lock is the mount daemon's for
+    ///   the mount's whole life, R7), and a One-Way profile `n/a` for the session lock
+    ///   (only bisync has one).
+    /// `ps` runs only when a lock holder is a live PID other than the app's: once for the
+    /// table, then once per such PID for its command line.
+    nonisolated static func profileHeartbeatReports(
+        _ snapshots: [ProfileHeartbeatSnapshot], appPID: Int32, homeDirectory: String
+    ) -> ProfileHeartbeatReports {
+        let isAlive: (Int32) -> Bool = SyncRunLock.processIsAlive
+        func readHolder(_ path: String) -> SyncRunLock.Holder {
+            SyncRunLock.parseHolder(try? String(contentsOfFile: path, encoding: .utf8))
+        }
+
+        // Both lock holders of every non-mount profile, read once.
+        var holders: [UUID: (run: SyncRunLock.Holder, session: SyncRunLock.Holder)] = [:]
+        for snapshot in snapshots where !snapshot.profile.isMountMode {
+            holders[snapshot.profile.id] = (
+                run: readHolder(snapshot.profile.lockFilePath),
+                session: readHolder(SyncRunLock.sessionLockPath(for: snapshot.profile))
+            )
+        }
+
+        // The live holder PIDs worth identifying: not the app's own launch-gap placeholder.
+        var livePIDs = Set<Int32>()
+        for held in holders.values {
+            for holder in [held.run, held.session] {
+                if case .pid(let pid) = holder, pid > 0, pid != appPID, isAlive(pid) {
+                    livePIDs.insert(pid)
+                }
+            }
+        }
+        var entriesByPID: [Int32: SyncAbort.ProcessEntry] = [:]
+        var argumentsByPID: [Int32: String] = [:]
+        if !livePIDs.isEmpty {
+            for entry in SyncAbort.readProcessTable() where livePIDs.contains(entry.pid) {
+                entriesByPID[entry.pid] = entry
+            }
+            for pid in entriesByPID.keys {
+                if let arguments = SyncAbort.readArguments(of: pid) {
+                    argumentsByPID[pid] = arguments
+                }
+            }
+        }
+        let entries = entriesByPID
+        let arguments = argumentsByPID
+
+        let rcloneConfig = snapshots.contains(where: { $0.profile.isEnabled })
+            ? RcloneConfigService.shared.readConfigContents() : nil
+
+        var reports = ProfileHeartbeatReports()
+        for snapshot in snapshots {
+            let profile = snapshot.profile
+            let held = holders[profile.id]
+            let runLive = SyncManager.runLiveness(
+                isMount: profile.isMountMode,
+                registryActive: snapshot.registryActive,
+                runLock: held?.run ?? SyncRunLock.Holder.none,
+                sessionLock: held?.session ?? SyncRunLock.Holder.none,
+                isAlive: isAlive
+            )
+            if !profile.isMountMode && (runLive || snapshot.state == .syncing) {
+                reports.progress.append(snapshot)
+            }
+            guard profile.isEnabled else { continue }
+
+            let identify: (Int32) -> Bool = { pid in
+                guard let entry = entries[pid] else { return false }
+                return SyncAbort.isProfileProcess(
+                    entry, arguments: arguments[pid],
+                    configPath: profile.configPath, localSyncPath: profile.localSyncPath)
+            }
+            var lockState = "n/a"
+            var sessionLockState = "n/a"
+            if let held {
+                lockState = SyncRunLock.lockState(
+                    holder: held.run, appPID: appPID, isAlive: isAlive, identify: identify)
+                if profile.syncMode == .bisync {
+                    sessionLockState = SyncRunLock.lockState(
+                        holder: held.session, appPID: appPID, isAlive: isAlive, identify: identify)
+                }
+            }
+            // The stored error when there is one, else the state's own message: "Script not
+            // found" / "Config not found" set `.error` without ever storing a profile error.
+            var errorType: String?
+            if case .error(let stateMessage) = snapshot.state {
+                errorType = TelemetryService.categorizeError(snapshot.storedError ?? stateMessage)
+            }
+            let remoteTypes = RemoteBackendType.types(for: profile, rcloneConfig: rcloneConfig)
+            reports.statuses.append(ProfileStatusReport(
+                profileId: profile.id,
+                profileName: profile.name,
+                syncMode: profile.syncMode,
+                state: TelemetryService.profileStateLabel(snapshot.state, isPaused: snapshot.isPaused),
+                runLive: runLive,
+                lockState: lockState,
+                sessionLockState: sessionLockState,
+                errorType: errorType,
+                localPathKind: SyncPathKind.classify(localPath: profile.localSyncPath, homeDirectory: homeDirectory),
+                remoteType: remoteTypes.primary,
+                fallbackRemoteType: remoteTypes.fallback
+            ))
+        }
+        return reports
     }
 
     /// How often a streaming profile's Cache Only partial-file list is rebuilt.

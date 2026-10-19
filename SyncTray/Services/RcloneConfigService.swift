@@ -227,6 +227,40 @@ final class RcloneConfigService {
         return config
     }
 
+    /// rclone.conf's raw text, or nil when it is missing or unreadable. Blocking file I/O —
+    /// call it off the main thread on a hot path. Used by telemetry's
+    /// `RemoteBackendType.types(for:rcloneConfig:)`, which reads it once per snapshot.
+    func readConfigContents() -> String? {
+        try? String(contentsOfFile: configPath, encoding: .utf8)
+    }
+
+    /// The raw `type` value of the `[name]` section in rclone.conf text `content` — e.g.
+    /// `drive`, `protondrive`, `smb` — or nil when there is no such section or it has no
+    /// `type` line (an encrypted rclone.conf has no readable sections at all). The same INI
+    /// reading as `readRemoteConfig(name:)`, but also accepts a hand-written `type=drive`
+    /// without spaces and skips `#`/`;` comment lines. Pure, so the self-test can drive it
+    /// on a string (AC-TS4).
+    static func remoteType(named name: String, inConfig content: String) -> String? {
+        guard !name.isEmpty else { return nil }
+        var inSection = false
+        for line in content.components(separatedBy: .newlines) {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            if trimmed.hasPrefix("[") && trimmed.hasSuffix("]") {
+                // Reached the next section without seeing a `type` line.
+                if inSection { return nil }
+                inSection = trimmed == "[\(name)]"
+                continue
+            }
+            guard inSection, !trimmed.hasPrefix("#"), !trimmed.hasPrefix(";"),
+                  let equals = trimmed.firstIndex(of: "=") else { continue }
+            let key = trimmed[..<equals].trimmingCharacters(in: .whitespaces)
+            guard key == "type" else { continue }
+            let value = trimmed[trimmed.index(after: equals)...].trimmingCharacters(in: .whitespaces)
+            return value.isEmpty ? nil : value
+        }
+        return nil
+    }
+
     /// Map rclone type string to RemoteProvider
     private func providerFromRcloneType(_ type: String, values: [String: String]) -> RemoteProvider {
         switch type {

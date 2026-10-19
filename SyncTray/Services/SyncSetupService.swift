@@ -986,6 +986,89 @@ enum SyncAbort {
     }
 }
 
+// MARK: - Lock state for telemetry ("Profile status")
+
+extension SyncRunLock {
+    /// A bounded description of one lock file's holder, for the `sync.lock_state` /
+    /// `sync.session_lock_state` attributes of the heartbeat's `Profile status` log:
+    /// - `none` — no lock file, or an empty one;
+    /// - `pending` — the legacy `"pending"` sentinel (the guard treats it as live);
+    /// - `unreadable` — content that is neither a PID nor rclone's lock JSON (or a PID ≤ 0);
+    /// - `stale` — a PID that is no longer running;
+    /// - `live_app` — the app's own PID, the launch-gap placeholder (D4);
+    /// - `live_verified` — a running PID that `identify` recognises as this profile's run;
+    /// - `live_unverified` — a running PID that is NOT recognisably this profile's run. This is
+    ///   the signature of a stale lock whose PID was reused: `isLive` (just `kill(pid, 0)`)
+    ///   calls it live and the single-run guard blocks every run, but nothing of the
+    ///   profile is actually running.
+    /// `identify` is only consulted for a live PID that isn't the app's. Pure.
+    static func lockState(
+        holder: Holder, appPID: Int32, isAlive: (Int32) -> Bool, identify: (Int32) -> Bool
+    ) -> String {
+        switch holder {
+        case .none: return "none"
+        case .pending: return "pending"
+        case .unreadable: return "unreadable"
+        case .pid(let pid):
+            // kill(0, 0) "succeeds" (it signals the process group), so a 0 or negative PID
+            // would otherwise read as alive.
+            guard pid > 0 else { return "unreadable" }
+            guard isAlive(pid) else { return "stale" }
+            if pid == appPID { return "live_app" }
+            return identify(pid) ? "live_verified" : "live_unverified"
+        }
+    }
+}
+
+extension SyncAbort {
+    /// Whether a running process is recognisably one of this profile's run processes — the
+    /// `identify` check behind `SyncRunLock.lockState`'s `live_verified`. Accepts:
+    /// - the sync script — `bash` (or the shared script's own file name, depending on how `ps`
+    ///   reports a `#!` script) whose command line names this profile's `configPath`;
+    /// - an rclone whose command line has this profile's `localSyncPath` (as stored or
+    ///   `~`-expanded, trailing slash ignored) as a whole ARGUMENT (`containsWholePath`) —
+    ///   not a sibling folder sharing its prefix (`/x/Pictures2`), not a folder inside it
+    ///   (another profile syncing `/x/Pictures/Holiday`), and not a path that merely starts
+    ///   with it (every SyncTray rclone carries `--filter-from ~/.config/synctray/profiles/…`,
+    ///   which would otherwise make a profile syncing the home folder match them all).
+    /// Unlike `isRunRoot` an rclone qualifies whatever its parent: telemetry only describes
+    /// the lock, it never signals anything, so a script run's rclone holding the session lock
+    /// must count too. `arguments` nil (the process is gone, or `ps` failed) never
+    /// qualifies. Pure.
+    static func isProfileProcess(
+        _ entry: ProcessEntry, arguments: String?, configPath: String, localSyncPath: String
+    ) -> Bool {
+        guard let arguments else { return false }
+        let executable = (entry.name as NSString).lastPathComponent
+        if isRclone(executable) {
+            let raw = trimmingTrailingSlashes(localSyncPath)
+            let expanded = trimmingTrailingSlashes((localSyncPath as NSString).expandingTildeInPath)
+            return containsWholePath(arguments, raw) || containsWholePath(arguments, expanded)
+        }
+        let scriptName = (SyncProfile.sharedScriptPath as NSString).lastPathComponent
+        guard executable == "bash" || executable == scriptName else { return false }
+        return !configPath.isEmpty && arguments.contains(configPath)
+    }
+
+    /// Whether `path` (or `path/`) is one whole argument of `arguments`, the space-joined
+    /// command line `ps -o args=` prints: delimited by spaces or the ends of the line, so a
+    /// longer path that starts with it — a sibling (`/x/Sync2`), a folder inside it
+    /// (`/x/Sync/Photos`), a file under it (`--filter-from /x/.config/…`) — never matches.
+    /// `ps` doesn't quote arguments, so a folder name containing a space could still match
+    /// a longer name that continues after that space; telemetry accepts that ambiguity. Pure.
+    private static func containsWholePath(_ arguments: String, _ path: String) -> Bool {
+        guard !path.isEmpty else { return false }
+        let padded = " " + arguments + " "
+        return padded.contains(" \(path) ") || padded.contains(" \(path)/ ")
+    }
+
+    private static func trimmingTrailingSlashes(_ path: String) -> String {
+        var result = path
+        while result.count > 1 && result.hasSuffix("/") { result.removeLast() }
+        return result
+    }
+}
+
 extension SyncSetupService {
     /// Record that SyncTray is about to detach this Stream profile's volume or unload its
     /// agent on purpose, so the mount-interruption telemetry doesn't count the disappearance

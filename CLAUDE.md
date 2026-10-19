@@ -1840,7 +1840,48 @@ Pseudonymous, opt-in telemetry using OpenTelemetry (opentelemetry-swift 1.17.1).
 ### Three signals
 - **Traces**: Sync lifecycle spans with real duration (start→complete/fail), mount/unmount spans
 - **Metrics**: 20 instruments — sync duration + check phase histograms, operation counters (sync, mount, file ops, contention, recovery, volume events, filter stats, offline pin/unpin), profile gauge (delta temporality, 30s export interval)
-- **Logs**: Structured log records for all key events (sync lifecycle, mount, transport changes, errors, config snapshots, session heartbeat, stale lock cleanup, precondition failures)
+- **Logs**: Structured log records for all key events (sync lifecycle, mount, transport changes, errors, config snapshots, session heartbeat, per-profile progress and status, stale lock cleanup, precondition failures)
+
+### Per-profile heartbeat: is a job progressing, or stuck behind a stale lock?
+The `synctray sync` span only exports when a run ends, and the aggregate `Session heartbeat`
+only counts profiles, so a multi-hour run — or one blocked by a lock whose PID was reused —
+was invisible. Every 5-minute heartbeat now also emits (`SyncManager.recordProfileHeartbeatTelemetry`;
+lock files, rclone.conf and `ps` read off the main actor, only when telemetry is on):
+- **`Sync progress`** — one per live Two-Way / One-Way run (`isRunLive`'s rule, or `.syncing`),
+  correlated to the open sync span: `sync.progress.has_stats`, `sync.progress.bytes_transferred`
+  / `bytes_total`, `transfers_done` / `transfers_total`, `checks_done` / `checks_total`, `errors`,
+  `speed_bps`, `eta_s`, `elapsed_s`, `listed`, and `sync.run_age_s`. Never file names
+  (`TelemetryService.syncProgressAttributes`, AC-TS5).
+- **`Profile status`** — one per enabled profile: `profile.state`, `profile.run_live`,
+  `sync.lock_state` (the `/tmp` run lock), `sync.session_lock_state` (the bisync `.lck`),
+  `error.type` (error state only), `config.local_path_kind`, `config.remote_type`,
+  `config.fallback_remote_type`. Lock states (`SyncRunLock.lockState`, AC-TS1): `none`, `pending`,
+  `unreadable`, `stale` (PID dead), `live_app` (the app's own placeholder PID), `live_verified`
+  (alive and identified by `SyncAbort.isProfileProcess` as this profile's script or rclone),
+  `live_unverified` (alive but not this profile's run — the reused-PID stuck-lock signature
+  `SyncRunLock.isLive` can't see), and `n/a` for both on a Stream profile (its `/tmp` lock is
+  the mount daemon's, Critical Rule 8 / R7) and for the session lock of a One-Way profile.
+
+### Error categories and folder / backend kinds
+- `error.type` (`categorizeError`) has specific buckets ahead of the generic ones: `rate_limited`,
+  `quota_exceeded`, `disk_full`, `auth_failed`, `tls_certificate`, `name_too_long`, `invalid_name`,
+  `checksum_mismatch`, `file_changed_during_transfer`, `file_busy`, `duplicate_object`,
+  `directory_not_empty`, and more `network` / `timeout` phrasings ("no such host" is `network`,
+  not `file_not_found`; a token refresh that timed out is `timeout`, not `auth_failed`). A
+  message the old buckets matched keeps its bucket unless it also names a more specific cause
+  (e.g. a rate-limit or auth phrase), which now wins; besides that, Go's "directory not empty"
+  moved from `critical` to `directory_not_empty` (AC-TS2). The `Sync error` log and
+  the `Sync failed` log and span also carry `error.operation`: `copy` / `delete` / `move` /
+  `list` / `mkdir` / `other`.
+- `Profile configuration` carries `config.local_path_kind` (`SyncPathKind.classify`: `desktop`,
+  `documents`, `downloads`, `pictures`, `music`, `movies`, `public`, `icloud_drive`,
+  `cloud_storage`, `library`, `home_root`, `home_other`, `external_volume`, `other`, `unknown`),
+  `config.local_path_privacy_protected` (desktop, documents, downloads, icloud_drive, library,
+  external_volume — folders TCC can refuse a launchd-run script), and `config.remote_type` /
+  `config.fallback_remote_type` (the rclone.conf `type`, bucketed through an allowlist of rclone
+  backend names by `RemoteBackendType`: known → itself, else `other`, unreadable → `unknown`,
+  no fallback → `none`). Never the path or the remote's name (AC-TS3, AC-TS4).
+- Full attribute tables: `.claude/rules/telemetry.md` ("Per-profile Heartbeat Logs", "Error categories").
 
 ### User correlation
 - `service.instance.id` — random UUID per install (changes on reinstall)
@@ -1858,7 +1899,7 @@ Pseudonymous, opt-in telemetry using OpenTelemetry (opentelemetry-swift 1.17.1).
 - `host.arch` — `arm64` / `amd64`, resolved at compile time so a universal binary reports the executing slice; omitted entirely on any other architecture rather than sending an undocumented value.
 
 ### Privacy
-No file paths, sync remote names, or credentials in telemetry. File operations tracked by normalized extension only. Error messages categorized into low-cardinality types. Profile names are user-chosen display names, not paths. Carve-out: `vcs.repository.url.full` (the source repo's origin URL, credentials stripped at build time) is exempt — it identifies the codebase, not a user's sync destination.
+No file paths, sync remote names, or credentials in telemetry. File operations tracked by normalized extension only. Error messages categorized into low-cardinality types. Local folders and remotes are described only by bounded kinds (`config.local_path_kind`, `config.remote_type`), sync progress only by counts. Profile names are user-chosen display names, not paths. Carve-out: `vcs.repository.url.full` (the source repo's origin URL, credentials stripped at build time) is exempt — it identifies the codebase, not a user's sync destination.
 
 ### Configuration
 Priority: process env vars > `~/.config/synctray/.env` > Info.plist. Key vars: `OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_EXPORTER_OTLP_HEADERS`, `DASH0_AUTH_TOKEN`.
