@@ -3923,11 +3923,65 @@ enum ConfigSelfTest {
             return report(name, slug, false, "(settings get wrong: \(out.debugDescription))")
         }
 
+        // Launch applies only keys changed outside the app since its last write.
+        let snapshot: [String: Any] = [
+            "debugLoggingEnabled": false, "autoFixSyncIssues": true, "telemetryEnabled": false, "launchAtLogin": false,
+            "menuBarIconStyle": "color", "menuBarIconSyncingColor": "", "menuBarIconIdleColor": "",
+        ]
+        // (a) The banner turned usage data on without rewriting the file: the stale `false` must not apply.
+        let bannerCase = AppSettingsFileStore.keysChangedSinceLastWrite(file: snapshot, snapshot: snapshot)
+        // (b) The CLI's merge write changed one key and carried the rest as the file had them.
+        var cliFile = snapshot
+        cliFile["debugLoggingEnabled"] = true
+        let cliCase = AppSettingsFileStore.keysChangedSinceLastWrite(file: cliFile, snapshot: snapshot)
+        // (c) A hand edit while the app was closed; a re-cased color is not a change.
+        var handFile = snapshot
+        handFile["menuBarIconStyle"] = "Monochrome"
+        handFile["menuBarIconIdleColor"] = ""
+        let handCase = AppSettingsFileStore.keysChangedSinceLastWrite(file: handFile, snapshot: snapshot)
+        // (e) An invalid value never applies; a key missing from the snapshot counts as changed.
+        var invalidFile = snapshot
+        invalidFile["menuBarIconStyle"] = "neon"
+        invalidFile["telemetryEnabled"] = "yes"
+        var partialSnapshot = snapshot
+        partialSnapshot["menuBarIconIdleColor"] = nil
+        var newKeyFile = snapshot
+        newKeyFile["menuBarIconIdleColor"] = "#00FF00"
+        guard bannerCase.isEmpty,
+              cliCase == ["debugLoggingEnabled"],
+              handCase == ["menuBarIconStyle"],
+              AppSettingsFileStore.keysChangedSinceLastWrite(file: cliFile, snapshot: nil).isEmpty,  // (d)
+              AppSettingsFileStore.keysChangedSinceLastWrite(file: invalidFile, snapshot: snapshot).isEmpty,
+              AppSettingsFileStore.keysChangedSinceLastWrite(file: newKeyFile, snapshot: partialSnapshot) == ["menuBarIconIdleColor"] else {
+            return report(name, slug, false, "(launch change set wrong: banner \(bannerCase), cli \(cliCase), hand \(handCase))")
+        }
+
+        // The app's whole-file write stores a snapshot equal to the values it wrote.
+        let snapshotSuite = "synctray.selftest.appsettings.snapshot"
+        guard let snapshotDefaults = UserDefaults(suiteName: snapshotSuite) else {
+            return report(name, slug, false, "(couldn't create a UserDefaults suite)")
+        }
+        snapshotDefaults.removePersistentDomain(forName: snapshotSuite)
+        let snapshotDir = "\(dir)/snapshot"
+        let writtenPath = AppSettingsFileStore.writeSettingsFile(isLoginItemEnabled: true, directory: snapshotDir, defaults: snapshotDefaults)
+        var writtenValues = writtenPath.flatMap { AppSettingsFileStore.readSettingsFileJSON(at: $0) } ?? [:]
+        writtenValues["$schema"] = nil
+        let stored = AppSettingsFileStore.lastWrittenSnapshot(defaults: snapshotDefaults)
+        snapshotDefaults.removePersistentDomain(forName: snapshotSuite)
+        guard writtenPath != nil, let stored, Set(stored.keys) == Set(AppSettingsFileStore.allKeyNames),
+              NSDictionary(dictionary: stored).isEqual(to: writtenValues),
+              AppSettingsFileStore.keysChangedSinceLastWrite(file: writtenValues, snapshot: stored).isEmpty else {
+            return report(name, slug, false, "(writeSettingsFile's snapshot \(String(describing: stored)) != written \(writtenValues))")
+        }
+
         guard let managerSource = readSourceFile("Services/SyncManager.swift"),
-              let applyAt = managerSource.range(of: "applySettingsFile(includeLoginItem: false)"),
+              let decideAt = managerSource.range(of: "AppSettingsFileStore.keysChangedSinceLastWrite("),
+              let applyAt = managerSource.range(
+                of: "applySettingsFile(includeLoginItem: false, onlyKeys: changedOutsideApp)",
+                range: decideAt.upperBound..<managerSource.endIndex),
               let rewriteAt = managerSource.range(of: "refreshSettingsFile()", range: applyAt.upperBound..<managerSource.endIndex),
-              !managerSource[applyAt.upperBound..<rewriteAt.lowerBound].contains("func ") else {
-            return report(name, slug, false, "(launch doesn't apply settings.json before rewriting it)")
+              !managerSource[decideAt.upperBound..<rewriteAt.lowerBound].contains("func ") else {
+            return report(name, slug, false, "(launch doesn't apply the outside-the-app changes in settings.json before rewriting it)")
         }
 
         return report(name, slug, true)

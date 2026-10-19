@@ -112,7 +112,7 @@ The schema is authoritative: when this table and [`profile.schema.json`](../Sync
 | `menuBarIconIdleColor` | The `custom` style's ring color when idle, as `#RRGGBB`; `""` for the default gray |
 
 An invalid value is ignored and the setting keeps its current value.
-An edit made while the app isn't running is applied at its next launch, except `launchAtLogin`, so a stale file can't undo a change made in System Settings.
+An edit made while the app isn't running is applied at its next launch. Launch applies only the keys changed outside the app since it last wrote the file, so a change made in the app without a file write (such as turning on usage data from the banner) is never reverted. It never applies `launchAtLogin`, so a stale file can't undo a change made in System Settings.
 `synctray settings set <key> <value>` changes the same settings from the terminal.
 
 ## Files SyncTray creates

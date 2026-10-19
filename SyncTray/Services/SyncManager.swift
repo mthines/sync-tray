@@ -472,9 +472,16 @@ final class SyncManager: ObservableObject {
         updateAppGroupMountPaths()
         // Apply edits made to settings.json while the app wasn't running BEFORE
         // rewriting the file from the app's state — otherwise the rewrite would
-        // silently discard them. Not launchAtLogin: a stale file must not undo a
+        // silently discard them. Only keys changed outside the app since it last
+        // wrote the file: a setting the app changed without rewriting the file
+        // (the telemetry banner, the setup wizard) must not be reverted by the
+        // stale value. Not launchAtLogin: a stale file must not undo a
         // login-item change made in System Settings while the app was closed.
-        applySettingsFile(includeLoginItem: false)
+        let changedOutsideApp = AppSettingsFileStore.keysChangedSinceLastWrite(
+            file: AppSettingsFileStore.readSettingsFileJSON() ?? [:],
+            snapshot: AppSettingsFileStore.lastWrittenSnapshot()
+        )
+        applySettingsFile(includeLoginItem: false, onlyKeys: changedOutsideApp)
         refreshSettingsFile()
         startConfigWatcher()
     }
@@ -1170,18 +1177,24 @@ final class SyncManager: ObservableObject {
         TelemetryService.shared.recordExternalConfigEdit(kind: "settings")
     }
 
-    /// Apply every valid key in `settings.json` to the app's settings. Keys that
-    /// are absent or invalid are left unchanged.
-    private func applySettingsFile(includeLoginItem: Bool) {
+    /// Apply every valid key in `settings.json` to the app's settings — or, with
+    /// `onlyKeys`, just those keys. Keys that are absent or invalid are left
+    /// unchanged.
+    private func applySettingsFile(includeLoginItem: Bool, onlyKeys: Set<String>? = nil) {
         var safeSettings = AppSettingsFileStore.readSafeSettings()
         if !includeLoginItem { safeSettings[.launchAtLogin] = nil }
+        var stringSettings = AppSettingsFileStore.readStringSettings()
+        if let onlyKeys {
+            safeSettings = safeSettings.filter { onlyKeys.contains($0.key.rawValue) }
+            stringSettings = stringSettings.filter { onlyKeys.contains($0.key.rawValue) }
+        }
 
         // String keys are the `@AppStorage` keys `SyncTrayApp` and
         // `AppSettingsView` read, so writing them redraws the menu bar icon.
         // Set even when the value looks unchanged: the CLI writes UserDefaults
         // from its own process, and this in-process write is what notifies
         // `@AppStorage`.
-        for (key, value) in AppSettingsFileStore.readStringSettings() {
+        for (key, value) in stringSettings {
             UserDefaults.standard.set(value, forKey: key.rawValue)
         }
 

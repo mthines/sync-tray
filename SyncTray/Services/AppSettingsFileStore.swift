@@ -159,15 +159,24 @@ enum AppSettingsFileStore {
         return payload
     }
 
+    /// `UserDefaults` key holding the key/value pairs the app last wrote to
+    /// `settings.json` (JSON), so launch can tell an edit made outside the app
+    /// from a value the app changed itself without rewriting the file.
+    static let lastWrittenSnapshotKey = "settingsFileLastWrittenSnapshot"
+
     /// Write `settings.json` (every key + `$schema`) into `directory` (defaults
     /// to the real config directory; overridable for self-test isolation).
     /// Notes the write's content hash in `ConfigSelfWriteRegistry` so
-    /// `ConfigFileWatcher` ignores the FSEvent this write produces.
+    /// `ConfigFileWatcher` ignores the FSEvent this write produces, and stores
+    /// the written values in `defaults` as the last-written snapshot. Only this
+    /// whole-file write updates the snapshot — `updateSettingsFile` (the CLI)
+    /// doesn't, so a CLI write counts as an edit made outside the app.
     /// - Returns: the written file path, or nil on failure.
     @discardableResult
     static func writeSettingsFile(
         isLoginItemEnabled: Bool,
-        directory: String = AppSettingsFileStore.defaultDirectory
+        directory: String = AppSettingsFileStore.defaultDirectory,
+        defaults: UserDefaults = .standard
     ) -> String? {
         let payload = currentPayload(isLoginItemEnabled: isLoginItemEnabled)
 
@@ -181,11 +190,54 @@ enum AppSettingsFileStore {
             try FileManager.default.createDirectory(atPath: directory, withIntermediateDirectories: true)
             try data.write(to: URL(fileURLWithPath: path), options: .atomic)
             ConfigSelfWriteRegistry.shared.noteSelfWrite(contentHash: ConfigSelfWriteRegistry.hash(data))
+            var snapshot = payload
+            snapshot["$schema"] = nil
+            if let snapshotData = try? JSONSerialization.data(withJSONObject: snapshot, options: [.sortedKeys]) {
+                defaults.set(snapshotData, forKey: lastWrittenSnapshotKey)
+            }
             return path
         } catch {
             print("Failed to write settings.json: \(error)")
             return nil
         }
+    }
+
+    /// The values the app last wrote to `settings.json`, or nil when it never
+    /// has (or the stored snapshot is unreadable).
+    static func lastWrittenSnapshot(defaults: UserDefaults = .standard) -> [String: Any]? {
+        guard let data = defaults.data(forKey: lastWrittenSnapshotKey) else { return nil }
+        return (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+    }
+
+    /// The whole `settings.json` at `path` as a JSON object, or nil when it is
+    /// missing or not a JSON object.
+    static func readSettingsFileJSON(at path: String = AppSettingsFileStore.settingsFilePath) -> [String: Any]? {
+        guard let data = FileManager.default.contents(atPath: path) else { return nil }
+        return (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+    }
+
+    /// The keys whose valid value in `file` differs from what the app last wrote
+    /// (`snapshot`) — the edits made outside the app since then (a hand edit, or
+    /// the CLI's merge write). Launch applies only these, so a value the app
+    /// changed without rewriting the file (the telemetry banner) is never
+    /// reverted by the stale file. Values compare normalized (`Bool` for a
+    /// `SafeKey`, `StringKey.normalize` for a `StringKey`); a key missing from
+    /// the snapshot counts as changed, an invalid file value never does. A nil
+    /// snapshot (the app has never written the file, e.g. the first launch after
+    /// an upgrade) changes nothing: the app's own settings stay authoritative.
+    static func keysChangedSinceLastWrite(file: [String: Any], snapshot: [String: Any]?) -> Set<String> {
+        guard let snapshot else { return [] }
+        var changed: Set<String> = []
+        for key in SafeKey.allCases {
+            guard let value = file[key.rawValue] as? Bool else { continue }
+            if snapshot[key.rawValue] as? Bool != value { changed.insert(key.rawValue) }
+        }
+        for key in StringKey.allCases {
+            guard let raw = file[key.rawValue] as? String, let value = key.normalize(raw) else { continue }
+            let previous = (snapshot[key.rawValue] as? String).flatMap(key.normalize)
+            if previous != value { changed.insert(key.rawValue) }
+        }
+        return changed
     }
 
     /// Read the safe keys present in the `settings.json` at `path` (defaults to
