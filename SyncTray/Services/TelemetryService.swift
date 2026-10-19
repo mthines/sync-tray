@@ -3183,8 +3183,9 @@ final class TelemetryService {
         ("quota_exceeded", ["storagequotaexceeded", "quotaexceeded", "quota exceeded", "insufficient storage"]),
         ("network", ["no such host", "connection reset", "connection refused", "network is unreachable", "broken pipe"]),
         ("timeout", ["context deadline exceeded", "deadline exceeded", "i/o timeout", "timed out", "handshake timeout"]),
+        // Go's TLS alert reads "tls: bad certificate", which " tls:" already matches.
         ("tls_certificate", [" x509:", " tls:", "certificate signed by", "certificate has expired",
-                             "certificate verify failed", "bad certificate"]),
+                             "certificate verify failed"]),
         ("auth_failed", ["invalid_grant", "token expired", "expired token", " oauth2:", "401 unauthorized",
                          "authentication failed", "couldn't fetch token", "failed to refresh token"]),
         ("name_too_long", ["file name too long", "name too long", "path too long"]),
@@ -3193,7 +3194,8 @@ final class TelemetryService {
         ("checksum_mismatch", ["corrupted on transfer", "hash differ", "hashes differ", "md5 differ", "sizes differ"]),
         ("file_changed_during_transfer", ["source file is being updated", "changed size during"]),
         ("file_busy", ["resource busy", "text file busy", "file is locked", "being used by another process"]),
-        ("duplicate_object", ["duplicate object", "duplicate file", "duplicate directory"]),
+        // rclone (fs/march) logs "Duplicate object found …" / "Duplicate directory found …".
+        ("duplicate_object", ["duplicate object found", "duplicate directory found"]),
         // Normally caught by the critical branch above (see there); this covers a message
         // whose case keeps it out of `isCriticalError`'s case-sensitive "not empty".
         ("directory_not_empty", ["directory not empty"]),
