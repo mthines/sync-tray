@@ -56,6 +56,10 @@ enum CLICommand: Equatable {
     case profileSet(target: String, assignments: [ProfileAssignment])
     case profileSetEnabled(target: String, enabled: Bool)
     case cacheMove(target: String, destination: String, includeOverlapping: Bool)
+    /// `report [<name|shortId>] [--lines N] [--output <path>] [--send] [--yes] [--json]` —
+    /// build a diagnostic report (all profiles when `target` is nil), print or save it, and
+    /// with `send` upload it after the user's explicit consent.
+    case report(target: String?, lines: Int, output: String?, send: Bool, yes: Bool, json: Bool)
     case help
 }
 
@@ -194,6 +198,18 @@ struct CLIEnvironment {
     var stdout: (String) -> Void
     var stderr: (String) -> Void
     var now: () -> Date
+    /// Build a diagnostic report for `profiles`, keeping the last `lineLimit` log lines per
+    /// profile (`DiagnosticReportBuilder.build` in production). The defaults below are
+    /// inert, so a fake environment never touches disk or the network unless a test sets them.
+    var buildDiagnosticReport: (_ profiles: [SyncProfile], _ lineLimit: Int) -> DiagnosticReport = { _, _ in
+        DiagnosticReport(code: DiagnosticReportCode.generate(), createdAt: Date(), sections: [])
+    }
+    /// Upload a diagnostic report, blocking until done. `nil` on success or an error message.
+    var sendDiagnosticReport: (DiagnosticReport) -> String? = { _ in
+        "diagnostic upload isn't available here"
+    }
+    /// Write text to a file (for `report --output`). Returns `true` on success.
+    var writeTextFile: (_ path: String, _ contents: String) -> Bool = { _, _ in false }
 }
 
 /// Headless `synctray` CLI, dispatched from `SyncTrayApp.init` exactly like
@@ -230,6 +246,16 @@ enum SyncTrayCLI {
                                    List the folders the app's folder chooser shows for a remote
       telemetry [status|on|off] [--json]
                                    Show or change usage-data sharing (shared with the app)
+
+    Support:
+      report [name|id] [--lines N] [--output <path>]
+                                   Build a diagnostic report (all profiles, or one) and print it,
+                                   or save it to <path>. Nothing is sent.
+      report [name|id] --send [--yes] [--json]
+                                   Send the report to the SyncTray developer and print its code
+                                   (ST-XXXXXX). Asks first; --yes skips the question and is
+                                   required when not run interactively. --lines N keeps the last
+                                   N log lines per profile (default 500).
 
     Configure:
       profile create --from <file> Create a profile from a .profile.json file
@@ -366,6 +392,9 @@ enum SyncTrayCLI {
             let sub = argv.dropFirst().first(where: { !$0.hasPrefix("-") }) ?? ""
             return sub == "status" ? "offline-status" : "(other)"
         }
+        if first == "report" {
+            return argv.dropFirst().contains("--send") ? "report-send" : "report"
+        }
         return known.contains(first) ? first : "(other)"
     }
 
@@ -475,6 +504,9 @@ enum SyncTrayCLI {
 
         case "cache":
             return parseCache(rest)
+
+        case "report":
+            return parseReport(rest)
 
         case "help", "-h", "--help":
             return .success(.help)
@@ -610,6 +642,41 @@ enum SyncTrayCLI {
         return .success(.cacheMove(target: target, destination: destination, includeOverlapping: includeOverlapping))
     }
 
+    static let reportUsage = "usage: synctray report [<name|shortId>] [--lines N] [--output <path>] [--send] [--yes] [--json]"
+
+    /// Parse `report`. Strict about flags (an unknown one is a usage error rather than
+    /// silently ignored), because `--send` uploads data.
+    private static func parseReport(_ rest: [String]) -> Result<CLICommand, CLIUsageError> {
+        let usageError = CLIUsageError(message: reportUsage)
+        let flags = parseFlags(rest, valueFlags: ["--lines", "--output"])
+        let knownBools: Set<String> = ["--send", "--yes", "-y", "--json"]
+        guard flags.positionals.count <= 1, flags.bools.isSubset(of: knownBools) else {
+            return .failure(usageError)
+        }
+        var lines = DiagnosticReportBuilder.defaultLineLimit
+        if let raw = flags.values["--lines"] {
+            guard let value = Int(raw), value > 0, value <= 100_000 else {
+                return .failure(CLIUsageError(message: "error: --lines takes a whole number from 1 to 100000, got \"\(raw)\""))
+            }
+            lines = value
+        }
+        var output: String?
+        if let raw = flags.values["--output"] {
+            guard !raw.isEmpty else {
+                return .failure(CLIUsageError(message: "error: --output takes a file path\n" + reportUsage))
+            }
+            output = raw
+        }
+        return .success(.report(
+            target: flags.positionals.first,
+            lines: lines,
+            output: output,
+            send: flags.bools.contains("--send"),
+            yes: flags.bools.contains("--yes") || flags.bools.contains("-y"),
+            json: flags.bools.contains("--json")
+        ))
+    }
+
     /// Parse + dispatch, printing usage via `env.stderr` on a parse failure.
     /// The single entry point both `dispatch` (real env) and the self-test
     /// (fake env) exercise for the unknown/absent-subcommand case.
@@ -668,6 +735,8 @@ enum SyncTrayCLI {
             return runProfileSetEnabled(target, enabled: enabled, env: env)
         case .cacheMove(let target, let destination, let includeOverlapping):
             return runCacheMove(target, destination: destination, includeOverlapping: includeOverlapping, env: env)
+        case .report(let target, let lines, let output, let send, let yes, let json):
+            return runReport(target: target, lines: lines, output: output, send: send, yes: yes, json: json, env: env)
         case .help:
             env.stdout(Self.usage + "\n")
             return 0
@@ -1734,6 +1803,81 @@ enum SyncTrayCLI {
             return 1
         }
     }
+
+    // MARK: - report
+
+    /// Build a diagnostic report and print it (or save it with `--output`); with `--send`,
+    /// show the same disclosure as the app, get explicit consent (an interactive `[y/N]`,
+    /// defaulting to No, or `--yes`), upload, and print the report code. A non-interactive
+    /// `--send` without `--yes` refuses with the usage-error code before building anything.
+    private static func runReport(
+        target: String?, lines: Int, output: String?, send: Bool, yes: Bool, json: Bool, env: CLIEnvironment
+    ) -> Int32 {
+        let all = env.readProfiles()
+        let profiles: [SyncProfile]
+        if let target {
+            guard let match = resolveProfile(target, in: all) else {
+                env.stderr("error: no profile matches \"\(target)\"\n")
+                return 1
+            }
+            profiles = [match]
+        } else {
+            profiles = all
+        }
+
+        if send {
+            env.stderr(DiagnosticReportCopy.disclosure + "\n\n")
+            if !yes && !env.isInteractiveTerminal() {
+                env.stderr("error: report --send needs --yes when not run interactively. Nothing was sent.\n")
+                return 64  // EX_USAGE
+            }
+        }
+
+        let report = env.buildDiagnosticReport(profiles, lines)
+
+        if let output {
+            guard env.writeTextFile(output, report.render()) else {
+                env.stderr("error: could not write the report to \(output)\n")
+                return 1
+            }
+            if send {
+                env.stderr("Saved a copy to \(output)\n")
+            } else {
+                env.stdout(output + "\n")
+            }
+        } else if !send {
+            env.stdout(report.render())
+        }
+
+        guard send else {
+            env.stderr("Nothing was sent.\n")
+            return 0
+        }
+
+        if !yes {
+            env.stderr("Report \(report.code): \(report.lineCount) lines from \(report.profileCount) profile(s). "
+                + "Preview it first with: synctray report\(target.map { " \($0)" } ?? "")\n")
+            env.stderr("Send this report? [y/N] ")
+            let answer = env.readLine()?.trimmingCharacters(in: .whitespaces).lowercased()
+            guard answer == "y" || answer == "yes" else {
+                env.stderr("\(answer == nil ? "\n" : "")Nothing was sent.\n")
+                return 1
+            }
+        }
+
+        if let error = env.sendDiagnosticReport(report) {
+            env.stderr("error: \(error)\n")
+            env.stderr("Save the report instead with: synctray report --output <path>\n")
+            return 1
+        }
+        if json {
+            env.stdout("{\"code\":\"\(report.code)\"}\n")
+        } else {
+            env.stdout("Report code: \(report.code)\n")
+            env.stderr(DiagnosticReportCopy.shareCode + "\n")
+        }
+        return 0
+    }
 }
 
 // MARK: - Production environment
@@ -1830,7 +1974,27 @@ extension CLIEnvironment {
             sleep: { Thread.sleep(forTimeInterval: $0) },
             stdout: { FileHandle.standardOutput.write(Data($0.utf8)) },
             stderr: { FileHandle.standardError.write(Data($0.utf8)) },
-            now: { Date() }
+            now: { Date() },
+            buildDiagnosticReport: { profiles, lineLimit in
+                DiagnosticReportBuilder.build(profiles: profiles, environment: .production(), lineLimit: lineLimit)
+            },
+            sendDiagnosticReport: { report in
+                let error = DiagnosticReportUploader.sendBlocking(report)
+                TelemetryService.shared.recordDiagnosticReport(
+                    reportId: report.code, sourceUI: "cli", succeeded: error == nil, lineCount: report.lineCount)
+                return error
+            },
+            writeTextFile: { path, contents in
+                let expanded = (path as NSString).expandingTildeInPath
+                do {
+                    try contents.write(toFile: expanded, atomically: true, encoding: .utf8)
+                    // The report can name personal paths and files — keep the copy owner-only.
+                    try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: expanded)
+                    return true
+                } catch {
+                    return false
+                }
+            }
         )
     }
 
