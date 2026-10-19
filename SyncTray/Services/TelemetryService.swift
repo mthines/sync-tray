@@ -3125,10 +3125,11 @@ final class TelemetryService {
         if SyncLogPatterns.isIOErrorsBlockedDeletes(msg) {
             return "io_errors_blocked_deletes"
         }
-        // Matched against the message with one leading space, so the space-prefixed TLS
-        // needles (" x509:", " tls:") also catch a message that STARTS with Go's prefix,
-        // while a path segment that merely ends in tls or x509 ("…/certs/tls: permission
-        // denied", where a "/" precedes it) never matches. Every other needle is unaffected.
+        // Matched against the message with one leading space, so the space-prefixed TLS and
+        // oauth2 needles (" x509:", " tls:", " oauth2:") also catch a message that STARTS
+        // with Go's prefix, while a path segment that merely ends in tls, x509 or oauth2
+        // ("…/certs/tls: permission denied", where a "/" precedes it) never matches. Every
+        // other needle is unaffected.
         let padded = " " + lower
         for (bucket, needles) in specificErrorBuckets where needles.contains(where: { padded.contains($0) }) {
             return bucket
@@ -3158,19 +3159,20 @@ final class TelemetryService {
     ///   … no such host", "oauth2: cannot fetch token: … i/o timeout", "… TLS handshake
     ///   timeout") is a network problem, not bad credentials. That is why `timeout` repeats
     ///   the generic "timed out" and also takes "i/o timeout" / "handshake timeout": without
-    ///   them such a message would reach the "oauth2:" needle first.
+    ///   them such a message would reach the " oauth2:" needle first.
     /// - all of these before the generic checks: "no such host" would otherwise be
     ///   `file_not_found` via "no such".
     /// Needles are phrases rclone and the Go runtime actually print, kept narrow because the
     /// message usually also carries a file path: TLS is matched by Go's `x509:` / `tls:`
     /// error prefixes rather than the bare words "x509" or "certificate", which would claim
     /// any error about a file named e.g. "x509.pem" or "Birth Certificate.pdf"; those two
-    /// prefixes are matched with a leading space (" x509:", " tls:"), against the message
-    /// padded with one leading space by `categorizeError`, so a path segment named `tls` or
-    /// `x509` followed by `: <error>` ("…/certs/tls: permission denied") is not claimed
-    /// either; the HTTP-status needles are matched with their code or full phrase ("401
-    /// unauthorized", "rate limit exceeded") rather than the bare words, which a file named
-    /// e.g. "Unauthorized.pdf" or "rate limit notes.txt" would match; and
+    /// prefixes, and Go's oauth2 package prefix, are matched with a leading space (" x509:",
+    /// " tls:", " oauth2:"), against the message padded with one leading space by
+    /// `categorizeError`, so a path segment named `tls`, `x509` or `oauth2` followed by
+    /// `: <error>` ("…/certs/tls: permission denied", "…/x/oauth2: permission denied") is
+    /// not claimed either; the HTTP-status needles are matched with their code or full
+    /// phrase ("401 unauthorized", "rate limit exceeded") rather than the bare words, which
+    /// a file named e.g. "Unauthorized.pdf" or "rate limit notes.txt" would match; and
     /// `invalid_name` takes "invalid characters" (plural), not "invalid character", which is
     /// how Go's JSON decoder reports an HTML page where JSON was expected ("invalid character
     /// '<' looking for beginning of value"). The values are bounded labels; the message
@@ -3183,7 +3185,7 @@ final class TelemetryService {
         ("timeout", ["context deadline exceeded", "deadline exceeded", "i/o timeout", "timed out", "handshake timeout"]),
         ("tls_certificate", [" x509:", " tls:", "certificate signed by", "certificate has expired",
                              "certificate verify failed", "bad certificate"]),
-        ("auth_failed", ["invalid_grant", "token expired", "expired token", "oauth2:", "401 unauthorized",
+        ("auth_failed", ["invalid_grant", "token expired", "expired token", " oauth2:", "401 unauthorized",
                          "authentication failed", "couldn't fetch token", "failed to refresh token"]),
         ("name_too_long", ["file name too long", "name too long", "path too long"]),
         ("invalid_name", ["illegal character", "invalid characters", "invalid name", "invalid file name",

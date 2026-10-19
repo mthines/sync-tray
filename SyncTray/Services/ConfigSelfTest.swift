@@ -7966,6 +7966,7 @@ enum ConfigSelfTest {
             // A path segment named tls or x509 is not a TLS error either ("/" precedes it, not a space)…
             ("open /Users/me/Sync/certs/tls: permission denied", "permission_denied"),
             ("open /Users/me/Sync/certs/x509: no such file or directory", "file_not_found"),
+            ("open /Users/me/Sync/x/oauth2: permission denied", "permission_denied"),
             // Nor is a file whose name merely contains an HTTP status phrase.
             ("open /Users/me/Sync/Unauthorized.pdf: permission denied", "permission_denied"),
             ("open /Users/me/Sync/rate limit notes.txt: no such file or directory", "file_not_found"),
