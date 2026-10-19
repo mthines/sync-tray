@@ -8014,6 +8014,10 @@ enum ConfigSelfTest {
             ("mkdir /Users/me/Sync/new: operation not permitted", "mkdir"),
             ("failed to make directory: permission denied", "mkdir"),
             ("can't copy - source file is being updated", "copy"),
+            ("Couldn't move: rename /Users/me/Sync/a.txt /Users/me/Sync/b.txt: permission denied", "move"),
+            ("error reading source directory: open /Users/me/Sync/Delete Me: permission denied", "list"),
+            ("error reading source root directory: directory not found", "list"),
+            ("error reading destination directory: googleapi: Error 403: rateLimitExceeded", "list"),
             ("something unexpected happened", "other"),
             (nil, "other"),
         ]

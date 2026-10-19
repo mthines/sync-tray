@@ -3207,16 +3207,20 @@ final class TelemetryService {
     /// message is `other`.
     ///
     /// Conservative heuristic over the lowercased text: rclone's own operation prefixes are
-    /// checked first ("Failed to copy:", "Couldn't delete:", "Failed to move:"/"Failed to
-    /// rename:", "error listing:"/"failed to list", then "mkdir"/"make directory"), and only
-    /// then the bare words "copy", "delete" and "listing". The bare words can also come from
-    /// a file path inside the message, which is why they are the last resort. Pure.
+    /// checked first ("Failed to copy:", "Couldn't delete:", "Failed to move:"/"Couldn't
+    /// move:"/"Failed to rename:", "error listing:"/"failed to list"/"error reading
+    /// source|destination [root] directory:" (rclone's march listing errors), then
+    /// "mkdir"/"make directory"), and only then the bare words "copy", "delete" and
+    /// "listing". The bare words can also come from a file path inside the message, which
+    /// is why they are the last resort. Pure.
     static func categorizeErrorOperation(_ message: String?) -> String {
         guard let lower = message?.lowercased() else { return "other" }
         if lower.contains("failed to copy") { return "copy" }
         if lower.contains("couldn't delete") { return "delete" }
-        if lower.contains("failed to move") || lower.contains("failed to rename") { return "move" }
-        if lower.contains("error listing") || lower.contains("failed to list") { return "list" }
+        if lower.contains("failed to move") || lower.contains("couldn't move")
+            || lower.contains("failed to rename") { return "move" }
+        if lower.contains("error listing") || lower.contains("failed to list")
+            || lower.contains("error reading source") || lower.contains("error reading destination") { return "list" }
         if lower.contains("mkdir") || lower.contains("make directory") { return "mkdir" }
         if lower.contains("copy") { return "copy" }
         if lower.contains("delete") { return "delete" }
