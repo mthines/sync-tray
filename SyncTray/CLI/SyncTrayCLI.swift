@@ -2299,8 +2299,19 @@ extension CLIEnvironment {
     /// opt-out event); launch at login registers the login item directly, so it
     /// also takes effect when the app isn't running.
     fileprivate static func writeAppSettingsProcess(_ values: [String: AppSettingValue]) -> String? {
+        // launchAtLogin first: it is the only write that can fail, so a failure
+        // returns before anything else has changed. telemetryEnabled next — it
+        // sends its opt-out event and writes settings.json itself — then the rest.
+        func applyRank(_ key: String) -> Int {
+            switch AppSettingsFileStore.SafeKey(rawValue: key) {
+            case .launchAtLogin?: return 0
+            case .telemetryEnabled?: return 1
+            default: return 2
+            }
+        }
+        let ordered = values.sorted { (applyRank($0.key), $0.key) < (applyRank($1.key), $1.key) }
         var fileValues: [String: Any] = [:]
-        for (key, value) in values {
+        for (key, value) in ordered {
             switch (AppSettingsFileStore.SafeKey(rawValue: key), value) {
             case (.telemetryEnabled?, .bool(let enabled)):
                 setTelemetryEnabledProcess(enabled)  // writes settings.json itself
