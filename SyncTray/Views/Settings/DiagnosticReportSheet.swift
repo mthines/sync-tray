@@ -246,7 +246,8 @@ struct DiagnosticReportSheet: View {
             Task { @MainActor in
                 let outcome = await Task.detached(priority: .userInitiated) { () -> SaveOutcome in
                     do {
-                        return .saved(try DiagnosticReportFile.write(built.render(), named: fileName))
+                        let url = try DiagnosticReportFile.write(built.render(), named: fileName)
+                        return .saved(url)
                     } catch {
                         return .failed(error.localizedDescription)
                     }

@@ -320,11 +320,11 @@ enum DiagnosticReportBuilder {
         let createdAt = env.now()
         var anyLineCut = false
 
-        func read(_ path: String) -> String? {
+        func readGuarded(_ path: String) -> String? {
             guard !isNeverRead(path) else { return nil }
             return env.readFile(path)
         }
-        func tail(_ path: String, _ count: Int) -> [String]? {
+        func tailGuarded(_ path: String, _ count: Int) -> [String]? {
             guard !isNeverRead(path) else { return nil }
             return env.tailLines(path, count)
         }
@@ -401,24 +401,24 @@ enum DiagnosticReportBuilder {
             let id = profile.id
             let name = profile.name
 
-            let configLines = read(profile.profileFilePath).map(splitLines)
+            let configLines = readGuarded(profile.profileFilePath).map(splitLines)
                 ?? ["(no profile file at \(profile.profileFilePath))"]
             sections.append(DiagnosticReport.Section(source: .config, profileId: id, profileName: name, lines: clean(configLines)))
 
-            let filterLines = read(profile.filterFilePath).map(splitLines)
+            let filterLines = readGuarded(profile.filterFilePath).map(splitLines)
                 ?? ["(no filter file at \(profile.filterFilePath))"]
             sections.append(DiagnosticReport.Section(source: .filter, profileId: id, profileName: name, lines: clean(filterLines)))
 
             var lockLines = [describeLock(label: "Run lock", path: profile.lockFilePath,
-                                          contents: read(profile.lockFilePath), isAlive: env.isProcessAlive)]
+                                          contents: readGuarded(profile.lockFilePath), isAlive: env.isProcessAlive)]
             if profile.syncMode == .bisync {
                 let sessionPath = SyncRunLock.sessionLockPath(for: profile)
                 lockLines.append(describeLock(label: "Bisync session lock", path: sessionPath,
-                                              contents: read(sessionPath), isAlive: env.isProcessAlive))
+                                              contents: readGuarded(sessionPath), isAlive: env.isProcessAlive))
             }
             sections.append(DiagnosticReport.Section(source: .locks, profileId: id, profileName: name, lines: clean(lockLines)))
 
-            let logLines = tail(profile.logPath, limit).map { Array($0.suffix(limit)) }
+            let logLines = tailGuarded(profile.logPath, limit).map { Array($0.suffix(limit)) }
                 ?? ["(no sync log at \(profile.logPath))"]
             sections.append(DiagnosticReport.Section(source: .log, profileId: id, profileName: name, lines: clean(logLines)))
         }
