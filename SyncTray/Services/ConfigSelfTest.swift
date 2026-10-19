@@ -125,6 +125,7 @@ enum ConfigSelfTest {
             testRemoteFolderListingKeepsSpaces,
             testCLIRemoteFolders,
             testCLITelemetryConsent,
+            testCLITelemetryFlushWaitsForSend,
             testCacheOnlyUnionConfig,
             testCacheOnlyUnionBehaviour,
             testMountModeSelection,
@@ -160,6 +161,11 @@ enum ConfigSelfTest {
             testMigrationV6VolumeSystemFolders,
             testVolumeSystemFoldersRealRclone,
             testPermissionDeniedBlockedAccess,
+            testTelemetryLockState,
+            testTelemetryErrorCategories,
+            testSyncPathKind,
+            testRemoteBackendType,
+            testSyncProgressAttributes,
             testRunLivenessMountMode,
             testExclusiveRunRegistryStaleGrace,
             testSyncRunLockAcquire,
@@ -176,6 +182,13 @@ enum ConfigSelfTest {
             testAbortRunEndSuppression,
             testAbortWiringPinned,
             testRcloneErrorLinesNotFileChanges,
+            testDiagnosticReportCode,
+            testDiagnosticRedaction,
+            testDiagnosticReportBuilder,
+            testDiagnosticOTLPEncoding,
+            testCLIReportParsing,
+            testCLIReportExecute,
+            testReportSheetCancelStopsSend,
         ]
 
         for check in checks {
@@ -3710,6 +3723,51 @@ enum ConfigSelfTest {
         guard SyncTrayCLI.run(.remoteFolders(target: "nope", json: false), env: failing) == 1,
               err.contains("didn't find section") else {
             return report(name, slug, false, "(rclone failure not surfaced: \(err.debugDescription))")
+        }
+        return report(name, slug, true)
+    }
+
+    // MARK: - AC-CLI14 — the CLI waits for its telemetry to be sent before exiting
+
+    /// opentelemetry-swift 1.17.1 OTLP/HTTP exporters return from `export` before the
+    /// request completes, so a CLI that exits right after `forceFlush()` sends nothing.
+    /// `waitUntilIdle` must keep polling while requests are in flight and give up at the
+    /// deadline; every exporter must send on the session `flushForExit` watches, and
+    /// `flushForExit` must actually wait on it.
+    private static func testCLITelemetryFlushWaitsForSend() -> Bool {
+        let name = "AC-CLI14", slug = "cli-telemetry-flush-waits"
+
+        // Drains: 2 in flight, then 1, then 0 → true after two sleeps.
+        var pending = [2, 1, 0]
+        var sleeps = 0
+        let drained = TelemetryService.waitUntilIdle(
+            deadline: .now() + 60,
+            inFlight: { pending.isEmpty ? 0 : pending.removeFirst() },
+            sleep: { _ in sleeps += 1 })
+        guard drained, sleeps == 2 else {
+            return report(name, slug, false, "(did not wait for in-flight requests: drained=\(drained) sleeps=\(sleeps))")
+        }
+
+        // Never drains: stops at the deadline instead of hanging the CLI.
+        let start = DispatchTime.now()
+        var ticks: UInt64 = 0
+        let gaveUp = !TelemetryService.waitUntilIdle(
+            deadline: start + .seconds(1),
+            inFlight: { 1 },
+            now: { ticks += 1; return start + .milliseconds(Int(ticks) * 300) },
+            sleep: { _ in })
+        guard gaveUp, ticks <= 5 else {
+            return report(name, slug, false, "(did not stop at the deadline: ticks=\(ticks))")
+        }
+
+        guard let source = readSourceFile("Services/TelemetryService.swift") else {
+            return report(name, slug, false, "(could not read TelemetryService.swift)")
+        }
+        let exporterSessions = source.components(separatedBy: "useSession: Self.exportSession").count - 1
+        let flush = extractFunctionBody(startingAt: "func flushForExit(", in: source) ?? ""
+        let quit = extractFunctionBody(startingAt: "func shutdown(", in: source) ?? ""
+        guard exporterSessions == 3, flush.contains("waitUntilIdle("), quit.contains("waitUntilIdle(") else {
+            return report(name, slug, false, "(exporters on the watched session: \(exporterSessions)/3; flushForExit waits: \(flush.contains("waitUntilIdle(")); shutdown waits: \(quit.contains("waitUntilIdle(")))")
         }
         return report(name, slug, true)
     }
@@ -8115,6 +8173,486 @@ enum ConfigSelfTest {
         return report(name, slug, true)
     }
 
+    // MARK: - AC-TS1 — telemetry lock state tells a verified run from a reused PID
+
+    /// `SyncRunLock.lockState` maps every holder to its bounded `sync.lock_state` label, and
+    /// only a live PID that `SyncAbort.isProfileProcess` recognises as this profile's run is
+    /// `live_verified` — a PID reused by another profile's script is `live_unverified`, the
+    /// stuck-lock signature `kill(pid, 0)` alone can't see. `isProfileProcess` accepts the
+    /// script by its config path and an rclone by its local folder (raw or `~`-expanded,
+    /// whatever its parent), and nothing without a command line.
+    private static func testTelemetryLockState() -> Bool {
+        let name = "AC-TS1", slug = "telemetry-lock-state"
+        let appPID: Int32 = 500
+        let alivePIDs: Set<Int32> = [500, 700, 701, 900, 950]
+        let isAlive: (Int32) -> Bool = { alivePIDs.contains($0) }
+        let configPath = "/Users/me/.config/synctray/profiles/c6169dcc.json"
+        let otherConfigPath = "/Users/me/.config/synctray/profiles/0badf00d.json"
+        let localSyncPath = "/Users/me/Sync"
+        let bash700 = SyncAbort.ProcessEntry(pid: 700, ppid: 1, name: "/bin/bash")
+        let rclone701 = SyncAbort.ProcessEntry(pid: 701, ppid: 700, name: "/opt/homebrew/bin/rclone")
+        let bash900 = SyncAbort.ProcessEntry(pid: 900, ppid: 1, name: "/bin/bash")
+        let table: [Int32: SyncAbort.ProcessEntry] = [700: bash700, 701: rclone701, 900: bash900]
+        let arguments: [Int32: String] = [
+            700: "/bin/bash /Users/me/.local/bin/synctray-sync.sh \(configPath)",
+            701: "/opt/homebrew/bin/rclone bisync remote:Sync \(localSyncPath) --verbose --use-json-log",
+            // The lock's PID was reused by ANOTHER profile's sync script.
+            900: "/bin/bash /Users/me/.local/bin/synctray-sync.sh \(otherConfigPath)",
+        ]
+        let identify: (Int32) -> Bool = { pid in
+            guard let entry = table[pid] else { return false }
+            return SyncAbort.isProfileProcess(
+                entry, arguments: arguments[pid], configPath: configPath, localSyncPath: localSyncPath)
+        }
+        func state(_ holder: SyncRunLock.Holder) -> String {
+            SyncRunLock.lockState(holder: holder, appPID: appPID, isAlive: isAlive, identify: identify)
+        }
+        let cases: [(SyncRunLock.Holder, String)] = [
+            (SyncRunLock.Holder.none, "none"),
+            (SyncRunLock.parseHolder(nil), "none"),
+            (SyncRunLock.parseHolder("  \n"), "none"),
+            (SyncRunLock.Holder.pending, "pending"),
+            (SyncRunLock.parseHolder("pending"), "pending"),
+            (SyncRunLock.Holder.unreadable, "unreadable"),
+            (SyncRunLock.parseHolder("not a pid"), "unreadable"),
+            (SyncRunLock.Holder.pid(0), "unreadable"),
+            (SyncRunLock.Holder.pid(4242), "stale"),
+            (SyncRunLock.Holder.pid(500), "live_app"),
+            (SyncRunLock.Holder.pid(700), "live_verified"),
+            (SyncRunLock.parseHolder(#"{"Session":"x","PID":"701"}"#), "live_verified"),
+            (SyncRunLock.Holder.pid(900), "live_unverified"),
+            // Alive, but not in the process table (or ps failed): never verified.
+            (SyncRunLock.Holder.pid(950), "live_unverified"),
+        ]
+        for (holder, expected) in cases {
+            let got = state(holder)
+            guard got == expected else {
+                return report(name, slug, false, "(lockState(\(holder)) = \(got), expected \(expected))")
+            }
+        }
+        // `identify` decides only between the two live labels: never for the app's own
+        // placeholder, never for a dead PID.
+        let alwaysYes: (Int32) -> Bool = { _ in true }
+        guard SyncRunLock.lockState(holder: .pid(500), appPID: appPID, isAlive: isAlive, identify: alwaysYes) == "live_app",
+              SyncRunLock.lockState(holder: .pid(4242), appPID: appPID, isAlive: isAlive, identify: alwaysYes) == "stale" else {
+            return report(name, slug, false, "(identify overrode live_app or stale)")
+        }
+
+        // isProfileProcess positives.
+        let scriptEntry = SyncAbort.ProcessEntry(pid: 710, ppid: 1, name: "/Users/me/.local/bin/synctray-sync.sh")
+        let tildeLocal = "~/SelfTestTS1Sync"
+        let expandedLocal = (tildeLocal as NSString).expandingTildeInPath
+        guard SyncAbort.isProfileProcess(bash700, arguments: arguments[700], configPath: configPath, localSyncPath: localSyncPath),
+              SyncAbort.isProfileProcess(scriptEntry, arguments: "synctray-sync.sh \(configPath)",
+                                         configPath: configPath, localSyncPath: localSyncPath),
+              SyncAbort.isProfileProcess(rclone701, arguments: arguments[701], configPath: configPath, localSyncPath: localSyncPath),
+              SyncAbort.isProfileProcess(rclone701, arguments: "rclone sync \(expandedLocal) remote:x",
+                                         configPath: configPath, localSyncPath: tildeLocal),
+              SyncAbort.isProfileProcess(rclone701, arguments: "rclone sync \(tildeLocal) remote:x",
+                                         configPath: configPath, localSyncPath: tildeLocal),
+              SyncAbort.isProfileProcess(rclone701, arguments: arguments[701], configPath: configPath,
+                                         localSyncPath: localSyncPath + "/") else {
+            return report(name, slug, false, "(isProfileProcess rejected one of this profile's run processes)")
+        }
+        // Unlike isRunRoot, a script run's rclone (parent = bash, not the app) still qualifies.
+        guard !SyncAbort.isRunRoot(rclone701, arguments: arguments[701], appPID: appPID,
+                                   configPath: configPath, localSyncPath: localSyncPath) else {
+            return report(name, slug, false, "(fixture assumption broken: isRunRoot accepted a non-app-child rclone)")
+        }
+
+        // isProfileProcess negatives.
+        let zsh = SyncAbort.ProcessEntry(pid: 720, ppid: 1, name: "/bin/zsh")
+        guard !SyncAbort.isProfileProcess(bash900, arguments: arguments[900], configPath: configPath, localSyncPath: localSyncPath),
+              !SyncAbort.isProfileProcess(zsh, arguments: "zsh -c synctray-sync.sh \(configPath)",
+                                          configPath: configPath, localSyncPath: localSyncPath),
+              !SyncAbort.isProfileProcess(rclone701, arguments: "rclone bisync remote:Other /Users/me/Other --verbose",
+                                          configPath: configPath, localSyncPath: localSyncPath),
+              !SyncAbort.isProfileProcess(rclone701, arguments: "rclone bisync remote:Sync2 /Users/me/Sync2 --verbose",
+                                          configPath: configPath, localSyncPath: localSyncPath),
+              !SyncAbort.isProfileProcess(rclone701, arguments: nil, configPath: configPath, localSyncPath: localSyncPath),
+              !SyncAbort.isProfileProcess(bash700, arguments: nil, configPath: configPath, localSyncPath: localSyncPath),
+              !SyncAbort.isProfileProcess(rclone701, arguments: arguments[701], configPath: configPath, localSyncPath: "") else {
+            return report(name, slug, false, "(isProfileProcess accepted a process that is not this profile's run)")
+        }
+
+        // The folder must be a whole argument: another profile's rclone syncing a folder INSIDE
+        // this one, or — for a profile syncing the home folder — any SyncTray rclone, whose
+        // `--filter-from ~/.config/synctray/profiles/…` starts with the home path, is not ours.
+        let homeProfileFolder = "/Users/me"
+        let otherProfileRclone = "rclone bisync /Users/me/Pictures gdrive:Pictures --filter-from /Users/me/.config/synctray/profiles/abcd1234-exclude.txt"
+        guard !SyncAbort.isProfileProcess(rclone701, arguments: "rclone bisync remote:Photos /Users/me/Sync/Photos --verbose",
+                                          configPath: configPath, localSyncPath: localSyncPath),
+              !SyncAbort.isProfileProcess(rclone701, arguments: otherProfileRclone,
+                                          configPath: configPath, localSyncPath: homeProfileFolder) else {
+            return report(name, slug, false, "(isProfileProcess accepted an rclone for a folder inside or under this profile's)")
+        }
+        guard SyncAbort.isProfileProcess(rclone701, arguments: "rclone bisync gdrive:Home /Users/me --verbose --filter-from /Users/me/.config/synctray/profiles/c6169dcc-exclude.txt",
+                                         configPath: configPath, localSyncPath: homeProfileFolder),
+              SyncAbort.isProfileProcess(rclone701, arguments: "rclone sync /Users/me/ gdrive:Home",
+                                         configPath: configPath, localSyncPath: homeProfileFolder) else {
+            return report(name, slug, false, "(isProfileProcess rejected an rclone whose argument is exactly this profile's home folder)")
+        }
+        return report(name, slug, true)
+    }
+
+    // MARK: - AC-TS2 — error categories: the new buckets, the old ones unchanged, and error.operation
+
+    private static func testTelemetryErrorCategories() -> Bool {
+        let name = "AC-TS2", slug = "telemetry-error-categories"
+        let photosDenial = "failed to open directory \"Photos Library.photoslibrary\": open /Users/someone/Pictures/Photos Library.photoslibrary: operation not permitted"
+        let checks: [(String?, String)] = [
+            // New buckets, from real rclone / Google Drive / Go runtime wording.
+            ("Failed to copy: googleapi: Error 403: User Rate Limit Exceeded. Rate of requests for user exceed configured project quota., userRateLimitExceeded", "rate_limited"),
+            ("googleapi: Error 403: Quota exceeded for quota metric 'Queries' and limit 'Queries per minute per user', rateLimitExceeded", "rate_limited"),
+            ("HTTP error 429 (429 Too Many Requests) returned body: \"slow down\"", "rate_limited"),
+            ("Failed to copy: googleapi: Error 403: The user's Drive storage quota has been exceeded., storageQuotaExceeded", "quota_exceeded"),
+            ("Failed to copy: 507 Insufficient Storage", "quota_exceeded"),
+            ("Failed to copy: write /Users/me/Sync/big.mov: no space left on device", "disk_full"),
+            ("Failed to create file system for \"gdrive:\": couldn't fetch token: invalid_grant: maybe token expired? - try refreshing with \"rclone config reconnect gdrive:\"", "auth_failed"),
+            ("oauth2: cannot fetch token: 400 Bad Request", "auth_failed"),
+            ("Failed to copy: HTTP 401 Unauthorized", "auth_failed"),
+            ("Get \"https://nas.local:5006/\": tls: failed to verify certificate: x509: certificate signed by unknown authority", "tls_certificate"),
+            ("Failed to copy: open /Users/me/Sync/aaaaaaaa: file name too long", "name_too_long"),
+            ("Failed to copy: invalidRequest: The provided name contains invalid characters", "invalid_name"),
+            ("Failed to copy: corrupted on transfer: md5 hash differ \"0cc1\" vs \"9f2e\"", "checksum_mismatch"),
+            ("Failed to copy: corrupted on transfer: sizes differ 1024 vs 2048", "checksum_mismatch"),
+            ("Failed to copy: can't copy - source file is being updated (size changed from 1024 to 2048)", "file_changed_during_transfer"),
+            ("Failed to copy: open /Users/me/Sync/library.sqlite: resource busy", "file_busy"),
+            ("Duplicate object found in source - ignoring", "duplicate_object"),
+            ("Duplicate directory found in destination - ignoring", "duplicate_object"),
+            ("Failed to rmdir: remove /Users/me/Sync/old: directory not empty", "directory_not_empty"),
+            // More network / timeout phrasings.
+            ("Failed to copy: Post \"https://www.googleapis.com/upload\": dial tcp: lookup www.googleapis.com: no such host", "network"),
+            ("Failed to copy: read tcp 10.0.0.2:52311->142.250.0.1:443: read: connection reset by peer", "network"),
+            ("Failed to copy: write tcp 10.0.0.2:52311->10.0.0.5:445: write: broken pipe", "network"),
+            ("Failed to copy: Get \"https://www.googleapis.com/drive/v3/files\": context deadline exceeded (Client.Timeout exceeded while awaiting headers)", "timeout"),
+            // Moved by this PR: a bare "no such host" was file_not_found (via "no such").
+            ("no such host", "network"),
+            // A token refresh that timed out is a timeout, not an auth failure ("oauth2:" /
+            // "failed to refresh token" must not win over the timeout wording).
+            ("oauth2: cannot fetch token: Post \"https://oauth2.googleapis.com/token\": dial tcp 1.2.3.4:443: i/o timeout", "timeout"),
+            ("oauth2: cannot fetch token: Post \"https://oauth2.googleapis.com/token\": net/http: TLS handshake timeout", "timeout"),
+            ("failed to refresh token: Post \"https://api.proton.me/auth/refresh\": dial tcp 1.2.3.4:443: connect: operation timed out", "timeout"),
+            // Go's JSON decoder on an HTML reply (e.g. a captive portal or proxy) is not a bad
+            // file name.
+            ("failed to get StartPageToken: invalid character '<' looking for beginning of value", "other"),
+            // A file merely named x509 is not a TLS error.
+            ("open /Users/me/Sync/certs/x509.pem: no such file or directory", "file_not_found"),
+            // A path segment named tls or x509 is not a TLS error either ("/" precedes it, not a space)…
+            ("open /Users/me/Sync/certs/tls: permission denied", "permission_denied"),
+            ("open /Users/me/Sync/certs/x509: no such file or directory", "file_not_found"),
+            ("open /Users/me/Sync/x/oauth2: permission denied", "permission_denied"),
+            ("open /Users/me/Sync/Duplicate Files/a.jpg: permission denied", "permission_denied"),
+            ("open /Users/me/Sync/Bad Certificate.pdf: permission denied", "permission_denied"),
+            // Nor is a file whose name merely contains an HTTP status phrase.
+            ("open /Users/me/Sync/Unauthorized.pdf: permission denied", "permission_denied"),
+            ("open /Users/me/Sync/rate limit notes.txt: no such file or directory", "file_not_found"),
+            // …while Go's prefixes still match mid-message and at the very start of the message.
+            ("tls: first record does not look like a TLS handshake", "tls_certificate"),
+            ("x509: certificate is valid for nas.local, not nas.example.com", "tls_certificate"),
+            ("remote error: tls: bad certificate", "tls_certificate"),
+            // Unchanged buckets.
+            (photosDenial, "permission_denied"),
+            ("Failed to sync with 2 errors: last error was: not deleting files as there were IO errors", "io_errors_blocked_deletes"),
+            ("file not found", "file_not_found"),
+            ("Failed to copy: permission denied", "permission_denied"),
+            // A file name that merely mentions a certificate is not a TLS error.
+            ("open /Users/me/Sync/Birth Certificate.pdf: permission denied", "permission_denied"),
+            ("dial tcp 10.0.0.5:445: i/o timeout", "timeout"),
+            ("network error", "network"),
+            ("Bisync critical error: out of sync - must run --resync", "out_of_sync"),
+            // rclone mount's mount-point error stays critical; only Go's ENOTEMPTY is split out.
+            ("Fatal error: Directory is not empty: /Users/me/Mount If you want to mount it anyway use: --allow-non-empty option", "critical"),
+            ("something unexpected happened", "other"),
+            (nil, "unknown"),
+        ]
+        for (input, expected) in checks {
+            let got = TelemetryService.categorizeError(input)
+            guard got == expected else {
+                return report(name, slug, false, "(categorizeError(\(input.debugDescription)) = \(got), expected \(expected))")
+            }
+        }
+        // Every specific bucket is reachable by the table above.
+        let covered = Set(checks.map { $0.1 })
+        for bucket in TelemetryService.specificErrorBuckets.map({ $0.bucket }) where !covered.contains(bucket) {
+            return report(name, slug, false, "(no case covers the \(bucket) bucket)")
+        }
+
+        let operations: [(String?, String)] = [
+            ("Failed to copy: corrupted on transfer: sizes differ 1024 vs 2048", "copy"),
+            ("Failed to copy: mkdir /Users/me/Sync/new: operation not permitted", "copy"),
+            ("Couldn't delete: remove /Users/me/Sync/old.txt: permission denied", "delete"),
+            ("Failed to move: object not found", "move"),
+            ("Failed to rename: duplicate file", "move"),
+            ("error listing: directory not found", "list"),
+            ("failed to list directory: context deadline exceeded", "list"),
+            ("mkdir /Users/me/Sync/new: operation not permitted", "mkdir"),
+            ("failed to make directory: permission denied", "mkdir"),
+            ("can't copy - source file is being updated", "copy"),
+            ("Couldn't move: rename /Users/me/Sync/a.txt /Users/me/Sync/b.txt: permission denied", "move"),
+            ("error reading source directory: open /Users/me/Sync/Delete Me: permission denied", "list"),
+            ("error reading source root directory: directory not found", "list"),
+            ("error reading destination directory: googleapi: Error 403: rateLimitExceeded", "list"),
+            ("Failed to rmdir: remove /Users/me/Sync/old: directory not empty", "delete"),
+            ("failed to rmdirs: directory not found", "delete"),
+            ("Failed to Rmdir: directory not empty", "delete"),
+            ("open /Users/me/Sync/rmdir.sh: permission denied", "other"),
+            ("Failed to rmdir: remove /Users/me/Sync/mkdir-old: directory not empty", "delete"),
+            ("open /Users/me/Sync/mkdir.sh: permission denied", "other"),
+            ("RenameDir mkdir: permission denied", "mkdir"),
+            ("mkdir metadata: failed make directory: permission denied", "mkdir"),
+            ("something unexpected happened", "other"),
+            (nil, "other"),
+        ]
+        for (input, expected) in operations {
+            let got = TelemetryService.categorizeErrorOperation(input)
+            guard got == expected else {
+                return report(name, slug, false, "(categorizeErrorOperation(\(input.debugDescription)) = \(got), expected \(expected))")
+            }
+        }
+        return report(name, slug, true)
+    }
+
+    // MARK: - AC-TS3 — config.local_path_kind buckets a folder, never sends it
+
+    private static func testSyncPathKind() -> Bool {
+        let name = "AC-TS3", slug = "sync-path-kind"
+        let home = "/Users/Me"
+        let cases: [(String, String)] = [
+            ("/Users/Me/Pictures", "pictures"),
+            ("/users/me/PICTURES/", "pictures"),
+            ("~/Pictures/Holiday/2024", "pictures"),
+            ("//Users//Me//Pictures//", "pictures"),
+            ("/Users/Me/Documents/../Pictures", "pictures"),
+            ("~/Desktop", "desktop"),
+            ("~/Documents/Work/Reports", "documents"),
+            ("~/Downloads", "downloads"),
+            ("~/Music/Logic", "music"),
+            ("~/Movies", "movies"),
+            ("~/Public/Drop Box", "public"),
+            ("~/Library/Mobile Documents/com~apple~CloudDocs/Notes", "icloud_drive"),
+            ("~/Library/CloudStorage/GoogleDrive-me@example.com/My Drive", "cloud_storage"),
+            ("~/Library/Mail", "library"),
+            ("/Users/Me/Library", "library"),
+            ("~", "home_root"),
+            ("/Users/Me", "home_root"),
+            ("/users/me/", "home_root"),
+            ("~/Code/project", "home_other"),
+            ("~/PicturesArchive", "home_other"),
+            ("/Volumes/SeagateHD/Kaiju", "external_volume"),
+            ("/volumes/usb", "external_volume"),
+            ("/Volumes", "other"),
+            ("/Users/MeToo/Pictures", "other"),
+            ("/tmp/sync", "other"),
+            ("relative/folder", "other"),
+            ("", "unknown"),
+            ("   ", "unknown"),
+        ]
+        for (path, expected) in cases {
+            let got = SyncPathKind.classify(localPath: path, homeDirectory: home)
+            guard got == expected else {
+                return report(name, slug, false, "(classify(\(path.debugDescription)) = \(got), expected \(expected))")
+            }
+        }
+        // A trailing slash on the home directory itself changes nothing.
+        guard SyncPathKind.classify(localPath: "/Users/Me/Pictures", homeDirectory: "/Users/Me/") == "pictures" else {
+            return report(name, slug, false, "(a trailing slash on the home directory broke classification)")
+        }
+        let protectedKinds: [String] = ["desktop", "documents", "downloads", "icloud_drive", "library", "external_volume"]
+        let unprotectedKinds: [String] = ["pictures", "music", "movies", "public", "cloud_storage", "home_root", "home_other", "other", "unknown"]
+        for kind in protectedKinds where !SyncPathKind.isPrivacyProtected(kind) {
+            return report(name, slug, false, "(\(kind) should be privacy-protected)")
+        }
+        for kind in unprotectedKinds where SyncPathKind.isPrivacyProtected(kind) {
+            return report(name, slug, false, "(\(kind) should not be privacy-protected)")
+        }
+        return report(name, slug, true)
+    }
+
+    // MARK: - AC-TS4 — config.remote_type comes from rclone.conf, bucketed by an allowlist
+
+    private static func testRemoteBackendType() -> Bool {
+        let name = "AC-TS4", slug = "remote-backend-type"
+        guard RemoteBackendType.bucket("drive") == "drive",
+              RemoteBackendType.bucket("protondrive") == "protondrive",
+              RemoteBackendType.bucket("SMB") == "smb",
+              RemoteBackendType.bucket(" s3 ") == "s3",
+              RemoteBackendType.bucket("my-private-backend") == "other",
+              RemoteBackendType.bucket("") == "unknown",
+              RemoteBackendType.bucket(nil) == "unknown" else {
+            return report(name, slug, false, "(bucket mapped a known, unknown or missing type wrongly)")
+        }
+        for knownType in RemoteBackendType.knownTypes where RemoteBackendType.bucket(knownType) != knownType {
+            return report(name, slug, false, "(known type \(knownType) was not reported as itself)")
+        }
+
+        let config = """
+            # rclone.conf
+            [gdrive]
+            type = drive
+            scope = drive
+            token = {"access_token":"x","expiry":"2026-10-19T10:00:00Z"}
+
+            [proton]
+            client_id = abc
+            type=protondrive
+
+            [notype]
+            user = me
+
+            [future]
+            type = some-future-backend
+
+            [commented]
+            # type = drive
+            ; type = s3
+
+            [nas-smb]
+            host = nas.local
+            type = smb
+            """
+        let reads: [(String, String?)] = [
+            ("gdrive", "drive"),
+            ("proton", "protondrive"),
+            ("notype", nil),
+            ("future", "some-future-backend"),
+            ("commented", nil),
+            ("nas-smb", "smb"),
+            ("missing", nil),
+            ("", nil),
+        ]
+        for (remote, expected) in reads {
+            let got = RcloneConfigService.remoteType(named: remote, inConfig: config)
+            guard got == expected else {
+                return report(name, slug, false, "(remoteType(named: \(remote)) = \(String(describing: got)), expected \(String(describing: expected)))")
+            }
+        }
+
+        var profile = sampleProfile()
+        func types(_ rcloneConfig: String?) -> [String] {
+            let pair = RemoteBackendType.types(for: profile, rcloneConfig: rcloneConfig)
+            return [pair.primary, pair.fallback]
+        }
+        profile.rcloneRemote = "gdrive:"
+        profile.fallbackRemote = ""
+        let noFallback = types(config)
+        profile.fallbackRemote = "nas-smb"
+        let withFallback = types(config)
+        profile.fallbackRemote = "nas-smb:"
+        let withColonFallback = types(config)
+        let unreadable = types(nil)
+        profile.rcloneRemote = "future:"
+        profile.fallbackRemote = "missing"
+        let unknownTypes = types(config)
+        guard noFallback == ["drive", "none"],
+              withFallback == ["drive", "smb"],
+              withColonFallback == ["drive", "smb"],
+              unreadable == ["unknown", "unknown"],
+              unknownTypes == ["other", "unknown"] else {
+            return report(name, slug, false,
+                          "(types(for:) gave \(noFallback) / \(withFallback) / \(withColonFallback) / \(unreadable) / \(unknownTypes))")
+        }
+        return report(name, slug, true)
+    }
+
+    // MARK: - AC-TS5 — the Sync progress attributes carry counts, never file names
+
+    private static func testSyncProgressAttributes() -> Bool {
+        let name = "AC-TS5", slug = "sync-progress-attributes"
+        let profileId = UUID()
+        let secretFile = "Projects/Top Secret/zz-ts5-distinctive-file-name.mov"
+        let progress = SyncProgress(
+            bytesTransferred: 123_456_789,
+            totalBytes: 987_654_321,
+            eta: 3_600,
+            speed: 2_500_000.5,
+            transfersDone: 41,
+            totalTransfers: 977,
+            checksDone: 1_234,
+            totalChecks: 5_678,
+            elapsedTime: 42.5,
+            errors: 3,
+            transferringFiles: [
+                TransferringFile(name: secretFile, size: 1_000, bytes: 500, percentage: 50,
+                                 speed: 10, speedAvg: nil, eta: 50),
+            ],
+            listedCount: 9_999
+        )
+        let attrs = TelemetryService.syncProgressAttributes(
+            profileId: profileId, profileName: "Work", syncMode: .bisync,
+            progress: progress, runAgeSeconds: 7_200)
+        let values = attrs.mapValues { "\($0)" }
+        let expected: [String: String] = [
+            "synctray.profile.id": profileId.uuidString,
+            "synctray.profile.name": "Work",
+            "sync.mode": "bisync",
+            "sync.progress.has_stats": "true",
+            "sync.run_age_s": "7200.0",
+            "sync.progress.bytes_transferred": "123456789",
+            "sync.progress.bytes_total": "987654321",
+            "sync.progress.transfers_done": "41",
+            "sync.progress.transfers_total": "977",
+            "sync.progress.checks_done": "1234",
+            "sync.progress.checks_total": "5678",
+            "sync.progress.errors": "3",
+            "sync.progress.speed_bps": "2500000.5",
+            "sync.progress.eta_s": "3600",
+            "sync.progress.elapsed_s": "42.5",
+            "sync.progress.listed": "9999",
+        ]
+        guard values == expected else {
+            return report(name, slug, false, "(attributes were \(values.sorted(by: { $0.key < $1.key })))")
+        }
+        // No value is, or contains, a file being transferred — whole path or base name.
+        let baseName = (secretFile as NSString).lastPathComponent
+        guard !values.values.contains(where: { $0 == secretFile || $0.contains(baseName) || $0.contains("Top Secret") }) else {
+            return report(name, slug, false, "(an attribute carried a transferring file's name)")
+        }
+
+        // Before rclone's first stats line: has_stats false, no counts, no run age when unknown.
+        let bare = TelemetryService.syncProgressAttributes(
+            profileId: profileId, profileName: "Work", syncMode: .sync,
+            progress: nil, runAgeSeconds: nil).mapValues { "\($0)" }
+        guard bare == [
+            "synctray.profile.id": profileId.uuidString,
+            "synctray.profile.name": "Work",
+            "sync.mode": "sync",
+            "sync.progress.has_stats": "false",
+        ] else {
+            return report(name, slug, false, "(attributes without stats were \(bare.sorted(by: { $0.key < $1.key })))")
+        }
+
+        // Optional fields rclone hasn't reported yet are left out, not zero-filled.
+        let partial = SyncProgress(bytesTransferred: 1, totalBytes: 2, eta: nil, speed: nil,
+                                   transfersDone: 0, totalTransfers: 0)
+        let partialKeys = Set(TelemetryService.syncProgressAttributes(
+            profileId: profileId, profileName: "Work", syncMode: .bisync,
+            progress: partial, runAgeSeconds: nil).keys)
+        guard partialKeys.isDisjoint(with: ["sync.progress.speed_bps", "sync.progress.eta_s",
+                                            "sync.progress.elapsed_s", "sync.progress.listed", "sync.run_age_s"]),
+              partialKeys.contains("sync.progress.bytes_total") else {
+            return report(name, slug, false, "(nil optional progress fields were emitted: \(partialKeys.sorted()))")
+        }
+
+        // Every profile state has a bounded label; a paused profile is "paused" whatever its state.
+        let labels: [(SyncState, Bool, String)] = [
+            (.idle, false, "idle"),
+            (.syncing, false, "syncing"),
+            (.paused, false, "paused"),
+            (.error("Exit code 1: /Users/me/Sync/x"), false, "error"),
+            (.driveNotMounted, false, "drive_not_mounted"),
+            (.notConfigured, false, "not_configured"),
+            (.error("boom"), true, "paused"),
+        ]
+        for (syncState, paused, label) in labels {
+            let got = TelemetryService.profileStateLabel(syncState, isPaused: paused)
+            guard got == label else {
+                return report(name, slug, false, "(profileStateLabel(\(syncState), \(paused)) = \(got), expected \(label))")
+            }
+        }
+        return report(name, slug, true)
+    }
+
     // MARK: - AC-SR7 — mount-mode liveness ignores lock files, registry only
 
     private static func testRunLivenessMountMode() -> Bool {
@@ -8630,6 +9168,702 @@ enum ConfigSelfTest {
             }
         }
         return report(name, slug, true)
+    }
+
+    // MARK: - AC-DR1 — diagnostic report code
+
+    /// `ST-` + 6 characters from the look-alike-free alphabet, deterministic for a seeded
+    /// generator, and `isValid` accepts exactly that shape.
+    private static func testDiagnosticReportCode() -> Bool {
+        let name = "AC-DR1", slug = "diagnostic-report-code"
+        let allowed = Set("23456789ABCDEFGHJKMNPQRSTUVWXYZ")
+        guard Set(DiagnosticReportCode.alphabet) == allowed,
+              !"0O1IL".contains(where: { allowed.contains($0) }) else {
+            return report(name, slug, false, "(alphabet differs: \(String(DiagnosticReportCode.alphabet)))")
+        }
+        var rng = DiagnosticSelfTestRNG(state: 42)
+        var codes: [String] = []
+        for _ in 0..<200 {
+            codes.append(DiagnosticReportCode.generate(using: &rng))
+        }
+        for code in codes {
+            guard code.hasPrefix("ST-"), code.count == 9,
+                  code.dropFirst(3).allSatisfy({ allowed.contains($0) }),
+                  DiagnosticReportCode.isValid(code) else {
+                return report(name, slug, false, "(bad code \(code.debugDescription))")
+            }
+        }
+        guard Set(codes).count > 190 else {
+            return report(name, slug, false, "(only \(Set(codes).count) distinct codes in 200 draws)")
+        }
+        var first = DiagnosticSelfTestRNG(state: 7)
+        var second = DiagnosticSelfTestRNG(state: 7)
+        var firstCodes: [String] = []
+        var secondCodes: [String] = []
+        for _ in 0..<5 {
+            firstCodes.append(DiagnosticReportCode.generate(using: &first))
+            secondCodes.append(DiagnosticReportCode.generate(using: &second))
+        }
+        guard firstCodes == secondCodes else {
+            return report(name, slug, false, "(seeded generation is not deterministic: \(firstCodes) vs \(secondCodes))")
+        }
+        let valid = ["ST-ABCDEF", "ST-234567", "ST-Z9Y8X7", DiagnosticReportCode.generate()]
+        for code in valid where !DiagnosticReportCode.isValid(code) {
+            return report(name, slug, false, "(\(code.debugDescription) rejected)")
+        }
+        let invalid = ["", "ST-", "ST-ABC12", "ST-ABCDEFG", "st-ABCDEF", "ST-abcdef", "ST-ABCDE0",
+                       "ST-ABCDEO", "ST-ABCDE1", "ST-ABCDEI", "ST-ABCDEL", "SX-ABCDEF", "ST_ABCDEF",
+                       " ST-ABCDEF", "ST-ABCDEF "]
+        for code in invalid where DiagnosticReportCode.isValid(code) {
+            return report(name, slug, false, "(\(code.debugDescription) accepted)")
+        }
+        return report(name, slug, true)
+    }
+
+    // MARK: - AC-DR2 — diagnostic report redaction
+
+    /// Every secret form is replaced with `[REDACTED]` while the key or flag name stays
+    /// visible; ordinary file names and rclone JSON lines pass through unchanged; redacting
+    /// twice changes nothing.
+    private static func testDiagnosticRedaction() -> Bool {
+        let name = "AC-DR2", slug = "diagnostic-redaction"
+        guard DiagnosticRedactor.definedRuleCount == DiagnosticRedactor.compiledRuleCount,
+              DiagnosticRedactor.compiledRuleCount > 0 else {
+            return report(name, slug, false,
+                "(\(DiagnosticRedactor.definedRuleCount) rules defined, \(DiagnosticRedactor.compiledRuleCount) compiled)")
+        }
+        let redacted: [(input: String, expected: String)] = [
+            ("Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.payload.sig", "Authorization: [REDACTED]"),
+            (#"curl -H "Authorization: Bearer abcdefghijklmnop1234""#, #"curl -H "Authorization: [REDACTED]""#),
+            ("retrying with Bearer abcdefghijklmnopqrstuvwxyz012345", "retrying with Bearer [REDACTED]"),
+            (#"{"access_token":"ya29.a0AfH6SM","token_type":"Bearer","refresh_token":"1//0gabc","expiry":"2026-10-13T07:13:40Z"}"#,
+             #"{"access_token":"[REDACTED]","token_type":"Bearer","refresh_token":"[REDACTED]","expiry":"2026-10-13T07:13:40Z"}"#),
+            (#"{"password": "hunter2", "user": "alice"}"#, #"{"password": "[REDACTED]", "user": "alice"}"#),
+            (#"{"client_secret":"abc\"def","x":1}"#, #"{"client_secret":"[REDACTED]","x":1}"#),
+            ("password=hunter2", "password=[REDACTED]"),
+            ("pass: hunter2", "pass: [REDACTED]"),
+            ("passwd: hunter2", "passwd: [REDACTED]"),
+            ("token=abc123", "token=[REDACTED]"),
+            ("access_token=zzz", "access_token=[REDACTED]"),
+            ("refresh_token=zzz", "refresh_token=[REDACTED]"),
+            ("client_secret: zzz", "client_secret: [REDACTED]"),
+            ("secret = \"two words\"", "secret = [REDACTED]"),
+            ("api_key = abc123", "api_key = [REDACTED]"),
+            ("APIKEY=abc123", "APIKEY=[REDACTED]"),
+            ("auth_token: zzz", "auth_token: [REDACTED]"),
+            ("session_token=abc; path=/", "session_token=[REDACTED]; path=/"),
+            ("cookie=abc", "cookie=[REDACTED]"),
+            ("Cookie: a=b; c=d", "Cookie: [REDACTED]"),
+            ("https://host/cb?token=abc123&state=x", "https://host/cb?token=[REDACTED]&state=x"),
+            ("rclone sync /a remote:b --sftp-pass obscured123 --verbose", "rclone sync /a remote:b --sftp-pass [REDACTED] --verbose"),
+            ("rclone sync /a remote:b --sftp-pass=obscured123", "rclone sync /a remote:b --sftp-pass=[REDACTED]"),
+            ("--webdav-password secretvalue", "--webdav-password [REDACTED]"),
+            (#"--dropbox-token {"access_token":"x"}"#, "--dropbox-token [REDACTED]"),
+            ("--drive-client-secret abc", "--drive-client-secret [REDACTED]"),
+            ("--s3-secret-access-key AKIAXYZ", "--s3-secret-access-key [REDACTED]"),
+            ("--crypt-password2 abc", "--crypt-password2 [REDACTED]"),
+            (#""additionalRcloneFlags" : "--sftp-pass abc123 --fast-list","#,
+             #""additionalRcloneFlags" : "--sftp-pass [REDACTED] --fast-list","#),
+            ("webdav url https://alice:hunter2@dav.example.com/remote.php", "webdav url https://[REDACTED]@dav.example.com/remote.php"),
+            ("sftp://bob:pw@nas.local:22/volume1", "sftp://[REDACTED]@nas.local:22/volume1"),
+            ("RCLONE_CONFIG_MYNAS_PASS=obscured123", "RCLONE_CONFIG_MYNAS_PASS=[REDACTED]"),
+            (#"export RCLONE_CONFIG_GDRIVE_TOKEN={"access_token":"x"}"#, "export RCLONE_CONFIG_GDRIVE_TOKEN=[REDACTED]"),
+            ("RCLONE_CONFIG_S3_SECRET=abc", "RCLONE_CONFIG_S3_SECRET=[REDACTED]"),
+            ("RCLONE_RC_PASS=abc123", "RCLONE_RC_PASS=[REDACTED]"),
+            ("DASH0_AUTH_TOKEN=auth_abc123", "DASH0_AUTH_TOKEN=[REDACTED]"),
+            ("OTEL_EXPORTER_OTLP_HEADERS=Authorization=Bearer abc123", "OTEL_EXPORTER_OTLP_HEADERS=[REDACTED]"),
+            ("OTEL_EXPORTER_OTLP_HEADERS=Dash0-Dataset=x,Authorization=Bearer abc123", "OTEL_EXPORTER_OTLP_HEADERS=[REDACTED]"),
+            ("secret_access_key = AKIAabc/xyz", "secret_access_key = [REDACTED]"),
+            // rclone connection string: the value runs to the next , ; & or space, so the
+            // trailing `:bucket` goes with it; the access key ID is not a secret.
+            (":s3,provider=AWS,access_key_id=AKIA1,secret_access_key=abc123:bucket",
+             ":s3,provider=AWS,access_key_id=AKIA1,secret_access_key=[REDACTED]"),
+            (#"{"private_key": "-----BEGIN PRIVATE KEY-----\nMIIabc\n-----END PRIVATE KEY-----\n"}"#,
+             #"{"private_key": "[REDACTED]"}"#),
+            ("X-Api-Key: abc123", "X-Api-Key: [REDACTED]"),
+            ("--azureblob-sas-url https://acct.blob.core.windows.net/c?sv=2022&sig=abc%2B123", "--azureblob-sas-url [REDACTED]"),
+            ("https://bucket.s3.amazonaws.com/o?X-Amz-Algorithm=AWS4&X-Amz-Signature=deadbeef",
+             "https://bucket.s3.amazonaws.com/o?X-Amz-Algorithm=AWS4&X-Amz-Signature=[REDACTED]"),
+        ]
+        for entry in redacted {
+            let got = DiagnosticRedactor.redact(entry.input)
+            guard got == entry.expected else {
+                return report(name, slug, false, "(\(entry.input.debugDescription) → \(got.debugDescription), want \(entry.expected.debugDescription))")
+            }
+            guard DiagnosticRedactor.redact(got) == got else {
+                return report(name, slug, false, "(redaction not idempotent for \(got.debugDescription))")
+            }
+        }
+        let unchanged = [
+            "/Users/alice/Documents/Keynote.key",
+            "Copied (new): passport.pdf",
+            "/Users/alice/token-ring notes.txt",
+            "/Users/alice/secret stuff/plan.txt",
+            #"rclone sync "/Users/alice/secret stuff/" remote:backup --fast-list"#,
+            "/Users/alice/a-b-token notes.txt",
+            #"{"level":"info","msg":"Copied (new)","object":"secret stuff/token-ring notes.txt","objectType":"*local.Object","source":"operations/copy.go:380","time":"2026-10-13T07:13:40.943947+02:00"}"#,
+            #"{"level":"error","msg":"Failed to copy: open /Users/alice/Keynote.key: operation not permitted","object":"Keynote.key","source":"operations/copy.go:354","time":"2026-10-13T07:13:40.943947+02:00"}"#,
+            #"{"level":"info","msg":"There was nothing to transfer","source":"sync/sync.go:954","time":"2026-10-13T07:13:41.1+02:00"}"#,
+            "2026-10-13 07:13:40 - Sync started (mode=bisync)",
+            "Basic notes.txt",
+            "smb://nas/share/a@b.txt",
+            #""remotePath" : "Kaiju/KAIJU","#,
+            "Compass: north.txt",
+            "bypass=1.txt",
+            "Design sig=draft.txt",
+            "",
+        ]
+        for line in unchanged {
+            let got = DiagnosticRedactor.redact(line)
+            guard got == line else {
+                return report(name, slug, false, "(ordinary line changed: \(line.debugDescription) → \(got.debugDescription))")
+            }
+        }
+        return report(name, slug, true)
+    }
+
+    // MARK: - AC-DR3 — diagnostic report builder
+
+    /// With a fake environment: the expected sections per profile, `lineLimit` honoured,
+    /// 8 KB line cap, redaction on every section, the 5 MB-style total cap dropping the
+    /// oldest log lines first, and no credential file ever requested from the reader.
+    private static func testDiagnosticReportBuilder() -> Bool {
+        let name = "AC-DR3", slug = "diagnostic-report-builder"
+        let bisync = sampleProfile(id: UUID(), name: "DR Bisync", isEnabled: true)
+        var stream = sampleProfile(id: UUID(), name: "DR Stream", isEnabled: true)
+        stream.syncMode = .mount
+        let profiles = [bisync, stream]
+
+        let longLine = String(repeating: "x", count: 10_000)
+        var logLines = (1...800).map { "log line \($0)" }
+        logLines.append(longLine)
+        logLines.append("Authorization: Bearer abcdefghijklmnopqrstuvwxyz")
+
+        var requested: [String] = []
+        let profileJSON = "{\n  \"additionalRcloneFlags\" : \"--sftp-pass hunter2\",\n  \"name\" : \"DR Bisync\"\n}\n"
+        // 101/102: this profile's script and its rclone child (named by parent, not args).
+        // 104: another profile's script; 105: the user's own unrelated rclone job; 106: a
+        // nested remote path and a sibling folder that only share a prefix. None may enter a
+        // report about these profiles. 107 names the profile's remote path exactly, so it does.
+        let psOutput = """
+              101     1 01:02:03 /bin/bash /Users/x/.local/bin/synctray-sync.sh \(bisync.configPath)
+              102   101    00:10 /opt/homebrew/bin/rclone bisync /a b: --sftp-pass hunter2
+              103     1    00:05 /usr/bin/vim notes.txt
+              104     1    00:07 /bin/bash /Users/x/.local/bin/synctray-sync.sh /Users/x/.config/synctray/profiles/other.json
+              105     1    00:09 /opt/homebrew/bin/rclone copy /Users/x/Private secret:vault
+              106     1    00:11 /opt/homebrew/bin/rclone sync \(bisync.fullRemotePath)/Nested \(bisync.localSyncPath)2
+              107     1    00:12 /opt/homebrew/bin/rclone nfsmount \(bisync.fullRemotePath) /Users/x/Mount
+
+            """
+        let env = DiagnosticReportEnvironment(
+            readFile: { path in
+                requested.append(path)
+                if path == bisync.profileFilePath { return profileJSON }
+                if path == bisync.filterFilePath { return "- .DS_Store\n- *.tmp\n" }
+                if path == bisync.lockFilePath { return "4242\n" }
+                return nil
+            },
+            tailLines: { path, count in
+                requested.append(path)
+                return path == bisync.logPath ? Array(logLines.suffix(count)) : nil
+            },
+            runProcess: { launchPath, _ in
+                if launchPath == "/bin/ps" { return (0, psOutput) }
+                return (0, "PID\tStatus\tLabel\n123\t0\t\(bisync.launchdLabel)\n124\t0\tcom.synctray.sync.otherjob\n-\t0\tcom.apple.other\n")
+            },
+            isProcessAlive: { $0 == 4242 },
+            statusJSON: { _ in "[\n  {\n    \"state\" : \"idle\"\n  }\n]\n" },
+            doctorLines: { _ in ["[ok] rclone: rclone v1.66.0"] },
+            now: { Date(timeIntervalSince1970: 1_791_868_420) },
+            appVersion: { "0.118.0+1.gabc1234" },
+            rcloneVersion: { "rclone v1.66.0" },
+            macOSVersion: { "Version 14.5" },
+            telemetryEnabled: { false },
+            makeCode: { "ST-ABCDEF" }
+        )
+
+        let built = DiagnosticReportBuilder.build(profiles: profiles, environment: env, lineLimit: 50)
+
+        let expectedSources: [DiagnosticReport.Source] = [
+            .system, .status, .doctor, .processes, .launchd,
+            .config, .filter, .locks, .log,
+            .config, .filter, .locks, .log,
+        ]
+        guard built.sections.map({ $0.source }) == expectedSources else {
+            return report(name, slug, false, "(sections \(built.sections.map { $0.source.rawValue }))")
+        }
+        guard built.sections[5...8].allSatisfy({ $0.profileId == bisync.id && $0.profileName == bisync.name }),
+              built.sections[9...12].allSatisfy({ $0.profileId == stream.id && $0.profileName == stream.name }),
+              built.sections[0...4].allSatisfy({ $0.profileId == nil }) else {
+            return report(name, slug, false, "(per-profile sections not tagged with their profile)")
+        }
+        guard built.code == "ST-ABCDEF", built.profileCount == 2,
+              built.appVersion == "0.118.0+1.gabc1234", built.rcloneVersion == "rclone v1.66.0" else {
+            return report(name, slug, false, "(header fields wrong: \(built.code) \(built.profileCount))")
+        }
+
+        let bisyncLog = built.sections[8].lines
+        guard bisyncLog.count == 50,
+              bisyncLog.last == "Authorization: [REDACTED]",
+              bisyncLog.first == "log line 753" else {
+            return report(name, slug, false, "(lineLimit not honoured: \(bisyncLog.count) lines, first \(bisyncLog.first ?? "-"))")
+        }
+        let marker = DiagnosticReportBuilder.truncationMarker
+        guard let cut = bisyncLog.first(where: { $0.hasSuffix(marker) }),
+              cut.utf8.count <= DiagnosticReportBuilder.maxLineBytes + marker.utf8.count,
+              cut.utf8.count > DiagnosticReportBuilder.maxLineBytes,
+              built.truncated,
+              built.notes.contains(where: { $0.contains("8 KB") }) else {
+            return report(name, slug, false, "(10 KB line not cut to 8 KB + marker)")
+        }
+
+        let rendered = built.render()
+        guard !rendered.contains("hunter2"),
+              built.sections[5].lines.contains(where: { $0.contains("--sftp-pass [REDACTED]") }),
+              built.sections[3].lines.count == 3,
+              built.sections[3].lines.allSatisfy({ !$0.contains("vim") && !$0.contains("other.json") && !$0.contains("vault") && !$0.contains("Nested") }),
+              built.sections[3].lines.contains(where: { $0.hasPrefix("pid=107 ") }),
+              DiagnosticReportBuilder.containsArgument("rclone sync /Users/x/My Work remote:a", "/Users/x/My Work"),
+              !DiagnosticReportBuilder.containsArgument("rclone sync /Users/x/My Work2 remote:a", "/Users/x/My Work"),
+              built.sections[3].lines.contains(where: { $0.contains("--sftp-pass [REDACTED]") && $0.hasPrefix("pid=102 ppid=101 elapsed=00:10 ") }),
+              built.sections[4].lines.contains(where: { $0.contains(bisync.launchdLabel) }),
+              !built.sections[4].lines.contains(where: { $0.contains("com.apple.other") || $0.contains("otherjob") }) else {
+            return report(name, slug, false, "(redaction or process/launchd filtering wrong)")
+        }
+        guard built.sections[7].lines.count == 2,
+              built.sections[7].lines[0].contains("held by pid 4242 (alive)"),
+              built.sections[7].lines[1].hasPrefix("Bisync session lock"),
+              built.sections[7].lines[1].hasSuffix(": absent"),
+              built.sections[11].lines.count == 1,
+              built.sections[11].lines[0].hasSuffix(": absent"),
+              built.sections[12].lines == ["(no sync log at \(stream.logPath))"] else {
+            return report(name, slug, false, "(lock or missing-log lines wrong: \(built.sections[7].lines) \(built.sections[11].lines))")
+        }
+        guard rendered.contains("Report code: ST-ABCDEF"),
+              rendered.contains("== Sync log — DR Bisync (\(bisync.shortId)) =="),
+              rendered.contains("SyncTray: 0.118.0+1.gabc1234"),
+              rendered.contains("Usage data sharing: off") else {
+            return report(name, slug, false, "(render() header or headings missing)")
+        }
+
+        // Never-read: every request is a planned read, none is a credential file, and the
+        // predicate recognises each never-read file.
+        let planned = Set(DiagnosticReportBuilder.plannedReads(for: profiles))
+        guard !requested.isEmpty,
+              Set(requested).isSubset(of: planned),
+              !requested.contains(where: { DiagnosticReportBuilder.isNeverRead($0) }),
+              !planned.contains(where: { DiagnosticReportBuilder.isNeverRead($0) }) else {
+            return report(name, slug, false, "(reader asked for an unplanned or never-read file: \(requested))")
+        }
+        let neverRead = [
+            "\(NSHomeDirectory())/.config/rclone/rclone.conf",
+            "/tmp/some/other/rclone.conf",
+            "\(NSHomeDirectory())/.config/synctray/.env",
+            SyncProfile.rcAuthPath(port: stream.rcPort),
+            stream.cacheOnlyConfigPath,
+        ]
+        let readable = [bisync.logPath, bisync.profileFilePath, bisync.filterFilePath, bisync.lockFilePath,
+                        SyncRunLock.sessionLockPath(for: bisync)]
+        guard neverRead.allSatisfy({ DiagnosticReportBuilder.isNeverRead($0) }),
+              readable.allSatisfy({ !DiagnosticReportBuilder.isNeverRead($0) }) else {
+            return report(name, slug, false, "(isNeverRead misclassifies a path)")
+        }
+
+        // Total cap: the oldest log lines go first, the newest survive, and it is noted.
+        let capped = DiagnosticReportBuilder.build(profiles: profiles, environment: env, lineLimit: 802, maxReportBytes: 12_000)
+        let cappedLog = capped.sections[8].lines
+        let cappedBytes = capped.sections.reduce(0) { sum, section in
+            sum + section.lines.reduce(0) { $0 + $1.utf8.count + 1 }
+        }
+        guard cappedLog.first?.hasPrefix("…[") == true,
+              cappedLog.last == "Authorization: [REDACTED]",
+              cappedBytes <= 12_000 + 200,
+              capped.truncated,
+              capped.notes.contains(where: { $0.contains("left out") }) else {
+            return report(name, slug, false, "(total cap not applied oldest-first: \(cappedBytes) bytes, first \(cappedLog.first ?? "-"))")
+        }
+        // A profile with no log keeps its "(no sync log at …)" line — the cap never turns it
+        // into a misleading "…[1 older log line(s) left out]".
+        guard capped.sections[12].lines == ["(no sync log at \(stream.logPath))"] else {
+            return report(name, slug, false, "(cap dropped the missing-log placeholder: \(capped.sections[12].lines))")
+        }
+        return report(name, slug, true)
+    }
+
+    // MARK: - AC-DR4 — diagnostic report OTLP encoding
+
+    /// Summary record first; every record carries `diagnostics.report_id` and is stamped
+    /// createdAt + its ordinal (strictly increasing, report order); an rclone JSON line maps to
+    /// severity and `rclone.*` attributes, its own time kept as `rclone.time`; a plain line is
+    /// INFO; batches split at 200 records and at ~1 MB; the resource carries
+    /// `synctray.process.kind=diagnostics` and, with usage data off, no install identity.
+    private static func testDiagnosticOTLPEncoding() -> Bool {
+        let name = "AC-DR4", slug = "diagnostic-otlp-encoding"
+        let profileId = UUID()
+        let plainLine = "2026-10-13 07:13:40 - Sync started"
+        let errorLine = #"{"level":"error","msg":"Failed to copy: quota exceeded","object":"big.mov","source":"operations/copy.go:354","time":"2026-10-13T07:13:40.943947+02:00"}"#
+        let warnLine = #"{"level":"warning","msg":"Retrying","time":"2026-10-13T07:13:41Z"}"#
+        let fixture = DiagnosticReport(
+            code: "ST-ABCDEF",
+            createdAt: Date(timeIntervalSince1970: 1_791_868_000),
+            sections: [
+                DiagnosticReport.Section(source: .system, lines: ["SyncTray version: x"]),
+                DiagnosticReport.Section(source: .log, profileId: profileId, profileName: "Work",
+                                         lines: [plainLine, errorLine, warnLine]),
+            ],
+            truncated: true
+        )
+        let records = DiagnosticOTLPEncoder.records(for: fixture)
+        guard records.count == 5 else {
+            return report(name, slug, false, "(expected 5 records, got \(records.count))")
+        }
+        let summary = records[0]
+        guard summary.body == "Diagnostic report",
+              summary.attributes["diagnostics.profile_count"] == .int(1),
+              summary.attributes["diagnostics.line_count"] == .int(4),
+              summary.attributes["diagnostics.truncated"] == .bool(true),
+              summary.timeUnixNano == 1_791_868_000_000_000_000 else {
+            return report(name, slug, false, "(summary record wrong: \(summary))")
+        }
+        guard records.allSatisfy({ $0.attributes["diagnostics.report_id"] == .string("ST-ABCDEF") }) else {
+            return report(name, slug, false, "(a record lacks diagnostics.report_id)")
+        }
+        let times = records.map { $0.timeUnixNano }
+        guard times == (0..<UInt64(records.count)).map({ 1_791_868_000_000_000_000 + $0 }) else {
+            return report(name, slug, false, "(records not stamped createdAt + ordinal in report order: \(times))")
+        }
+        let system = records[1], plain = records[2], error = records[3], warn = records[4]
+        guard system.attributes["synctray.profile.id"] == nil,
+              system.attributes["diagnostics.source"] == .string("system"),
+              plain.severityNumber == 9, plain.severityText == "INFO",
+              plain.timeUnixNano == 1_791_868_000_000_000_002,
+              plain.attributes["rclone.level"] == nil,
+              plain.attributes["rclone.time"] == nil,
+              plain.attributes["diagnostics.line"] == .int(1),
+              plain.attributes["synctray.profile.id"] == .string(profileId.uuidString),
+              plain.attributes["synctray.profile.name"] == .string("Work") else {
+            return report(name, slug, false, "(plain line record wrong: \(plain))")
+        }
+        guard error.severityNumber == 17, error.severityText == "ERROR",
+              error.timeUnixNano == 1_791_868_000_000_000_003,
+              error.attributes["rclone.time"] == .string("2026-10-13T07:13:40.943947+02:00"),
+              error.body == errorLine,
+              error.attributes["rclone.level"] == .string("error"),
+              error.attributes["rclone.msg"] == .string("Failed to copy: quota exceeded"),
+              error.attributes["rclone.object"] == .string("big.mov"),
+              error.attributes["diagnostics.source"] == .string("log"),
+              error.attributes["diagnostics.line"] == .int(2) else {
+            return report(name, slug, false, "(rclone error line record wrong: \(error))")
+        }
+        guard warn.severityNumber == 13, warn.severityText == "WARN",
+              warn.timeUnixNano == 1_791_868_000_000_000_004,
+              warn.attributes["rclone.time"] == .string("2026-10-13T07:13:41Z"),
+              warn.attributes["rclone.object"] == nil else {
+            return report(name, slug, false, "(rclone warning line record wrong: \(warn))")
+        }
+        let levels = ["critical", "notice", "info", "debug", "weird"].map { DiagnosticOTLPEncoder.severity(forRcloneLevel: $0).number }
+        guard levels == [17, 9, 9, 5, 9] else {
+            return report(name, slug, false, "(level mapping \(levels))")
+        }
+
+        // Batching + JSON shape.
+        let big = DiagnosticReport(
+            code: "ST-ABCDEF",
+            createdAt: Date(timeIntervalSince1970: 1_791_868_000),
+            sections: [DiagnosticReport.Section(source: .log, profileId: profileId, profileName: "Work",
+                                                lines: (1...450).map { "line \($0)" })]
+        )
+        let batches = DiagnosticOTLPEncoder.batches(DiagnosticOTLPEncoder.records(for: big))
+        guard batches.map({ $0.count }) == [200, 200, 51] else {
+            return report(name, slug, false, "(batch sizes \(batches.map { $0.count }))")
+        }
+        // Byte cap: well under 200 records, but ~100 KB each, so requests split near 1 MB;
+        // a single record bigger than the cap still goes, alone.
+        let heavy = DiagnosticReport(
+            code: "ST-ABCDEF",
+            createdAt: Date(timeIntervalSince1970: 1_791_868_000),
+            sections: [DiagnosticReport.Section(source: .log, profileId: profileId, profileName: "Work",
+                                                lines: Array(repeating: String(repeating: "x", count: 100_000), count: 30)
+                                                    + [String(repeating: "y", count: 1_200_000)])]
+        )
+        let heavyRecords = DiagnosticOTLPEncoder.records(for: heavy)
+        let heavyBatches = DiagnosticOTLPEncoder.batches(heavyRecords)
+        let withinCap = heavyBatches.allSatisfy { batch -> Bool in
+            let bytes = batch.reduce(0) { $0 + DiagnosticOTLPEncoder.estimatedSize($1) }
+            return batch.count == 1 || bytes <= DiagnosticOTLPEncoder.maxBatchBytes
+        }
+        guard heavyBatches.count > 1, withinCap,
+              heavyBatches.allSatisfy({ $0.count <= DiagnosticOTLPEncoder.maxRecordsPerBatch }),
+              Array(heavyBatches.joined()) == heavyRecords,
+              heavyBatches.last?.count == 1,
+              heavyBatches.last?.first?.body.utf8.count == 1_200_000 else {
+            return report(name, slug, false, "(byte cap not applied: batch sizes \(heavyBatches.map { $0.count }))")
+        }
+
+        let identityBase = ["service.name": "synctray", "synctray.process.kind": "app",
+                            "enduser.id": "hash", "service.instance.id": "install"]
+        let resource = DiagnosticReportUploader.resourceAttributes(base: identityBase, telemetryEnabled: false)
+        let resourceWithUsage = DiagnosticReportUploader.resourceAttributes(base: identityBase, telemetryEnabled: true)
+        guard resource["synctray.process.kind"] == "diagnostics", resource["service.name"] == "synctray",
+              resource["enduser.id"] == nil, resource["service.instance.id"] == nil,
+              resourceWithUsage["synctray.process.kind"] == "diagnostics",
+              resourceWithUsage["enduser.id"] == "hash", resourceWithUsage["service.instance.id"] == "install" else {
+            return report(name, slug, false, "(resource process kind or install identity wrong: off=\(resource) on=\(resourceWithUsage))")
+        }
+        let bodies = DiagnosticOTLPEncoder.encodeBatches(for: big, resource: resource)
+        guard bodies.count == 3,
+              let firstBody = bodies.first,
+              let root = (try? JSONSerialization.jsonObject(with: firstBody)) as? [String: Any],
+              let resourceLogs = root["resourceLogs"] as? [[String: Any]],
+              let resourceObject = resourceLogs.first?["resource"] as? [String: Any],
+              let resourceAttributes = resourceObject["attributes"] as? [[String: Any]],
+              let scopeLogs = resourceLogs.first?["scopeLogs"] as? [[String: Any]],
+              let logRecords = scopeLogs.first?["logRecords"] as? [[String: Any]],
+              logRecords.count == 200,
+              let summaryRecord = logRecords.first,
+              let summaryBody = summaryRecord["body"] as? [String: Any],
+              summaryBody["stringValue"] as? String == "Diagnostic report",
+              summaryRecord["timeUnixNano"] as? String == "1791868000000000000",
+              summaryRecord["severityNumber"] as? Int == 9 else {
+            return report(name, slug, false, "(first OTLP JSON body has the wrong shape)")
+        }
+        let kind = resourceAttributes.first(where: { ($0["key"] as? String) == "synctray.process.kind" })
+        let kindValue = kind?["value"] as? [String: Any]
+        let summaryAttributes = summaryRecord["attributes"] as? [[String: Any]] ?? []
+        let lineCountAttribute = summaryAttributes.first(where: { ($0["key"] as? String) == "diagnostics.line_count" })
+        let lineCount = lineCountAttribute?["value"] as? [String: Any]
+        guard kindValue?["stringValue"] as? String == "diagnostics",
+              lineCount?["intValue"] as? String == "450" else {
+            return report(name, slug, false, "(resource kind or intValue encoding wrong)")
+        }
+        return report(name, slug, true)
+    }
+
+    // MARK: - AC-DR5 — `synctray report` parsing
+
+    private static func testCLIReportParsing() -> Bool {
+        let name = "AC-DR5", slug = "cli-report-parse"
+        let defaultLines = DiagnosticReportBuilder.defaultLineLimit
+        guard SyncTrayCLI.parse(["report"])
+                == .success(.report(target: nil, lines: defaultLines, output: nil, send: false, yes: false, json: false)),
+              SyncTrayCLI.parse(["report", "Work", "--lines", "50", "--output", "x"])
+                == .success(.report(target: "Work", lines: 50, output: "x", send: false, yes: false, json: false)),
+              SyncTrayCLI.parse(["report", "--send", "--yes", "--json"])
+                == .success(.report(target: nil, lines: defaultLines, output: nil, send: true, yes: true, json: true)),
+              SyncTrayCLI.parse(["report", "abcd1234", "--lines=20", "--send"])
+                == .success(.report(target: "abcd1234", lines: 20, output: nil, send: true, yes: false, json: false)) else {
+            return report(name, slug, false, "(a valid report invocation did not parse as expected)")
+        }
+        let bad: [[String]] = [
+            ["report", "--lines", "abc"], ["report", "--lines", "0"], ["report", "--lines", "-5"],
+            ["report", "--lines"], ["report", "--output"], ["report", "--sned"], ["report", "a", "b"],
+            ["report", "--json"],
+        ]
+        for argv in bad {
+            guard case .failure = SyncTrayCLI.parse(argv) else {
+                return report(name, slug, false, "(\(argv) parsed but must be a usage error)")
+            }
+        }
+        var err = ""
+        let env = fakeCLIEnvironment(stderr: { err += $0 })
+        guard SyncTrayCLI.execute(["report", "--lines", "abc"], env: env) == 64, err.contains("--lines") else {
+            return report(name, slug, false, "(bad --lines did not exit 64 with a message: \(err.debugDescription))")
+        }
+        guard SyncTrayCLI.telemetryVerb(for: ["report"]) == "report",
+              SyncTrayCLI.telemetryVerb(for: ["report", "Work", "--send", "--yes"]) == "report-send",
+              SyncTrayCLI.usage.contains("report [name|id]") else {
+            return report(name, slug, false, "(telemetry verbs or help text missing report)")
+        }
+        return report(name, slug, true)
+    }
+
+    // MARK: - AC-DR7 — Cancel while collecting never sends; a retry never re-sends
+
+    /// The sheet's build task is cancelled by Cancel and on close, and the build checks for
+    /// cancellation before running its action — so Send then Cancel uploads nothing. A failed
+    /// send drops the cached report, so a retry sends a new report rather than duplicates.
+    private static func testReportSheetCancelStopsSend() -> Bool {
+        let name = "AC-DR7", slug = "report-sheet-cancel-stops-send"
+        guard let source = readSourceFile("Views/Settings/DiagnosticReportSheet.swift") else {
+            return report(name, slug, false, "(could not read DiagnosticReportSheet.swift)")
+        }
+        let build = extractFunctionBody(startingAt: "private func withReport(", in: source) ?? ""
+        let guarded: Bool = {
+            guard let task = build.range(of: "buildTask = Task"),
+                  let check = build.range(of: "guard !Task.isCancelled else { return }"),
+                  let action = build.range(of: "action(built.report)") else { return false }
+            return task.lowerBound < check.lowerBound && check.lowerBound < action.lowerBound
+        }()
+        let cancels = source.components(separatedBy: "buildTask?.cancel()").count - 1
+        // A failed send drops the cached report, so a retry never re-sends landed batches.
+        let send = extractFunctionBody(startingAt: "private func send(", in: source) ?? ""
+        let dropsOnFailure = send.range(of: "catch")
+            .map { send[$0.upperBound...].contains("report = nil") } ?? false
+        guard guarded, cancels >= 2, dropsOnFailure else {
+            return report(name, slug, false, "(build checks cancellation before its action: \(guarded); cancel sites: \(cancels)/2; failed send drops the report: \(dropsOnFailure))")
+        }
+        return report(name, slug, true)
+    }
+
+    // MARK: - AC-DR6 — `synctray report` consent and send routing
+
+    /// Without `--send` the report is printed and never sent; a non-interactive `--send`
+    /// without `--yes` refuses (exit 64) before building or sending; `--send --yes` sends
+    /// exactly once and prints the code.
+    private static func testCLIReportExecute() -> Bool {
+        let name = "AC-DR6", slug = "cli-report-execute"
+        let profile = sampleProfile(id: UUID(), name: "DR Work", isEnabled: true)
+        let fixture = DiagnosticReport(
+            code: "ST-ABCDEF",
+            createdAt: Date(timeIntervalSince1970: 1_791_868_000),
+            sections: [DiagnosticReport.Section(source: .log, profileId: profile.id, profileName: profile.name, lines: ["hello"])]
+        )
+        var out = "", err = ""
+        var built = 0, sent = 0, builtLimit = 0
+        var builtProfiles: [SyncProfile] = []
+        var written: [String: String] = [:]
+        var interactive = false
+        var answer: String? = nil
+        var sendResult: String? = nil
+        var env = fakeCLIEnvironment(
+            readProfiles: { [profile] },
+            isInteractiveTerminal: { interactive },
+            readLine: { answer },
+            stdout: { out += $0 },
+            stderr: { err += $0 }
+        )
+        env.buildDiagnosticReport = { profiles, limit in
+            built += 1
+            builtProfiles = profiles
+            builtLimit = limit
+            return fixture
+        }
+        env.sendDiagnosticReport = { _ in
+            sent += 1
+            return sendResult
+        }
+        env.writeTextFile = { path, contents in
+            written[path] = contents
+            return true
+        }
+        func reset() { out = ""; err = ""; built = 0; sent = 0 }
+
+        // No --send: print, never send.
+        guard SyncTrayCLI.execute(["report"], env: env) == 0,
+              out == fixture.render(), err.contains("Nothing was sent."),
+              built == 1, sent == 0, builtLimit == DiagnosticReportBuilder.defaultLineLimit,
+              builtProfiles == [profile] else {
+            return report(name, slug, false, "(plain report printed wrong or sent: out=\(out.prefix(80).debugDescription) sent=\(sent))")
+        }
+        reset()
+        guard SyncTrayCLI.execute(["report", "DR Work", "--lines", "20", "--output", "/tmp/dr6.txt"], env: env) == 0,
+              out == "/tmp/dr6.txt\n", written["/tmp/dr6.txt"] == fixture.render(),
+              builtLimit == 20, sent == 0, err.contains("Nothing was sent.") else {
+            return report(name, slug, false, "(--output did not write and print the path, or sent)")
+        }
+        reset()
+        guard SyncTrayCLI.execute(["report", "nope"], env: env) == 1, built == 0, sent == 0 else {
+            return report(name, slug, false, "(unknown target built or sent)")
+        }
+
+        // Non-interactive --send without --yes: refuse before building or sending.
+        reset()
+        interactive = false
+        guard SyncTrayCLI.execute(["report", "--send"], env: env) == 64,
+              built == 0, sent == 0,
+              err.contains(DiagnosticReportCopy.disclosure), err.contains("--yes"), out.isEmpty else {
+            return report(name, slug, false, "(non-interactive --send without --yes did not refuse: \(err.debugDescription))")
+        }
+        // Interactive: No by default (EOF, empty, "n").
+        for declined in [nil, "", "n", "nope"] as [String?] {
+            reset()
+            interactive = true
+            answer = declined
+            guard SyncTrayCLI.execute(["report", "--send"], env: env) == 1, sent == 0,
+                  err.contains("Send this report? [y/N]"), err.contains("Nothing was sent.") else {
+                return report(name, slug, false, "(answer \(declined.debugDescription) sent the report)")
+            }
+        }
+        reset()
+        interactive = true
+        answer = nil
+        guard SyncTrayCLI.execute(["report", "DR Work", "--send"], env: env) == 1, sent == 0,
+              err.contains("Preview it first with: synctray report 'DR Work'"),
+              SyncTrayCLI.shellQuoted("Bob's Work") == #"'Bob'\''s Work'"# else {
+            return report(name, slug, false, "(preview hint not shell-quoted: \(err.debugDescription))")
+        }
+        reset()
+        interactive = true
+        answer = "y"
+        guard SyncTrayCLI.execute(["report", "--send"], env: env) == 0, sent == 1,
+              out == "Report code: ST-ABCDEF\n" else {
+            return report(name, slug, false, "(interactive yes did not send once)")
+        }
+
+        // --send --yes: send exactly once, print the code.
+        reset()
+        interactive = false
+        guard SyncTrayCLI.execute(["report", "--send", "--yes"], env: env) == 0,
+              sent == 1, built == 1,
+              out == "Report code: ST-ABCDEF\n",
+              err.contains(DiagnosticReportCopy.disclosure),
+              err.contains(DiagnosticReportCopy.shareCode) else {
+            return report(name, slug, false, "(--send --yes did not send once and print the code: sent=\(sent) out=\(out.debugDescription))")
+        }
+        reset()
+        guard SyncTrayCLI.execute(["report", "--send", "--yes", "--json"], env: env) == 0,
+              sent == 1, out == "{\"code\":\"ST-ABCDEF\"}\n" else {
+            return report(name, slug, false, "(--json output wrong: \(out.debugDescription))")
+        }
+        reset()
+        sendResult = "Diagnostic upload isn't configured in this build."
+        guard SyncTrayCLI.execute(["report", "--send", "--yes"], env: env) == 1,
+              sent == 1, out.isEmpty, err.contains("isn't configured") else {
+            return report(name, slug, false, "(a failed send did not exit 1 with the error)")
+        }
+
+        // The saved copy (`--output`, Save to Desktop) is owner-only, including when it
+        // replaces an existing world-readable file.
+        let privatePath = "\(selfTestRoot)/dr6-report.txt"
+        FileManager.default.createFile(atPath: privatePath, contents: Data("old".utf8),
+                                       attributes: [.posixPermissions: 0o644])
+        do {
+            try DiagnosticReportFile.writePrivately("report body", toPath: privatePath)
+        } catch {
+            return report(name, slug, false, "(writePrivately threw: \(error))")
+        }
+        let attributes = (try? FileManager.default.attributesOfItem(atPath: privatePath)) ?? [:]
+        let permissions = (attributes[.posixPermissions] as? NSNumber)?.intValue
+        guard permissions == 0o600,
+              (try? String(contentsOfFile: privatePath, encoding: .utf8)) == "report body" else {
+            return report(name, slug, false, "(saved report not 0600 or content wrong: \(String(describing: permissions)))")
+        }
+
+        // A directory at the output path is refused and left intact — never removed
+        // (`--output ~/Documents` must not delete the folder).
+        let directoryPath = "\(selfTestRoot)/dr6-output-dir"
+        let keptFile = "\(directoryPath)/keep.txt"
+        try? FileManager.default.createDirectory(atPath: directoryPath, withIntermediateDirectories: true)
+        FileManager.default.createFile(atPath: keptFile, contents: Data("keep".utf8))
+        let refused = (try? DiagnosticReportFile.writePrivately("report body", toPath: directoryPath)) == nil
+        guard refused, FileManager.default.fileExists(atPath: keptFile) else {
+            return report(name, slug, false, "(writePrivately replaced a directory at the output path)")
+        }
+        return report(name, slug, true)
+    }
+}
+
+/// SplitMix64 — a tiny seedable generator so AC-DR1 can check that report codes are
+/// deterministic for a given seed.
+private struct DiagnosticSelfTestRNG: RandomNumberGenerator {
+    var state: UInt64
+
+    mutating func next() -> UInt64 {
+        state &+= 0x9E37_79B9_7F4A_7C15
+        var z = state
+        z = (z ^ (z >> 30)) &* 0xBF58_476D_1CE4_E5B9
+        z = (z ^ (z >> 27)) &* 0x94D0_49BB_1331_11EB
+        return z ^ (z >> 31)
     }
 }
 

@@ -20,12 +20,14 @@ struct TelemetryDetailsSheet: View {
                         "How often syncs are triggered and whether they were skipped",
                         "App launch count and number of active profiles",
                         "The display names you give your profiles (e.g. \"Work\") and which settings each one uses",
+                        "Which kind of storage each profile uses (e.g. Google Drive, SMB) and what kind of folder it syncs (e.g. Pictures, an external drive) — never the folder path or the remote's name",
+                        "Progress of a running sync — bytes and file counts, never file names",
                         "When background caching pauses for something reading a streamed folder: which macOS component it was (e.g. Quick Look), or just \"shell\" or \"app\" — never another app's name",
                     ]
                 )
 
                 section(
-                    title: "What we never collect",
+                    title: "What usage data never includes",
                     items: [
                         "File names, folder names, or file contents",
                         "Remote names, hostnames, server addresses, or credentials",
@@ -58,6 +60,17 @@ struct TelemetryDetailsSheet: View {
                         .font(.headline)
                     Text("Open App Settings (gear icon in the sidebar) and toggle off \"Share usage data\". Takes effect immediately.")
                         .foregroundStyle(.secondary)
+                }
+
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("Diagnostic reports — only when you send one")
+                        .font(.headline)
+                    Text("The lists above describe automatic usage data. A diagnostic report is different: SyncTray never sends one on its own, and it works whether usage data is on or off. You send one yourself with \"Send Diagnostic Report…\" and get a code to share with the developer.")
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Text(DiagnosticReportCopy.disclosure)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
             }
             .padding(24)

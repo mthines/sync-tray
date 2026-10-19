@@ -7,6 +7,7 @@ struct AppSettingsView: View {
     @State private var telemetryEnabled = SyncTraySettings.telemetryEnabled
     @State private var autoFixSyncIssues = SyncTraySettings.autoFixSyncIssues
     @State private var showingTelemetryDetails: Bool = false
+    @State private var showingDiagnosticReport: Bool = false
     @State private var rcloneVersion: String?
 
     var body: some View {
@@ -194,9 +195,35 @@ struct AppSettingsView: View {
                     }
                     Spacer(minLength: 0)
                 }
+
+                Divider()
+
+                HStack(alignment: .top, spacing: 12) {
+                    Image(systemName: "paperplane.fill")
+                        .font(.title3)
+                        .foregroundStyle(.tint)
+                        .accessibilityHidden(true)
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Send a diagnostic report")
+                            .font(.body)
+                        Text("Something not syncing right? Send the developer your recent sync logs and settings, and get a code to share. Separate from usage data — nothing is sent until you press Send.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                        Button("Send Diagnostic Report…") {
+                            showingDiagnosticReport = true
+                        }
+                        .controlSize(.small)
+                        .padding(.top, 2)
+                    }
+                    Spacer(minLength: 0)
+                }
             }
             .padding(4)
             .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .sheet(isPresented: $showingDiagnosticReport) {
+            DiagnosticReportSheet(allProfiles: syncManager.profileStore.profiles)
         }
     }
 

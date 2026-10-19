@@ -146,6 +146,9 @@ struct ProfileDetailView: View {
     // leaves those other fields un-applied (finding 12).
     @State private var cacheMoveOtherFieldsNeedReinstall = false
 
+    // "Send Diagnostic Report" sheet (banner "Send Report…" and the footer button)
+    @State private var showingDiagnosticReport: Bool = false
+
     private let setupService = SyncSetupService.shared
 
     // MARK: - Computed Properties
@@ -482,6 +485,12 @@ struct ProfileDetailView: View {
                     onDismiss: { showingCacheMoveSheet = false }
                 )
             }
+        }
+        .sheet(isPresented: $showingDiagnosticReport) {
+            DiagnosticReportSheet(
+                allProfiles: profileStore.profiles,
+                focusProfile: profileStore.profile(for: profile.id) ?? profile
+            )
         }
         .alert("Delete Remote?", isPresented: $showingDeleteRemoteConfirm) {
             Button("Cancel", role: .cancel) {
@@ -1381,6 +1390,16 @@ struct ProfileDetailView: View {
                         }
                     }
 
+                    // Manual diagnostic report — the user chooses to send this error's
+                    // context (log lines, settings, status) to the developer.
+                    Button {
+                        showingDiagnosticReport = true
+                    } label: {
+                        Label("Send Report…", systemImage: "paperplane")
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .help("Send a diagnostic report about this error to the SyncTray developer")
                 }
             }
 
@@ -2162,6 +2181,13 @@ struct ProfileDetailView: View {
 
     private var actionButtons: some View {
         HStack {
+            Button {
+                showingDiagnosticReport = true
+            } label: {
+                Label("Send Report…", systemImage: "paperplane")
+            }
+            .help("Send a diagnostic report for this profile to the SyncTray developer")
+
             if hasChanges {
                 Text("You have unsaved changes")
                     .font(.caption)
