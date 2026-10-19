@@ -156,7 +156,7 @@ Skip files by pattern — for example `*.rpp-bak` for every Reaper backup, or `*
 
 - Matching files stop syncing. Nothing is deleted on either side.
 - Patterns are case-sensitive: `*` matches within one folder name, `?` one character, and `**` any number of folders.
-- Changes apply when you press **Save** — editing the list alone doesn't sync anything. Save offers to stop a running sync and apply right away, or runs normally when the profile is idle.
+- Changes apply when you press **Save** — editing the list alone doesn't sync anything. Save offers to stop a running sync and apply right away, or starts a sync immediately when the profile is idle.
 - On a two-way profile, add broad patterns in steps. Excluding more than half of the files at once trips the [mass-deletion stop](#two-way-sync).
 
 ### Sync Only These Folders
