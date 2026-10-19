@@ -1647,9 +1647,10 @@ final class TelemetryService {
     /// Flush every signal for a short-lived process (the CLI) that is about to
     /// `exit()`. Unlike `shutdown()` — the app's terminate path, which prints a
     /// diagnostic line and ends the sync spans — this is SILENT (no stdout, so
-    /// it never pollutes CLI output) and also flushes the logger, so a CLI run's
-    /// `synctray.cli.invoked` counter AND its "CLI invoked" log both reach the
-    /// collector before the process dies. No-op when telemetry is disabled.
+    /// it never pollutes CLI output) and never shuts the providers down. It flushes
+    /// the logger too, so a CLI run's `synctray.cli.invoked` counter AND its
+    /// "CLI invoked" log both reach the collector before the process dies. No-op
+    /// when telemetry is disabled.
     func flushForExit(timeout: TimeInterval = 3) {
         guard SyncTraySettings.telemetryEnabled else { return }
         // The OTLP exporters send on `exportSession`, which sets no custom request
