@@ -1960,6 +1960,125 @@ final class TelemetryService {
         )
     }
 
+    // MARK: - Per-profile heartbeat: Sync progress / Profile status
+
+    /// Attributes of the `Sync progress` log. Counts only: `SyncProgress.transferringFiles`
+    /// (the paths of the files in flight) is deliberately never read. `has_stats` is false
+    /// until rclone's first stats line has been parsed, and the `sync.progress.*` numbers are
+    /// then absent. `runAgeSeconds` is how long ago the app saw the run start (absent when it
+    /// didn't, e.g. a run already going when the app launched). Pure, so the self-test can
+    /// assert it carries no file name (AC-TS5).
+    static func syncProgressAttributes(
+        profileId: UUID,
+        profileName: String,
+        syncMode: SyncMode,
+        progress: SyncProgress?,
+        runAgeSeconds: TimeInterval?
+    ) -> [String: AttributeValue] {
+        var attrs: [String: AttributeValue] = [
+            "synctray.profile.id": .string(profileId.uuidString),
+            "synctray.profile.name": .string(profileName),
+            "sync.mode": .string(syncMode.rawValue),
+            "sync.progress.has_stats": .bool(progress != nil),
+        ]
+        if let runAgeSeconds {
+            attrs["sync.run_age_s"] = .double(max(0, runAgeSeconds))
+        }
+        guard let progress else { return attrs }
+        attrs["sync.progress.bytes_transferred"] = .int(Int(progress.bytesTransferred))
+        attrs["sync.progress.bytes_total"] = .int(Int(progress.totalBytes))
+        attrs["sync.progress.transfers_done"] = .int(progress.transfersDone)
+        attrs["sync.progress.transfers_total"] = .int(progress.totalTransfers)
+        attrs["sync.progress.checks_done"] = .int(progress.checksDone)
+        attrs["sync.progress.checks_total"] = .int(progress.totalChecks)
+        attrs["sync.progress.errors"] = .int(progress.errors)
+        if let speed = progress.speed { attrs["sync.progress.speed_bps"] = .double(speed) }
+        if let eta = progress.eta { attrs["sync.progress.eta_s"] = .int(eta) }
+        if let elapsed = progress.elapsedTime { attrs["sync.progress.elapsed_s"] = .double(elapsed) }
+        if let listed = progress.listedCount { attrs["sync.progress.listed"] = .int(listed) }
+        return attrs
+    }
+
+    /// One `Sync progress` log for a live Two-Way / One-Way run, emitted from the 5-minute
+    /// heartbeat (`SyncManager.recordProfileHeartbeatTelemetry`). The `synctray sync` span
+    /// only exports when the run ends, so without this a multi-hour run shows nothing but its
+    /// "Sync started" log. Correlated to that span's context while it is open. Call on the
+    /// main thread (`activeSyncSpans` is main-thread state).
+    func recordSyncProgress(
+        profileId: UUID,
+        profileName: String,
+        syncMode: SyncMode,
+        progress: SyncProgress?,
+        runAgeSeconds: TimeInterval?
+    ) {
+        guard SyncTraySettings.telemetryEnabled else { return }
+        ensureSetup()
+
+        emitLog(
+            severity: .info,
+            body: "Sync progress",
+            attributes: Self.syncProgressAttributes(
+                profileId: profileId,
+                profileName: profileName,
+                syncMode: syncMode,
+                progress: progress,
+                runAgeSeconds: runAgeSeconds
+            ),
+            spanContext: activeSyncSpans[profileId]?.context
+        )
+    }
+
+    /// The bounded `profile.state` label: every `SyncState` case, with a profile in
+    /// `pausedProfiles` reported as `paused` whatever its state says. Pure.
+    static func profileStateLabel(_ state: SyncState, isPaused: Bool) -> String {
+        if isPaused { return "paused" }
+        switch state {
+        case .idle: return "idle"
+        case .syncing: return "syncing"
+        case .paused: return "paused"
+        case .error: return "error"
+        case .driveNotMounted: return "drive_not_mounted"
+        case .notConfigured: return "not_configured"
+        }
+    }
+
+    /// Attributes of the `Profile status` log. `error.type` only when the report has one
+    /// (the profile is in an error state). Pure.
+    static func profileStatusAttributes(_ report: ProfileStatusReport) -> [String: AttributeValue] {
+        var attrs: [String: AttributeValue] = [
+            "synctray.profile.id": .string(report.profileId.uuidString),
+            "synctray.profile.name": .string(report.profileName),
+            "sync.mode": .string(report.syncMode.rawValue),
+            "profile.state": .string(report.state),
+            "profile.run_live": .bool(report.runLive),
+            "sync.lock_state": .string(report.lockState),
+            "sync.session_lock_state": .string(report.sessionLockState),
+            "config.local_path_kind": .string(report.localPathKind),
+            "config.remote_type": .string(report.remoteType),
+            "config.fallback_remote_type": .string(report.fallbackRemoteType),
+        ]
+        if let errorType = report.errorType {
+            attrs["error.type"] = .string(errorType)
+        }
+        return attrs
+    }
+
+    /// One `Profile status` log per enabled profile, emitted from the 5-minute heartbeat
+    /// alongside the aggregate `Session heartbeat` (which stays as it is). Answers "is this
+    /// job really running, or held by a stale lock?" per profile: `sync.lock_state` /
+    /// `sync.session_lock_state` tell a verified live run from a reused-PID lock
+    /// (`SyncRunLock.lockState`).
+    func recordProfileStatus(_ report: ProfileStatusReport) {
+        guard SyncTraySettings.telemetryEnabled else { return }
+        ensureSetup()
+
+        emitLog(
+            severity: .info,
+            body: "Profile status",
+            attributes: Self.profileStatusAttributes(report)
+        )
+    }
+
     // MARK: - Volume Events
 
     /// Record external drive mount/unmount events detected by NSWorkspace.
@@ -3103,6 +3222,34 @@ final class TelemetryService {
 }
 
 // MARK: - Bounded profile descriptors (never a path or a remote name)
+
+/// One enabled profile's state for the heartbeat's `Profile status` log
+/// (`TelemetryService.recordProfileStatus`). Assembled by
+/// `SyncManager.profileHeartbeatReports`, which reads the lock files and the process table
+/// off the main actor. Every field is a bounded label or a bool — no path, no remote name,
+/// no raw error text.
+struct ProfileStatusReport: Equatable {
+    let profileId: UUID
+    let profileName: String
+    let syncMode: SyncMode
+    /// `TelemetryService.profileStateLabel`.
+    let state: String
+    /// `SyncManager.runLiveness`: registry token or a live lock holder (registry only for a
+    /// Stream profile, R7).
+    let runLive: Bool
+    /// `SyncRunLock.lockState` of the `/tmp` run lock, or `n/a` for a Stream profile.
+    let lockState: String
+    /// `SyncRunLock.lockState` of the bisync session `.lck`, or `n/a` for a One-Way or
+    /// Stream profile.
+    let sessionLockState: String
+    /// `TelemetryService.categorizeError` of the stored error, only in an error state.
+    let errorType: String?
+    /// `SyncPathKind.classify`.
+    let localPathKind: String
+    /// `RemoteBackendType.types(for:rcloneConfig:)`.
+    let remoteType: String
+    let fallbackRemoteType: String
+}
 
 /// What kind of folder a profile syncs — `config.local_path_kind` — so telemetry can tell a
 /// Pictures sync from one of `~/Library` or an external drive without ever sending the path.
