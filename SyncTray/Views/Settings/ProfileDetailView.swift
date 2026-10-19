@@ -64,6 +64,22 @@ struct ProfileDetailView: View {
     @State private var bandwidthLimit: String = ""
     @State private var mountResilient: Bool = true
 
+    // "Don't Sync" patterns — staged-until-Save (plan D6). `syncExcludePatterns` is the form's
+    // current (possibly unsaved) list, edited by `DontSyncSection` and by the macOS-blocked-
+    // access banner's "Exclude from Sync"; `savedSyncExcludePatternsBaseline` is the last value
+    // this form either loaded or adopted from an external edit, so an edit made outside this
+    // form (CLI, a hand-edited file) can still flow in while nothing is staged, without
+    // clobbering an in-progress edit the user hasn't saved yet.
+    @State private var syncExcludePatterns: [String] = []
+    @State private var savedSyncExcludePatternsBaseline: [String] = []
+
+    /// A confirmed "Stop the Current Sync and Apply?" Save still in flight — the profile value
+    /// to persist once the user presses "Stop and Apply" (plan D7). `showingStopAndApplyConfirm`
+    /// drives the alert's `isPresented` directly (a plain `Bool`, not a derived `Binding`, keeps
+    /// the already-large `body` ViewBuilder expression within the type-checker's time budget).
+    @State private var pendingStopAndApplyProfile: SyncProfile?
+    @State private var showingStopAndApplyConfirm: Bool = false
+
     // UI State
     @State private var showAdvanced: Bool = false
     @State private var isInstalling: Bool = false
@@ -181,28 +197,35 @@ struct ProfileDetailView: View {
     }
 
     private var hasChanges: Bool {
-        name != profile.name ||
-        rcloneRemote != profile.rcloneRemote ||
-        remotePath != profile.remotePath ||
-        localSyncPath != profile.localSyncPath ||
-        computedDrivePath != profile.drivePathToMonitor ||
-        syncIntervalMinutes != profile.syncIntervalMinutes ||
-        additionalRcloneFlags != profile.additionalRcloneFlags ||
-        syncMode != profile.syncMode ||
-        syncDirection != profile.syncDirection ||
-        (fallbackEnabled ? fallbackRemote : "") != profile.fallbackRemote ||
-        ((fallbackEnabled && fallbackUseDifferentPath) ? fallbackRemotePath : "") != profile.fallbackRemotePath ||
-        mountBackend != profile.mountBackend ||
-        vfsCacheMode != profile.vfsCacheMode ||
-        vfsCacheMaxSize != profile.vfsCacheMaxSize ||
-        vfsCacheMaxAge != profile.vfsCacheMaxAge ||
-        vfsCachePath != profile.vfsCachePath ||
-        allowNonEmptyMount != profile.allowNonEmptyMount ||
-        mountAtStartup != profile.mountAtStartup ||
-        streamCacheOnly != profile.streamCacheOnly ||
-        downloadConnections != profile.downloadConnections ||
-        SyncProfile.normalizedBandwidthLimit(bandwidthLimit) != profile.bandwidthLimit ||
-        mountResilient != profile.mountResilient
+        // Split into sub-expressions — one combined `||` chain over every field is slow enough
+        // for the type-checker to time out (it did, once `syncExcludePatterns` was the straw
+        // that broke it).
+        let coreFieldsChanged =
+            name != profile.name ||
+            rcloneRemote != profile.rcloneRemote ||
+            remotePath != profile.remotePath ||
+            localSyncPath != profile.localSyncPath ||
+            computedDrivePath != profile.drivePathToMonitor ||
+            syncIntervalMinutes != profile.syncIntervalMinutes ||
+            additionalRcloneFlags != profile.additionalRcloneFlags ||
+            syncMode != profile.syncMode ||
+            syncDirection != profile.syncDirection ||
+            (fallbackEnabled ? fallbackRemote : "") != profile.fallbackRemote ||
+            ((fallbackEnabled && fallbackUseDifferentPath) ? fallbackRemotePath : "") != profile.fallbackRemotePath
+        let mountFieldsChanged =
+            mountBackend != profile.mountBackend ||
+            vfsCacheMode != profile.vfsCacheMode ||
+            vfsCacheMaxSize != profile.vfsCacheMaxSize ||
+            vfsCacheMaxAge != profile.vfsCacheMaxAge ||
+            vfsCachePath != profile.vfsCachePath ||
+            allowNonEmptyMount != profile.allowNonEmptyMount ||
+            mountAtStartup != profile.mountAtStartup ||
+            streamCacheOnly != profile.streamCacheOnly ||
+            downloadConnections != profile.downloadConnections ||
+            SyncProfile.normalizedBandwidthLimit(bandwidthLimit) != profile.bandwidthLimit ||
+            mountResilient != profile.mountResilient
+        let syncFilterFieldsChanged = syncExcludePatterns != profile.syncExcludePatterns
+        return coreFieldsChanged || mountFieldsChanged || syncFilterFieldsChanged
     }
 
     /// Display name for the mount folder, used in the offline-access caption
@@ -280,6 +303,24 @@ struct ProfileDetailView: View {
         localDirectoryItemCount > 0
     }
 
+    /// Built with an EXPLICIT type annotation (not inferred inline in `body`'s modifier chain)
+    /// — constructing this `ViewModifier` directly inside the already-large `body` expression
+    /// is what pushed the type-checker past its time budget; a separately-typed computed
+    /// property gives the compiler a much smaller expression to solve.
+    private var stagedSyncExcludePatternsModifier: StagedSyncExcludePatternsModifier {
+        StagedSyncExcludePatternsModifier(
+            profileSyncExcludePatterns: profile.syncExcludePatterns,
+            syncExcludePatterns: $syncExcludePatterns,
+            savedSyncExcludePatternsBaseline: $savedSyncExcludePatternsBaseline,
+            pendingStopAndApplyProfile: $pendingStopAndApplyProfile,
+            showingStopAndApplyConfirm: $showingStopAndApplyConfirm,
+            currentProfile: profile,
+            onConfirmStopAndApply: { [self] updated in
+                applyFilterSaveAndFollowUp(current: profile, updated: updated, followUp: .confirmStopThenSync)
+            }
+        )
+    }
+
     // MARK: - Body
 
     var body: some View {
@@ -330,7 +371,8 @@ struct ProfileDetailView: View {
                             profileStore: profileStore,
                             syncManager: syncManager,
                             syncMode: syncMode,
-                            syncDirection: syncDirection
+                            syncDirection: syncDirection,
+                            patterns: $syncExcludePatterns
                         )
 
                         // Sync Only These Folders (selective folders, Option A) — syncs just
@@ -400,6 +442,11 @@ struct ProfileDetailView: View {
                 availableFolders = []
             }
         }
+        // Staged "Don't Sync" edits + the stop-then-apply confirm (plan D6/D7) — pulled into a
+        // dedicated `ViewModifier` (below `DontSyncSection`) so its closures are type-checked
+        // independently of this already-large modifier chain, which otherwise blows the
+        // type-checker's time budget.
+        .modifier(stagedSyncExcludePatternsModifier)
         .alert("Uninstall Scheduled Sync?", isPresented: $showingUninstallConfirm) {
             Button("Cancel", role: .cancel) {}
             Button("Uninstall", role: .destructive) { uninstallSync() }
@@ -2218,6 +2265,8 @@ struct ProfileDetailView: View {
         downloadConnections = profile.downloadConnections
         bandwidthLimit = profile.bandwidthLimit
         mountResilient = profile.mountResilient
+        syncExcludePatterns = profile.syncExcludePatterns
+        savedSyncExcludePatternsBaseline = profile.syncExcludePatterns
 
         // Show text input if the path contains "/" (nested path) or is a custom path
         // that won't be in the folder picker dropdown
@@ -2354,7 +2403,11 @@ struct ProfileDetailView: View {
             return
         }
 
-        let updatedProfile = buildProfileFromForm()
+        var updatedProfile = buildProfileFromForm()
+        // Overlay the staged "Don't Sync" patterns here only — `buildProfileFromForm()` keeps
+        // reading the store's patterns so Install/Reinstall/Mount Anyway and the cache-move
+        // cancel path can never write back a stale or unsaved list (plan D6).
+        updatedProfile.syncExcludePatterns = syncExcludePatterns
         let currentProfile = profile
 
         // Refuse a Cache Directory change while Cache Only files wait to upload: the overlay
@@ -2406,6 +2459,9 @@ struct ProfileDetailView: View {
         // so `hasChanges` goes false and Save becomes unavailable to retry. Checking
         // here instead means the edit is never persisted at all until it can actually
         // take effect: the form stays dirty and Save works again once the run ends.
+        // A reinstall-needing Save while the run is live keeps today's refusal (plan D8):
+        // extending stop-then-apply to a reinstall would change Rule 8's reinstall semantics,
+        // which the user did not ask for. The form stays dirty; the alert says to press Abort.
         if needsReinstall, syncManager.isRunLive(for: currentProfile) {
             showingSyncInProgressAlert = true
             TelemetryService.shared.recordProfileLifecycleOperation(
@@ -2416,14 +2472,60 @@ struct ProfileDetailView: View {
             return
         }
 
-        profileStore.update(updatedProfile)
+        // A reinstall's own agent load (RunAtLoad) starts the sync, so `filterSaveFollowUp`
+        // returns `.none` whenever `needsReinstall` is true — this decision only matters for a
+        // filter-only Save (plan D7).
+        let followUp = SyncManager.filterSaveFollowUp(
+            filterChanged: SyncManager.syncFilterReconcileNeeded(from: currentProfile, to: updatedProfile),
+            needsReinstall: needsReinstall,
+            runLive: syncManager.isRunLive(for: currentProfile),
+            installed: isInstalled
+        )
 
-        // Clear any cached error since config changed
-        syncManager.clearError(for: profile.id)
+        // A live run needs confirmation before SyncTray stops it — nothing is persisted until
+        // the user presses "Stop and Apply" (plan D7), so Cancel leaves the form exactly as
+        // dirty as it was.
+        if followUp == .confirmStopThenSync {
+            pendingStopAndApplyProfile = updatedProfile
+            showingStopAndApplyConfirm = true
+            return
+        }
+
+        applyFilterSaveAndFollowUp(current: currentProfile, updated: updatedProfile, followUp: followUp)
 
         // Only reinstall if sync-related settings changed
         if needsReinstall {
             reinstallSync(previous: currentProfile)
+        }
+    }
+
+    /// Persist the profile, write the "Don't Sync" filter if it changed, clear any stale error,
+    /// and perform the follow-up `filterSaveFollowUp` decided (plan D7): `.syncNow` starts a
+    /// sync immediately, `.confirmStopThenSync` stops the live run first (only called here once
+    /// the user has confirmed), `.none` does nothing further. The filter is written BEFORE any
+    /// stop-then-sync request — the live run already read its `--filter-from` at launch, so
+    /// writing mid-run can't change it, and this ordering keeps "saved == applied on disk" true
+    /// even if the abort gives up or the window closes during the up-to-90s wait.
+    private func applyFilterSaveAndFollowUp(current: SyncProfile, updated: SyncProfile, followUp: FilterSaveFollowUp) {
+        profileStore.update(updated)
+        syncManager.applySyncFilterReconcile(from: current, to: updated)
+        syncManager.clearError(for: updated.id)
+        guard syncManager.syncFilterErrors[updated.id] == nil else { return }
+        switch followUp {
+        case .none:
+            break
+        case .syncNow:
+            syncManager.triggerManualSync(for: updated)
+            TelemetryService.shared.recordProfileLifecycleOperation(
+                profileId: updated.id, profileName: updated.name,
+                operation: "apply_sync_filter", syncMode: updated.syncMode.rawValue, result: "sync_now"
+            )
+        case .confirmStopThenSync:
+            syncManager.stopRunThenSync(for: updated)
+            TelemetryService.shared.recordProfileLifecycleOperation(
+                profileId: updated.id, profileName: updated.name,
+                operation: "apply_sync_filter", syncMode: updated.syncMode.rawValue, result: "stop_requested"
+            )
         }
     }
 
@@ -4596,12 +4698,58 @@ struct ProfileDetailView: View {
     }
 }
 
+// MARK: - Staged "Don't Sync" + stop-then-apply confirm (plan D6/D7)
+
+/// Pulled out of `ProfileDetailView.body`'s modifier chain into its own `ViewModifier` so its
+/// `onChange`/`alert` closures are type-checked as a separate declaration — inlined, they
+/// pushed the already-large `body` expression past the type-checker's time budget.
+///
+/// Two responsibilities:
+/// 1. External-edit adoption — a CLI or hand-edited-file change to `syncExcludePatterns` is
+///    adopted into the form ONLY while the form has no staged edit of its own (the baseline
+///    rule): an in-progress unsaved edit always wins over an external change until the user
+///    explicitly Saves or Reverts.
+/// 2. The "Stop the Current Sync and Apply?" confirm a filter-changing Save shows when the
+///    profile's run is live (plan D7) — persists nothing until the user presses "Stop and Apply".
+private struct StagedSyncExcludePatternsModifier: ViewModifier {
+    let profileSyncExcludePatterns: [String]
+    @Binding var syncExcludePatterns: [String]
+    @Binding var savedSyncExcludePatternsBaseline: [String]
+    @Binding var pendingStopAndApplyProfile: SyncProfile?
+    @Binding var showingStopAndApplyConfirm: Bool
+    let currentProfile: SyncProfile
+    let onConfirmStopAndApply: (SyncProfile) -> Void
+
+    func body(content: Content) -> some View {
+        content
+            .onChange(of: profileSyncExcludePatterns) { newValue in
+                if syncExcludePatterns == savedSyncExcludePatternsBaseline {
+                    syncExcludePatterns = newValue
+                }
+                savedSyncExcludePatternsBaseline = newValue
+            }
+            .alert("Stop the Current Sync and Apply?", isPresented: $showingStopAndApplyConfirm) {
+                Button("Cancel", role: .cancel) { pendingStopAndApplyProfile = nil }
+                Button("Stop and Apply", role: .destructive) {
+                    if let updated = pendingStopAndApplyProfile {
+                        onConfirmStopAndApply(updated)
+                    }
+                    pendingStopAndApplyProfile = nil
+                }
+            } message: {
+                Text("The running sync still uses the old \"Don't Sync\" rules. SyncTray stops it "
+                    + "(it finishes the files it's transferring first, which can take up to about a "
+                    + "minute and a half), saves the changes, then starts a new sync.")
+            }
+    }
+}
+
 // MARK: - Don't Sync
 
 /// "Don't Sync" patterns for Two-Way and One-Way profiles: the same pattern list and syntax
 /// as Offline Files' "Don't Download", stored in `syncExcludePatterns` and written as rclone
-/// exclude rules into the profile's filter file. Edits save immediately (like "Don't
-/// Download") and apply from the next sync — no reinstall.
+/// exclude rules into the profile's filter file. Staged until the form's Save applies them
+/// (plan D6) — the live run keeps using the old rules until then.
 struct DontSyncSection: View {
     let profile: SyncProfile
     @ObservedObject var profileStore: ProfileStore
@@ -4610,12 +4758,10 @@ struct DontSyncSection: View {
     /// user is looking at.
     let syncMode: SyncMode
     let syncDirection: SyncDirection
-
-    @State private var patterns: [String] = []
-
-    private var liveProfile: SyncProfile {
-        profileStore.profile(for: profile.id) ?? profile
-    }
+    /// The form's staged (possibly unsaved) pattern list — owned by `ProfileDetailView`, not
+    /// this section (plan D6). External-edit adoption and the stop-then-apply confirm live in
+    /// `StagedSyncExcludePatternsModifier`, attached once at the top-level form, not here.
+    @Binding var patterns: [String]
 
     private var remoteName: String {
         let name = profile.rcloneRemote.hasSuffix(":")
@@ -4637,7 +4783,7 @@ struct DontSyncSection: View {
         }
         var text = effect + " Use wildcards: *.bak matches any file ending in .bak, and "
             + "**/BACKUP/** skips every folder named BACKUP, at any depth. Patterns are "
-            + "case-sensitive and apply from the next sync."
+            + "case-sensitive and apply when you Save."
         if syncMode == .bisync {
             text += " A new pattern that covers more than half of the files stops two-way sync "
                 + "at its mass-deletion safety check until you remove it, so add broad "
@@ -4655,7 +4801,6 @@ struct DontSyncSection: View {
                 patterns: patterns
             ) { updated in
                 patterns = updated
-                syncManager.updateSyncExcludePatterns(updated, for: profile.id)
             }
 
             // Kept by SyncManager, not this view: it survives the view being recreated and
@@ -4666,16 +4811,6 @@ struct DontSyncSection: View {
                     .foregroundStyle(.red)
                     .fixedSize(horizontal: false, vertical: true)
             }
-        }
-        .onAppear { patterns = liveProfile.syncExcludePatterns }
-        .onChange(of: profile.id) { _ in
-            patterns = liveProfile.syncExcludePatterns
-        }
-        // Mirror edits made outside this view (CLI, a hand-edited .profile.json).
-        .onReceive(profileStore.$profiles) { profiles in
-            guard let updated = profiles.first(where: { $0.id == profile.id }),
-                  updated.syncExcludePatterns != patterns else { return }
-            patterns = updated.syncExcludePatterns
         }
     }
 }
