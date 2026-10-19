@@ -642,7 +642,7 @@ enum SyncTrayCLI {
         return .success(.cacheMove(target: target, destination: destination, includeOverlapping: includeOverlapping))
     }
 
-    static let reportUsage = "usage: synctray report [<name|shortId>] [--lines N] [--output <path>] [--send] [--yes] [--json]"
+    static let reportUsage = "usage: synctray report [<name|shortId>] [--lines N] [--output <path>] [--send [--yes|-y] [--json]]"
 
     /// Parse `report`. Strict about flags (an unknown one is a usage error rather than
     /// silently ignored), because `--send` uploads data.
@@ -1871,7 +1871,8 @@ enum SyncTrayCLI {
 
         if let error = env.sendDiagnosticReport(report) {
             env.stderr("error: \(error)\n")
-            env.stderr("Save the report instead with: synctray report --output <path>\n")
+            let saveCommand = "synctray report" + (target.map { " " + SyncTrayCLI.shellQuoted($0) } ?? "")
+            env.stderr("Save the report instead with: \(saveCommand) --output <path>\n")
             return 1
         }
         if json {
