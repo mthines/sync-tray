@@ -1680,7 +1680,11 @@ final class TelemetryService {
 
     /// The session every OTLP exporter sends on (the SDK's own default is also an
     /// ephemeral session). Owned here so `flushForExit` can see the requests in flight.
-    private static let exportSession = URLSession(configuration: .ephemeral)
+    private static let exportSession: URLSession = {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.urlCache = nil  // as the SDK's own default session: don't keep request bodies
+        return URLSession(configuration: configuration)
+    }()
 
     /// Requests the exporters have started and not finished, or 0 if the session
     /// doesn't answer within a second.
@@ -2183,6 +2187,11 @@ final class TelemetryService {
         // run points at the OTLP /v1/metrics exchange as the real culprit.
         let metricsFlush = meterProvider?.forceFlush()
         Self.diagnostic("metrics forceFlush on shutdown: \(String(describing: metricsFlush)) → \(Self.endpoint)/v1/metrics")
+        logProcessor?.forceFlush()
+        tracerProvider?.forceFlush()
+        // The flushes only start the sends (see `flushForExit`); the app exits right
+        // after this returns, so wait briefly for them to finish, as the CLI does.
+        _ = Self.waitUntilIdle(deadline: .now() + 2, inFlight: Self.inFlightExportCount)
         _ = meterProvider?.shutdown()
         tracerProvider?.shutdown()
     }

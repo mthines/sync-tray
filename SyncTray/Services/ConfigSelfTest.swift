@@ -3748,8 +3748,9 @@ enum ConfigSelfTest {
         }
         let exporterSessions = source.components(separatedBy: "useSession: Self.exportSession").count - 1
         let flush = extractFunctionBody(startingAt: "func flushForExit(", in: source) ?? ""
-        guard exporterSessions == 3, flush.contains("waitUntilIdle(") else {
-            return report(name, slug, false, "(exporters on the watched session: \(exporterSessions)/3; flushForExit waits: \(flush.contains("waitUntilIdle(")))")
+        let quit = extractFunctionBody(startingAt: "func shutdown(", in: source) ?? ""
+        guard exporterSessions == 3, flush.contains("waitUntilIdle("), quit.contains("waitUntilIdle(") else {
+            return report(name, slug, false, "(exporters on the watched session: \(exporterSessions)/3; flushForExit waits: \(flush.contains("waitUntilIdle(")); shutdown waits: \(quit.contains("waitUntilIdle(")))")
         }
         return report(name, slug, true)
     }
