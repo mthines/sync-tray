@@ -653,6 +653,9 @@ enum SyncTrayCLI {
         guard flags.positionals.count <= 1, flags.bools.isSubset(of: knownBools) else {
             return .failure(usageError)
         }
+        guard !flags.bools.contains("--json") || flags.bools.contains("--send") else {
+            return .failure(CLIUsageError(message: "error: --json only applies with --send\n" + reportUsage))
+        }
         var lines = DiagnosticReportBuilder.defaultLineLimit
         if let raw = flags.values["--lines"] {
             guard let value = Int(raw), value > 0, value <= 100_000 else {

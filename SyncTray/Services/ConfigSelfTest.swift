@@ -8792,6 +8792,7 @@ enum ConfigSelfTest {
         let bad: [[String]] = [
             ["report", "--lines", "abc"], ["report", "--lines", "0"], ["report", "--lines", "-5"],
             ["report", "--lines"], ["report", "--output"], ["report", "--sned"], ["report", "a", "b"],
+            ["report", "--json"],
         ]
         for argv in bad {
             guard case .failure = SyncTrayCLI.parse(argv) else {
