@@ -3935,10 +3935,12 @@ enum ConfigSelfTest {
         cliFile["debugLoggingEnabled"] = true
         let cliCase = AppSettingsFileStore.keysChangedSinceLastWrite(file: cliFile, snapshot: snapshot)
         // (c) A hand edit while the app was closed; a re-cased color is not a change.
-        var handFile = snapshot
+        var handSnapshot = snapshot
+        handSnapshot["menuBarIconIdleColor"] = "#ABCDEF"
+        var handFile = handSnapshot
         handFile["menuBarIconStyle"] = "Monochrome"
-        handFile["menuBarIconIdleColor"] = ""
-        let handCase = AppSettingsFileStore.keysChangedSinceLastWrite(file: handFile, snapshot: snapshot)
+        handFile["menuBarIconIdleColor"] = "#abcdef"
+        let handCase = AppSettingsFileStore.keysChangedSinceLastWrite(file: handFile, snapshot: handSnapshot)
         // (e) An invalid value never applies; a key missing from the snapshot counts as changed.
         var invalidFile = snapshot
         invalidFile["menuBarIconStyle"] = "neon"
