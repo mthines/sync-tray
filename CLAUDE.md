@@ -1186,7 +1186,7 @@ as v5 (`addingVolumeSystemFolderDefaults` returns nil once every rule is present
 resync-pending marker only for a Two-Way profile whose bisync listings hold one of the folders
 (`VolumeSystemFolderListings.containSystemFolder`: any component of a path in the `.path1.lst` /
 `.path2.lst` of exactly the sessions the sync script's `REQUIRED_SESSIONS` runs — the primary,
-plus the fallback's own when it swaps the whole remote — so a leftover session from an old
+plus the fallback's own when it swaps the whole remote, decided from the derived `{shortId}.json` as the script reads it (no derived config: any fallback counts) — so a leftover session from an old
 fallback, or another folder with the same canonical name, never counts): only then does
 excluding it count as deletions. The listings sit in `~/Library/Caches`, so the decision doesn't depend on
 the drive being plugged in at upgrade, and a folder "Sync Only These Folders" kept out of the

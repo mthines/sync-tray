@@ -7968,7 +7968,7 @@ enum ConfigSelfTest {
             fm.fileExists(atPath: "\(dir)/\(fixtures[key]!.shortId).resync-pending")
         }
 
-        let outcome = MigrationV6VolumeSystemFoldersExclude.addVolumeSystemFoldersExclude(in: dir) { ($0["localSyncPath"] as? String) == listedRoot }
+        let outcome = MigrationV6VolumeSystemFoldersExclude.addVolumeSystemFoldersExclude(in: dir) { profile, _ in (profile["localSyncPath"] as? String) == listedRoot }
         let updatedKeys = ["bisyncListed", "oneWayListed", "bisyncPlain", "legacyNoMode"]
         guard outcome.updated.sorted() == updatedKeys.map({ fixtures[$0]!.shortId }).sorted(),
               outcome.resyncScheduled.sorted() == ["bisyncListed", "legacyNoMode"].map({ fixtures[$0]!.shortId }).sorted(),
@@ -7990,7 +7990,7 @@ enum ConfigSelfTest {
         }
 
         let filtersBefore = fixtures.keys.sorted().map { filter($0) }
-        let second = MigrationV6VolumeSystemFoldersExclude.addVolumeSystemFoldersExclude(in: dir) { ($0["localSyncPath"] as? String) == listedRoot }
+        let second = MigrationV6VolumeSystemFoldersExclude.addVolumeSystemFoldersExclude(in: dir) { profile, _ in (profile["localSyncPath"] as? String) == listedRoot }
         guard second == MigrationV6VolumeSystemFoldersExclude.Outcome(),
               fixtures.keys.sorted().map({ filter($0) }) == filtersBefore else {
             return report(name, slug, false, "(a second pass changed something)")
@@ -8011,8 +8011,9 @@ enum ConfigSelfTest {
             let file = "\(work)/\(SyncSetupService.bisyncSessionName(remote: remote, localPath: local)).\(side).lst\(suffix)"
             try? (header + body + "\n").write(toFile: file, atomically: true, encoding: .utf8)
         }
-        func lists(_ profile: [String: Any]) -> Bool {
-            VolumeSystemFolderListings.containSystemFolder(profile: profile, workDir: work)
+        // Every case but the fallback ones has no fallback, so the derived config doesn't matter.
+        func lists(_ profile: [String: Any], derived: [String: Any]? = nil) -> Bool {
+            VolumeSystemFolderListings.containSystemFolder(profile: profile, derivedConfig: derived, workDir: work)
         }
         let tildeLocal = "~/SelfTestVS2 Drive"
         listing("nas:Kaiju", "/Volumes/Kaiju", "path1", ["Config/a.zip", ".fseventsd/fseventsd-uuid"])
@@ -8037,17 +8038,30 @@ enum ConfigSelfTest {
               !lists(["rcloneRemote": "nas", "localSyncPath": ""]),
               !VolumeSystemFolderListings.containSystemFolder(
                   profile: ["rcloneRemote": "nas", "remotePath": "Kaiju", "localSyncPath": "/Volumes/Kaiju"],
-                  workDir: "\(work)/absent") else {
+                  derivedConfig: nil, workDir: "\(work)/absent") else {
             return report(name, slug, false, "(VolumeSystemFolderListings gave a wrong answer)")
         }
-        // The fallback's own session counts only when it swaps the whole remote reference.
-        let swap: [String: Any] = ["rcloneRemote": "nas", "remotePath": "Swap", "localSyncPath": "/Volumes/Swap", "fallbackRemote": "sftp"]
-        var swapByRebuild = swap; swapByRebuild["fallbackRequiresCacheRebuild"] = true
-        var swapByPath = swap; swapByPath["fallbackRemotePath"] = "Swap"
-        guard !lists(swap), lists(swapByRebuild), lists(swapByPath),
-              VolumeSystemFolderListings.sessionNames(profile: swap)
+        // The fallback's own session counts only when it swaps the whole remote reference, as the
+        // script decides it: from the derived config's `fallbackRequiresCacheRebuild` (the stored
+        // one is never computed, so it is ignored) or a fallback path; with no derived config,
+        // any fallback counts.
+        let swap: [String: Any] = ["rcloneRemote": "nas", "remotePath": "Swap", "localSyncPath": "/Volumes/Swap",
+                                   "fallbackRemote": "sftp", "fallbackRequiresCacheRebuild": true]
+        let derived: [String: Any] = ["remote": "nas:Swap", "remotePath": "Swap", "localPath": "/Volumes/Swap",
+                                      "fallbackRemote": "sftp", "fallbackRemotePath": "", "fallbackRequiresCacheRebuild": false]
+        var derivedRebuild = derived; derivedRebuild["fallbackRequiresCacheRebuild"] = true
+        var derivedPath = derived; derivedPath["fallbackRemotePath"] = "Swap"
+        guard !lists(swap, derived: derived), lists(swap, derived: derivedRebuild), lists(swap, derived: derivedPath),
+              lists(swap, derived: nil),
+              VolumeSystemFolderListings.sessionNames(profile: swap, derivedConfig: derived)
                 == [SyncSetupService.bisyncSessionName(remote: "nas:Swap", localPath: "/Volumes/Swap")] else {
             return report(name, slug, false, "(the fallback session was counted under the wrong condition)")
+        }
+        // The derived config is read from beside the profile file.
+        try? (try? JSONSerialization.data(withJSONObject: derivedRebuild))?.write(to: URL(fileURLWithPath: "\(work)/abcd1234.json"))
+        guard (VolumeSystemFolderListings.derivedConfig(shortId: "abcd1234", in: work)?["fallbackRequiresCacheRebuild"] as? Bool) == true,
+              VolumeSystemFolderListings.derivedConfig(shortId: "missing0", in: work) == nil else {
+            return report(name, slug, false, "(derivedConfig did not read the derived config)")
         }
         guard VolumeSystemFolderListings.listedPath(in: header.dropLast()) == nil,
               VolumeSystemFolderListings.listedPath(in: "") == nil,
@@ -8107,7 +8121,7 @@ enum ConfigSelfTest {
         }
         let filtersBefore = fixtures.keys.sorted().map { try? String(contentsOfFile: "\(dir)/\(fixtures[$0]!.shortId)-exclude.txt", encoding: .utf8) }
 
-        let outcome = MigrationV7VolumeSystemFolderResyncFromListings.scheduleResyncs(in: dir) { ($0["localSyncPath"] as? String) == listed }
+        let outcome = MigrationV7VolumeSystemFolderResyncFromListings.scheduleResyncs(in: dir) { profile, _ in (profile["localSyncPath"] as? String) == listed }
         guard outcome.resyncScheduled.sorted() == ["unpluggedAtV6", "legacyNoMode"].map({ fixtures[$0]!.shortId }).sorted(),
               outcome.failed.isEmpty else {
             return report(name, slug, false, "(unexpected outcome: \(outcome))")
@@ -8121,7 +8135,7 @@ enum ConfigSelfTest {
             return report(name, slug, false, "(v7 edited a filter)")
         }
         let tokenBefore = try? String(contentsOfFile: markerPath("unpluggedAtV6"), encoding: .utf8)
-        let second = MigrationV7VolumeSystemFolderResyncFromListings.scheduleResyncs(in: dir) { ($0["localSyncPath"] as? String) == listed }
+        let second = MigrationV7VolumeSystemFolderResyncFromListings.scheduleResyncs(in: dir) { profile, _ in (profile["localSyncPath"] as? String) == listed }
         guard second == MigrationV7VolumeSystemFolderResyncFromListings.Outcome(),
               (try? String(contentsOfFile: markerPath("unpluggedAtV6"), encoding: .utf8)) == tokenBefore else {
             return report(name, slug, false, "(a second pass changed something)")
