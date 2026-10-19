@@ -3902,7 +3902,7 @@ enum ConfigSelfTest {
         return report(name, slug, true)
     }
 
-    // MARK: - AC-CLI14 — doctor judges a lock file by its holder's liveness
+    // MARK: - AC-CLI15 — doctor judges a lock file by its holder's liveness
 
     /// `doctor`'s lock check (plan D4) must report a live holder as `ok` "sync running (PID n)"
     /// (or "mount running" for a Stream profile), a dead holder as `warn` "stale lock file (PID
@@ -3910,7 +3910,7 @@ enum ConfigSelfTest {
     /// present lock as `warn` "stale lock file (no PID recorded)", and no lock file at all as
     /// `ok` "no stale lock" — never the old existence-only "stale lock file present".
     private static func testDoctorLockLiveness() -> Bool {
-        let name = "AC-CLI14", slug = "doctor-lock-liveness"
+        let name = "AC-CLI15", slug = "doctor-lock-liveness"
         let alwaysAlive: (Int32) -> Bool = { _ in true }
         let neverAlive: (Int32) -> Bool = { _ in false }
 
@@ -3974,14 +3974,14 @@ enum ConfigSelfTest {
         return report(name, slug, true)
     }
 
-    // MARK: - AC-CLI15 — doctor/test-remote probe with lsjson --stat, never lsd
+    // MARK: - AC-CLI16 — doctor/test-remote probe with lsjson --stat, never lsd
 
     /// `remoteProbe` runs `lsjson --stat <remote>:<path>` (never `lsd`), treats exits 0/3/4 as
     /// reachable, reports the CLI's own watchdog-timeout sentinel as "timed out after 15s", and
     /// `rcloneFailureSummary` prefers an ERROR/CRITICAL stderr line over a NOTICE line (rclone's
     /// shared-client_id notice was previously echoed as "the error").
     private static func testRemoteProbePathScopedAndSummarized() -> Bool {
-        let name = "AC-CLI15", slug = "remote-probe-path-scoped"
+        let name = "AC-CLI16", slug = "remote-probe-path-scoped"
         var profile = sampleProfile()
         profile.rcloneRemote = "myremote:"
         profile.remotePath = "Some Path"
