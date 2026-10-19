@@ -786,12 +786,14 @@ final class TelemetryService {
         ])
 
         // End the active span with error
+        let errorOperation = Self.categorizeErrorOperation(errorMessage)
         if let span = activeSyncSpans.removeValue(forKey: profileId) {
             span.setAttribute(key: "sync.result", value: .string("failure"))
             span.setAttribute(key: "sync.files_changed", value: .int(filesChanged))
             span.setAttribute(key: "sync.duration_s", value: .double(duration))
             span.setAttribute(key: "sync.exit_code", value: .int(exitCode))
             span.setAttribute(key: "error.type", value: .string(errorType))
+            span.setAttribute(key: "error.operation", value: .string(errorOperation))
             // Category only — the raw message can carry paths and remote names, and the
             // privacy disclosure promises "never the raw message".
             span.status = .error(description: errorType)
@@ -808,6 +810,7 @@ final class TelemetryService {
                     "sync.exit_code": .int(exitCode),
                     "sync.duration_s": .double(duration),
                     "error.type": .string(errorType),
+                    "error.operation": .string(errorOperation),
                 ],
                 spanContext: span.context
             )
@@ -1020,6 +1023,7 @@ final class TelemetryService {
                 "synctray.profile.id": .string(profileId.uuidString),
                 "synctray.profile.name": .string(profileName),
                 "error.type": .string(errorType),
+                "error.operation": .string(Self.categorizeErrorOperation(errorMessage)),
             ],
             spanContext: spanContext
         )
@@ -2922,11 +2926,25 @@ final class TelemetryService {
     /// Categorize an error message into a low-cardinality type for metrics/attributes.
     /// Static and internal (pure — it only consults `SyncLogPatterns`) so `ConfigSelfTest`
     /// can assert the buckets directly.
+    ///
+    /// Order: the `SyncLogPatterns` checks first (unchanged), then the specific buckets in
+    /// `specificErrorBuckets` (matched on a lowercased copy), then the original generic
+    /// `not found` / `permission` / `timeout` / `network` checks on the raw message, exactly
+    /// as before. So a message the generic checks matched keeps its bucket unless one of the
+    /// specific needles names the real cause (e.g. "no such host" is `network`, not the
+    /// `file_not_found` its "no such" used to give it).
     static func categorizeError(_ message: String?) -> String {
         guard let msg = message else { return "unknown" }
+        let lower = msg.lowercased()
         if SyncLogPatterns.isCriticalError(msg) {
             if msg.contains("resync") || msg.contains("out of sync") {
                 return "out_of_sync"
+            }
+            // Go's ENOTEMPTY text. `isCriticalError` matches it only through its "not
+            // empty", which is there for rclone mount's "Directory is not empty" mount-point
+            // error (that one stays `critical`); a failed rmdir is a file-level error.
+            if lower.contains("directory not empty") {
+                return "directory_not_empty"
             }
             return "critical"
         }
@@ -2952,6 +2970,9 @@ final class TelemetryService {
         if SyncLogPatterns.isIOErrorsBlockedDeletes(msg) {
             return "io_errors_blocked_deletes"
         }
+        for (bucket, needles) in specificErrorBuckets where needles.contains(where: { lower.contains($0) }) {
+            return bucket
+        }
         if msg.contains("not found") || msg.contains("no such") {
             return "file_not_found"
         }
@@ -2964,6 +2985,66 @@ final class TelemetryService {
         if msg.contains("network") || msg.contains("connection") {
             return "network"
         }
+        return "other"
+    }
+
+    /// The specific `error.type` buckets `categorizeError` tries after its `SyncLogPatterns`
+    /// checks and before its generic ones, in order, each against the LOWERCASED message.
+    /// First match wins, so the order is load-bearing:
+    /// - `rate_limited` before `quota_exceeded`: Google's per-minute limit reads "Quota
+    ///   exceeded for quota metric … rateLimitExceeded" and is a rate limit, not a full drive.
+    /// - `network`, `timeout` and `tls_certificate` before `auth_failed`: a token refresh that
+    ///   failed because DNS, the connection or TLS failed ("couldn't fetch token: … no such
+    ///   host") is a network problem, not bad credentials.
+    /// - all of these before the generic checks: "no such host" would otherwise be
+    ///   `file_not_found` via "no such".
+    /// Needles are phrases rclone and the Go runtime actually print, kept narrow because the
+    /// message usually also carries a file path: TLS is matched by Go's `x509:` / `tls:`
+    /// error prefixes rather than the bare word "certificate", which would claim any error
+    /// about a file named e.g. "Birth Certificate.pdf". The values are bounded labels; the
+    /// message itself never leaves the machine.
+    static let specificErrorBuckets: [(bucket: String, needles: [String])] = [
+        ("disk_full", ["no space left on device"]),
+        ("rate_limited", ["ratelimitexceeded", "userratelimitexceeded", "rate limit", "too many requests"]),
+        ("quota_exceeded", ["storagequotaexceeded", "quotaexceeded", "quota exceeded", "insufficient storage"]),
+        ("network", ["no such host", "connection reset", "connection refused", "network is unreachable", "broken pipe"]),
+        ("timeout", ["context deadline exceeded", "deadline exceeded"]),
+        ("tls_certificate", ["x509", "tls:", "certificate signed by", "certificate has expired",
+                             "certificate verify failed", "bad certificate"]),
+        ("auth_failed", ["invalid_grant", "token expired", "expired token", "oauth2:", "unauthorized",
+                         "authentication failed", "couldn't fetch token", "failed to refresh token"]),
+        ("name_too_long", ["file name too long", "name too long", "path too long"]),
+        ("invalid_name", ["illegal character", "invalid character", "invalid name", "invalid file name",
+                          "invalid filename"]),
+        ("checksum_mismatch", ["corrupted on transfer", "hash differ", "hashes differ", "md5 differ", "sizes differ"]),
+        ("file_changed_during_transfer", ["source file is being updated", "changed size during"]),
+        ("file_busy", ["resource busy", "text file busy", "file is locked", "being used by another process"]),
+        ("duplicate_object", ["duplicate object", "duplicate file", "duplicate directory"]),
+        // Normally caught by the critical branch above (see there); this covers a message
+        // whose case keeps it out of `isCriticalError`'s case-sensitive "not empty".
+        ("directory_not_empty", ["directory not empty"]),
+    ]
+
+    /// Which rclone operation an error message is about, for the `error.operation` attribute
+    /// on the `Sync error` log and the `Sync failed` log and span. A bounded label:
+    /// `copy` | `delete` | `move` (a move or rename) | `list` | `mkdir` | `other`. A nil
+    /// message is `other`.
+    ///
+    /// Conservative heuristic over the lowercased text: rclone's own operation prefixes are
+    /// checked first ("Failed to copy:", "Couldn't delete:", "Failed to move:"/"Failed to
+    /// rename:", "error listing:"/"failed to list", then "mkdir"/"make directory"), and only
+    /// then the bare words "copy", "delete" and "listing". The bare words can also come from
+    /// a file path inside the message, which is why they are the last resort. Pure.
+    static func categorizeErrorOperation(_ message: String?) -> String {
+        guard let lower = message?.lowercased() else { return "other" }
+        if lower.contains("failed to copy") { return "copy" }
+        if lower.contains("couldn't delete") { return "delete" }
+        if lower.contains("failed to move") || lower.contains("failed to rename") { return "move" }
+        if lower.contains("error listing") || lower.contains("failed to list") { return "list" }
+        if lower.contains("mkdir") || lower.contains("make directory") { return "mkdir" }
+        if lower.contains("copy") { return "copy" }
+        if lower.contains("delete") { return "delete" }
+        if lower.contains("listing") { return "list" }
         return "other"
     }
 
