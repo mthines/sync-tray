@@ -159,6 +159,9 @@ enum ConfigSelfTest {
             testMacOSBlockedAccessWiringPinned,
             testPhotoBoothLibraryDefaultExclude,
             testMigrationV6PhotoBoothLibraryExclude,
+            testFilterSaveFollowUpMatrix,
+            testStagedDontSyncSourcePins,
+            testStopThenSyncWiringPinned,
             testRunLivenessMountMode,
             testExclusiveRunRegistryStaleGrace,
             testSyncRunLockAcquire,
@@ -8143,6 +8146,124 @@ enum ConfigSelfTest {
         guard rbOutcome.failed == [rbFixture.shortId], rbOutcome.updated.isEmpty, rbOutcome.resyncScheduled.isEmpty,
               (try? String(contentsOfFile: rbFilterPath, encoding: .utf8)) == "- .DS_Store\n" else {
             return report(name, slug, false, "(a marker-write failure did not roll the filter back to its original contents)")
+        }
+        return report(name, slug, true)
+    }
+
+    // MARK: - AC-DS6 — filterSaveFollowUp returns the right follow-up for every combination
+
+    /// Pure decision matrix (plan D7): a reinstall always wins (`.none`, the agent's own
+    /// `RunAtLoad` starts the sync); otherwise a filter-only change starts Sync Now
+    /// immediately when nothing is running, or asks to confirm stopping the run first when
+    /// something is; no filter change (or nothing installed yet) does nothing further.
+    private static func testFilterSaveFollowUpMatrix() -> Bool {
+        let name = "AC-DS6", slug = "filter-save-follow-up-matrix"
+        let cases: [(filterChanged: Bool, needsReinstall: Bool, runLive: Bool, installed: Bool, expected: FilterSaveFollowUp)] = [
+            (true, false, false, true, .syncNow),
+            (true, false, true, true, .confirmStopThenSync),
+            (true, true, false, true, .none),
+            (true, true, true, true, .none),
+            (false, false, false, true, .none),
+            (false, false, true, true, .none),
+            (true, false, false, false, .none),
+            (true, false, true, false, .none),
+        ]
+        for c in cases {
+            let got = SyncManager.filterSaveFollowUp(
+                filterChanged: c.filterChanged, needsReinstall: c.needsReinstall,
+                runLive: c.runLive, installed: c.installed
+            )
+            guard got == c.expected else {
+                return report(name, slug, false,
+                    "(filterChanged=\(c.filterChanged) needsReinstall=\(c.needsReinstall) runLive=\(c.runLive) "
+                        + "installed=\(c.installed) -> \(got), expected \(c.expected))")
+            }
+        }
+        return report(name, slug, true)
+    }
+
+    // MARK: - AC-DS7 — staging source pins: the banner and the list editor change only form state
+
+    /// Source-text pins for plan D6/D9's staging contract: `stageBlockedPathExclusion` and
+    /// `DontSyncSection`'s pattern editor must change only the form's `@State`/`@Binding`
+    /// `syncExcludePatterns` — never call the retired `updateSyncExcludePatterns`, never write
+    /// the filter file, never trigger a sync — and `hasChanges` must notice a staged pattern
+    /// edit so Save stays unavailable until something actually changed.
+    private static func testStagedDontSyncSourcePins() -> Bool {
+        let name = "AC-DS7", slug = "staged-dont-sync-source-pins"
+        guard let viewSource = readSourceFile("Views/Settings/ProfileDetailView.swift") else {
+            return report(name, slug, false, "(could not read ProfileDetailView.swift)")
+        }
+        guard !viewSource.contains("updateSyncExcludePatterns(") else {
+            return report(name, slug, false, "(a call to the retired updateSyncExcludePatterns still exists)")
+        }
+        guard let stageFn = extractFunctionBody(startingAt: "private func stageBlockedPathExclusion()", in: viewSource) else {
+            return report(name, slug, false, "(stageBlockedPathExclusion() not found)")
+        }
+        guard stageFn.contains("syncExcludePatterns.append("),
+              !stageFn.contains("triggerManualSync"),
+              !stageFn.contains("writeExcludeFilter"),
+              !stageFn.contains("clearError") else {
+            return report(name, slug, false, "(stageBlockedPathExclusion does more than stage a pattern)")
+        }
+        // DontSyncSection is a top-level type (its own closing brace sits at column 0), so it is
+        // bounded by hand here rather than via `extractFunctionBody`, which only bounds a
+        // direct member (one level of nesting) and would stop at the first NESTED member's own
+        // 4-space-indented closing brace — far short of the whole struct.
+        let lines = viewSource.components(separatedBy: "\n")
+        guard let sectionStart = lines.firstIndex(where: { $0 == "struct DontSyncSection: View {" }),
+              let sectionEndOffset = lines[sectionStart...].firstIndex(where: { $0 == "}" }) else {
+            return report(name, slug, false, "(DontSyncSection not found)")
+        }
+        let sectionBody = lines[sectionStart...sectionEndOffset].joined(separator: "\n")
+        guard sectionBody.contains("@Binding var patterns: [String]") else {
+            return report(name, slug, false, "(DontSyncSection no longer binds patterns to the form's staged state)")
+        }
+        guard !sectionBody.contains("syncManager.updateSyncExcludePatterns") else {
+            return report(name, slug, false, "(DontSyncSection still writes through SyncManager on every edit)")
+        }
+        guard let hasChangesBody = extractFunctionBody(startingAt: "private var hasChanges: Bool {", in: viewSource),
+              hasChangesBody.contains("syncExcludePatterns != profile.syncExcludePatterns") else {
+            return report(name, slug, false, "(hasChanges does not account for a staged Don't Sync edit)")
+        }
+        return report(name, slug, true)
+    }
+
+    // MARK: - AC-DS8 — stop-then-sync Save wiring is pinned by source-text assertions
+
+    /// Pins plan D7's Save flow: `applyFilterSaveAndFollowUp` writes the filter and clears the
+    /// error BEFORE the follow-up switch (so "saved == applied on disk" even if an abort gives
+    /// up), `.confirmStopThenSync` goes through `stopRunThenSync` (never a raw `abortSync` call
+    /// from the view), and `stopRunThenSync` itself reuses `abortSync`/`abortTasks` with no new
+    /// pause, agent-load/unload, or lock touch (CLAUDE.md Rule 9).
+    private static func testStopThenSyncWiringPinned() -> Bool {
+        let name = "AC-DS8", slug = "stop-then-sync-wiring-pinned"
+        guard let viewSource = readSourceFile("Views/Settings/ProfileDetailView.swift"),
+              let managerSource = readSourceFile("Services/SyncManager.swift") else {
+            return report(name, slug, false, "(could not read source files)")
+        }
+        guard let applyFn = extractFunctionBody(
+            startingAt: "private func applyFilterSaveAndFollowUp(current: SyncProfile, updated: SyncProfile, followUp: FilterSaveFollowUp) {",
+            in: viewSource
+        ) else {
+            return report(name, slug, false, "(applyFilterSaveAndFollowUp not found)")
+        }
+        guard let writeRange = applyFn.range(of: "syncManager.applySyncFilterReconcile("),
+              let followUpRange = applyFn.range(of: "switch followUp {"),
+              writeRange.upperBound <= followUpRange.lowerBound else {
+            return report(name, slug, false, "(the filter is not written before the follow-up switch)")
+        }
+        guard applyFn.contains("syncManager.stopRunThenSync(for: updated)"),
+              !applyFn.contains("syncManager.abortSync(") else {
+            return report(name, slug, false, "(confirmStopThenSync does not go through stopRunThenSync)")
+        }
+        guard let stopFn = extractFunctionBody(startingAt: "func stopRunThenSync(for profile: SyncProfile) {", in: managerSource) else {
+            return report(name, slug, false, "(stopRunThenSync not found)")
+        }
+        guard stopFn.contains("abortSync(for: profile)"), stopFn.contains("abortTasks[profile.id]"),
+              !stopFn.contains("pause("), !stopFn.contains("loadAgent"), !stopFn.contains("unloadAgent"),
+              !stopFn.contains("removeStaleLocks"), !stopFn.contains("removeItem") else {
+            return report(name, slug, false, "(stopRunThenSync does more than reuse abortSync/abortTasks)")
         }
         return report(name, slug, true)
     }
