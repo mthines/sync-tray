@@ -8944,6 +8944,17 @@ enum ConfigSelfTest {
               (try? String(contentsOfFile: privatePath, encoding: .utf8)) == "report body" else {
             return report(name, slug, false, "(saved report not 0600 or content wrong: \(String(describing: permissions)))")
         }
+
+        // A directory at the output path is refused and left intact — never removed
+        // (`--output ~/Documents` must not delete the folder).
+        let directoryPath = "\(selfTestRoot)/dr6-output-dir"
+        let keptFile = "\(directoryPath)/keep.txt"
+        try? FileManager.default.createDirectory(atPath: directoryPath, withIntermediateDirectories: true)
+        FileManager.default.createFile(atPath: keptFile, contents: Data("keep".utf8))
+        let refused = (try? DiagnosticReportFile.writePrivately("report body", toPath: directoryPath)) == nil
+        guard refused, FileManager.default.fileExists(atPath: keptFile) else {
+            return report(name, slug, false, "(writePrivately replaced a directory at the output path)")
+        }
         return report(name, slug, true)
     }
 }

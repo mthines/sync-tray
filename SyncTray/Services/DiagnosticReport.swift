@@ -721,10 +721,17 @@ enum DiagnosticReportFile {
     /// Write `text` to `path` so the file is owner-only (0600) from the moment it exists —
     /// a report can name personal paths and files, so it is never briefly world-readable the
     /// way an atomic write followed by a chmod is. An existing file (or symlink) at `path` is
-    /// removed first, then the file is created with `O_CREAT | O_EXCL | O_NOFOLLOW`.
+    /// removed first, then the file is created with `O_CREAT | O_EXCL | O_NOFOLLOW`. Anything
+    /// else at `path` — a directory above all — is refused with `EISDIR`/`EEXIST`, never
+    /// removed: `removeItem` is recursive, so `--output ~/Documents` would delete the folder.
     static func writePrivately(_ text: String, toPath path: String) throws {
         let fileManager = FileManager.default
-        if (try? fileManager.attributesOfItem(atPath: path)) != nil {
+        // `attributesOfItem` does not follow a final symlink, so a link is replaced, not its target.
+        if let type = (try? fileManager.attributesOfItem(atPath: path))?[.type] as? FileAttributeType {
+            guard type == .typeRegular || type == .typeSymbolicLink else {
+                let code = type == .typeDirectory ? EISDIR : EEXIST
+                throw NSError(domain: NSPOSIXErrorDomain, code: Int(code), userInfo: [NSFilePathErrorKey: path])
+            }
             try fileManager.removeItem(atPath: path)
         }
         let descriptor = open(path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0o600)
