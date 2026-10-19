@@ -12,6 +12,20 @@ enum ProfileReconcileAction: Equatable {
     case reinstall
 }
 
+/// What a Save that changed the "Don't Sync" filter should do next (plan D7), once the
+/// caller has already handled the pre-existing reinstall-while-live refusal (that case never
+/// reaches this decision).
+enum FilterSaveFollowUp: Equatable {
+    /// Nothing filter-related changed, a reinstall is needed (its own agent load will start the
+    /// sync), or the profile isn't installed — no follow-up action.
+    case none
+    /// The filter changed and no run is live — write it and start Sync Now immediately.
+    case syncNow
+    /// The filter changed while a run is live — confirm with the user, then stop the run
+    /// gracefully and start Sync Now once it has ended (`SyncManager.stopRunThenSync`).
+    case confirmStopThenSync
+}
+
 /// Outcome of considering an external `*.profile.json` write against an
 /// UNKNOWN profile id — i.e. a potential CREATE, not an edit.
 enum ExternalCreateOutcome: Equatable {
@@ -157,6 +171,34 @@ extension SyncManager {
             && updated.isEnabled
             && (current.syncExcludePatterns != updated.syncExcludePatterns
                 || current.syncIncludeFolders != updated.syncIncludeFolders)
+    }
+
+    /// Decide what a Save that changed the "Don't Sync" filter should do next (plan D7),
+    /// composing `syncFilterReconcileNeeded`'s result with whether a reinstall is needed and
+    /// whether the profile's run is currently live. Pure — no I/O.
+    ///
+    /// The `needsReinstall && runLive` refusal (today's "press Abort to stop it first" alert) is
+    /// decided and acted on by the caller BEFORE this is reached — see plan D8: extending
+    /// stop-then-apply to a reinstall-needing Save is explicitly out of scope, so that case is
+    /// never passed in here with `runLive: true` in practice. If it were, this still returns
+    /// `.none` (no follow-up), matching the "a reinstall is needed" row below regardless of
+    /// `runLive`.
+    ///
+    /// | needsReinstall | filterChanged && installed | runLive | Result |
+    /// | --- | --- | --- | --- |
+    /// | true | any | any | `.none` (the reinstall's own agent load starts the sync, or the refusal already handled it) |
+    /// | false | true | false | `.syncNow` |
+    /// | false | true | true | `.confirmStopThenSync` |
+    /// | false | false | any | `.none` |
+    nonisolated static func filterSaveFollowUp(
+        filterChanged: Bool,
+        needsReinstall: Bool,
+        runLive: Bool,
+        installed: Bool
+    ) -> FilterSaveFollowUp {
+        guard !needsReinstall else { return .none }
+        guard filterChanged, installed else { return .none }
+        return runLive ? .confirmStopThenSync : .syncNow
     }
 
     /// Decide whether an edit should rewrite the exclude filter file and, if so, invoke

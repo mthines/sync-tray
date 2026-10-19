@@ -1965,6 +1965,45 @@ final class SyncManager: ObservableObject {
         }
     }
 
+    /// Stop a profile's live run, then start a fresh sync once it has ended — the follow-up a
+    /// confirmed "Stop the Current Sync and Apply?" Save performs after writing the new "Don't
+    /// Sync" filter (plan D7). Joins an abort already in flight rather than starting a second
+    /// one. Reuses `abortSync` only (CLAUDE.md Rule 9): no new signalling to rclone, no agent
+    /// load or unload, no pause, no lock touch — `runSyncScript` already performs the deferred
+    /// agent load and clears `abortSuppressUntil` once the aborted run needed it.
+    func stopRunThenSync(for profile: SyncProfile) {
+        if !isAborting(for: profile.id) {
+            abortSync(for: profile)
+        }
+        let inFlight = abortTasks[profile.id]
+        Task { [weak self] in
+            await inFlight?.value
+            self?.resumeAfterStopRunThenSync(for: profile)
+        }
+    }
+
+    /// The follow-through once `stopRunThenSync`'s abort has finished: start Sync Now only if
+    /// the abort actually ended the run — it can give up after `SyncAbort`'s own timeout, in
+    /// which case nothing is restarted and the already-saved filter simply applies from the
+    /// next run. Re-reads the profile from the store since it may have changed (disabled,
+    /// deleted, edited again) while the abort was in flight.
+    private func resumeAfterStopRunThenSync(for profile: SyncProfile) {
+        let latest = profileStore.profile(for: profile.id) ?? profile
+        guard !isAborting(for: profile.id), !isRunLive(for: latest) else {
+            TelemetryService.shared.recordProfileLifecycleOperation(
+                profileId: profile.id, profileName: profile.name,
+                operation: "apply_sync_filter", syncMode: profile.syncMode.rawValue, result: "not_restarted"
+            )
+            return
+        }
+        clearError(for: profile.id)
+        triggerManualSync(for: latest)
+        TelemetryService.shared.recordProfileLifecycleOperation(
+            profileId: profile.id, profileName: profile.name,
+            operation: "apply_sync_filter", syncMode: profile.syncMode.rawValue, result: "restarted"
+        )
+    }
+
     /// Skip the rest of an in-flight abort's graceful wait: SIGTERM the run now (SIGKILL
     /// after `SyncAbort.terminateTimeout`). A no-op when no abort is in flight — a Force Stop
     /// confirmed after its abort already finished must not start a new one.
