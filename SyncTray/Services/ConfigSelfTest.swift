@@ -8018,6 +8018,10 @@ enum ConfigSelfTest {
             ("error reading source directory: open /Users/me/Sync/Delete Me: permission denied", "list"),
             ("error reading source root directory: directory not found", "list"),
             ("error reading destination directory: googleapi: Error 403: rateLimitExceeded", "list"),
+            ("Failed to rmdir: remove /Users/me/Sync/old: directory not empty", "delete"),
+            ("failed to rmdirs: directory not found", "delete"),
+            ("Failed to Rmdir: directory not empty", "delete"),
+            ("open /Users/me/Sync/rmdir.sh: permission denied", "other"),
             ("something unexpected happened", "other"),
             (nil, "other"),
         ]

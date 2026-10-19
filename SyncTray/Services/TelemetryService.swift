@@ -3222,6 +3222,9 @@ final class TelemetryService {
         if lower.contains("error listing") || lower.contains("failed to list")
             || lower.contains("error reading source") || lower.contains("error reading destination") { return "list" }
         if lower.contains("mkdir") || lower.contains("make directory") { return "mkdir" }
+        // rclone's directory-removal failures: "Failed to rmdir:", "failed to rmdirs:", "Failed to Rmdir:".
+        // Anchored on rclone's prefix so a path containing "rmdir" can't match.
+        if lower.contains("failed to rmdir") { return "delete" }
         if lower.contains("copy") { return "copy" }
         if lower.contains("delete") { return "delete" }
         if lower.contains("listing") { return "list" }

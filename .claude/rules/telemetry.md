@@ -193,9 +193,9 @@ the `Sync failed` log and span says which rclone operation failed: `copy` | `del
 (move or rename) | `list` | `mkdir` | `other`. Conservative: rclone's own prefixes first ("Failed
 to copy", "Couldn't delete", "Failed to move"/"Couldn't move"/"Failed to rename", "error
 listing"/"failed to list"/"error reading source/destination directory" (rclone's march listing
-errors, root directory included), "mkdir"/"make directory"), the bare words
-"copy"/"delete"/"listing" last, since a file path in the message can contain them. Log/span
-only — never a metric label.
+errors, root directory included), "mkdir"/"make directory", "failed to rmdir" (rclone's
+rmdir/rmdirs failures, labelled `delete`)), the bare words "copy"/"delete"/"listing" last, since
+a file path in the message can contain them. Log/span only — never a metric label.
 
 ## Rules
 
