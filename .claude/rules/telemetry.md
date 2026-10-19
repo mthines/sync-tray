@@ -308,7 +308,7 @@ rollout. No event is emitted on a fresh install.
 | `synctray.sync.duration` | Histogram | Duration of sync operations (seconds) |
 | `synctray.sync.completed` | Counter | Sync operations completed (by mode + result) |
 | `synctray.sync.files_changed` | Counter | Files changed during sync |
-| `synctray.sync.errors` | Counter | Sync errors by type |
+| `synctray.sync.errors` | Counter | Sync errors by type (`error.type`); a `permission_denied` failure also carries `error.access_denial` (`operation_not_permitted`/`permission_denied`) — the only access-denial attribute on the counter |
 | `synctray.app.profiles.active` | UpDownCounter | Number of active profiles |
 | `synctray.app.launch` | Counter | App launches |
 | `synctray.mount.operations` | Counter | Mount/unmount operations |
