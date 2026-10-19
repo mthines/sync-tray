@@ -338,7 +338,9 @@ enum DiagnosticReportBuilder {
             var result: [String] = []
             result.reserveCapacity(raw.count)
             for line in raw {
-                let sanitized = sanitize(line)
+                // Each redaction bridges through NSString/NSRegularExpression; without a pool
+                // the autoreleased temporaries pile up (~1.7 GB peak at --lines 100000).
+                let sanitized = autoreleasepool { sanitize(line) }
                 if sanitized.truncated { anyLineCut = true }
                 result.append(sanitized.line)
             }
