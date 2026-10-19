@@ -786,12 +786,14 @@ final class TelemetryService {
         ])
 
         // End the active span with error
+        let errorOperation = Self.categorizeErrorOperation(errorMessage)
         if let span = activeSyncSpans.removeValue(forKey: profileId) {
             span.setAttribute(key: "sync.result", value: .string("failure"))
             span.setAttribute(key: "sync.files_changed", value: .int(filesChanged))
             span.setAttribute(key: "sync.duration_s", value: .double(duration))
             span.setAttribute(key: "sync.exit_code", value: .int(exitCode))
             span.setAttribute(key: "error.type", value: .string(errorType))
+            span.setAttribute(key: "error.operation", value: .string(errorOperation))
             // Category only — the raw message can carry paths and remote names, and the
             // privacy disclosure promises "never the raw message".
             span.status = .error(description: errorType)
@@ -808,6 +810,7 @@ final class TelemetryService {
                     "sync.exit_code": .int(exitCode),
                     "sync.duration_s": .double(duration),
                     "error.type": .string(errorType),
+                    "error.operation": .string(errorOperation),
                 ],
                 spanContext: span.context
             )
@@ -1020,6 +1023,7 @@ final class TelemetryService {
                 "synctray.profile.id": .string(profileId.uuidString),
                 "synctray.profile.name": .string(profileName),
                 "error.type": .string(errorType),
+                "error.operation": .string(Self.categorizeErrorOperation(errorMessage)),
             ],
             spanContext: spanContext
         )
@@ -1095,6 +1099,32 @@ final class TelemetryService {
     /// Captures only feature preferences — never paths, remote names, or credentials.
     func recordProfileConfiguration(_ profile: SyncProfile) {
         guard SyncTraySettings.telemetryEnabled else { return }
+        emitProfileConfigurationsAfterReadingRcloneConfig([profile])
+    }
+
+    /// Read rclone.conf (for `config.remote_type` / `config.fallback_remote_type`) on a
+    /// `.utility` queue — never the caller's thread, which is the main thread for both
+    /// callers (`ProfileStore.update`, the launch snapshot) — then emit one `Profile
+    /// configuration` log per profile back on main, where `emitProfileConfiguration` always
+    /// ran. The file is read once for all `profiles`; the attributes are unchanged.
+    private func emitProfileConfigurationsAfterReadingRcloneConfig(_ profiles: [SyncProfile]) {
+        guard !profiles.isEmpty else { return }
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            guard let self = self else { return }
+            let rcloneConfig = RcloneConfigService.shared.readConfigContents()
+            DispatchQueue.main.async {
+                for profile in profiles {
+                    self.emitProfileConfiguration(profile, rcloneConfig: rcloneConfig)
+                }
+            }
+        }
+    }
+
+    /// `recordProfileConfiguration` with rclone.conf's text already read (nil = unreadable),
+    /// so a launch snapshot of every profile reads the file once, not once per profile.
+    /// Re-checks the opt-in, since telemetry may have been turned off while the file was read.
+    private func emitProfileConfiguration(_ profile: SyncProfile, rcloneConfig: String?) {
+        guard SyncTraySettings.telemetryEnabled else { return }
         ensureSetup()
 
         let cacheVolume = profile.isMountMode
@@ -1102,10 +1132,19 @@ final class TelemetryService {
 
         let intervalBucket = bucketSyncInterval(profile.syncIntervalMinutes)
 
+        // What kind of folder / storage backend this is — bounded buckets, never the path or
+        // the remote's name (`SyncPathKind`, `RemoteBackendType`).
+        let localPathKind = SyncPathKind.classify(localPath: profile.localSyncPath, homeDirectory: NSHomeDirectory())
+        let remoteTypes = RemoteBackendType.types(for: profile, rcloneConfig: rcloneConfig)
+
         emitLog(
             severity: .info,
             body: "Profile configuration",
             attributes: [
+                "config.local_path_kind": .string(localPathKind),
+                "config.local_path_privacy_protected": .bool(SyncPathKind.isPrivacyProtected(localPathKind)),
+                "config.remote_type": .string(remoteTypes.primary),
+                "config.fallback_remote_type": .string(remoteTypes.fallback),
                 "synctray.profile.id": .string(profile.id.uuidString),
                 "synctray.profile.name": .string(profile.name),
                 "config.sync_mode": .string(profile.syncMode.rawValue),
@@ -1215,10 +1254,9 @@ final class TelemetryService {
             ]
         )
 
-        // Individual profile configs
-        for profile in profiles {
-            recordProfileConfiguration(profile)
-        }
+        // Individual profile configs — rclone.conf read once for all of them, off the main
+        // thread; the per-profile logs follow the summary once it has been read.
+        emitProfileConfigurationsAfterReadingRcloneConfig(profiles)
     }
 
     // MARK: - Profile Lifecycle Operations
@@ -1936,6 +1974,125 @@ final class TelemetryService {
                 "session.paused_profiles": .int(pausedProfiles),
                 "session.error_profiles": .int(errorProfiles),
             ]
+        )
+    }
+
+    // MARK: - Per-profile heartbeat: Sync progress / Profile status
+
+    /// Attributes of the `Sync progress` log. Counts only: `SyncProgress.transferringFiles`
+    /// (the paths of the files in flight) is deliberately never read. `has_stats` is false
+    /// until rclone's first stats line has been parsed, and the `sync.progress.*` numbers are
+    /// then absent. `runAgeSeconds` is how long ago the app saw the run start (absent when it
+    /// didn't, e.g. a run already going when the app launched). Pure, so the self-test can
+    /// assert it carries no file name (AC-TS5).
+    static func syncProgressAttributes(
+        profileId: UUID,
+        profileName: String,
+        syncMode: SyncMode,
+        progress: SyncProgress?,
+        runAgeSeconds: TimeInterval?
+    ) -> [String: AttributeValue] {
+        var attrs: [String: AttributeValue] = [
+            "synctray.profile.id": .string(profileId.uuidString),
+            "synctray.profile.name": .string(profileName),
+            "sync.mode": .string(syncMode.rawValue),
+            "sync.progress.has_stats": .bool(progress != nil),
+        ]
+        if let runAgeSeconds {
+            attrs["sync.run_age_s"] = .double(max(0, runAgeSeconds))
+        }
+        guard let progress else { return attrs }
+        attrs["sync.progress.bytes_transferred"] = .int(Int(progress.bytesTransferred))
+        attrs["sync.progress.bytes_total"] = .int(Int(progress.totalBytes))
+        attrs["sync.progress.transfers_done"] = .int(progress.transfersDone)
+        attrs["sync.progress.transfers_total"] = .int(progress.totalTransfers)
+        attrs["sync.progress.checks_done"] = .int(progress.checksDone)
+        attrs["sync.progress.checks_total"] = .int(progress.totalChecks)
+        attrs["sync.progress.errors"] = .int(progress.errors)
+        if let speed = progress.speed { attrs["sync.progress.speed_bps"] = .double(speed) }
+        if let eta = progress.eta { attrs["sync.progress.eta_s"] = .int(eta) }
+        if let elapsed = progress.elapsedTime { attrs["sync.progress.elapsed_s"] = .double(elapsed) }
+        if let listed = progress.listedCount { attrs["sync.progress.listed"] = .int(listed) }
+        return attrs
+    }
+
+    /// One `Sync progress` log for a live Two-Way / One-Way run, emitted from the 5-minute
+    /// heartbeat (`SyncManager.recordProfileHeartbeatTelemetry`). The `synctray sync` span
+    /// only exports when the run ends, so without this a multi-hour run shows nothing but its
+    /// "Sync started" log. Correlated to that span's context while it is open. Call on the
+    /// main thread (`activeSyncSpans` is main-thread state).
+    func recordSyncProgress(
+        profileId: UUID,
+        profileName: String,
+        syncMode: SyncMode,
+        progress: SyncProgress?,
+        runAgeSeconds: TimeInterval?
+    ) {
+        guard SyncTraySettings.telemetryEnabled else { return }
+        ensureSetup()
+
+        emitLog(
+            severity: .info,
+            body: "Sync progress",
+            attributes: Self.syncProgressAttributes(
+                profileId: profileId,
+                profileName: profileName,
+                syncMode: syncMode,
+                progress: progress,
+                runAgeSeconds: runAgeSeconds
+            ),
+            spanContext: activeSyncSpans[profileId]?.context
+        )
+    }
+
+    /// The bounded `profile.state` label: every `SyncState` case, with a profile in
+    /// `pausedProfiles` reported as `paused` whatever its state says. Pure.
+    static func profileStateLabel(_ state: SyncState, isPaused: Bool) -> String {
+        if isPaused { return "paused" }
+        switch state {
+        case .idle: return "idle"
+        case .syncing: return "syncing"
+        case .paused: return "paused"
+        case .error: return "error"
+        case .driveNotMounted: return "drive_not_mounted"
+        case .notConfigured: return "not_configured"
+        }
+    }
+
+    /// Attributes of the `Profile status` log. `error.type` only when the report has one
+    /// (the profile is in an error state). Pure.
+    static func profileStatusAttributes(_ report: ProfileStatusReport) -> [String: AttributeValue] {
+        var attrs: [String: AttributeValue] = [
+            "synctray.profile.id": .string(report.profileId.uuidString),
+            "synctray.profile.name": .string(report.profileName),
+            "sync.mode": .string(report.syncMode.rawValue),
+            "profile.state": .string(report.state),
+            "profile.run_live": .bool(report.runLive),
+            "sync.lock_state": .string(report.lockState),
+            "sync.session_lock_state": .string(report.sessionLockState),
+            "config.local_path_kind": .string(report.localPathKind),
+            "config.remote_type": .string(report.remoteType),
+            "config.fallback_remote_type": .string(report.fallbackRemoteType),
+        ]
+        if let errorType = report.errorType {
+            attrs["error.type"] = .string(errorType)
+        }
+        return attrs
+    }
+
+    /// One `Profile status` log per enabled profile, emitted from the 5-minute heartbeat
+    /// alongside the aggregate `Session heartbeat` (which stays as it is). Answers "is this
+    /// job really running, or held by a stale lock?" per profile: `sync.lock_state` /
+    /// `sync.session_lock_state` tell a verified live run from a reused-PID lock
+    /// (`SyncRunLock.lockState`).
+    func recordProfileStatus(_ report: ProfileStatusReport) {
+        guard SyncTraySettings.telemetryEnabled else { return }
+        ensureSetup()
+
+        emitLog(
+            severity: .info,
+            body: "Profile status",
+            attributes: Self.profileStatusAttributes(report)
         )
     }
 
@@ -2937,11 +3094,27 @@ final class TelemetryService {
     /// Categorize an error message into a low-cardinality type for metrics/attributes.
     /// Static and internal (pure — it only consults `SyncLogPatterns`) so `ConfigSelfTest`
     /// can assert the buckets directly.
+    ///
+    /// Order: the `SyncLogPatterns` checks first (unchanged), then the specific buckets in
+    /// `specificErrorBuckets` (matched on a lowercased copy), then the original generic
+    /// `not found` / `permission` / `timeout` / `network` checks on the raw message, exactly
+    /// as before. So a message the generic checks used to bucket keeps that bucket, except
+    /// when it also names a more specific cause — a rate-limit, quota or auth phrase, "no
+    /// such host" (`network`, not the `file_not_found` its "no such" used to give it), and so
+    /// on — which now wins; and Go's "directory not empty" moved from `critical` to
+    /// `directory_not_empty` (see below).
     static func categorizeError(_ message: String?) -> String {
         guard let msg = message else { return "unknown" }
+        let lower = msg.lowercased()
         if SyncLogPatterns.isCriticalError(msg) {
             if msg.contains("resync") || msg.contains("out of sync") {
                 return "out_of_sync"
+            }
+            // Go's ENOTEMPTY text. `isCriticalError` matches it only through its "not
+            // empty", which is there for rclone mount's "Directory is not empty" mount-point
+            // error (that one stays `critical`); a failed rmdir is a file-level error.
+            if lower.contains("directory not empty") {
+                return "directory_not_empty"
             }
             return "critical"
         }
@@ -2967,6 +3140,15 @@ final class TelemetryService {
         if SyncLogPatterns.isIOErrorsBlockedDeletes(msg) {
             return "io_errors_blocked_deletes"
         }
+        // Matched against the message with one leading space, so the space-prefixed TLS and
+        // oauth2 needles (" x509:", " tls:", " oauth2:") also catch a message that STARTS
+        // with Go's prefix, while a path segment that merely ends in tls, x509 or oauth2
+        // ("…/certs/tls: permission denied", where a "/" precedes it) never matches. Every
+        // other needle is unaffected.
+        let padded = " " + lower
+        for (bucket, needles) in specificErrorBuckets where needles.contains(where: { padded.contains($0) }) {
+            return bucket
+        }
         if msg.contains("not found") || msg.contains("no such") {
             return "file_not_found"
         }
@@ -2979,6 +3161,93 @@ final class TelemetryService {
         if msg.contains("network") || msg.contains("connection") {
             return "network"
         }
+        return "other"
+    }
+
+    /// The specific `error.type` buckets `categorizeError` tries after its `SyncLogPatterns`
+    /// checks and before its generic ones, in order, each against the LOWERCASED message.
+    /// First match wins, so the order is load-bearing:
+    /// - `rate_limited` before `quota_exceeded`: Google's per-minute limit reads "Quota
+    ///   exceeded for quota metric … rateLimitExceeded" and is a rate limit, not a full drive.
+    /// - `network`, `timeout` and `tls_certificate` before `auth_failed`: a token refresh that
+    ///   failed because DNS, the connection or TLS failed or timed out ("couldn't fetch token:
+    ///   … no such host", "oauth2: cannot fetch token: … i/o timeout", "… TLS handshake
+    ///   timeout") is a network problem, not bad credentials. That is why `timeout` repeats
+    ///   the generic "timed out" and also takes "i/o timeout" / "handshake timeout": without
+    ///   them such a message would reach the " oauth2:" needle first.
+    /// - all of these before the generic checks: "no such host" would otherwise be
+    ///   `file_not_found` via "no such".
+    /// Needles are phrases rclone and the Go runtime actually print, kept narrow because the
+    /// message usually also carries a file path: TLS is matched by Go's `x509:` / `tls:`
+    /// error prefixes rather than the bare words "x509" or "certificate", which would claim
+    /// any error about a file named e.g. "x509.pem" or "Birth Certificate.pdf"; those two
+    /// prefixes, and Go's oauth2 package prefix, are matched with a leading space (" x509:",
+    /// " tls:", " oauth2:"), against the message padded with one leading space by
+    /// `categorizeError`, so a path segment named `tls`, `x509` or `oauth2` followed by
+    /// `: <error>` ("…/certs/tls: permission denied", "…/x/oauth2: permission denied") is
+    /// not claimed either; the HTTP-status needles are matched with their code or full
+    /// phrase ("401 unauthorized", "rate limit exceeded") rather than the bare words, which
+    /// a file named e.g. "Unauthorized.pdf" or "rate limit notes.txt" would match; and
+    /// `invalid_name` takes "invalid characters" (plural), not "invalid character", which is
+    /// how Go's JSON decoder reports an HTML page where JSON was expected ("invalid character
+    /// '<' looking for beginning of value"). The values are bounded labels; the message
+    /// itself never leaves the machine.
+    static let specificErrorBuckets: [(bucket: String, needles: [String])] = [
+        ("disk_full", ["no space left on device"]),
+        ("rate_limited", ["ratelimitexceeded", "userratelimitexceeded", "rate limit exceeded", "too many requests"]),
+        ("quota_exceeded", ["storagequotaexceeded", "quotaexceeded", "quota exceeded", "insufficient storage"]),
+        ("network", ["no such host", "connection reset", "connection refused", "network is unreachable", "broken pipe"]),
+        ("timeout", ["context deadline exceeded", "deadline exceeded", "i/o timeout", "timed out", "handshake timeout"]),
+        // Go's TLS alert reads "tls: bad certificate", which " tls:" already matches.
+        ("tls_certificate", [" x509:", " tls:", "certificate signed by", "certificate has expired",
+                             "certificate verify failed"]),
+        ("auth_failed", ["invalid_grant", "token expired", "expired token", " oauth2:", "401 unauthorized",
+                         "authentication failed", "couldn't fetch token", "failed to refresh token"]),
+        ("name_too_long", ["file name too long", "name too long", "path too long"]),
+        ("invalid_name", ["illegal character", "invalid characters", "invalid name", "invalid file name",
+                          "invalid filename"]),
+        ("checksum_mismatch", ["corrupted on transfer", "hash differ", "hashes differ", "md5 differ", "sizes differ"]),
+        ("file_changed_during_transfer", ["source file is being updated", "changed size during"]),
+        ("file_busy", ["resource busy", "text file busy", "file is locked", "being used by another process"]),
+        // rclone (fs/march) logs "Duplicate object found …" / "Duplicate directory found …".
+        ("duplicate_object", ["duplicate object found", "duplicate directory found"]),
+        // Normally caught by the critical branch above (see there); this covers a message
+        // whose case keeps it out of `isCriticalError`'s case-sensitive "not empty".
+        ("directory_not_empty", ["directory not empty"]),
+    ]
+
+    /// Which rclone operation an error message is about, for the `error.operation` attribute
+    /// on the `Sync error` log and the `Sync failed` log and span. A bounded label:
+    /// `copy` | `delete` | `move` (a move or rename) | `list` | `mkdir` | `other`. A nil
+    /// message is `other`.
+    ///
+    /// Conservative heuristic over the lowercased text: rclone's own operation prefixes are
+    /// checked first ("Failed to copy:", "Couldn't delete:", "Failed to move:"/"Couldn't
+    /// move:"/"Failed to rename:", "error listing:"/"failed to list"/"error reading
+    /// source|destination [root] directory:" (rclone's march listing errors), then
+    /// "failed to rmdir" (rclone's rmdir/rmdirs failures, labelled `delete`), then "mkdir"
+    /// as a word (Go's "mkdir <path>:", rclone's "… mkdir:") or "make directory"), and only
+    /// then the bare words "copy", "delete" and "listing". The bare words can also come from
+    /// a file path inside the message, which is why they are the last resort. Pure.
+    static func categorizeErrorOperation(_ message: String?) -> String {
+        guard let lower = message?.lowercased() else { return "other" }
+        if lower.contains("failed to copy") { return "copy" }
+        if lower.contains("couldn't delete") { return "delete" }
+        if lower.contains("failed to move") || lower.contains("couldn't move")
+            || lower.contains("failed to rename") { return "move" }
+        if lower.contains("error listing") || lower.contains("failed to list")
+            || lower.contains("error reading source") || lower.contains("error reading destination") { return "list" }
+        // rclone's directory-removal failures: "Failed to rmdir:", "failed to rmdirs:", "Failed to Rmdir:".
+        // Anchored on rclone's prefix so a path containing "rmdir" can't match.
+        if lower.contains("failed to rmdir") { return "delete" }
+        // "mkdir" only as a word: Go's "mkdir <path>:", rclone's "RenameDir mkdir:" and
+        // "mkdir metadata:". A path like ".../mkdir-old" or ".../mkdir.sh" doesn't match.
+        let padded = " " + lower
+        if padded.contains(" mkdir ") || padded.contains(" mkdir:")
+            || lower.contains("make directory") { return "mkdir" }
+        if lower.contains("copy") { return "copy" }
+        if lower.contains("delete") { return "delete" }
+        if lower.contains("listing") { return "list" }
         return "other"
     }
 
@@ -3070,6 +3339,159 @@ extension TelemetryService {
                 "diagnostics.line_count": .int(lineCount),
             ]
         )
+    }
+}
+
+// MARK: - Bounded profile descriptors (never a path or a remote name)
+
+/// One enabled profile's state for the heartbeat's `Profile status` log
+/// (`TelemetryService.recordProfileStatus`). Assembled by
+/// `SyncManager.profileHeartbeatReports`, which reads the lock files and the process table
+/// off the main actor. Every field is a bounded label or a bool — no path, no remote name,
+/// no raw error text.
+struct ProfileStatusReport: Equatable {
+    let profileId: UUID
+    let profileName: String
+    let syncMode: SyncMode
+    /// `TelemetryService.profileStateLabel`.
+    let state: String
+    /// `SyncManager.runLiveness`: registry token or a live lock holder (registry only for a
+    /// Stream profile, R7).
+    let runLive: Bool
+    /// `SyncRunLock.lockState` of the `/tmp` run lock, or `n/a` for a Stream profile.
+    let lockState: String
+    /// `SyncRunLock.lockState` of the bisync session `.lck`, or `n/a` for a One-Way or
+    /// Stream profile.
+    let sessionLockState: String
+    /// `TelemetryService.categorizeError` of the stored error (or, when none was stored, the
+    /// error state's own message, e.g. "Script not found"), only in an error state.
+    let errorType: String?
+    /// `SyncPathKind.classify`.
+    let localPathKind: String
+    /// `RemoteBackendType.types(for:rcloneConfig:)`.
+    let remoteType: String
+    let fallbackRemoteType: String
+}
+
+/// What kind of folder a profile syncs — `config.local_path_kind` — so telemetry can tell a
+/// Pictures sync from one of `~/Library` or an external drive without ever sending the path.
+/// Pure: the home directory is injected, nothing touches the file system.
+enum SyncPathKind {
+    /// Folders macOS privacy controls (TCC) guard, so a sync script run by launchd can be
+    /// refused access to them even when the app itself has it — `config.local_path_privacy_protected`.
+    static let privacyProtectedKinds: Set<String> = [
+        "desktop", "documents", "downloads", "icloud_drive", "library", "external_volume",
+    ]
+
+    /// The home sub-folders reported by name: `~/<Folder>` itself or anything under it.
+    private static let homeFolderKinds: [String: String] = [
+        "desktop": "desktop",
+        "documents": "documents",
+        "downloads": "downloads",
+        "pictures": "pictures",
+        "music": "music",
+        "movies": "movies",
+        "public": "public",
+    ]
+
+    /// Bucket a local sync path: `desktop` | `documents` | `downloads` | `pictures` | `music` |
+    /// `movies` | `public` (each `~/<Folder>` or below), `icloud_drive` (`~/Library/Mobile
+    /// Documents`), `cloud_storage` (`~/Library/CloudStorage`), `library` (anything else under
+    /// `~/Library`), `home_root` (the home folder itself), `home_other` (any other folder under
+    /// home), `external_volume` (`/Volumes/<name>/…`), `other`, or `unknown` (empty path).
+    /// Case-insensitive (APFS is by default), expands a leading `~`, and ignores trailing and
+    /// doubled slashes and `.`/`..` components. Pure.
+    static func classify(localPath: String, homeDirectory: String) -> String {
+        let raw = localPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !raw.isEmpty else { return "unknown" }
+        let expanded: String
+        if raw == "~" {
+            expanded = homeDirectory
+        } else if raw.hasPrefix("~/") {
+            expanded = homeDirectory + "/" + String(raw.dropFirst(2))
+        } else {
+            expanded = raw
+        }
+        // A relative path (or `~otheruser/…`) can't be placed.
+        guard expanded.hasPrefix("/") else { return "other" }
+
+        let path = normalizedComponents(expanded.lowercased())
+        let home = normalizedComponents(homeDirectory.lowercased())
+        if !home.isEmpty, path.count >= home.count, Array(path.prefix(home.count)) == home {
+            let rest = Array(path.dropFirst(home.count))
+            guard let first = rest.first else { return "home_root" }
+            if let kind = homeFolderKinds[first] { return kind }
+            if first == "library" {
+                if rest.count >= 2, rest[1] == "mobile documents" { return "icloud_drive" }
+                if rest.count >= 2, rest[1] == "cloudstorage" { return "cloud_storage" }
+                return "library"
+            }
+            return "home_other"
+        }
+        if path.count >= 2, path[0] == "volumes" { return "external_volume" }
+        return "other"
+    }
+
+    /// Whether a `classify` result is a folder macOS privacy controls guard. Pure.
+    static func isPrivacyProtected(_ kind: String) -> Bool {
+        privacyProtectedKinds.contains(kind)
+    }
+
+    /// Path components with empty and `.` components dropped and `..` applied. Pure.
+    private static func normalizedComponents(_ path: String) -> [String] {
+        var parts: [String] = []
+        for component in path.split(separator: "/", omittingEmptySubsequences: true) {
+            if component == "." { continue }
+            if component == ".." {
+                if !parts.isEmpty { parts.removeLast() }
+                continue
+            }
+            parts.append(String(component))
+        }
+        return parts
+    }
+}
+
+/// Which storage backend a profile's remote is — `config.remote_type` /
+/// `config.fallback_remote_type` — read from the remote's `type = …` line in rclone.conf and
+/// bucketed through a fixed allowlist of rclone backend names, so a hand-edited or future
+/// type can never put free text into telemetry. The remote's NAME is never sent.
+enum RemoteBackendType {
+    /// rclone's backend type names (`rclone help backends`).
+    static let knownTypes: Set<String> = [
+        "alias", "azureblob", "azurefiles", "b2", "box", "cache", "chunker", "cloudinary",
+        "combine", "compress", "crypt", "drive", "dropbox", "fichier", "filefabric", "filescom",
+        "ftp", "gofile", "googlecloudstorage", "googlephotos", "hasher", "hdfs", "hidrive",
+        "http", "iclouddrive", "imagekit", "internetarchive", "jottacloud", "koofr", "linkbox",
+        "local", "mailru", "mega", "memory", "netstorage", "onedrive", "opendrive",
+        "oracleobjectstorage", "pcloud", "pikpak", "pixeldrain", "premiumizeme", "protondrive",
+        "putio", "qingstor", "quatrix", "s3", "seafile", "sftp", "sharefile", "sia", "smb",
+        "storj", "sugarsync", "swift", "ulozto", "union", "uptobox", "webdav", "yandex", "zoho",
+    ]
+
+    /// A known backend type is reported as itself, any other non-empty type as `other`, and a
+    /// missing or unreadable one (no such section, no `type` line, no rclone.conf) as
+    /// `unknown`. Case-insensitive. Pure.
+    static func bucket(_ rawType: String?) -> String {
+        guard let type = rawType?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
+              !type.isEmpty else { return "unknown" }
+        return knownTypes.contains(type) ? type : "other"
+    }
+
+    /// `(config.remote_type, config.fallback_remote_type)` for a profile, given rclone.conf's
+    /// text (`nil` when it could not be read). The fallback is `none` when the profile has no
+    /// fallback remote. Pure.
+    static func types(for profile: SyncProfile, rcloneConfig: String?) -> (primary: String, fallback: String) {
+        let primaryRaw = rcloneConfig.flatMap {
+            RcloneConfigService.remoteType(named: profile.primaryRemoteName, inConfig: $0)
+        }
+        guard profile.hasFallback else { return (bucket(primaryRaw), "none") }
+        let fallbackName = profile.fallbackRemote.hasSuffix(":")
+            ? String(profile.fallbackRemote.dropLast()) : profile.fallbackRemote
+        let fallbackRaw = rcloneConfig.flatMap {
+            RcloneConfigService.remoteType(named: fallbackName, inConfig: $0)
+        }
+        return (bucket(primaryRaw), bucket(fallbackRaw))
     }
 }
 
