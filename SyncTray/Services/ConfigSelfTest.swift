@@ -8022,6 +8022,10 @@ enum ConfigSelfTest {
             ("failed to rmdirs: directory not found", "delete"),
             ("Failed to Rmdir: directory not empty", "delete"),
             ("open /Users/me/Sync/rmdir.sh: permission denied", "other"),
+            ("Failed to rmdir: remove /Users/me/Sync/mkdir-old: directory not empty", "delete"),
+            ("open /Users/me/Sync/mkdir.sh: permission denied", "other"),
+            ("RenameDir mkdir: permission denied", "mkdir"),
+            ("mkdir metadata: failed make directory: permission denied", "mkdir"),
             ("something unexpected happened", "other"),
             (nil, "other"),
         ]

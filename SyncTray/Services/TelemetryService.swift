@@ -3210,10 +3210,10 @@ final class TelemetryService {
     /// checked first ("Failed to copy:", "Couldn't delete:", "Failed to move:"/"Couldn't
     /// move:"/"Failed to rename:", "error listing:"/"failed to list"/"error reading
     /// source|destination [root] directory:" (rclone's march listing errors), then
-    /// "mkdir"/"make directory", then "failed to rmdir" (rclone's rmdir/rmdirs failures,
-    /// labelled `delete`)), and only then the bare words "copy", "delete" and
-    /// "listing". The bare words can also come from a file path inside the message, which
-    /// is why they are the last resort. Pure.
+    /// "failed to rmdir" (rclone's rmdir/rmdirs failures, labelled `delete`), then "mkdir"
+    /// as a word (Go's "mkdir <path>:", rclone's "… mkdir:") or "make directory"), and only
+    /// then the bare words "copy", "delete" and "listing". The bare words can also come from
+    /// a file path inside the message, which is why they are the last resort. Pure.
     static func categorizeErrorOperation(_ message: String?) -> String {
         guard let lower = message?.lowercased() else { return "other" }
         if lower.contains("failed to copy") { return "copy" }
@@ -3222,10 +3222,14 @@ final class TelemetryService {
             || lower.contains("failed to rename") { return "move" }
         if lower.contains("error listing") || lower.contains("failed to list")
             || lower.contains("error reading source") || lower.contains("error reading destination") { return "list" }
-        if lower.contains("mkdir") || lower.contains("make directory") { return "mkdir" }
         // rclone's directory-removal failures: "Failed to rmdir:", "failed to rmdirs:", "Failed to Rmdir:".
         // Anchored on rclone's prefix so a path containing "rmdir" can't match.
         if lower.contains("failed to rmdir") { return "delete" }
+        // "mkdir" only as a word: Go's "mkdir <path>:", rclone's "RenameDir mkdir:" and
+        // "mkdir metadata:". A path like ".../mkdir-old" or ".../mkdir.sh" doesn't match.
+        let padded = " " + lower
+        if padded.contains(" mkdir ") || padded.contains(" mkdir:")
+            || lower.contains("make directory") { return "mkdir" }
         if lower.contains("copy") { return "copy" }
         if lower.contains("delete") { return "delete" }
         if lower.contains("listing") { return "list" }
