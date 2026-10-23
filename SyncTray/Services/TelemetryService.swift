@@ -180,6 +180,12 @@ final class TelemetryService {
 
     private var activeSyncSpans: [UUID: any Span] = [:]
 
+    /// When each profile's last sync failure was recorded — cleared when its next run starts
+    /// or a success is recorded. Main-thread state, like `activeSyncSpans`. Lets
+    /// `recordSyncFailed` count a run once although one run reports its failure more than
+    /// once (see `isDuplicateSyncFailure`).
+    private var lastSyncFailureAt: [UUID: Date] = [:]
+
     // MARK: - State
 
     private var lastReportedProfileCount: Int = 0
@@ -655,6 +661,8 @@ final class TelemetryService {
         trigger: String = "scheduled"  // manual | directory_watch | scheduled | startup
     ) {
         guard SyncTraySettings.telemetryEnabled else { return }
+        // A new run: its failure is never a repeat of the previous run's.
+        lastSyncFailureAt[profileId] = nil
         ensureSetup()
         guard let tracer = tracer else { return }
 
@@ -704,6 +712,8 @@ final class TelemetryService {
     ) {
         guard SyncTraySettings.telemetryEnabled else { return }
         ensureSetup()
+        // A run ended in success, so a failure after it belongs to a different run.
+        lastSyncFailureAt[profileId] = nil
 
         let labels: [String: AttributeValue] = [
             "sync.mode": .string(mode.rawValue),
@@ -748,6 +758,39 @@ final class TelemetryService {
         }
     }
 
+    /// How long after a recorded failure another failure for the same profile, with no run
+    /// started and no success recorded in between, is still the same run's. A run's end
+    /// lines are written within a second of each other, and `LogWatcher` reads them at
+    /// most one poll apart (`heartbeatInterval`, 5 s, when the profile isn't syncing).
+    static let duplicateSyncFailureWindow: TimeInterval = 15
+
+    /// True when a sync failure repeats one already recorded for the same run, so it must
+    /// not be counted again.
+    ///
+    /// One failed run reports its end more than once. A failed bisync logs rclone's own
+    /// "Failed to bisync: …" notice, then the wrapper's "Bisync failed with exit code N"
+    /// (the sync script and the auto-fix resync both write it); Force Sync adds "Force sync
+    /// failed with exit code N" after rclone's notice. `LogParser` turns each into a
+    /// `.syncFailed`, so every failed bisync used to count twice in `synctray.sync.completed`
+    /// and `synctray.sync.errors`, and added a 0 s sample to `synctray.sync.duration` (the
+    /// second event finds `syncStartTimes` already cleared). A success has a single end line,
+    /// so `recordSyncCompleted` needs no such check.
+    ///
+    /// `lastFailureAt` is cleared when a run starts or succeeds, so a failure after a start
+    /// always counts. The window is for runs that log no start (Force Sync and the profile
+    /// editor's resync run rclone directly): their first failure counts unless another was
+    /// recorded for the profile moments before it.
+    static func isDuplicateSyncFailure(
+        lastFailureAt: Date?,
+        now: Date,
+        window: TimeInterval = duplicateSyncFailureWindow
+    ) -> Bool {
+        guard let lastFailureAt else { return false }
+        let elapsed = now.timeIntervalSince(lastFailureAt)
+        // A clock that stepped backwards proves nothing about the run, so it counts.
+        return elapsed >= 0 && elapsed < window
+    }
+
     /// Called when a sync operation fails.
     func recordSyncFailed(
         profileId: UUID,
@@ -761,6 +804,15 @@ final class TelemetryService {
     ) {
         guard SyncTraySettings.telemetryEnabled else { return }
         ensureSetup()
+
+        // One failed run, one failure: a repeat of the failure just recorded is that run's
+        // own trailing end line, so it records nothing — no second `synctray.sync.completed`
+        // or `synctray.sync.errors` increment, no 0 s duration sample.
+        let now = Date()
+        if Self.isDuplicateSyncFailure(lastFailureAt: lastSyncFailureAt[profileId], now: now) {
+            return
+        }
+        lastSyncFailureAt[profileId] = now
 
         let labels: [String: AttributeValue] = [
             "sync.mode": .string(mode.rawValue),
