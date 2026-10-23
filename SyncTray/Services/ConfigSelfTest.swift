@@ -176,6 +176,7 @@ enum ConfigSelfTest {
             testSyncPathKind,
             testRemoteBackendType,
             testSyncProgressAttributes,
+            testSyncFailureCountedOnce,
             testRunLivenessMountMode,
             testExclusiveRunRegistryStaleGrace,
             testSyncRunLockAcquire,
@@ -9547,6 +9548,80 @@ enum ConfigSelfTest {
             guard got == label else {
                 return report(name, slug, false, "(profileStateLabel(\(syncState), \(paused)) = \(got), expected \(label))")
             }
+        }
+        return report(name, slug, true)
+    }
+
+    // MARK: - AC-TS6 — a failed sync run counts once, though it reports its failure twice
+
+    private static func testSyncFailureCountedOnce() -> Bool {
+        let name = "AC-TS6", slug = "sync-failure-counted-once"
+        let window = TelemetryService.duplicateSyncFailureWindow
+        let failedAt = Date(timeIntervalSince1970: 1_800_000_000)
+
+        // The decision: a repeat inside the window is the same run's; anything else counts.
+        let cases: [(lastFailureAt: Date?, now: Date, duplicate: Bool, label: String)] = [
+            (nil, failedAt, false, "no failure recorded yet"),
+            (failedAt, failedAt, true, "both end lines read in the same poll"),
+            (failedAt, failedAt.addingTimeInterval(5), true, "the second end line read one idle poll later"),
+            (failedAt, failedAt.addingTimeInterval(window - 0.001), true, "just inside the window"),
+            (failedAt, failedAt.addingTimeInterval(window), false, "at the end of the window"),
+            (failedAt, failedAt.addingTimeInterval(30 * 60), false, "the next scheduled run"),
+            (failedAt, failedAt.addingTimeInterval(-1), false, "a clock that stepped backwards"),
+        ]
+        for c in cases {
+            let got = TelemetryService.isDuplicateSyncFailure(lastFailureAt: c.lastFailureAt, now: c.now)
+            guard got == c.duplicate else {
+                return report(name, slug, false, "(\(c.label): isDuplicateSyncFailure = \(got), expected \(c.duplicate))")
+            }
+        }
+        // LogWatcher polls every 5 s when a profile isn't syncing, so a run's second end line
+        // can be read one poll after the first; a shorter window would count it again.
+        guard window > 5 else {
+            return report(name, slug, false, "(duplicateSyncFailureWindow is \(window) s, not longer than LogWatcher's 5 s idle poll)")
+        }
+
+        // Wiring, read from this run's own source next to this file (the AC-C5 technique):
+        // recordSyncFailed decides before it records any metric and remembers the failure it
+        // counted; a run start and a success both forget it.
+        let telemetryPath = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
+            .appendingPathComponent("TelemetryService.swift").path
+        guard let source = try? String(contentsOfFile: telemetryPath, encoding: .utf8) else {
+            return report(name, slug, false, "(could not read TelemetryService.swift to verify the wiring)")
+        }
+        // A method's body: from its signature to the closing brace at member indentation.
+        func body(of signature: String) -> Substring? {
+            guard let start = source.range(of: signature) else { return nil }
+            let rest = source[start.upperBound...]
+            guard let end = rest.range(of: "\n    }\n") else { return nil }
+            return rest[..<end.lowerBound]
+        }
+        func offset(of needle: String, in text: Substring) -> String.Index? {
+            text.range(of: needle)?.lowerBound
+        }
+
+        guard let failed = body(of: "func recordSyncFailed("),
+              let check = offset(of: "Self.isDuplicateSyncFailure(", in: failed) else {
+            return report(name, slug, false, "(recordSyncFailed does not call isDuplicateSyncFailure)")
+        }
+        for metric in ["syncCompletedCounter?.add", "syncErrorCounter?.add", "syncDurationHistogram?.record"] {
+            guard let recorded = offset(of: metric, in: failed), check < recorded else {
+                return report(name, slug, false, "(recordSyncFailed reaches \(metric) before deciding the failure is not a repeat)")
+            }
+        }
+        guard failed.contains("lastSyncFailureAt[profileId] = now") else {
+            return report(name, slug, false, "(recordSyncFailed does not remember the failure it counted)")
+        }
+
+        guard let started = body(of: "func recordSyncStarted("),
+              let reset = offset(of: "lastSyncFailureAt[profileId] = nil", in: started),
+              let tracerGuard = offset(of: "guard let tracer", in: started),
+              reset < tracerGuard else {
+            return report(name, slug, false, "(recordSyncStarted does not forget the last failure before its tracer guard)")
+        }
+        guard let completed = body(of: "func recordSyncCompleted("),
+              completed.contains("lastSyncFailureAt[profileId] = nil") else {
+            return report(name, slug, false, "(recordSyncCompleted does not forget the last failure)")
         }
         return report(name, slug, true)
     }
