@@ -9949,8 +9949,9 @@ enum ConfigSelfTest {
               let gate = failed.range(of: "if Self.notifiesSyncFailure(muted: muted, consecutiveFailedRuns: failedRuns) {"),
               let notify = failed.range(of: "notificationService.notifySyncError("),
               counted.upperBound <= gate.lowerBound, gate.upperBound <= notify.lowerBound,
+              failed.contains("muted ? Self.mutedRepeatedFailureNotice(notificationText, consecutiveFailedRuns: failedRuns) : notificationText"),
               !failed.contains("if !isNotificationsMuted(for: profileId) {") else {
-            return report(name, slug, false, "(syncFailed no longer counts failed runs once, or mute alone still gates its notification)")
+            return report(name, slug, false, "(syncFailed no longer counts failed runs once, mute alone still gates its notification, or a muted profile's notification lacks the reason)")
         }
         return report(name, slug, true)
     }
