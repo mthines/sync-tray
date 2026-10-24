@@ -1501,7 +1501,8 @@ final class SyncManager: ObservableObject {
         /// The same run's second end line, and the auto-fix the first one tried was refused
         /// because a run still held the profile's lock: only try auto-fix again.
         case retryAutoFixOnly
-        /// The same run's second end line: the first one already did everything.
+        /// The same run's second end line: the first one already did everything except a
+        /// deferred external reinstall, which is retried again.
         case ignore
     }
 

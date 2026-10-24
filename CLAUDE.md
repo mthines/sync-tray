@@ -1582,11 +1582,12 @@ for the first one only: `SyncManager.syncFailureHandling` (pure) treats a failur
 success in between, as the same run's — the rule `recordSyncFailed` counts by. An app-launched
 recovery run (Force Sync, the editor's resync, Smart Fix, …) logs no start line, so
 `beginExclusiveRun` clears that state for every source but auto-fix — auto-fix starts while
-the failure's second end line is still to come. The one thing
-the repeat still does: when the first failure's auto-fix was refused as
-`blockedAlreadyRunning` (rclone's notice is read while the script still holds its run lock), it
-tries auto-fix again, since the script writes its own line as it exits. Covered by
-`ConfigSelfTest` AC-SF1.
+the failure's second end line is still to come. The repeat does only two things: when the
+first failure's auto-fix was refused as `blockedAlreadyRunning` (rclone's notice is read while
+the script still holds its run lock), it tries auto-fix again, since the script writes its own
+line as it exits; and it retries a deferred external reinstall
+(`retryPendingExternalReinstallIfNeeded`), so an edit deferred between the two end lines is not
+left until the next run ends. Covered by `ConfigSelfTest` AC-SF1.
 
 ### @MainActor Thread Safety
 
