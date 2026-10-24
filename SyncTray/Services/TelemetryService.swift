@@ -767,19 +767,20 @@ final class TelemetryService {
     /// True when a sync failure repeats one already recorded for the same run, so it must
     /// not be counted again.
     ///
-    /// One failed run reports its end more than once. A failed bisync logs rclone's own
+    /// One failed run reports its end twice. A failed bisync logs rclone's own
     /// "Failed to bisync: …" notice, then the wrapper's "Bisync failed with exit code N"
-    /// (the sync script and the auto-fix resync both write it); Force Sync adds "Force sync
-    /// failed with exit code N" after rclone's notice. `LogParser` turns each into a
+    /// (the sync script and the auto-fix resync both write it). `LogParser` turns each into a
     /// `.syncFailed`, so every failed bisync used to count twice in `synctray.sync.completed`
     /// and `synctray.sync.errors`, and added a 0 s sample to `synctray.sync.duration` (the
     /// second event finds `syncStartTimes` already cleared). A success has a single end line,
     /// so `recordSyncCompleted` needs no such check.
     ///
     /// `lastFailureAt` is cleared when a run starts or succeeds, so a failure after a start
-    /// always counts. The window is for runs that log no start (Force Sync and the profile
-    /// editor's resync run rclone directly): their first failure counts unless another was
-    /// recorded for the profile moments before it.
+    /// always counts. Runs that log no start (Force Sync and the profile editor's resync run
+    /// rclone directly) report a failure once, as rclone's notice: Force Sync's own exit line
+    /// has no timestamp, so `LogParser` never reads it. For them the window removes no
+    /// duplicate; it only bounds the cost — their failure counts unless another was recorded
+    /// for the profile moments before it.
     static func isDuplicateSyncFailure(
         lastFailureAt: Date?,
         now: Date,
