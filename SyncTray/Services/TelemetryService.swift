@@ -1305,7 +1305,8 @@ final class TelemetryService {
         emitLog(severity: health == "healthy" ? .info : .warn, body: "Mount read health", attributes: attrs)
     }
 
-    /// Emit a full snapshot of all profile configurations. Call on app launch.
+    /// Emit a full snapshot of all profile configurations. Called at app launch and when
+    /// telemetry is switched on while the app runs (`SyncManager.recordConfigurationSnapshot`).
     func recordAllProfileConfigurations(_ profiles: [SyncProfile]) {
         guard SyncTraySettings.telemetryEnabled else { return }
         ensureSetup()
