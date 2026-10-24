@@ -1373,6 +1373,15 @@ final class SyncManager: ObservableObject {
         }
         // A new run: an earlier abort's trailing suppression must not hide its failures.
         abortSuppressUntil[profile.id] = nil
+        // Nor may the last run's failure: Force Sync and the editor's resync log no start
+        // line, so without this a failure of theirs within `duplicateSyncFailureWindow` of the
+        // last one handled was dropped as that run's repeated end line (#122). Not auto-fix:
+        // it starts from inside that failure's own handling, before the run's second end line
+        // arrives, and its start line resets this anyway.
+        if source != .autoFix {
+            lastHandledSyncFailureAt[profile.id] = nil
+            lastSyncFailureAutoFix[profile.id] = nil
+        }
         return token
     }
 
@@ -1502,7 +1511,8 @@ final class SyncManager: ObservableObject {
     ///
     /// A failure is the same run's when it comes within
     /// `TelemetryService.duplicateSyncFailureWindow` of the one handled before it, with no run
-    /// started and no success in between (both clear `lastHandledAt`) — the rule
+    /// started, no success, and no app-launched recovery run in between (each clears
+    /// `lastHandledAt`; `beginExclusiveRun` does it for every source but auto-fix) — the rule
     /// `TelemetryService.recordSyncFailed` counts by, so the app and its telemetry agree on
     /// what one failed run is.
     ///

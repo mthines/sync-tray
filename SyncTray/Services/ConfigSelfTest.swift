@@ -9703,6 +9703,16 @@ enum ConfigSelfTest {
               blockedLog.upperBound <= blockedReturn.lowerBound else {
             return report(name, slug, false, "(triggerAutoFix no longer reports a refused attempt as .blockedAlreadyRunning)")
         }
+        // An app-launched recovery run logs no start line, so starting one forgets the last
+        // failure — except auto-fix, which starts while that failure's end lines still arrive.
+        guard let begin = extractFunctionBody(startingAt: "func beginExclusiveRun(for profile: SyncProfile", in: source),
+              let notAutoFix = begin.range(of: "if source != .autoFix {"),
+              let forget = begin.range(of: "lastHandledSyncFailureAt[profile.id] = nil",
+                                       range: notAutoFix.upperBound..<begin.endIndex),
+              let granted = begin.range(of: "abortSuppressUntil[profile.id] = nil"),
+              granted.upperBound <= notAutoFix.lowerBound, forget.lowerBound < begin.endIndex else {
+            return report(name, slug, false, "(beginExclusiveRun no longer forgets the last failure for a recovery run, or does it for auto-fix too)")
+        }
         return report(name, slug, true)
     }
 

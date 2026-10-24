@@ -1579,7 +1579,10 @@ bisync: …" notice, then the wrapper's "Bisync failed with exit code N" — and
 `.syncFailed`. `processLogEvent` sets the error, notifies, records telemetry and tries auto-fix
 for the first one only: `SyncManager.syncFailureHandling` (pure) treats a failure within
 `TelemetryService.duplicateSyncFailureWindow` of the last one handled, with no run start or
-success in between, as the same run's — the rule `recordSyncFailed` counts by. The one thing
+success in between, as the same run's — the rule `recordSyncFailed` counts by. An app-launched
+recovery run (Force Sync, the editor's resync, Smart Fix, …) logs no start line, so
+`beginExclusiveRun` clears that state for every source but auto-fix — auto-fix starts while
+the failure's second end line is still to come. The one thing
 the repeat still does: when the first failure's auto-fix was refused as
 `blockedAlreadyRunning` (rclone's notice is read while the script still holds its run lock), it
 tries auto-fix again, since the script writes its own line as it exits. Covered by
