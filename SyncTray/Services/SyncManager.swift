@@ -1501,8 +1501,9 @@ final class SyncManager: ObservableObject {
         /// The same run's second end line, and the auto-fix the first one tried was refused
         /// because a run still held the profile's lock: only try auto-fix again.
         case retryAutoFixOnly
-        /// The same run's second end line: the first one already did everything except a
-        /// deferred external reinstall, which is retried again.
+        /// The same run's second end line: the first one already did everything. The repeat
+        /// only corrects the exit code of an error still shown and retries a deferred external
+        /// reinstall.
         case ignore
     }
 
@@ -3138,6 +3139,12 @@ final class SyncManager: ObservableObject {
                 now: failureHandledAt
             )
             if handling != .handle {
+                // rclone's notice carries no exit code (parsed as 1); the wrapper's line, written
+                // as the script exits, has the real one. Show it on an error still shown, without
+                // notifying or recording anything again.
+                if exitCode > 0, case .error = profileStates[profileId] {
+                    profileStates[profileId] = .error("Exit code \(exitCode)")
+                }
                 if handling == .retryAutoFixOnly,
                    let storedError = profileErrors[profileId],
                    SyncLogPatterns.isOutOfSyncError(storedError),

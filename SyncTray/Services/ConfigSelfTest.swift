@@ -9683,11 +9683,19 @@ enum ConfigSelfTest {
               failed[skip.upperBound..<remember.lowerBound].contains("break") else {
             return report(name, slug, false, "(syncFailed does not skip a repeated failure before remembering this one)")
         }
-        for effect in ["profileStates[profileId] = .error(", "TelemetryService.shared.recordSyncFailed(",
-                       "notificationService.notifySyncError("] {
+        for effect in ["TelemetryService.shared.recordSyncFailed(", "notificationService.notifySyncError("] {
             guard let at = failed.range(of: effect), remember.upperBound <= at.lowerBound else {
                 return report(name, slug, false, "(syncFailed reaches \(effect) before deciding the failure is not a repeat)")
             }
+        }
+        // A new failure sets the error after the check; the repeat may only correct the exit
+        // code of an error already shown (rclone's notice has none), never raise one.
+        let repeatBlock = failed[skip.upperBound..<remember.lowerBound]
+        guard failed.range(of: "profileStates[profileId] = .error(", range: remember.upperBound..<failed.endIndex) != nil,
+              !repeatBlock.contains("profileStates[profileId] = .error(")
+                || repeatBlock.contains("if exitCode > 0, case .error = profileStates[profileId] {") else {
+            return report(name, slug, false,
+                "(syncFailed sets the error before deciding the failure is not a repeat, or the repeat raises an error that was not shown)")
         }
         // Every auto-fix attempt from this handler records what it did, or the repeat cannot
         // tell a refused attempt from one that started.
