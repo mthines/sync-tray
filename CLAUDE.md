@@ -1567,9 +1567,23 @@ private var directoryWatchers: [UUID: DirectoryWatcher] = [:]
 // Auto-fix backoff (in-memory, not persisted):
 private var autoFixAttempts: [UUID: [Date]] = [:]     // timestamps of recent fix attempts
 private var autoFixSuppressed: Set<UUID> = []          // profiles where auto-fix is paused
+// One failed run, handled once (in-memory, cleared on a run start or a success):
+private var lastHandledSyncFailureAt: [UUID: Date] = [:]
+private var lastSyncFailureAutoFix: [UUID: AutoFixOutcome] = [:]
 ```
 
 This allows independent state tracking per profile while maintaining a single source of truth.
+
+**A failed run is handled once.** A failed bisync reports its end twice — rclone's "Failed to
+bisync: …" notice, then the wrapper's "Bisync failed with exit code N" — and each parses to a
+`.syncFailed`. `processLogEvent` sets the error, notifies, records telemetry and tries auto-fix
+for the first one only: `SyncManager.syncFailureHandling` (pure) treats a failure within
+`TelemetryService.duplicateSyncFailureWindow` of the last one handled, with no run start or
+success in between, as the same run's — the rule `recordSyncFailed` counts by. The one thing
+the repeat still does: when the first failure's auto-fix was refused as
+`blockedAlreadyRunning` (rclone's notice is read while the script still holds its run lock), it
+tries auto-fix again, since the script writes its own line as it exits. Covered by
+`ConfigSelfTest` AC-SF1.
 
 ### @MainActor Thread Safety
 

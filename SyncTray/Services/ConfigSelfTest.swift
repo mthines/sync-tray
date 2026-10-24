@@ -177,6 +177,7 @@ enum ConfigSelfTest {
             testRemoteBackendType,
             testSyncProgressAttributes,
             testSyncFailureCountedOnce,
+            testSyncFailureHandledOnce,
             testRunLivenessMountMode,
             testExclusiveRunRegistryStaleGrace,
             testSyncRunLockAcquire,
@@ -9622,6 +9623,85 @@ enum ConfigSelfTest {
         guard let completed = body(of: "func recordSyncCompleted("),
               completed.contains("lastSyncFailureAt[profileId] = nil") else {
             return report(name, slug, false, "(recordSyncCompleted does not forget the last failure)")
+        }
+        return report(name, slug, true)
+    }
+
+    // MARK: - AC-SF1 — a failed run is handled once in the app, though it reports its failure twice
+
+    /// The app-side half of AC-TS6 (#122): the run's second end line must not set the error
+    /// again, send a second "Sync failed" notification, or record the failure again — but it
+    /// must still retry an auto-fix the exiting run's own lock refused.
+    private static func testSyncFailureHandledOnce() -> Bool {
+        let name = "AC-SF1", slug = "sync-failure-handled-once"
+        let window = TelemetryService.duplicateSyncFailureWindow
+        let failedAt = Date(timeIntervalSince1970: 1_800_000_000)
+
+        let cases: [(lastHandledAt: Date?, autoFix: AutoFixOutcome?, now: Date,
+                     expected: SyncManager.SyncFailureHandling, label: String)] = [
+            (nil, nil, failedAt, .handle, "no failure handled yet"),
+            (failedAt, nil, failedAt, .ignore, "both end lines read together, no auto-fix tried"),
+            (failedAt, .triggered, failedAt.addingTimeInterval(1), .ignore, "auto-fix already started"),
+            (failedAt, .gaveUpBackoff, failedAt.addingTimeInterval(1), .ignore, "auto-fix gave up"),
+            (failedAt, .notApplicable, failedAt.addingTimeInterval(1), .ignore, "auto-fix off or not bisync"),
+            (failedAt, .blockedAlreadyRunning, failedAt.addingTimeInterval(1), .retryAutoFixOnly,
+             "auto-fix refused while the failing run still held its lock"),
+            (failedAt, .blockedAlreadyRunning, failedAt.addingTimeInterval(window), .handle, "at the end of the window"),
+            (failedAt, .triggered, failedAt.addingTimeInterval(30 * 60), .handle, "the next scheduled run"),
+            (failedAt, nil, failedAt.addingTimeInterval(-1), .handle, "a clock that stepped backwards"),
+        ]
+        for c in cases {
+            let got = SyncManager.syncFailureHandling(lastHandledAt: c.lastHandledAt, autoFixOutcome: c.autoFix, now: c.now)
+            guard got == c.expected else {
+                return report(name, slug, false, "(\(c.label): syncFailureHandling = \(got), expected \(c.expected))")
+            }
+        }
+
+        // Wiring in processLogEvent, read from this build's own source.
+        guard let source = readSourceFile("Services/SyncManager.swift"),
+              let handler = source.range(of: "private func processLogEvent(") else {
+            return report(name, slug, false, "(could not read SyncManager.processLogEvent)")
+        }
+        func caseBody(from start: String, to end: String) -> Substring? {
+            guard let s = source.range(of: start, range: handler.upperBound..<source.endIndex),
+                  let e = source.range(of: end, range: s.upperBound..<source.endIndex) else { return nil }
+            return source[s.upperBound..<e.lowerBound]
+        }
+        guard let started = caseBody(from: "case .syncStarted:", to: "case .syncCompleted:"),
+              let completed = caseBody(from: "case .syncCompleted:", to: "case .syncFailed("),
+              let failed = caseBody(from: "case .syncFailed(let exitCode, let message):", to: "case .transportChanged(") else {
+            return report(name, slug, false, "(could not find the syncStarted / syncCompleted / syncFailed cases)")
+        }
+        guard started.contains("lastHandledSyncFailureAt[profileId] = nil"),
+              completed.contains("lastHandledSyncFailureAt[profileId] = nil") else {
+            return report(name, slug, false, "(a run start or a success no longer forgets the failure last handled)")
+        }
+        guard let decision = failed.range(of: "Self.syncFailureHandling("),
+              let skip = failed.range(of: "if handling != .handle {", range: decision.upperBound..<failed.endIndex),
+              let remember = failed.range(of: "lastHandledSyncFailureAt[profileId] = failureHandledAt",
+                                          range: skip.upperBound..<failed.endIndex),
+              failed[skip.upperBound..<remember.lowerBound].contains("break") else {
+            return report(name, slug, false, "(syncFailed does not skip a repeated failure before remembering this one)")
+        }
+        for effect in ["profileStates[profileId] = .error(", "TelemetryService.shared.recordSyncFailed(",
+                       "notificationService.notifySyncError("] {
+            guard let at = failed.range(of: effect), remember.upperBound <= at.lowerBound else {
+                return report(name, slug, false, "(syncFailed reaches \(effect) before deciding the failure is not a repeat)")
+            }
+        }
+        // Every auto-fix attempt from this handler records what it did, or the repeat cannot
+        // tell a refused attempt from one that started.
+        let calls = failed.components(separatedBy: "triggerAutoFix(").count - 1
+        let stored = failed.components(separatedBy: "lastSyncFailureAutoFix[profileId] = triggerAutoFix(").count - 1
+        guard calls >= 2, calls == stored else {
+            return report(name, slug, false,
+                "(\(calls) auto-fix call(s) in syncFailed, \(stored) storing the outcome; expected the retry and the first attempt to both store it)")
+        }
+        guard let trigger = extractFunctionBody(startingAt: "func triggerAutoFix(for profile: SyncProfile)", in: source),
+              let blockedLog = trigger.range(of: "result: \"blocked_already_running\""),
+              let blockedReturn = trigger.range(of: "return .blockedAlreadyRunning"),
+              blockedLog.upperBound <= blockedReturn.lowerBound else {
+            return report(name, slug, false, "(triggerAutoFix no longer reports a refused attempt as .blockedAlreadyRunning)")
         }
         return report(name, slug, true)
     }
