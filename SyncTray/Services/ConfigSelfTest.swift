@@ -9710,7 +9710,8 @@ enum ConfigSelfTest {
               let forget = begin.range(of: "lastHandledSyncFailureAt[profile.id] = nil",
                                        range: notAutoFix.upperBound..<begin.endIndex),
               let granted = begin.range(of: "abortSuppressUntil[profile.id] = nil"),
-              granted.upperBound <= notAutoFix.lowerBound, forget.lowerBound < begin.endIndex else {
+              granted.upperBound <= notAutoFix.lowerBound,
+              !begin[notAutoFix.upperBound..<forget.lowerBound].contains("}") else {
             return report(name, slug, false, "(beginExclusiveRun no longer forgets the last failure for a recovery run, or does it for auto-fix too)")
         }
         return report(name, slug, true)
