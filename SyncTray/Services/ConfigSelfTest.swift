@@ -180,6 +180,8 @@ enum ConfigSelfTest {
             testSyncFailureHandledOnce,
             testAutoFixRecurringResync,
             testAdditionalFlagsSplitParity,
+            testMutedRepeatedFailureNotified,
+            testTelemetryOptInRecordsSnapshot,
             testRunLivenessMountMode,
             testExclusiveRunRegistryStaleGrace,
             testSyncRunLockAcquire,
@@ -9893,6 +9895,101 @@ enum ConfigSelfTest {
                 return report(name, slug, false,
                     "(script and app split \(e.flags) differently: script \(Array(run.args.dropFirst(base.args.count))), app \(ours); log=\(run.log))")
             }
+        }
+        return report(name, slug, true)
+    }
+
+    // MARK: - AC-NT1 — a muted profile that keeps failing is still told, once per streak
+
+    /// #112: a muted profile failed every run for 10+ hours and its user was never told.
+    /// Muting silences change notices, not a broken profile: at
+    /// `mutedFailureNotifyThreshold` failed runs in a row, one notification goes out anyway.
+    private static func testMutedRepeatedFailureNotified() -> Bool {
+        let name = "AC-NT1", slug = "muted-repeated-failure-notified"
+        let threshold = SyncManager.mutedFailureNotifyThreshold
+        guard threshold == 3 else {
+            return report(name, slug, false, "(threshold is \(threshold), expected 3)")
+        }
+        let cases: [(muted: Bool, runs: Int, notifies: Bool)] = [
+            (false, 1, true), (false, 5, true),
+            (true, 1, false), (true, 2, false), (true, 3, true), (true, 4, false), (true, 30, false),
+        ]
+        for c in cases {
+            let got = SyncManager.notifiesSyncFailure(muted: c.muted, consecutiveFailedRuns: c.runs)
+            guard got == c.notifies else {
+                return report(name, slug, false, "(muted=\(c.muted), \(c.runs) failed runs: notifies=\(got), expected \(c.notifies))")
+            }
+        }
+        let notice = SyncManager.mutedRepeatedFailureNotice("Sync failed: boom", consecutiveFailedRuns: 3)
+        guard notice.hasPrefix("Sync failed: boom"), notice.contains("muted"), notice.contains("3") else {
+            return report(name, slug, false, "(muted notice text wrong: \(notice))")
+        }
+
+        guard let source = readSourceFile("Services/SyncManager.swift"),
+              let handler = source.range(of: "private func processLogEvent(") else {
+            return report(name, slug, false, "(could not read SyncManager.processLogEvent)")
+        }
+        func caseBody(from start: String, to end: String) -> Substring? {
+            guard let s = source.range(of: start, range: handler.upperBound..<source.endIndex),
+                  let e = source.range(of: end, range: s.upperBound..<source.endIndex) else { return nil }
+            return source[s.upperBound..<e.lowerBound]
+        }
+        guard let completed = caseBody(from: "case .syncCompleted:", to: "case .syncFailed("),
+              let failed = caseBody(from: "case .syncFailed(let exitCode, let message):", to: "case .transportChanged(") else {
+            return report(name, slug, false, "(could not find the syncCompleted / syncFailed cases)")
+        }
+        guard completed.contains("consecutiveFailedRuns[profileId] = nil") else {
+            return report(name, slug, false, "(a success no longer resets the failed-run count)")
+        }
+        // Counted after the repeated-end-line check (one failed run, one count), and the
+        // notification is gated by notifiesSyncFailure, not by mute alone.
+        guard let remembered = failed.range(of: "lastHandledSyncFailureAt[profileId] = failureHandledAt"),
+              let counted = failed.range(of: "consecutiveFailedRuns[profileId] = failedRuns"),
+              remembered.upperBound <= counted.lowerBound,
+              let gate = failed.range(of: "if Self.notifiesSyncFailure(muted: muted, consecutiveFailedRuns: failedRuns) {"),
+              let notify = failed.range(of: "notificationService.notifySyncError("),
+              counted.upperBound <= gate.lowerBound, gate.upperBound <= notify.lowerBound,
+              !failed.contains("if !isNotificationsMuted(for: profileId) {") else {
+            return report(name, slug, false, "(syncFailed no longer counts failed runs once, or mute alone still gates its notification)")
+        }
+        return report(name, slug, true)
+    }
+
+    // MARK: - AC-TS7 — switching telemetry on mid-session records the configuration snapshot
+
+    /// #112: the configuration snapshot was recorded only at launch, so an install that opted
+    /// in from Settings (or the banner, the wizard, `synctray telemetry on`) sent no profile
+    /// configuration until its next launch. Any off → on change of the setting while the app
+    /// runs now records it, from one observer on `UserDefaults` changes.
+    private static func testTelemetryOptInRecordsSnapshot() -> Bool {
+        let name = "AC-TS7", slug = "opt-in-records-configuration"
+        let cases: [(was: Bool, now: Bool, expected: Bool)] = [
+            (false, true, true), (true, true, false), (true, false, false), (false, false, false),
+        ]
+        for c in cases {
+            guard SyncManager.telemetryJustEnabled(wasEnabled: c.was, isEnabled: c.now) == c.expected else {
+                return report(name, slug, false, "(telemetryJustEnabled(\(c.was) → \(c.now)) != \(c.expected))")
+            }
+        }
+        guard let source = readSourceFile("Services/SyncManager.swift") else {
+            return report(name, slug, false, "(could not read SyncManager.swift)")
+        }
+        guard let snapshot = extractFunctionBody(startingAt: "func recordConfigurationSnapshot()", in: source),
+              snapshot.contains("TelemetryService.shared.recordProfileCount("),
+              snapshot.contains("TelemetryService.shared.recordAllProfileConfigurations(") else {
+            return report(name, slug, false, "(recordConfigurationSnapshot no longer records the profile count and configurations)")
+        }
+        guard let observer = extractFunctionBody(startingAt: "private func setupTelemetryOptInObserver()", in: source),
+              observer.contains("UserDefaults.didChangeNotification"),
+              let decide = observer.range(of: "Self.telemetryJustEnabled("),
+              let record = observer.range(of: "self.recordConfigurationSnapshot()"),
+              decide.upperBound <= record.lowerBound else {
+            return report(name, slug, false, "(no observer records the snapshot when telemetry is switched on)")
+        }
+        // Wired at launch, after the launch snapshot, with the current value as the baseline
+        // so launch itself is not counted as an opt-in.
+        guard source.contains("        recordConfigurationSnapshot()\n        telemetryWasEnabled = SyncTraySettings.telemetryEnabled\n        setupTelemetryOptInObserver()\n") else {
+            return report(name, slug, false, "(SyncManager no longer records the snapshot at launch and then starts the opt-in observer)")
         }
         return report(name, slug, true)
     }

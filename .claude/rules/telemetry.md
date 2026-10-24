@@ -89,7 +89,7 @@ TelemetryService.shared.recordFileOperation(
 
 ## Profile Configuration Snapshots (RUM)
 
-On app launch and every profile save, a structured log captures the user's chosen configuration:
+On app launch, every profile save, and whenever telemetry is switched on while the app runs (`SyncManager.setupTelemetryOptInObserver` watches `UserDefaults` for the off → on change — Settings toggle, opt-in banner, setup wizard, or a `settings.json` edit such as `synctray telemetry on`; AC-TS7), a structured log captures the user's chosen configuration:
 - `config.sync_mode`, `config.sync_direction`, `config.sync_interval_bucket`
 - `config.has_fallback`, `config.has_external_drive`, `config.is_enabled`, `config.is_muted`
 - Mount-specific: `config.mount_backend` (nfs/macfuse), `config.mount_at_startup` (true/false), `config.stream_cache_only` (true/false; `n/a` for non-mount — the union-overlay Cache-only mount toggle), `config.vfs_cache_mode`, `config.has_pinned_directories`, `config.pinned_directory_count`, `config.download_connections` (parallel `--transfers`/warm concurrency, 1–16; `0` for non-mount profiles), `config.has_bandwidth_limit` (bool — whether an rclone `--bwlimit` cap is set; presence only, never the rate value; all modes), `config.mount_resilient` (true/false — the bounded rclone `--timeout` hard mount that stops a stalled backend freezing Finder without the soft-mount sticky-EPERM downside; `n/a` for non-mount), `config.cache_fs_type` (bucketed filesystem of the VFS cache volume: apfs/hfs/exfat/fat/ntfs/network/other/unknown; `n/a` for non-mount), `config.cache_volume` (internal/external/unknown; `n/a` for non-mount)
