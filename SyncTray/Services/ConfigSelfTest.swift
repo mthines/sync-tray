@@ -9981,10 +9981,11 @@ enum ConfigSelfTest {
         }
         guard let observer = extractFunctionBody(startingAt: "private func setupTelemetryOptInObserver()", in: source),
               observer.contains("UserDefaults.didChangeNotification"),
+              observer.contains("self.telemetryWasEnabled = isEnabled"),
               let decide = observer.range(of: "Self.telemetryJustEnabled("),
               let record = observer.range(of: "self.recordConfigurationSnapshot()"),
               decide.upperBound <= record.lowerBound else {
-            return report(name, slug, false, "(no observer records the snapshot when telemetry is switched on)")
+            return report(name, slug, false, "(no observer records the snapshot when telemetry is switched on, or it no longer updates its baseline)")
         }
         // Wired at launch, after the launch snapshot, with the current value as the baseline
         // so launch itself is not counted as an opt-in.
