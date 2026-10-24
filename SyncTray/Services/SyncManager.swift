@@ -1448,6 +1448,16 @@ final class SyncManager: ObservableObject {
         }
         // A new run: an earlier abort's trailing suppression must not hide its failures.
         abortSuppressUntil[profile.id] = nil
+        // Nor may the last run's failure: Force Sync and the editor's resync log no start
+        // line, so without this a failure of theirs within `duplicateSyncFailureWindow` of the
+        // last one handled was dropped as that run's repeated end line (#122). Not auto-fix:
+        // it starts from inside that failure's own handling, before the run's second end line
+        // arrives, and its start line resets this anyway.
+        if source != .autoFix {
+            lastHandledSyncFailureAt[profile.id] = nil
+            lastSyncFailureAutoFix[profile.id] = nil
+            TelemetryService.shared.forgetLastSyncFailure(profileId: profile.id)
+        }
         return token
     }
 
@@ -1619,9 +1629,12 @@ final class SyncManager: ObservableObject {
         /// A new failure: set the error, notify, record telemetry, try auto-fix.
         case handle
         /// The same run's second end line, and the auto-fix the first one tried was refused
-        /// because a run still held the profile's lock: only try auto-fix again.
+        /// because a run still held the profile's lock: try auto-fix again, on top of what
+        /// `.ignore` does.
         case retryAutoFixOnly
-        /// The same run's second end line: the first one already did everything.
+        /// The same run's second end line: the first one already did everything. The repeat
+        /// only corrects the exit code of an error still shown and retries a deferred external
+        /// reinstall.
         case ignore
     }
 
@@ -1632,7 +1645,8 @@ final class SyncManager: ObservableObject {
     ///
     /// A failure is the same run's when it comes within
     /// `TelemetryService.duplicateSyncFailureWindow` of the one handled before it, with no run
-    /// started and no success in between (both clear `lastHandledAt`) — the rule
+    /// started, no success, and no app-launched recovery run in between (each clears
+    /// `lastHandledAt`; `beginExclusiveRun` does it for every source but auto-fix) — the rule
     /// `TelemetryService.recordSyncFailed` counts by, so the app and its telemetry agree on
     /// what one failed run is.
     ///
@@ -3234,15 +3248,19 @@ final class SyncManager: ObservableObject {
             lastHandledSyncFailureAt[profileId] = nil
             lastSyncFailureAutoFix[profileId] = nil
             consecutiveFailedRuns[profileId] = nil
+            // Any success, the auto-fix resync's included, ends the backoff's window: it exists
+            // for a resync that itself fails back-to-back. Kept across a resync success, it
+            // gave up as `gave_up_backoff` on a 1–2 minute interval before
+            // `AutoFixRecurrence` could reach its limit (review finding on #126).
+            autoFixAttempts[profileId] = nil
             if autoFixResyncRunning.remove(profileId) != nil {
                 // The auto-fix resync worked, but that alone does not show the pair converged:
-                // only a normal bisync succeeding after it does (#123). Keep the backoff and
-                // recurrence state, so a resync that keeps "working" while the next bisync
+                // only a normal bisync succeeding after it does (#123). Keep the suppression
+                // and recurrence state, so a resync that keeps "working" while the next bisync
                 // fails the same way is caught by `AutoFixRecurrence`.
                 autoFixResyncSucceeded.insert(profileId)
             } else {
                 autoFixSuppressed.remove(profileId)
-                autoFixAttempts[profileId] = nil
                 autoFixResyncSucceeded.remove(profileId)
                 autoFixRecurrences[profileId] = nil
                 autoFixGaveUpRecurring.remove(profileId)
@@ -3345,6 +3363,12 @@ final class SyncManager: ObservableObject {
                 now: failureHandledAt
             )
             if handling != .handle {
+                // rclone's notice carries no exit code (parsed as 1); the wrapper's line, written
+                // as the script exits, has the real one. Show it on an error still shown, without
+                // notifying or recording anything again.
+                if exitCode > 0, case .error = profileStates[profileId] {
+                    profileStates[profileId] = .error("Exit code \(exitCode)")
+                }
                 if handling == .retryAutoFixOnly,
                    let storedError = profileErrors[profileId],
                    SyncLogPatterns.isOutOfSyncError(storedError),
@@ -3354,6 +3378,9 @@ final class SyncManager: ObservableObject {
                 }
                 SyncTraySettings.debugLog(
                     "Ignoring repeated syncFailed (exit \(exitCode)) for '\(profileName)': this run's failure was already handled")
+                // An external edit deferred between the run's two end lines is applied now,
+                // not only when the next run ends.
+                retryPendingExternalReinstallIfNeeded(for: profileId)
                 break
             }
             lastHandledSyncFailureAt[profileId] = failureHandledAt

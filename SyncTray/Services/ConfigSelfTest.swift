@@ -9687,11 +9687,19 @@ enum ConfigSelfTest {
               failed[skip.upperBound..<remember.lowerBound].contains("break") else {
             return report(name, slug, false, "(syncFailed does not skip a repeated failure before remembering this one)")
         }
-        for effect in ["profileStates[profileId] = .error(", "TelemetryService.shared.recordSyncFailed(",
-                       "notificationService.notifySyncError("] {
+        for effect in ["TelemetryService.shared.recordSyncFailed(", "notificationService.notifySyncError("] {
             guard let at = failed.range(of: effect), remember.upperBound <= at.lowerBound else {
                 return report(name, slug, false, "(syncFailed reaches \(effect) before deciding the failure is not a repeat)")
             }
+        }
+        // A new failure sets the error after the check; the repeat may only correct the exit
+        // code of an error already shown (rclone's notice has none), never raise one.
+        let repeatBlock = failed[skip.upperBound..<remember.lowerBound]
+        guard failed.range(of: "profileStates[profileId] = .error(", range: remember.upperBound..<failed.endIndex) != nil,
+              !repeatBlock.contains("profileStates[profileId] = .error(")
+                || repeatBlock.contains("if exitCode > 0, case .error = profileStates[profileId] {") else {
+            return report(name, slug, false,
+                "(syncFailed sets the error before deciding the failure is not a repeat, or the repeat raises an error that was not shown)")
         }
         // Every auto-fix attempt from this handler records what it did, or the repeat cannot
         // tell a refused attempt from one that started.
@@ -9706,6 +9714,18 @@ enum ConfigSelfTest {
               let blockedReturn = trigger.range(of: "return .blockedAlreadyRunning"),
               blockedLog.upperBound <= blockedReturn.lowerBound else {
             return report(name, slug, false, "(triggerAutoFix no longer reports a refused attempt as .blockedAlreadyRunning)")
+        }
+        // An app-launched recovery run logs no start line, so starting one forgets the last
+        // failure — except auto-fix, which starts while that failure's end lines still arrive.
+        guard let begin = extractFunctionBody(startingAt: "func beginExclusiveRun(for profile: SyncProfile", in: source),
+              let notAutoFix = begin.range(of: "if source != .autoFix {"),
+              let forget = begin.range(of: "lastHandledSyncFailureAt[profile.id] = nil",
+                                       range: notAutoFix.upperBound..<begin.endIndex),
+              let granted = begin.range(of: "abortSuppressUntil[profile.id] = nil"),
+              granted.upperBound <= notAutoFix.lowerBound,
+              !begin[notAutoFix.upperBound..<forget.lowerBound].contains("}"),
+              begin[notAutoFix.upperBound...].prefix(400).contains("TelemetryService.shared.forgetLastSyncFailure(profileId: profile.id)") else {
+            return report(name, slug, false, "(beginExclusiveRun no longer forgets the last failure — in the app and in telemetry — for a recovery run, or does it for auto-fix too)")
         }
         return report(name, slug, true)
     }
@@ -9793,18 +9813,25 @@ enum ConfigSelfTest {
               errorCase.contains("SyncLogPatterns.isCheckSyncMismatch(message)") else {
             return report(name, slug, false, "(a run's start no longer records whether it is the auto-fix resync, or check-sync files are not kept)")
         }
-        // Only a normal success re-arms auto-fix: the resets sit in the else branch of the
-        // auto-fix-resync check, and the resync's own success only records itself.
+        // Only a normal success re-arms auto-fix: suppression and recurrence resets sit in the
+        // else branch of the auto-fix-resync check, and the resync's own success records itself
+        // (and, like every success, clears the backoff's attempts).
         guard let resyncCheck = completed.range(of: "if autoFixResyncRunning.remove(profileId) != nil {"),
               let elseBranch = completed.range(of: "} else {", range: resyncCheck.upperBound..<completed.endIndex),
               completed[resyncCheck.upperBound..<elseBranch.lowerBound].contains("autoFixResyncSucceeded.insert(profileId)") else {
             return report(name, slug, false, "(syncCompleted no longer tells the auto-fix resync's success apart)")
         }
-        for reset in ["autoFixSuppressed.remove(profileId)", "autoFixAttempts[profileId] = nil",
-                      "autoFixRecurrences[profileId] = nil", "autoFixGaveUpRecurring.remove(profileId)"] {
+        for reset in ["autoFixSuppressed.remove(profileId)", "autoFixRecurrences[profileId] = nil",
+                      "autoFixGaveUpRecurring.remove(profileId)"] {
             guard let at = completed.range(of: reset), elseBranch.upperBound <= at.lowerBound else {
                 return report(name, slug, false, "(\(reset) is not limited to a normal success)")
             }
+        }
+        // The backoff's attempt list clears on every success, the resync's included, or a
+        // short sync interval trips the backoff before the recurrence limit.
+        guard let attemptsReset = completed.range(of: "autoFixAttempts[profileId] = nil"),
+              attemptsReset.upperBound <= resyncCheck.lowerBound else {
+            return report(name, slug, false, "(the backoff's attempt list is no longer cleared on every success)")
         }
         guard let trigger = extractFunctionBody(startingAt: "func triggerAutoFix(for profile: SyncProfile)", in: source),
               let suppressedGuard = trigger.range(of: "guard !autoFixSuppressed.contains(profileId) else {"),

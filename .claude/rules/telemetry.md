@@ -124,10 +124,11 @@ recorded in between (`isDuplicateSyncFailure`, pure). Without it,
 `synctray.sync.completed{sync.result=failure}` and `synctray.sync.errors` counted every failed
 bisync twice and `synctray.sync.duration` got a second, 0 s sample. Force Sync and the profile
 editor's resync log no start and report a failure once (Force Sync's own exit line has no
-timestamp, so it is never parsed); for them the window only bounds how soon after another
-failure theirs would be dropped. Covered by `ConfigSelfTest` AC-TS6. The app applies the same
-rule to the error state, the "Sync failed" notification and auto-fix
-(`SyncManager.syncFailureHandling`, AC-SF1; CLAUDE.md "A failed run is handled once").
+timestamp, so it is never parsed); `SyncManager.beginExclusiveRun` calls
+`forgetLastSyncFailure` when one of them starts, so theirs always counts. Covered by
+`ConfigSelfTest` AC-TS6. The app applies the same rule to the error state, the "Sync failed"
+notification and auto-fix (`SyncManager.syncFailureHandling`, AC-SF1; CLAUDE.md "A failed run
+is handled once").
 
 ## Per-profile Heartbeat Logs
 
