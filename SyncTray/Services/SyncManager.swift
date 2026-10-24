@@ -1499,7 +1499,8 @@ final class SyncManager: ObservableObject {
         /// A new failure: set the error, notify, record telemetry, try auto-fix.
         case handle
         /// The same run's second end line, and the auto-fix the first one tried was refused
-        /// because a run still held the profile's lock: only try auto-fix again.
+        /// because a run still held the profile's lock: try auto-fix again, on top of what
+        /// `.ignore` does.
         case retryAutoFixOnly
         /// The same run's second end line: the first one already did everything. The repeat
         /// only corrects the exit code of an error still shown and retries a deferred external
