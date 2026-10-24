@@ -174,6 +174,19 @@ final class NotificationService {
         )
     }
 
+    /// Notify the user that auto-fix stopped because its resyncs did not stick (#123): each
+    /// resync succeeded, and the next sync was out of sync again. Sent even when the
+    /// profile's notifications are muted — muting silences change notices, not a recovery
+    /// that never holds — and only once, when auto-fix stops.
+    func notifyAutoFixGaveUpRecurring(profileId: UUID, profileName: String) {
+        sendNotification(
+            title: "Auto-fix stopped for \(profileName)",
+            body: "Each resync worked, but the next sync was out of sync again. Open SyncTray to see which file.",
+            sound: .default,
+            profileId: profileId
+        )
+    }
+
     /// Notify the user their Cache Only mount is back on the network but can't auto-resume
     /// yet because something has a file open on it. Called at most once per busy episode —
     /// the caller (`SyncManager`) tracks that, this just sends the notification.

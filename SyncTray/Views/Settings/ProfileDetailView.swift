@@ -3492,9 +3492,22 @@ struct ProfileDetailView: View {
                 arguments.append("--no-check-certificate")
             }
 
-            // Add any additional flags from profile
+            // Add any additional flags from profile, split exactly as the sync script splits
+            // them (`SyncSetupService.splitAdditionalFlags`) — a whitespace split broke quoted
+            // values and skipped `~` / `$VAR`, so this resync ran different filters (#123).
             if !capturedAdditionalFlags.isEmpty {
-                let extraFlags = capturedAdditionalFlags.components(separatedBy: .whitespaces).filter { !$0.isEmpty }
+                guard let extraFlags = SyncSetupService.splitAdditionalFlags(capturedAdditionalFlags) else {
+                    let errMsg = "Error: Additional rclone flags could not be parsed (unbalanced quote or trailing backslash) - not running rclone"
+                    writeToLog(errMsg)
+                    SyncRunLock.releaseIfOwned(path: capturedLockPath, ownTokens: [placeholder])
+                    DispatchQueue.main.async {
+                        self.syncManager.endExclusiveRun(runToken)
+                        self.isRunningResync = false
+                        self.resyncOutputLines = [errMsg]
+                        self.syncManager.setSyncing(for: currentProfile.id, isSyncing: false)
+                    }
+                    return
+                }
                 arguments.append(contentsOf: extraFlags)
             }
 

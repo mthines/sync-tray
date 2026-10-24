@@ -427,7 +427,7 @@ final class TelemetryService {
 
         autoFixTriggeredCounter = meter
             .counterBuilder(name: "synctray.sync.auto_fix_triggered")
-            .setDescription("Number of automatic --resync recoveries triggered (by result: triggered, gave_up_backoff)")
+            .setDescription("Number of automatic --resync recovery decisions (by result: triggered, recurred, gave_up_backoff, gave_up_recurring, skipped_drive_not_mounted, blocked_already_running)")
             .setUnit("1")
             .build()
 
@@ -1502,7 +1502,10 @@ final class TelemetryService {
     /// - Parameters:
     ///   - profileId:   UUID of the affected profile.
     ///   - profileName: Display name of the affected profile.
-    ///   - result:      `"triggered"` when the resync starts; `"gave_up_backoff"` when
+    ///   - result:      `"triggered"` when the resync starts; `"recurred"` when it starts
+    ///                  again although the last resync succeeded and the next sync was out
+    ///                  of sync anyway (#123); `"gave_up_recurring"` when auto-fix stops after
+    ///                  `AutoFixRecurrence.limit` such recurrences; `"gave_up_backoff"` when
     ///                  backoff suppresses the retry after repeated triggers;
     ///                  `"skipped_drive_not_mounted"` when the external drive is absent;
     ///                  `"blocked_already_running"` when the single-run guard refused
@@ -1511,7 +1514,8 @@ final class TelemetryService {
     func recordAutoFixTriggered(
         profileId: UUID,
         profileName: String,
-        // "triggered" | "gave_up_backoff" | "skipped_drive_not_mounted" | "blocked_already_running"
+        // "triggered" | "recurred" | "gave_up_recurring" | "gave_up_backoff"
+        // | "skipped_drive_not_mounted" | "blocked_already_running"
         result: String
     ) {
         guard SyncTraySettings.telemetryEnabled else { return }
@@ -1522,11 +1526,16 @@ final class TelemetryService {
             "result": .string(result),
         ])
 
-        let severity: Severity = (result == "gave_up_backoff" || result == "blocked_already_running") ? .warn : .info
+        let severity: Severity = ["gave_up_backoff", "blocked_already_running", "recurred", "gave_up_recurring"]
+            .contains(result) ? .warn : .info
         let body: String
         switch result {
         case "gave_up_backoff":
             body = "Auto-fix suppressed by backoff for \(profileName)"
+        case "recurred":
+            body = "Auto-resyncing \(profileName) again: the last resync did not stick"
+        case "gave_up_recurring":
+            body = "Auto-fix stopped for \(profileName): resyncs did not stick"
         case "skipped_drive_not_mounted":
             body = "Auto-fix skipped: external drive not mounted for \(profileName)"
         case "blocked_already_running":

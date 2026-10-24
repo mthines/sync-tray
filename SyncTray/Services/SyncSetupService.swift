@@ -447,6 +447,170 @@ final class SyncSetupService {
          "--verbose", "--use-json-log", "--stats", "2s"]
     }
 
+    /// Splits a profile's `additionalRcloneFlags` into rclone arguments exactly as the sync
+    /// script's `split_additional_flags` does: Python's `shlex.split` (POSIX quoting, never
+    /// evaluated), then on each token `os.path.expandvars` followed by `os.path.expanduser`,
+    /// plus `expanduser` on the value of a `--flag=~/path` token. Returns `nil` where the
+    /// script refuses to run rclone: an unbalanced quote, or a trailing backslash.
+    ///
+    /// The auto-fix resync used to split on whitespace instead, so a quoted value
+    /// (`--exclude "some dir/**"`) or a `~` / `$VAR` path gave the resync different filters
+    /// than the scheduled run — the resync converged on one file set and the next bisync
+    /// found a file the resync never listed (#123). `ConfigSelfTest` AC-AF2 checks this
+    /// against the script's own splitter. Pure (environment and home lookups are injected).
+    static func splitAdditionalFlags(
+        _ flags: String,
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        userHome: (String) -> String? = { FileManager.default.homeDirectory(forUser: $0)?.path }
+    ) -> [String]? {
+        guard let tokens = shlexSplit(flags) else { return nil }
+        func expandUser(_ path: String) -> String {
+            // posixpath.expanduser
+            guard path.hasPrefix("~") else { return path }
+            let afterTilde = path.index(after: path.startIndex)
+            let slash = path[afterTilde...].firstIndex(of: "/") ?? path.endIndex
+            let name = String(path[afterTilde..<slash])
+            let home: String
+            if name.isEmpty {
+                guard let envHome = environment["HOME"] ?? userHome(NSUserName()) else { return path }
+                home = envHome
+            } else {
+                guard let found = userHome(name) else { return path }
+                home = found
+            }
+            var trimmed = Substring(home)
+            while trimmed.hasSuffix("/") { trimmed = trimmed.dropLast() }
+            let result = String(trimmed) + String(path[slash...])
+            return result.isEmpty ? "/" : result
+        }
+        return tokens.map { token in
+            var tok = expandUser(expandVariables(token, environment: environment))
+            if let eq = tok.firstIndex(of: "=") {
+                let flag = tok[..<eq], value = tok[tok.index(after: eq)...]
+                if flag.hasPrefix("-"), value.hasPrefix("~") {
+                    tok = String(flag) + "=" + expandUser(String(value))
+                }
+            }
+            return tok
+        }
+    }
+
+    /// Python's `shlex.split(s)` (posix, whitespace-split, no comments), scalar for scalar.
+    /// `nil` where shlex raises: "No closing quotation" / "No escaped character".
+    private static func shlexSplit(_ s: String) -> [String]? {
+        let whitespace: Set<Unicode.Scalar> = [" ", "\t", "\r", "\n"]
+        var tokens: [String] = []
+        var token = String.UnicodeScalarView()
+        var quoted = false
+        // " ": between tokens. "a": in a word. "'" / "\"": in a quote.
+        var state: Unicode.Scalar = " "
+        var escaped = false          // the previous scalar was an active backslash
+        var escapeReturn: Unicode.Scalar = "a"
+        func finishToken() {
+            tokens.append(String(token))
+            token = String.UnicodeScalarView()
+            quoted = false
+        }
+        for c in s.unicodeScalars {
+            if escaped {
+                // Inside double quotes a backslash only escapes `"` and `\`; elsewhere it is kept.
+                if escapeReturn == "\"", c != "\\", c != "\"" { token.append("\\") }
+                token.append(c)
+                escaped = false
+                state = escapeReturn
+                continue
+            }
+            switch state {
+            case "'":
+                quoted = true
+                if c == "'" { state = "a" } else { token.append(c) }
+            case "\"":
+                quoted = true
+                if c == "\"" {
+                    state = "a"
+                } else if c == "\\" {
+                    escapeReturn = "\""
+                    escaped = true
+                } else {
+                    token.append(c)
+                }
+            case "a":
+                if whitespace.contains(c) {
+                    state = " "
+                    finishToken()
+                } else if c == "'" || c == "\"" {
+                    state = c
+                } else if c == "\\" {
+                    escapeReturn = "a"
+                    escaped = true
+                } else {
+                    token.append(c)
+                }
+            default:
+                if whitespace.contains(c) { continue }
+                if c == "'" || c == "\"" {
+                    state = c
+                } else if c == "\\" {
+                    escapeReturn = "a"
+                    escaped = true
+                } else {
+                    token.append(c)
+                    state = "a"
+                }
+            }
+        }
+        if escaped { return nil }                       // "No escaped character"
+        if state == "'" || state == "\"" { return nil }  // "No closing quotation"
+        if state == "a", !token.isEmpty || quoted { finishToken() }
+        return tokens
+    }
+
+    /// Python's `posixpath.expandvars`: `$name` (ASCII letters, digits, `_`) and `${…}` are
+    /// replaced from `environment`; an unset name, or an unclosed `${`, stays literal, and a
+    /// substituted value is not scanned again.
+    private static func expandVariables(_ s: String, environment: [String: String]) -> String {
+        guard s.unicodeScalars.contains("$") else { return s }
+        let lower: ClosedRange<Unicode.Scalar> = "a"..."z"
+        let upper: ClosedRange<Unicode.Scalar> = "A"..."Z"
+        let digits: ClosedRange<Unicode.Scalar> = "0"..."9"
+        func isWord(_ c: Unicode.Scalar) -> Bool {
+            lower.contains(c) || upper.contains(c) || digits.contains(c) || c == "_"
+        }
+        let scalars = Array(s.unicodeScalars)
+        var out = String.UnicodeScalarView()
+        var i = 0
+        while i < scalars.count {
+            guard scalars[i] == "$", i + 1 < scalars.count else {
+                out.append(scalars[i]); i += 1; continue
+            }
+            var j = i + 1
+            var name: String?
+            if isWord(scalars[j]) {
+                while j < scalars.count, isWord(scalars[j]) { j += 1 }
+                name = String(String.UnicodeScalarView(scalars[(i + 1)..<j]))
+            } else if scalars[j] == "{" {
+                guard let close = scalars[(j + 1)...].firstIndex(of: "}") else {
+                    // An unclosed `${` keeps the rest literal, as current CPython does
+                    // (`\$(\w+|\{[^}]*\}?)`). Pythons before that fix (macOS's own 3.9)
+                    // still expand a later `$name` here; no real flag value has this shape.
+                    out.append(contentsOf: scalars[i...])
+                    break
+                }
+                name = String(String.UnicodeScalarView(scalars[(j + 1)..<close]))
+                j = close + 1
+            }
+            if let name, let value = environment[name] {
+                out.append(contentsOf: value.unicodeScalars)
+            } else if name != nil {
+                out.append(contentsOf: scalars[i..<j])
+            } else {
+                out.append(scalars[i]); j = i + 1
+            }
+            i = j
+        }
+        return String(out)
+    }
+
     /// rclone bisync's working directory on macOS (`os.UserCacheDir()/rclone/bisync`).
     static var bisyncWorkDir: String {
         ("~/Library/Caches/rclone/bisync" as NSString).expandingTildeInPath

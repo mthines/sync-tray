@@ -340,7 +340,7 @@ rollout. No event is emitted on a fresh install.
 | `synctray.directory_watch.filtered` | Counter | Directory watch events filtered out (out_of_scope, phantom, metadata) |
 | `synctray.sync.resumed_external` | Counter | Externally-started syncs detected and resumed at app startup |
 | `synctray.app.settings_opened` | Counter | Settings window opens |
-| `synctray.sync.auto_fix_triggered` | Counter | Automatic --resync recovery attempts (`result`: `triggered`, `gave_up_backoff`, `skipped_drive_not_mounted`, or `blocked_already_running` — the single-run guard refused because another run already held the profile's lock) |
+| `synctray.sync.auto_fix_triggered` | Counter | Automatic --resync recovery attempts (`result`: `triggered`, `recurred` — started again although the last resync succeeded and the next sync was out of sync anyway, `gave_up_recurring` — stopped after `AutoFixRecurrence.limit` such recurrences, `gave_up_backoff`, `skipped_drive_not_mounted`, or `blocked_already_running` — the single-run guard refused because another run already held the profile's lock) |
 | `synctray.offline.pin_operations` | Counter | Offline pin/unpin operations from Finder or in-app UI (`action`: `pin` or `unpin`) |
 | `synctray.wizard.step` | Counter | Onboarding funnel events (`wizard.outcome`: started/provider_selected/remote_ready/folder_chosen/created/abandoned; `wizard.abandoned_at_step`, `provider.type`) |
 | `synctray.remote.oauth` | Counter | OAuth auth outcomes during remote setup (`result`: success/failure/cancelled; `provider.type`) |
@@ -418,7 +418,7 @@ All key lifecycle events are emitted as structured OTel logs:
 - Sync precondition failures: script_not_found, config_not_found (setup issue detection)
 - Resumed external syncs: syncs detected running at startup (launchd overlap detection)
 - App upgraded: `service.version` changed since the previous launch (deployment markers)
-- Auto-fix: automatic --resync triggered (`triggered`), suppressed by backoff (`gave_up_backoff`), skipped because the external drive is not mounted (`skipped_drive_not_mounted`), or blocked because the single-run guard found another run already holding the profile's lock (`blocked_already_running` — CLAUDE.md "One Run Per Profile")
+- Auto-fix: automatic --resync triggered (`triggered`), triggered again after a resync that did not stick (`recurred`), stopped because resyncs keep not sticking (`gave_up_recurring`), suppressed by backoff (`gave_up_backoff`), skipped because the external drive is not mounted (`skipped_drive_not_mounted`), or blocked because the single-run guard found another run already holding the profile's lock (`blocked_already_running` — CLAUDE.md "One Run Per Profile")
 - Offline pin operations: directory pinned or unpinned via Finder right-click or in-app UI (`offline.action`, `offline.path_count`)
 - Wizard step: onboarding funnel events (`wizard.outcome`, `wizard.abandoned_at_step`, `provider.type`) — new-profile flow only, not edit mode
 - OAuth outcome: OAuth auth result during remote setup (`result`, `provider.type`)

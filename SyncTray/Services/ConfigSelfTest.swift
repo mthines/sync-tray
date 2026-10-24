@@ -178,6 +178,8 @@ enum ConfigSelfTest {
             testSyncProgressAttributes,
             testSyncFailureCountedOnce,
             testSyncFailureHandledOnce,
+            testAutoFixRecurringResync,
+            testAdditionalFlagsSplitParity,
             testRunLivenessMountMode,
             testExclusiveRunRegistryStaleGrace,
             testSyncRunLockAcquire,
@@ -9702,6 +9704,195 @@ enum ConfigSelfTest {
               let blockedReturn = trigger.range(of: "return .blockedAlreadyRunning"),
               blockedLog.upperBound <= blockedReturn.lowerBound else {
             return report(name, slug, false, "(triggerAutoFix no longer reports a refused attempt as .blockedAlreadyRunning)")
+        }
+        return report(name, slug, true)
+    }
+
+    // MARK: - AC-AF1 — auto-fix stops when its resyncs succeed but never stick
+
+    /// #123: an auto-fix `--resync` succeeded every time while the next scheduled bisync failed
+    /// the same check-sync, for days; the 5-minute backoff never tripped and every resync
+    /// success reset it. A recurrence is an out-of-sync failure after a resync success with no
+    /// normal success in between; after `AutoFixRecurrence.limit` auto-fix stops, the profile
+    /// keeps an error naming the file, and only a normal success re-arms it.
+    private static func testAutoFixRecurringResync() -> Bool {
+        let name = "AC-AF1", slug = "auto-fix-recurring-resync"
+        guard AutoFixRecurrence.limit == 2 else {
+            return report(name, slug, false, "(recurrence limit is \(AutoFixRecurrence.limit), expected 2)")
+        }
+        // The loop from the issue: resync ok → fail → resync ok → fail → give up.
+        var count = 0
+        var trace: [String] = []
+        for resyncSucceeded in [false, true, true] {
+            let step = AutoFixRecurrence.next(previous: count, resyncSucceededSinceLastFailure: resyncSucceeded)
+            count = step.count
+            trace.append("\(step.count)\(step.giveUp ? "!" : "")")
+        }
+        guard trace == ["0", "1", "2!"] else {
+            return report(name, slug, false, "(recurrence trace \(trace), expected [0, 1, 2!])")
+        }
+        // Failures with no resync success in between (auto-fix refused, or the resync itself
+        // failed) are not recurrences, and do not reset the count.
+        let noResync = AutoFixRecurrence.next(previous: 1, resyncSucceededSinceLastFailure: false)
+        guard noResync.count == 1, !noResync.giveUp else {
+            return report(name, slug, false, "(a failure without a resync success changed the count: \(noResync))")
+        }
+
+        // The error names the file rclone reported, taken from the JSON line's `object`.
+        let rawLine = #"{"level":"error","msg":"Path1 file not found in Path2","object":"Docs/a b.pages","objectType":"string","source":"bisync/checksync.go:1","time":"2026-10-22T17:33:00.000000+02:00"}"#
+        let mismatch = AutoFixRecurrence.mismatchDescription(message: "Path1 file not found in Path2", rawLine: rawLine)
+        guard mismatch == "Path1 file not found in Path2: Docs/a b.pages",
+              AutoFixRecurrence.mismatchDescription(message: "Path2 file not found in Path1", rawLine: "not json")
+                == "Path2 file not found in Path1" else {
+            return report(name, slug, false, "(check-sync mismatch description wrong: \(mismatch))")
+        }
+        let withFile = AutoFixRecurrence.errorMessage(recurrences: 2, mismatch: mismatch)
+        let withoutFile = AutoFixRecurrence.errorMessage(recurrences: 2, mismatch: nil)
+        // "out of sync" in the text keeps the error banner's Fix Sync Issues button
+        // (detectErrorAction) and the heartbeat's `out_of_sync` category; it cannot re-arm
+        // auto-fix, which stays suppressed until a normal success.
+        guard withFile.contains("Docs/a b.pages"), withFile.contains("Fix Sync Issues"),
+              !withoutFile.contains("nil"), withoutFile.contains("sync log"),
+              withFile.contains("out of sync"), withoutFile.contains("out of sync"),
+              TelemetryService.categorizeError(withFile) == "out_of_sync" else {
+            return report(name, slug, false, "(give-up error text wrong: \(withFile) / \(withoutFile))")
+        }
+        guard SyncLogPatterns.isCheckSyncMismatch("Path1 file not found in Path2"),
+              SyncLogPatterns.isCheckSyncMismatch("Path2 file not found in Path1"),
+              !SyncLogPatterns.isCheckSyncMismatch("directory not found") else {
+            return report(name, slug, false, "(isCheckSyncMismatch misses bisync's check-sync lines)")
+        }
+        // The auto-fix start line still opens a run, and is told apart from a normal start.
+        let autoFixStart = "2026-10-22 17:35:00 - \(SyncLogPatterns.autoFixResyncStartLine)"
+        guard SyncLogPatterns.isSyncStarted(autoFixStart),
+              SyncLogPatterns.isAutoFixResyncStart(autoFixStart),
+              !SyncLogPatterns.isAutoFixResyncStart("2026-10-22 17:35:00 - Starting bisync") else {
+            return report(name, slug, false, "(the auto-fix resync start line is not recognised)")
+        }
+
+        // Wiring, read from this build's source.
+        guard let source = readSourceFile("Services/SyncManager.swift"),
+              let detailSource = readSourceFile("Views/Settings/ProfileDetailView.swift"),
+              let handler = source.range(of: "private func processLogEvent(") else {
+            return report(name, slug, false, "(could not read the sources)")
+        }
+        func caseBody(from start: String, to end: String) -> Substring? {
+            guard let s = source.range(of: start, range: handler.upperBound..<source.endIndex),
+                  let e = source.range(of: end, range: s.upperBound..<source.endIndex) else { return nil }
+            return source[s.upperBound..<e.lowerBound]
+        }
+        guard let started = caseBody(from: "case .syncStarted:", to: "case .syncCompleted:"),
+              let completed = caseBody(from: "case .syncCompleted:", to: "case .syncFailed("),
+              let failed = caseBody(from: "case .syncFailed(let exitCode, let message):", to: "case .transportChanged("),
+              let errorCase = caseBody(from: "case .errorMessage(let message):", to: "case .driveNotMounted:") else {
+            return report(name, slug, false, "(could not find the processLogEvent cases)")
+        }
+        guard started.contains("SyncLogPatterns.isAutoFixResyncStart(event.rawLine)"),
+              errorCase.contains("SyncLogPatterns.isCheckSyncMismatch(message)") else {
+            return report(name, slug, false, "(a run's start no longer records whether it is the auto-fix resync, or check-sync files are not kept)")
+        }
+        // Only a normal success re-arms auto-fix: the resets sit in the else branch of the
+        // auto-fix-resync check, and the resync's own success only records itself.
+        guard let resyncCheck = completed.range(of: "if autoFixResyncRunning.remove(profileId) != nil {"),
+              let elseBranch = completed.range(of: "} else {", range: resyncCheck.upperBound..<completed.endIndex),
+              completed[resyncCheck.upperBound..<elseBranch.lowerBound].contains("autoFixResyncSucceeded.insert(profileId)") else {
+            return report(name, slug, false, "(syncCompleted no longer tells the auto-fix resync's success apart)")
+        }
+        for reset in ["autoFixSuppressed.remove(profileId)", "autoFixAttempts[profileId] = nil",
+                      "autoFixRecurrences[profileId] = nil", "autoFixGaveUpRecurring.remove(profileId)"] {
+            guard let at = completed.range(of: reset), elseBranch.upperBound <= at.lowerBound else {
+                return report(name, slug, false, "(\(reset) is not limited to a normal success)")
+            }
+        }
+        guard let trigger = extractFunctionBody(startingAt: "func triggerAutoFix(for profile: SyncProfile)", in: source),
+              let suppressedGuard = trigger.range(of: "guard !autoFixSuppressed.contains(profileId) else {"),
+              let recurrenceCheck = trigger.range(of: "AutoFixRecurrence.next("),
+              let backoff = trigger.range(of: "attempts.append(now)"),
+              suppressedGuard.upperBound <= recurrenceCheck.lowerBound, recurrenceCheck.upperBound <= backoff.lowerBound,
+              let gaveUp = trigger.range(of: "result: \"gave_up_recurring\""),
+              let gaveUpReturn = trigger.range(of: "return .gaveUpRecurring"),
+              gaveUp.upperBound <= gaveUpReturn.lowerBound,
+              trigger.contains("result: resyncDidNotStick ? \"recurred\" : \"triggered\""),
+              trigger.contains("notificationService.notifyAutoFixGaveUpRecurring(") else {
+            return report(name, slug, false, "(triggerAutoFix no longer checks for a recurring resync before its backoff)")
+        }
+        // A failure's auto-fix refused by a live lock gets a delayed retry, from every call site.
+        let afterCalls = failed.components(separatedBy: "= triggerAutoFix(for: currentProfile)").dropFirst()
+        let calls = afterCalls.count
+        let retries = afterCalls.filter {
+            $0.drop(while: { $0.isWhitespace }).hasPrefix("scheduleAutoFixLockRetryIfRefused(for: profileId)")
+        }.count
+        guard calls >= 2, calls == retries else {
+            return report(name, slug, false, "(\(calls) auto-fix call(s) in syncFailed, \(retries) followed by the delayed lock retry)")
+        }
+        // Both resync paths split the extra flags like the script does (AC-AF2 checks parity).
+        guard let resync = extractFunctionBody(startingAt: "private func performResync(", in: source),
+              resync.contains("SyncSetupService.splitAdditionalFlags(additionalFlags)"),
+              !resync.contains("components(separatedBy: .whitespaces)"),
+              detailSource.contains("SyncSetupService.splitAdditionalFlags(capturedAdditionalFlags)"),
+              !detailSource.contains("capturedAdditionalFlags.components(separatedBy: .whitespaces)") else {
+            return report(name, slug, false, "(a resync path still splits additionalRcloneFlags on whitespace)")
+        }
+        return report(name, slug, true)
+    }
+
+    // MARK: - AC-AF2 — the app splits additionalRcloneFlags exactly as the sync script does
+
+    /// The auto-fix and editor resyncs used to split the extra flags on whitespace while the
+    /// script uses shlex + `~` / `$VAR` expansion, so the resync ran different filters than the
+    /// scheduled bisync it was repairing (#123). Runs the script's real splitter through the
+    /// dry-run seam and compares its argv with `SyncSetupService.splitAdditionalFlags`.
+    private static func testAdditionalFlagsSplitParity() -> Bool {
+        let name = "AC-AF2", slug = "additional-flags-split-parity"
+        let fm = FileManager.default
+        let root = "\(selfTestRoot)/af2-\(UUID().uuidString)"
+        let local = "\(root)/mnt", cache = "\(root)/cache", target = "\(root)/remote-target"
+        for dir in [local, cache, target] {
+            try? fm.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        }
+        let rcloneConfig = aliasRcloneConfig(name: "synology", path: target)
+        let home = ProcessInfo.processInfo.environment["HOME"] ?? NSHomeDirectory()
+
+        // Direct expectations first, so the two splitters cannot agree on a wrong answer.
+        let expectations: [(flags: String, args: [String])] = [
+            ("--exclude \"some dir/**\" --filter-from ~/x.txt", ["--exclude", "some dir/**", "--filter-from", "\(home)/x.txt"]),
+            ("--log-file=~/y.log --exclude 'a b' --exclude a\\ b", ["--log-file=\(home)/y.log", "--exclude", "a b", "--exclude", "a b"]),
+            ("--exclude \"c\\\"d\" --exclude \"e\\f\"", ["--exclude", "c\"d", "--exclude", "e\\f"]),
+            ("--exclude \"$HOME/q\" --exclude '${HOME}/r' --exclude $SYNCTRAY_AF2_UNSET_VAR",
+             ["--exclude", "\(home)/q", "--exclude", "\(home)/r", "--exclude", "$SYNCTRAY_AF2_UNSET_VAR"]),
+            ("--bwlimit 10M  \t --transfers=8 --exclude x\"y\"'z'", ["--bwlimit", "10M", "--transfers=8", "--exclude", "xyz"]),
+        ]
+        for e in expectations {
+            guard let got = SyncSetupService.splitAdditionalFlags(e.flags), got == e.args else {
+                return report(name, slug, false, "(splitAdditionalFlags(\(e.flags)) = \(String(describing: SyncSetupService.splitAdditionalFlags(e.flags))), expected \(e.args))")
+            }
+        }
+        for malformed in ["--exclude \"unterminated", "--exclude 'open", "--exclude trailing\\"] {
+            guard SyncSetupService.splitAdditionalFlags(malformed) == nil else {
+                return report(name, slug, false, "(\(malformed) split instead of being refused, as the script refuses it)")
+            }
+        }
+
+        // Parity with the script's own splitter: same tokens, nothing added or dropped.
+        var baseline = mountFixtureProfile(localPath: local, cachePath: cache)
+        baseline.additionalRcloneFlags = ""
+        defer { try? fm.removeItem(atPath: baseline.cacheOnlyConfigPath) }
+        let base = dryRunMountScript(profile: baseline, rcloneConfig: rcloneConfig)
+        guard base.exitCode == 0, !base.args.isEmpty else {
+            return report(name, slug, false, "(baseline dry run failed: exit=\(base.exitCode) out=\(base.output) log=\(base.log))")
+        }
+        for e in expectations + [("--exclude ~root/x --exclude=~/z", [])] {
+            guard let ours = SyncSetupService.splitAdditionalFlags(e.flags) else {
+                return report(name, slug, false, "(splitAdditionalFlags refused \(e.flags))")
+            }
+            var profile = mountFixtureProfile(localPath: local, cachePath: cache)
+            profile.additionalRcloneFlags = e.flags
+            let run = dryRunMountScript(profile: profile, rcloneConfig: rcloneConfig)
+            guard run.exitCode == 0, run.args.count == base.args.count + ours.count,
+                  Array(run.args.suffix(ours.count)) == ours else {
+                return report(name, slug, false,
+                    "(script and app split \(e.flags) differently: script \(Array(run.args.dropFirst(base.args.count))), app \(ours); log=\(run.log))")
+            }
         }
         return report(name, slug, true)
     }

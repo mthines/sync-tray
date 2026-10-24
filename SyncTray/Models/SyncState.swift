@@ -514,6 +514,22 @@ enum SyncLogPatterns {
         return lower.contains("starting bisync") || lower.contains("starting sync")
     }
 
+    /// The start line `SyncManager.performResync` writes for an auto-fix `--resync`. It still
+    /// matches `isSyncStarted`; `isAutoFixResyncStart` lets the log pipeline tell that run's
+    /// success apart from a normal bisync's (#123).
+    static let autoFixResyncStartLine = "Starting bisync (auto-fix --resync)"
+
+    static func isAutoFixResyncStart(_ line: String) -> Bool {
+        line.contains(autoFixResyncStartLine)
+    }
+
+    /// bisync's final check-sync listing comparison found a file on one side only ("Path1 file
+    /// not found in Path2", "Path2 file not found in Path1"). rclone names the file only in the
+    /// JSON line's `object`.
+    static func isCheckSyncMismatch(_ message: String) -> Bool {
+        message.contains("file not found in Path")
+    }
+
     /// Patterns indicating sync completed successfully
     static func isSyncCompleted(_ message: String) -> Bool {
         let lower = message.lowercased()

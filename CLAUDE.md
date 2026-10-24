@@ -13,7 +13,7 @@ SyncTray is a macOS menu bar application that provides Google Drive-style backgr
 - **Live progress tracking**: Parses rclone JSON logs for real-time transfer progress
 - **macOS notifications**: Batch notifications for file changes with "Open Directory" action
 - **Fallback remote**: Automatic failover to an alternative remote when the primary is unreachable
-- **Auto-fix sync issues**: Automatically runs `--resync` recovery when bisync detects an out-of-sync state (app-wide setting, default ON). Skipped when the profile's external drive is unmounted — a `--resync` against a missing/empty local path can't safely fix anything, so the profile is left in `.driveNotMounted` and resumes normally once the drive reconnects. Gated by the single-run guard (Critical Rule 8) — it never fires while another run already holds the profile's lock.
+- **Auto-fix sync issues**: Automatically runs `--resync` recovery when bisync detects an out-of-sync state (app-wide setting, default ON). Skipped when the profile's external drive is unmounted — a `--resync` against a missing/empty local path can't safely fix anything, so the profile is left in `.driveNotMounted` and resumes normally once the drive reconnects. Gated by the single-run guard (Critical Rule 8) — it never fires while another run already holds the profile's lock; when that lock belongs to the failing run itself (its script still exiting), it retries once after 5 s. Stops after `AutoFixRecurrence.limit` (2) **recurrences** — an out-of-sync failure when the last run to succeed was the auto-fix resync itself — and leaves the profile in error with the check-sync file rclone named (`Auto-fix stopped: …`), plus one notification sent even when the profile is muted. The auto-fix resync's own success never resets backoff or recurrences; only a normal success does. The resync (like the editor's) splits `additionalRcloneFlags` exactly as the script does (`SyncSetupService.splitAdditionalFlags`, checked against the script by AC-AF2), so it runs the same filters as the scheduled bisync. Covered by AC-AF1.
 
 ### Sync Modes
 
@@ -1570,6 +1570,12 @@ private var autoFixSuppressed: Set<UUID> = []          // profiles where auto-fi
 // One failed run, handled once (in-memory, cleared on a run start or a success):
 private var lastHandledSyncFailureAt: [UUID: Date] = [:]
 private var lastSyncFailureAutoFix: [UUID: AutoFixOutcome] = [:]
+// Resyncs that succeed but don't stick (AutoFixRecurrence; cleared by a NORMAL success):
+private var autoFixResyncRunning: Set<UUID> = []       // current run is the auto-fix resync
+private var autoFixResyncSucceeded: Set<UUID> = []     // last success was the auto-fix resync
+private var autoFixRecurrences: [UUID: Int] = [:]
+private var autoFixGaveUpRecurring: Set<UUID> = []
+private var lastCheckSyncMismatch: [UUID: String] = [:] // "Path1 file not found in Path2: <file>", app-only
 ```
 
 This allows independent state tracking per profile while maintaining a single source of truth.
