@@ -1585,10 +1585,16 @@ bisync: …" notice, then the wrapper's "Bisync failed with exit code N" — and
 `.syncFailed`. `processLogEvent` sets the error, notifies, records telemetry and tries auto-fix
 for the first one only: `SyncManager.syncFailureHandling` (pure) treats a failure within
 `TelemetryService.duplicateSyncFailureWindow` of the last one handled, with no run start or
-success in between, as the same run's — the rule `recordSyncFailed` counts by. The one thing
-the repeat still does: when the first failure's auto-fix was refused as
-`blockedAlreadyRunning` (rclone's notice is read while the script still holds its run lock), it
-tries auto-fix again, since the script writes its own line as it exits. Covered by
+success in between, as the same run's — the rule `recordSyncFailed` counts by. An app-launched
+recovery run (Force Sync, the editor's resync, Smart Fix, …) logs no start line, so
+`beginExclusiveRun` clears that state for every source but auto-fix — auto-fix starts while
+the failure's second end line is still to come. The repeat sends no notification and records
+nothing; it only (1) tries auto-fix again when the first failure's attempt was refused as
+`blockedAlreadyRunning` (rclone's notice is read while the script still holds its run lock, and
+the script writes its own line as it exits), (2) replaces the exit code of an error still
+shown with the script's real one (rclone's notice carries none, so it parses as 1), and (3)
+retries a deferred external reinstall (`retryPendingExternalReinstallIfNeeded`), so an edit
+deferred between the two end lines is not left until the next run ends. Covered by
 `ConfigSelfTest` AC-SF1.
 
 ### @MainActor Thread Safety
