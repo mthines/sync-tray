@@ -3145,6 +3145,9 @@ final class SyncManager: ObservableObject {
                 }
                 SyncTraySettings.debugLog(
                     "Ignoring repeated syncFailed (exit \(exitCode)) for '\(profileName)': this run's failure was already handled")
+                // An external edit deferred between the run's two end lines is applied now,
+                // not only when the next run ends.
+                retryPendingExternalReinstallIfNeeded(for: profileId)
                 break
             }
             lastHandledSyncFailureAt[profileId] = failureHandledAt
