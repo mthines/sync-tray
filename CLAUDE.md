@@ -1597,7 +1597,7 @@ that same failure only), (2) replaces the exit code of an error still
 shown with the script's real one (rclone's notice carries none, so it parses as 1), and (3)
 retries a deferred external reinstall (`retryPendingExternalReinstallIfNeeded`), so an edit
 deferred between the two end lines is not left until the next run ends. Covered by
-`ConfigSelfTest` AC-SF1.
+`ConfigSelfTest` AC-SF1; the 5 s lock retry by AC-AF1.
 
 ### @MainActor Thread Safety
 
