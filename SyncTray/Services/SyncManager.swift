@@ -1573,9 +1573,10 @@ final class SyncManager: ObservableObject {
         !muted || consecutiveFailedRuns == threshold
     }
 
-    /// The muted profile's notification: the usual failure text, plus why it was sent anyway.
+    /// The muted profile's notification: why it was sent anyway first — a banner truncates
+    /// the end, and rclone's error can be long — then the usual failure text.
     nonisolated static func mutedRepeatedFailureNotice(_ text: String, consecutiveFailedRuns: Int) -> String {
-        "\(text) This profile's notifications are muted, but its last \(consecutiveFailedRuns) syncs all failed."
+        "Notifications are muted for this profile, but its last \(consecutiveFailedRuns) syncs all failed. \(text)"
     }
 
     // MARK: - Telemetry Opt-In

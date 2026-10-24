@@ -9921,7 +9921,7 @@ enum ConfigSelfTest {
             }
         }
         let notice = SyncManager.mutedRepeatedFailureNotice("Sync failed: boom", consecutiveFailedRuns: 3)
-        guard notice.hasPrefix("Sync failed: boom"), notice.contains("muted"), notice.contains("3") else {
+        guard notice.hasPrefix("Notifications are muted"), notice.hasSuffix(". Sync failed: boom"), notice.contains("3 syncs") else {
             return report(name, slug, false, "(muted notice text wrong: \(notice))")
         }
 
