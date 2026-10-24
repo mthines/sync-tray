@@ -3168,15 +3168,19 @@ final class SyncManager: ObservableObject {
             // shared log file, not necessarily the run that holds the token.
             lastHandledSyncFailureAt[profileId] = nil
             lastSyncFailureAutoFix[profileId] = nil
+            // Any success, the auto-fix resync's included, ends the backoff's window: it exists
+            // for a resync that itself fails back-to-back. Kept across a resync success, it
+            // gave up as `gave_up_backoff` on a 1–2 minute interval before
+            // `AutoFixRecurrence` could reach its limit (review finding on #126).
+            autoFixAttempts[profileId] = nil
             if autoFixResyncRunning.remove(profileId) != nil {
                 // The auto-fix resync worked, but that alone does not show the pair converged:
-                // only a normal bisync succeeding after it does (#123). Keep the backoff and
-                // recurrence state, so a resync that keeps "working" while the next bisync
+                // only a normal bisync succeeding after it does (#123). Keep the suppression
+                // and recurrence state, so a resync that keeps "working" while the next bisync
                 // fails the same way is caught by `AutoFixRecurrence`.
                 autoFixResyncSucceeded.insert(profileId)
             } else {
                 autoFixSuppressed.remove(profileId)
-                autoFixAttempts[profileId] = nil
                 autoFixResyncSucceeded.remove(profileId)
                 autoFixRecurrences[profileId] = nil
                 autoFixGaveUpRecurring.remove(profileId)

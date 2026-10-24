@@ -9791,18 +9791,25 @@ enum ConfigSelfTest {
               errorCase.contains("SyncLogPatterns.isCheckSyncMismatch(message)") else {
             return report(name, slug, false, "(a run's start no longer records whether it is the auto-fix resync, or check-sync files are not kept)")
         }
-        // Only a normal success re-arms auto-fix: the resets sit in the else branch of the
-        // auto-fix-resync check, and the resync's own success only records itself.
+        // Only a normal success re-arms auto-fix: suppression and recurrence resets sit in the
+        // else branch of the auto-fix-resync check, and the resync's own success records itself
+        // (and, like every success, clears the backoff's attempts).
         guard let resyncCheck = completed.range(of: "if autoFixResyncRunning.remove(profileId) != nil {"),
               let elseBranch = completed.range(of: "} else {", range: resyncCheck.upperBound..<completed.endIndex),
               completed[resyncCheck.upperBound..<elseBranch.lowerBound].contains("autoFixResyncSucceeded.insert(profileId)") else {
             return report(name, slug, false, "(syncCompleted no longer tells the auto-fix resync's success apart)")
         }
-        for reset in ["autoFixSuppressed.remove(profileId)", "autoFixAttempts[profileId] = nil",
-                      "autoFixRecurrences[profileId] = nil", "autoFixGaveUpRecurring.remove(profileId)"] {
+        for reset in ["autoFixSuppressed.remove(profileId)", "autoFixRecurrences[profileId] = nil",
+                      "autoFixGaveUpRecurring.remove(profileId)"] {
             guard let at = completed.range(of: reset), elseBranch.upperBound <= at.lowerBound else {
                 return report(name, slug, false, "(\(reset) is not limited to a normal success)")
             }
+        }
+        // The backoff's attempt list clears on every success, the resync's included, or a
+        // short sync interval trips the backoff before the recurrence limit.
+        guard let attemptsReset = completed.range(of: "autoFixAttempts[profileId] = nil"),
+              attemptsReset.upperBound <= resyncCheck.lowerBound else {
+            return report(name, slug, false, "(the backoff's attempt list is no longer cleared on every success)")
         }
         guard let trigger = extractFunctionBody(startingAt: "func triggerAutoFix(for profile: SyncProfile)", in: source),
               let suppressedGuard = trigger.range(of: "guard !autoFixSuppressed.contains(profileId) else {"),
