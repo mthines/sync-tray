@@ -9711,8 +9711,9 @@ enum ConfigSelfTest {
                                        range: notAutoFix.upperBound..<begin.endIndex),
               let granted = begin.range(of: "abortSuppressUntil[profile.id] = nil"),
               granted.upperBound <= notAutoFix.lowerBound,
-              !begin[notAutoFix.upperBound..<forget.lowerBound].contains("}") else {
-            return report(name, slug, false, "(beginExclusiveRun no longer forgets the last failure for a recovery run, or does it for auto-fix too)")
+              !begin[notAutoFix.upperBound..<forget.lowerBound].contains("}"),
+              begin[notAutoFix.upperBound...].prefix(400).contains("TelemetryService.shared.forgetLastSyncFailure(profileId: profile.id)") else {
+            return report(name, slug, false, "(beginExclusiveRun no longer forgets the last failure — in the app and in telemetry — for a recovery run, or does it for auto-fix too)")
         }
         return report(name, slug, true)
     }

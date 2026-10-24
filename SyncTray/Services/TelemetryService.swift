@@ -778,9 +778,9 @@ final class TelemetryService {
     /// `lastFailureAt` is cleared when a run starts or succeeds, so a failure after a start
     /// always counts. Runs that log no start (Force Sync and the profile editor's resync run
     /// rclone directly) report a failure once, as rclone's notice: Force Sync's own exit line
-    /// has no timestamp, so `LogParser` never reads it. For them the window removes no
-    /// duplicate; it only bounds the cost — their failure counts unless another was recorded
-    /// for the profile moments before it.
+    /// has no timestamp, so `LogParser` never reads it. `SyncManager.beginExclusiveRun`
+    /// forgets the last failure when one of them starts (`forgetLastSyncFailure`), so their
+    /// failure always counts.
     static func isDuplicateSyncFailure(
         lastFailureAt: Date?,
         now: Date,
@@ -790,6 +790,14 @@ final class TelemetryService {
         let elapsed = now.timeIntervalSince(lastFailureAt)
         // A clock that stepped backwards proves nothing about the run, so it counts.
         return elapsed >= 0 && elapsed < window
+    }
+
+    /// An app-launched recovery run (Force Sync, the editor's resync, …) started. It logs no
+    /// start line, so forget the profile's last recorded failure here, or a failure of its own
+    /// within `duplicateSyncFailureWindow` would be dropped as a repeat. Called by
+    /// `SyncManager.beginExclusiveRun`, which resets the app's own state the same way.
+    func forgetLastSyncFailure(profileId: UUID) {
+        lastSyncFailureAt[profileId] = nil
     }
 
     /// Called when a sync operation fails.

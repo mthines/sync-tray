@@ -1381,6 +1381,7 @@ final class SyncManager: ObservableObject {
         if source != .autoFix {
             lastHandledSyncFailureAt[profile.id] = nil
             lastSyncFailureAutoFix[profile.id] = nil
+            TelemetryService.shared.forgetLastSyncFailure(profileId: profile.id)
         }
         return token
     }
