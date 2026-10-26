@@ -146,14 +146,16 @@ failure is recorded first by anything that ends the profile's span or starts its
 code is what makes a stopped run `error.type=interrupted` (see [Error
 categories](#error-categories)). Covered by AC-TS8.
 
-**A run the user stopped is not a failure.** Abort (CLAUDE.md Critical Rule 9) and Pause both
-make `.syncFailed` drop the stopped run's end lines (`SyncManager.wasRunAborted`), so they
+**A run Abort or Pause stopped is not a failure.** Abort (CLAUDE.md Critical Rule 9) and Pause
+both make `.syncFailed` drop the stopped run's end lines (`SyncManager.wasRunAborted`), so they
 record no failure: the span ends as `sync.result=skipped` with `sync.skip_reason`
 `aborted`/`paused`, and `synctray.sync.completed` is not incremented. Pause SIGTERMs the run's
 process group and opens the same window for `SyncAbort.pauseRunEndSuppression` (rclone's
 graceful shutdown plus the trailing backstop, 120 s); Resume ends it. Usually the group signal
 kills the script and its `tee` too, so nothing more reaches the log; the window covers what
-still does. Covered by AC-AB3–AC-AB5.
+still does. Covered by AC-AB3–AC-AB5. Other stops (Ctrl-C on `synctray sync`, an external
+SIGTERM/SIGKILL) still count in `synctray.sync.completed{sync.result=failure}`; tell them apart
+by `error.type=interrupted` on `synctray.sync.errors` and on the `synctray sync` span.
 
 ## Per-profile Heartbeat Logs
 
