@@ -1413,6 +1413,34 @@ final class SyncManager: ObservableObject {
             || SyncRunLock.isLive(sessionLock, isAlive: isAlive)
     }
 
+    /// Clear a Two-Way profile's own STALE locks before `resumeProfile` reloads its
+    /// `RunAtLoad` agent. Pause SIGTERMs the run's whole process group
+    /// (`terminateRunningSync`) but removes only the `/tmp` run lock; rclone can die
+    /// without releasing its bisync session `.lck` (signalling `tee` makes it SIGPIPE
+    /// mid-shutdown — Critical Rule 9), and rclone never expires that lock itself, so
+    /// the run the agent starts on resume would fail "prior lock file found" until
+    /// Unlock & Retry. Stale-only via `SyncRunLock.removeStaleLocks` (refuses if either
+    /// holder is live), and skipped while a run token or an abort is active — the same
+    /// gates as Unlock & Retry. Not for Stream (R7) or One-Way profiles, which have no
+    /// session lock. Returns `nil` when skipped. Pure static so it is self-testable
+    /// (AC-SR19).
+    @discardableResult
+    nonisolated static func clearStaleLocksBeforeResume(
+        syncMode: SyncMode,
+        abortInFlight: Bool,
+        registryActive: Bool,
+        runLockPath: String,
+        sessionLockPath: String,
+        isAlive: (Int32) -> Bool
+    ) -> SyncRunLock.UnlockDecision? {
+        guard syncMode == .bisync, !abortInFlight, !registryActive else { return nil }
+        return SyncRunLock.removeStaleLocks(
+            runLockPath: runLockPath,
+            sessionLockPath: sessionLockPath,
+            isAlive: isAlive
+        )
+    }
+
     /// Read a profile's two lock holders fresh from disk: the `/tmp` run lock and
     /// the bisync session `.lck`. Shared by every method below so the parse logic
     /// lives in one place.
@@ -2222,6 +2250,22 @@ final class SyncManager: ObservableObject {
               profile.isEnabled else { return }
 
         pausedProfiles.remove(profileId)
+
+        // The agent is RunAtLoad, so loading it starts a run at once. A pause that
+        // interrupted a bisync can leave its session .lck behind with a dead holder;
+        // clear it (stale-only) first, or that run fails "prior lock file found".
+        // A refusal (a live holder) is logged so a resume that still hits the lock
+        // can be traced back to it.
+        if let decision = Self.clearStaleLocksBeforeResume(
+            syncMode: profile.syncMode,
+            abortInFlight: isAborting(for: profileId),
+            registryActive: exclusiveRunRegistry.isActive(profile.id),
+            runLockPath: profile.lockFilePath,
+            sessionLockPath: SyncRunLock.sessionLockPath(for: profile),
+            isAlive: SyncRunLock.processIsAlive
+        ), decision != .allow {
+            SyncTraySettings.debugLog("Resume '\(profile.name)': stale-lock cleanup refused (\(decision))")
+        }
 
         // The run Pause stopped has had its say: the agent is `RunAtLoad`, so loading it below
         // starts a run at once, and Pause's run-end window must not hide that run's failure

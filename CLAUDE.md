@@ -1767,6 +1767,12 @@ This is now structurally prevented:
   sibling profile's lock. A run releases its `/tmp` lock on exit only if the file still holds one
   of its own tokens (`SyncRunLock.releaseIfOwned`), and swaps its launch-time placeholder for the
   real child PID only if the lock still holds that placeholder (`SyncRunLock.replaceIfOwned`).
+  **Resume also clears stale locks first.** Pause SIGTERMs a running sync's process group
+  (`terminateRunningSync`) and removes only the `/tmp` run lock, so rclone can die without
+  releasing its session `.lck`; the `RunAtLoad` agent `resumeProfile` reloads would then fail
+  `prior lock file found`. `resumeProfile` therefore calls
+  `SyncManager.clearStaleLocksBeforeResume` (→ `removeStaleLocks`) before `loadAgent` — Two-Way
+  profiles only, and never while a registry token or an abort is active.
 - **"Running" comes from real liveness, not the cosmetic `.syncing` state.** `isSyncRunningForProfile`
   and the "Last sync error" banner consult `SyncManager.isRunLive(for:)`, which is registry-token
   OR run-lock OR session-lock liveness (mount-mode profiles consult the registry only — R7: a
@@ -1783,6 +1789,9 @@ Covered by `ConfigSelfTest` AC-SR1–AC-SR8, AC-SR16–AC-SR18 (9 original cases
 review — the `profile set` persist-before-refuse ordering and a source-text pin on the
 `getpid()`/`uninstallForReinstall`/deferred-reinstall-retry guards); each negative assertion
 was independently shown to fail once by a temporary mutation before being fixed.
+AC-SR19 covers the resume-time cleanup (a dead holder's session lock is removed, a live one,
+a Stream / One-Way profile and an active abort or token are left alone, and `resumeProfile`
+runs it before `loadAgent`).
 
 ### 9. Aborting a Running Sync — Graceful First, Stale-Only Cleanup
 While a Two-Way / One-Way profile's run is live, the profile card's Pause button becomes
