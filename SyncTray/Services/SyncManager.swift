@@ -2206,14 +2206,18 @@ final class SyncManager: ObservableObject {
         // The agent is RunAtLoad, so loading it starts a run at once. A pause that
         // interrupted a bisync can leave its session .lck behind with a dead holder;
         // clear it (stale-only) first, or that run fails "prior lock file found".
-        Self.clearStaleLocksBeforeResume(
+        // A refusal (a live holder) is logged so a resume that still hits the lock
+        // can be traced back to it.
+        if let decision = Self.clearStaleLocksBeforeResume(
             syncMode: profile.syncMode,
             abortInFlight: isAborting(for: profileId),
             registryActive: exclusiveRunRegistry.isActive(profile.id),
             runLockPath: profile.lockFilePath,
             sessionLockPath: SyncRunLock.sessionLockPath(for: profile),
             isAlive: SyncRunLock.processIsAlive
-        )
+        ), decision != .allow {
+            SyncTraySettings.debugLog("Resume '\(profile.name)': stale-lock cleanup refused (\(decision))")
+        }
 
         // Reload the launchd agent that pause unloaded so scheduled syncs run
         // again. (No-op if it somehow never unloaded.)
