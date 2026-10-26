@@ -1,4 +1,5 @@
 import Foundation
+import Darwin
 
 /// Service for generating and managing sync scripts and launchd configuration
 final class SyncSetupService {
@@ -410,6 +411,16 @@ final class SyncSetupService {
         } else {
             cleanupBisyncCache(for: old)
             cleanupBisyncCache(for: new)
+        }
+        // Not rethrown: the agent is already unloaded and its plist deleted, and the CLI's
+        // `profile set` and launchd reconcile treat any error from here as a refusal and skip
+        // the reinstall, which would leave the profile with no agent at all. The app callers
+        // ignore it and install anyway. `requestInitialScheduledSync` has already written the
+        // visible profile error.
+        do {
+            try Self.requestInitialScheduledSync(from: old, to: new)
+        } catch {
+            SyncTraySettings.debugLog("Initial scheduled sync request failed for \(new.name): \(error)")
         }
     }
 
@@ -1538,14 +1549,157 @@ extension SyncSetupService {
                 python3 -c "import json,sys; d=json.load(open('$CONFIG_FILE')); print(d.get('$1', '$2'))"
             }
 
-            REMOTE=$(parse_json "remote" "")
-            LOCAL_PATH=$(parse_json "localPath" "")
-            LOG_FILE=$(parse_json "logPath" "")
-            LOCK_FILE=$(parse_json "lockFile" "")
-            DRIVE_PATH=$(parse_json "drivePath" "")
+            # Inspect eligibility before taking the sync lock. Idle checks load the
+            # config once and never contend with Sync Now / Save. Only a due/manual
+            # run takes the run lock and rechecks + records its attempt below.
+            schedule_check() {
+                python3 - "$CONFIG_FILE" "${2:-}" "${SYNCTRAY_DRY_RUN:-}" "$1" <<'SYNCTRAY_SCHEDULE'
+            import fcntl, json, os, sys, tempfile, time
+            def emit(key, value):
+                sys.stdout.buffer.write((key + '\\0' + str(value) + '\\0').encode())
+            def write_state(path, state):
+                fd, tmp = tempfile.mkstemp(prefix='.schedule-', dir=os.path.dirname(path))
+                try:
+                    with os.fdopen(fd, 'w') as f:
+                        json.dump(state, f)
+                        f.flush()
+                        os.fsync(f.fileno())
+                    os.replace(tmp, path)
+                finally:
+                    if os.path.exists(tmp):
+                        os.unlink(tmp)
+            try:
+                with open(sys.argv[1]) as f:
+                    config = json.load(f)
+                fields = {'REMOTE': ('remote', ''), 'LOCAL_PATH': ('localPath', ''),
+                          'LOG_FILE': ('logPath', ''), 'LOCK_FILE': ('lockFile', ''),
+                          'DRIVE_PATH': ('drivePath', ''), 'SYNC_MODE': ('syncMode', 'bisync')}
+                for name, (key, default) in fields.items():
+                    emit(name, config.get(key, default))
+                if config.get('syncMode', 'bisync') == 'mount' or config.get('syncOnLocalChanges', True) is not False:
+                    emit('SCHEDULE_STATUS', 0)
+                    sys.exit(0)
+                path = config.get('scheduleStatePath', '')
+                if not path:
+                    raise ValueError('schedule state path is missing')
+                interval = config.get('syncIntervalMinutes', 5)
+                if type(interval) is not int or not 1 <= interval <= 525600:
+                    raise ValueError('invalid sync interval')
+                identity = [config['remote'], config['localPath'], config['syncMode'], config['syncDirection']]
+                manual = sys.argv[2] == '--manual'
+                dry = sys.argv[3] == '1'
+                commit = sys.argv[4] == 'commit'
+                now = int(time.time())
+                # This short metadata lock is separate from the run lock/UI liveness.
+                # It serializes clock correction with real attempt writes, so an idle
+                # check cannot overwrite an attempt that just started in another process.
+                os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+                with os.fdopen(os.open(path + '.lock', os.O_CREAT | os.O_RDWR, 0o600), 'r+') as metadata:
+                    fcntl.flock(metadata, fcntl.LOCK_EX)
+                    state = {}
+                    try:
+                        with open(path) as f:
+                            state = json.load(f)
+                        if not isinstance(state, dict):
+                            raise ValueError('schedule history is not an object')
+                    except FileNotFoundError:
+                        pass
+                    except (ValueError, TypeError):
+                        if not manual:
+                            raise ValueError('schedule history is invalid; use Sync Now to rebuild it')
+                        state = {}
+                    request = ''
+                    try:
+                        with open(path + '.request') as f:
+                            request = f.read().strip()
+                    except FileNotFoundError:
+                        pass
+                    last = state.get('lastAttempt') if state.get('identity') == identity else None
+                    if type(last) is not int or last < 0:
+                        last = None
+                    if last is not None and last > now:
+                        last = now
+                        state['lastAttempt'] = now
+                        if not dry:
+                            write_state(path, state)
+                    pending = bool(request) and request != state.get('requestToken', '')
+                    due = manual or pending or last is None or now >= last + interval * 60
+                    if due and commit and not dry:
+                        write_state(path, {'identity': identity, 'lastAttempt': now, 'requestToken': request})
+                    emit('SCHEDULE_STATUS', 0 if due else 10)
+            except Exception as error:
+                emit('SCHEDULE_ERROR', str(error))
+                emit('SCHEDULE_STATUS', 1)
+                print('SyncTray schedule check failed: %s' % error, file=sys.stderr)
+            SYNCTRAY_SCHEDULE
+            }
+
+            read_schedule() {
+                local key value
+                SCHEDULE_STATUS=1
+                SCHEDULE_ERROR="Unable to read schedule configuration"
+                # NUL-delimited values preserve paths literally; no eval or shell
+                # interpolation of configuration values. Names come from the fixed map.
+                while IFS= read -r -d '' key && IFS= read -r -d '' value; do
+                    case "$key" in
+                        REMOTE|LOCAL_PATH|LOG_FILE|LOCK_FILE|DRIVE_PATH|SYNC_MODE|SCHEDULE_STATUS|SCHEDULE_ERROR)
+                            printf -v "$key" '%s' "$value" ;;
+                    esac
+                done < <(schedule_check "$1" "${2:-}")
+                if [[ "$SCHEDULE_STATUS" == "10" ]]; then
+                    return 10
+                elif [[ "$SCHEDULE_STATUS" != "0" ]]; then
+                    ERROR_LINE="$(date '+%Y-%m-%d %H:%M:%S') - Schedule check failed: $SCHEDULE_ERROR"
+                    if [[ -n "$LOG_FILE" ]]; then
+                        echo "$ERROR_LINE" >> "$LOG_FILE"
+                    fi
+                    echo "$ERROR_LINE" >&2
+                    return 1
+                fi
+                return 0
+            }
+
+            read_schedule inspect "${2:-}"
+            SCHEDULE_RESULT=$?
+            if [[ $SCHEDULE_RESULT -eq 10 ]]; then exit 0; fi
+            if [[ $SCHEDULE_RESULT -ne 0 ]]; then exit 1; fi
+
+            if [[ -z "$REMOTE" || -z "$LOCAL_PATH" ]]; then
+                echo "Error: Invalid config - missing remote or localPath"
+                exit 1
+            fi
+
+            # A disconnected drive is checked only once an attempt is actually due.
+            if [[ -n "$DRIVE_PATH" && ! -d "$DRIVE_PATH" ]]; then
+                echo "$(date '+%Y-%m-%d %H:%M:%S') - Drive not mounted, skipping sync" >> "$LOG_FILE"
+                exit 0
+            fi
+
+            acquire_lock() {
+                ( set -o noclobber; echo $$ > "$LOCK_FILE" ) 2>/dev/null
+            }
+            if ! acquire_lock; then
+                PID=$(cat "$LOCK_FILE" 2>/dev/null)
+                if [[ -n "$PID" ]] && ps -p "$PID" > /dev/null 2>&1; then
+                    echo "$(date '+%Y-%m-%d %H:%M:%S') - Sync already running (PID $PID), skipping" >> "$LOG_FILE"
+                    exit 0
+                fi
+                echo "$(date '+%Y-%m-%d %H:%M:%S') - Removing stale lock (PID ${PID:-unknown} not running)" >> "$LOG_FILE"
+                rm -f "$LOCK_FILE"
+                if ! acquire_lock; then
+                    echo "$(date '+%Y-%m-%d %H:%M:%S') - Could not acquire lock, skipping" >> "$LOG_FILE"
+                    exit 0
+                fi
+            fi
+            trap 'rm -f "$LOCK_FILE"' EXIT
+
+            read_schedule commit "${2:-}"
+            SCHEDULE_RESULT=$?
+            if [[ $SCHEDULE_RESULT -eq 10 ]]; then exit 0; fi
+            if [[ $SCHEDULE_RESULT -ne 0 ]]; then exit 1; fi
+
             ADDITIONAL_FLAGS=$(parse_json "additionalFlags" "")
             FILTER_FILE=$(parse_json "filterPath" "")
-            SYNC_MODE=$(parse_json "syncMode" "bisync")
             SYNC_DIRECTION=$(parse_json "syncDirection" "localToRemote")
             FALLBACK_REMOTE=$(parse_json "fallbackRemote" "")
             FALLBACK_PATH=$(parse_json "fallbackRemotePath" "")
@@ -1601,11 +1755,6 @@ extension SyncSetupService {
             # Mount resilience (mount mode). Default true, matching the Swift model default
             # so a config that predates the field hardens on its next mount.
             MOUNT_RESILIENT=$(parse_json "mountResilient" "true")
-
-            if [[ -z "$REMOTE" || -z "$LOCAL_PATH" ]]; then
-                echo "Error: Invalid config - missing remote or localPath"
-                exit 1
-            fi
 
             # Find rclone binary. Cover the common package-manager locations,
             # including nix-darwin's system and per-user profiles which live outside
@@ -1719,37 +1868,7 @@ extension SyncSetupService {
                 [[ $rc -eq 0 || $rc -eq 3 || $rc -eq 4 ]]
             }
 
-            # Check if drive is mounted (if configured)
-            if [[ -n "$DRIVE_PATH" && ! -d "$DRIVE_PATH" ]]; then
-                echo "$(date '+%Y-%m-%d %H:%M:%S') - Drive not mounted, skipping sync" >> "$LOG_FILE"
-                exit 0
-            fi
 
-            # Acquire the lock ATOMICALLY. `set -o noclobber` makes the '>'
-            # redirection fail if the file already exists, so the check and the
-            # write are a single atomic step — closing the check-then-write
-            # (TOCTOU) race where two launchd/manual runs could both pass the
-            # old `[[ -f ]]` test and start concurrently. The PID is still stored
-            # as the file's contents, so the app's lock readers are unchanged.
-            acquire_lock() {
-                ( set -o noclobber; echo $$ > "$LOCK_FILE" ) 2>/dev/null
-            }
-
-            if ! acquire_lock; then
-                PID=$(cat "$LOCK_FILE" 2>/dev/null)
-                if [[ -n "$PID" ]] && ps -p "$PID" > /dev/null 2>&1; then
-                    echo "$(date '+%Y-%m-%d %H:%M:%S') - Sync already running (PID $PID), skipping" >> "$LOG_FILE"
-                    exit 0
-                fi
-                # Lock owner is gone — reclaim the stale lock and retry once.
-                echo "$(date '+%Y-%m-%d %H:%M:%S') - Removing stale lock (PID ${PID:-unknown} not running)" >> "$LOG_FILE"
-                rm -f "$LOCK_FILE"
-                if ! acquire_lock; then
-                    echo "$(date '+%Y-%m-%d %H:%M:%S') - Could not acquire lock, skipping" >> "$LOG_FILE"
-                    exit 0
-                fi
-            fi
-            trap 'rm -f "$LOCK_FILE"' EXIT
 
             # Ensure local sync directory exists
             mkdir -p "$LOCAL_PATH"
@@ -2707,6 +2826,84 @@ extension SyncSetupService {
         ]
     }
 
+    /// Metadata operations never hold the sync run lock by themselves. The shell uses
+    /// the same short flock so a clock correction cannot overwrite a newer attempt.
+    private static func withScheduleMetadataLock(path: String, action: () throws -> Void) throws {
+        let parent = (path as NSString).deletingLastPathComponent
+        try FileManager.default.createDirectory(atPath: parent, withIntermediateDirectories: true,
+                                                attributes: [.posixPermissions: 0o700])
+        let fd = Darwin.open(path + ".lock", O_CREAT | O_RDWR, 0o600)
+        guard fd >= 0 else { throw POSIXError(.init(rawValue: errno) ?? .EIO) }
+        defer { Darwin.close(fd) }
+        guard flock(fd, LOCK_EX) == 0 else { throw POSIXError(.init(rawValue: errno) ?? .EIO) }
+        defer { flock(fd, LOCK_UN) }
+        try action()
+    }
+
+    /// An explicit switch or folder/direction change requests exactly one initial run.
+    /// Ordinary saves and interval edits preserve the existing attempt time.
+    static func needsInitialScheduledSync(from old: SyncProfile, to new: SyncProfile) -> Bool {
+        !new.isMountMode && !new.syncOnLocalChanges
+            && (old.syncOnLocalChanges || old.scheduleIdentity != new.scheduleIdentity)
+    }
+
+    static func requestInitialScheduledSync(from old: SyncProfile, to new: SyncProfile,
+                                            statePath: String? = nil) throws {
+        guard needsInitialScheduledSync(from: old, to: new) else { return }
+        let path = statePath ?? new.scheduleStatePath
+        do {
+            try withScheduleMetadataLock(path: path) {
+                try Data(UUID().uuidString.utf8).write(to: URL(fileURLWithPath: path + ".request"), options: .atomic)
+                try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: path + ".request")
+            }
+        } catch {
+            recordScheduleError(for: new, error: error)
+            throw error
+        }
+    }
+
+    /// Direct setup/manual recovery runs share the shell's cadence. Automatic recovery
+    /// belongs to the failing attempt; its caller deliberately does not advance this time.
+    static func recordSyncAttempt(for profile: SyncProfile, at date: Date = Date(), statePath: String? = nil) throws {
+        guard !profile.isMountMode, !profile.syncOnLocalChanges else { return }
+        let path = statePath ?? profile.scheduleStatePath
+        try withScheduleMetadataLock(path: path) {
+            let request = (try? String(contentsOfFile: path + ".request", encoding: .utf8)) ?? ""
+            let state: [String: Any] = ["identity": profile.scheduleIdentity,
+                                        "lastAttempt": Int(date.timeIntervalSince1970),
+                                        "requestToken": request.trimmingCharacters(in: .whitespacesAndNewlines)]
+            try JSONSerialization.data(withJSONObject: state, options: [.sortedKeys])
+                .write(to: URL(fileURLWithPath: path), options: .atomic)
+            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: path)
+        }
+    }
+
+    /// Direct setup/manual writers use the same visible profile error as the shell.
+    static func recordScheduleError(for profile: SyncProfile, error: Error) {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
+        let line = "\(formatter.string(from: Date())) - Schedule check failed: \(error.localizedDescription)\n"
+        guard let data = line.data(using: .utf8) else { return }
+        do {
+            if !FileManager.default.fileExists(atPath: profile.logPath) {
+                try data.write(to: URL(fileURLWithPath: profile.logPath), options: .atomic)
+            } else {
+                let handle = try FileHandle(forWritingTo: URL(fileURLWithPath: profile.logPath))
+                defer { try? handle.close() }
+                try handle.seekToEnd()
+                try handle.write(contentsOf: data)
+            }
+        } catch { SyncTraySettings.debugLog("Could not write schedule error: \(error)") }
+    }
+
+    /// Only deletion removes cadence history; disabling/reinstalling keeps it.
+    static func removeScheduleState(for profile: SyncProfile, statePath: String? = nil) {
+        let path = statePath ?? profile.scheduleStatePath
+        for suffix in ["", ".request", ".lock"] {
+            try? FileManager.default.removeItem(atPath: path + suffix)
+        }
+    }
+
     /// Generate profile-specific JSON config.
     /// Not private — `ConfigSelfTest` calls this directly to verify the
     /// derived config's key set stays frozen (AC-2) without going through
@@ -2723,6 +2920,8 @@ extension SyncSetupService {
             "additionalFlags": profile.additionalRcloneFlags,
             "filterPath": profile.filterFilePath,
             "syncIntervalMinutes": profile.syncIntervalMinutes,
+            "syncOnLocalChanges": profile.syncOnLocalChanges,
+            "scheduleStatePath": profile.scheduleStatePath,
             "syncMode": profile.syncMode.rawValue,
             "syncDirection": profile.syncDirection.rawValue,
             "fallbackRemote": profile.fallbackRemote,
@@ -2752,7 +2951,7 @@ extension SyncSetupService {
         return "{}"
     }
 
-    private func generateLaunchdPlist(for profile: SyncProfile) -> String {
+    func generateLaunchdPlist(for profile: SyncProfile) -> String {
         let scriptPath = SyncProfile.sharedScriptPath
         let configPath = profile.configPath
         let logDir = (profile.logPath as NSString).deletingLastPathComponent
@@ -2802,7 +3001,11 @@ extension SyncSetupService {
                 """
         } else {
             // Sync modes: use StartInterval for periodic execution
-            let intervalSeconds = profile.syncIntervalMinutes * 60
+            // Schedule-only checks are cheap local due-time checks. Polling avoids
+            // losing a week-long timer when launchd reloads at login or after sleep.
+            let intervalSeconds = profile.syncOnLocalChanges
+                ? min(max(1, profile.syncIntervalMinutes), SyncProfile.maximumSyncIntervalMinutes) * 60
+                : profile.scheduleCheckIntervalSeconds
             return """
                 <?xml version="1.0" encoding="UTF-8"?>
                 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">

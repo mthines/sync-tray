@@ -491,6 +491,8 @@ final class SyncManager: ObservableObject {
     /// Cleared when a run starts or succeeds.
     private var lastHandledSyncFailureAt: [UUID: Date] = [:]
     private var lastSyncFailureAutoFix: [UUID: AutoFixOutcome] = [:]
+    private let scheduleRecoveryMonitoringStartedAt = Date()
+    private var latestScheduleFailureAt: [UUID: Date] = [:]
 
     /// An auto-fix resync that succeeds while the next bisync fails the same way again (#123,
     /// `AutoFixRecurrence`). A normal (non-auto-fix) success clears all of these.
@@ -1458,6 +1460,13 @@ final class SyncManager: ObservableObject {
             lastSyncFailureAutoFix[profile.id] = nil
             TelemetryService.shared.forgetLastSyncFailure(profileId: profile.id)
         }
+        // Explicit setup/recovery starts establish the cadence; auto-fix belongs
+        // to the attempt already in progress and must not advance it again.
+        if source != .autoFix {
+            let current = profileStore.profile(for: profile.id) ?? profile
+            do { try SyncSetupService.recordSyncAttempt(for: current) }
+            catch { SyncSetupService.recordScheduleError(for: current, error: error) }
+        }
         return token
     }
 
@@ -1621,6 +1630,18 @@ final class SyncManager: ObservableObject {
             .store(in: &cancellables)
     }
 
+    /// Recovery belongs to the live failing attempt, never to a failure replayed
+    /// from an earlier app session. The normal auto-fix backoff/recurrence guards
+    /// still bound the repair itself. Log timestamps have one-second precision.
+    nonisolated static func scheduleRecoveryAllowed(syncOnLocalChanges: Bool, failureAt: Date?,
+                                                    monitoringStartedAt: Date, now: Date) -> Bool {
+        if syncOnLocalChanges { return true }
+        guard let failureAt else { return false }
+        let sessionStart = Date(timeIntervalSince1970: floor(monitoringStartedAt.timeIntervalSince1970))
+        return failureAt >= sessionStart && now.timeIntervalSince(failureAt) >= -2
+            && now.timeIntervalSince(failureAt) <= 300
+    }
+
     // MARK: - Auto-Fix
 
     /// What `processLogEvent` does with a genuine `.syncFailed` (one that is not an aborted
@@ -1680,6 +1701,9 @@ final class SyncManager: ObservableObject {
     /// view is driven by the profile state change visible via `@Published profileStates`).
     @discardableResult
     func triggerAutoFix(for profile: SyncProfile) -> AutoFixOutcome {
+        guard Self.scheduleRecoveryAllowed(
+            syncOnLocalChanges: profile.syncOnLocalChanges, failureAt: latestScheduleFailureAt[profile.id],
+            monitoringStartedAt: scheduleRecoveryMonitoringStartedAt, now: Date()) else { return .notApplicable }
         let profileId = profile.id
 
         // Respect the global setting
@@ -2821,16 +2845,20 @@ final class SyncManager: ObservableObject {
 
     private func setupProfileObserver() {
         profileStore.$profiles
-            .sink { [weak self] _ in
-                self?.startWatchingAllProfiles()
+            .sink { [weak self] profiles in
+                // @Published emits before the store property changes: use the
+                // emitted snapshot so switching to schedule-only stops watching now.
+                self?.startWatchingAllProfiles(profiles: profiles)
                 self?.updateAggregateState()
                 self?.updateAppGroupMountPaths()
             }
             .store(in: &cancellables)
     }
 
-    private func startWatchingAllProfiles() {
-        let enabledProfileIds = Set(profileStore.enabledProfiles.map { $0.id })
+    private func startWatchingAllProfiles(profiles: [SyncProfile]? = nil) {
+        let enabledProfiles = (profiles ?? profileStore.profiles).filter { $0.isEnabled }
+        let enabledProfileIds = Set(enabledProfiles.map { $0.id })
+        let watchedProfileIds = Set(enabledProfiles.filter { $0.syncOnLocalChanges && !$0.isMountMode }.map { $0.id })
 
         // Remove watchers for profiles that are no longer enabled
         // (Don't touch watchers for profiles that are still enabled - avoids interrupting active syncs)
@@ -2838,18 +2866,18 @@ final class SyncManager: ObservableObject {
             logWatchers[id]?.stopWatching()
             logWatchers.removeValue(forKey: id)
         }
-        for id in directoryWatchers.keys where !enabledProfileIds.contains(id) {
+        for id in directoryWatchers.keys where !watchedProfileIds.contains(id) {
             directoryWatchers[id]?.stop()
             directoryWatchers.removeValue(forKey: id)
         }
 
         // Add watchers only for profiles that don't already have them
-        for profile in profileStore.enabledProfiles {
+        for profile in enabledProfiles {
             if logWatchers[profile.id] == nil {
                 startWatching(profile: profile)
             }
             // Skip directory watching for mount mode profiles (no need to watch - files stream on-demand)
-            if directoryWatchers[profile.id] == nil && !profile.isMountMode {
+            if directoryWatchers[profile.id] == nil && !profile.isMountMode && profile.syncOnLocalChanges {
                 startWatchingDirectory(for: profile)
             }
         }
@@ -2872,6 +2900,7 @@ final class SyncManager: ObservableObject {
 
     /// Start watching a profile's local sync directory for file changes
     private func startWatchingDirectory(for profile: SyncProfile) {
+        guard profile.syncOnLocalChanges, !isPaused(for: profile.id) else { return }
         guard !profile.localSyncPath.isEmpty else { return }
         guard FileManager.default.fileExists(atPath: profile.localSyncPath) else { return }
         // Skip directory watching for mount mode (files stream on-demand, no sync needed)
@@ -2938,7 +2967,7 @@ final class SyncManager: ObservableObject {
 
         // Get profile and verify it's still valid
         guard let profile = profileStore.profile(for: profileId),
-              profile.isEnabled else {
+              profile.isEnabled, profile.syncOnLocalChanges else {
             SyncTraySettings.debugLog("DirectoryWatcher: Skipping sync for \(profileId.uuidString.prefix(8)) - profile not found or disabled")
             return
         }
@@ -3185,18 +3214,25 @@ final class SyncManager: ObservableObject {
         // A new run, started after the abort finished: its failures are its own again.
         abortSuppressUntil[profile.id] = nil
 
-        if agentLoadDeferredByAbort.remove(profile.id) != nil, !setupService.isLoaded(profile: profile) {
-            if setupService.loadAgent(for: profile) {
-                SyncTraySettings.debugLog("Restarted '\(profile.name)' by loading its launchd agent (deferred by an abort)")
-                return
-            }
-            // Could not load it: still run now, and try the load again next time.
+        let restoreDeferredAgent = agentLoadDeferredByAbort.remove(profile.id) != nil
+            && !setupService.isLoaded(profile: profile)
+        if restoreDeferredAgent && profile.syncOnLocalChanges {
+            if setupService.loadAgent(for: profile) { return }
             agentLoadDeferredByAbort.insert(profile.id)
+        }
+        // For schedule-only, load AFTER the explicit manual attempt. RunAtLoad
+        // must not start the same due attempt next to its --manual override.
+        defer {
+            if restoreDeferredAgent && !profile.syncOnLocalChanges,
+               !setupService.loadAgent(for: profile) {
+                agentLoadDeferredByAbort.insert(profile.id)
+            }
         }
 
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/bin/bash")
         process.arguments = [SyncProfile.sharedScriptPath, profile.configPath]
+        if trigger == "manual" { process.arguments?.append("--manual") }
 
         do {
             try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
@@ -3398,6 +3434,14 @@ final class SyncManager: ObservableObject {
 
             // A failed bisync reports its end twice (#122). The repeat must not set the error,
             // notify, or record the failure again — see `syncFailureHandling`.
+            if SyncLogPatterns.isScheduleCheckFailed(event.rawLine) {
+                // Eligibility failed before any sync started. Do not mistake an old
+                // out-of-sync error for this failure and launch automatic recovery.
+                latestScheduleFailureAt[profileId] = nil
+                profileErrors[profileId] = message
+            } else {
+                latestScheduleFailureAt[profileId] = event.timestamp
+            }
             let failureHandledAt = Date()
             let handling = Self.syncFailureHandling(
                 lastHandledAt: lastHandledSyncFailureAt[profileId],

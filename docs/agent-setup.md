@@ -229,3 +229,10 @@ They're worth copying into your agent's instructions file (`AGENTS.md`, `CLAUDE.
 | Exit code `65`                                | The JSON or a value is invalid; the message says which                    |
 
 More fixes are in [Troubleshooting](troubleshooting.md).
+
+### Daily or weekly backups
+
+For periodic backups, set `syncOnLocalChanges` to `false` and choose an interval
+in minutes (for example `10080` for weekly). See [schedule-only configuration](configuration.md#schedule-only-state)
+for first-run, recovery and persistence rules, and the [user guide](user-guide.md#automatic-sync-and-longer-intervals)
+for the settings UI.

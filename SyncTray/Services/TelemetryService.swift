@@ -1312,6 +1312,7 @@ final class TelemetryService {
             ? VFSCacheService.shared.cacheVolumeInfo(path: profile.vfsCachePath) : nil
 
         let intervalBucket = bucketSyncInterval(profile.syncIntervalMinutes)
+        let longIntervalBucket = bucketLongSyncInterval(profile.syncIntervalMinutes)
 
         // What kind of folder / storage backend this is — bounded buckets, never the path or
         // the remote's name (`SyncPathKind`, `RemoteBackendType`).
@@ -1331,6 +1332,8 @@ final class TelemetryService {
                 "config.sync_mode": .string(profile.syncMode.rawValue),
                 "config.sync_direction": .string(profile.syncDirection.rawValue),
                 "config.sync_interval_bucket": .string(intervalBucket),
+                "config.sync_interval_long_bucket": .string(longIntervalBucket),
+                "config.sync_on_local_changes": .string(profile.isMountMode ? "n/a" : String(profile.syncOnLocalChanges)),
                 "config.has_fallback": .bool(profile.hasFallback),
                 "config.has_external_drive": .bool(!profile.drivePathToMonitor.isEmpty),
                 "config.is_enabled": .bool(profile.isEnabled),
@@ -3346,6 +3349,19 @@ final class TelemetryService {
         case 16...30: return "16-30min"
         case 31...60: return "31-60min"
         default: return ">60min"
+        }
+    }
+
+    /// Splits `bucketSyncInterval`'s `>60min` bucket for the intervals Schedule only made
+    /// common. A separate attribute rather than new values on `config.sync_interval_bucket`,
+    /// so existing queries on `>60min` keep matching. `n/a` at 60 minutes or less.
+    private func bucketLongSyncInterval(_ minutes: Int) -> String {
+        switch minutes {
+        case ...60: return "n/a"
+        case 61...360: return "61min-6h"
+        case 361...1_440: return "6h-1d"
+        case 1_441...10_080: return "1d-1w"
+        default: return ">1w"
         }
     }
 

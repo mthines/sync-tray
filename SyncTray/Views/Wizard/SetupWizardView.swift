@@ -3,6 +3,7 @@ import SwiftUI
 /// Main setup wizard view for creating new sync profiles or editing existing ones
 struct SetupWizardView: View {
     @Environment(\.dismiss) private var dismiss
+    @EnvironmentObject private var syncManager: SyncManager
     @ObservedObject var profileStore: ProfileStore
 
     /// Optional profile to edit. If nil, creates a new profile.
@@ -24,6 +25,8 @@ struct SetupWizardView: View {
     @State private var syncMode: SyncMode = .bisync
     @State private var syncDirection: SyncDirection = .localToRemote
     @State private var syncInterval: Int = 5
+    @State private var syncOnLocalChanges: Bool = true
+    @State private var isScheduleValid: Bool = true
     @State private var isExternalDrive: Bool = false
 
     // UI state
@@ -172,6 +175,7 @@ struct SetupWizardView: View {
         syncMode = profile.syncMode
         syncDirection = profile.syncDirection
         syncInterval = profile.syncIntervalMinutes
+        syncOnLocalChanges = profile.syncOnLocalChanges
         isExternalDrive = !profile.drivePathToMonitor.isEmpty
 
         // Skip to remote path step (user already has a remote)
@@ -486,25 +490,18 @@ struct SetupWizardView: View {
                 }
             }
 
-            Divider()
+            if syncMode != .mount {
+                Divider()
 
-            // Sync interval
-            VStack(alignment: .leading, spacing: 8) {
-                Text("Sync Interval")
-                    .font(.subheadline)
-                    .foregroundColor(.secondary)
-
-                Picker("", selection: $syncInterval) {
-                    Text("1 minute").tag(1)
-                    Text("2 minutes").tag(2)
-                    Text("5 minutes").tag(5)
-                    Text("10 minutes").tag(10)
-                    Text("15 minutes").tag(15)
-                    Text("30 minutes").tag(30)
-                    Text("1 hour").tag(60)
-                }
-                .pickerStyle(.menu)
-                .labelsHidden()
+                SyncScheduleControls(
+                    syncOnLocalChanges: $syncOnLocalChanges,
+                    intervalMinutes: $syncInterval,
+                    isValid: $isScheduleValid
+                )
+            } else {
+                Text("Stream mode runs continuously; no periodic sync is needed.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
         }
     }
@@ -524,7 +521,15 @@ struct SetupWizardView: View {
                     if syncMode == .sync {
                         LabeledContent("Direction", value: syncDirection.displayName)
                     }
-                    LabeledContent("Interval", value: "\(syncInterval) minutes")
+                    if syncMode != .mount {
+                        LabeledContent("Automatic Sync", value: syncOnLocalChanges ? "On local changes + schedule" : "Schedule only")
+                        LabeledContent("Interval", value: SyncScheduleInterval.label(for: syncInterval))
+                        Text(isEditMode
+                             ? "Switching to Schedule only or changing sync folders starts one sync immediately."
+                             : "The initial sync runs immediately during setup. This interval applies to subsequent automatic syncs.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
@@ -738,7 +743,7 @@ struct SetupWizardView: View {
         case .localPath:
             return !localPath.isEmpty
         case .syncSettings:
-            return true
+            return syncMode == .mount || isScheduleValid
         case .confirmation:
             return true
         case .helpImprove:
@@ -908,6 +913,7 @@ struct SetupWizardView: View {
     }
 
     private func saveProfile() {
+        guard syncMode == .mount || isScheduleValid else { return }
         // Capture BEFORE profileStore.add() changes the count
         wasFirstProfile = profileStore.profiles.isEmpty
 
@@ -936,14 +942,39 @@ struct SetupWizardView: View {
             updatedProfile.localSyncPath = localPath
             updatedProfile.drivePathToMonitor = drivePath
             updatedProfile.syncIntervalMinutes = syncInterval
+            updatedProfile.syncOnLocalChanges = syncOnLocalChanges
             updatedProfile.syncMode = syncMode
             updatedProfile.syncDirection = syncDirection
 
+            // Refuse while a run is live, before anything is written: the reinstall below
+            // reloads the agent (RunAtLoad), which must not start next to a running sync.
+            // Matches ProfileDetailView.reinstallSync.
+            guard !syncManager.isRunLive(for: existingProfile) else {
+                errorMessage = "A sync is currently running for \(existingProfile.name); try again once it finishes."
+                isLoading = false
+                return
+            }
+            do {
+                try SyncSetupService.requestInitialScheduledSync(from: existingProfile, to: updatedProfile)
+            } catch {
+                errorMessage = "Could not update the sync schedule: \(error.localizedDescription)"
+                isLoading = false
+                return
+            }
             profileStore.update(updatedProfile)
             profileToInstall = updatedProfile
+            // `install(profile:)` below only runs `launchctl load`, which does nothing for an
+            // agent that is already loaded: the new plist and the RunAtLoad initial sync would
+            // wait for the next login. Tear down first, as Save does. Teardown errors are
+            // ignored as in ProfileDetailView.reinstallSync; install regenerates every file.
+            do {
+                try SyncSetupService.shared.uninstallForReinstall(from: existingProfile, to: updatedProfile)
+            } catch {
+                print("Failed to tear down profile before reinstall: \(error)")
+            }
         } else {
             // Create new profile
-            let profile = SyncProfile(
+            var profile = SyncProfile(
                 name: profileName.isEmpty ? "New Profile" : profileName,
                 rcloneRemote: remoteName,
                 remotePath: remotePath,
@@ -953,6 +984,8 @@ struct SetupWizardView: View {
                 syncMode: syncMode,
                 syncDirection: syncDirection
             )
+
+            profile.syncOnLocalChanges = syncOnLocalChanges
 
             profileStore.add(profile)
             profileToInstall = profile
@@ -968,6 +1001,13 @@ struct SetupWizardView: View {
         // Automatically install the scheduled sync
         do {
             try SyncSetupService.shared.install(profile: profileToInstall)
+            if !isEditMode && !profileToInstall.isMountMode && !profileToInstall.syncOnLocalChanges {
+                profileToInstall.isEnabled = true
+                profileStore.update(profileToInstall)
+                syncManager.refreshSettings()
+                // RunAtLoad starts the initial attempt. Do not launch a second
+                // manual process next to that same initial run.
+            }
         } catch {
             print("Failed to install scheduled sync: \(error)")
             // Don't block - the user can manually install from settings

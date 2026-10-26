@@ -89,6 +89,7 @@ extension SyncManager {
             current.remotePath != updated.remotePath ||
             current.localSyncPath != updated.localSyncPath ||
             current.syncIntervalMinutes != updated.syncIntervalMinutes ||
+            current.syncOnLocalChanges != updated.syncOnLocalChanges ||
             current.additionalRcloneFlags != updated.additionalRcloneFlags ||
             current.syncMode != updated.syncMode ||
             current.syncDirection != updated.syncDirection ||
@@ -194,8 +195,11 @@ extension SyncManager {
         filterChanged: Bool,
         needsReinstall: Bool,
         runLive: Bool,
-        installed: Bool
+        installed: Bool,
+        syncOnLocalChanges: Bool = true
     ) -> FilterSaveFollowUp {
+        // Schedule-only filter edits take effect on the next scheduled/manual run.
+        guard syncOnLocalChanges else { return .none }
         guard !needsReinstall else { return .none }
         guard filterChanged, installed else { return .none }
         return runLive ? .confirmStopThenSync : .syncNow

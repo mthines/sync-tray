@@ -238,6 +238,7 @@ final class ProfileStore: ObservableObject {
         save()
 
         if let removed {
+            SyncSetupService.removeScheduleState(for: removed)
             let path = "\(profilesDirectory)/\(removed.shortId).profile.json"
             try? FileManager.default.removeItem(atPath: path)
         }

@@ -538,10 +538,14 @@ enum SyncLogPatterns {
                lower.contains("sync complete")
     }
 
+    static func isScheduleCheckFailed(_ message: String) -> Bool {
+        message.lowercased().contains("schedule check failed:")
+    }
+
     /// Patterns indicating sync failed
     static func isSyncFailed(_ message: String) -> Bool {
         let lower = message.lowercased()
-        return lower.contains("bisync failed") ||
+        return isScheduleCheckFailed(message) || lower.contains("bisync failed") ||
                lower.contains("failed with exit code") ||
                lower.contains("failed to bisync")
     }
