@@ -549,6 +549,9 @@ final class SyncManager: ObservableObject {
         cleanupStaleLockFiles()
         setupService.refreshSharedScriptIfChanged()  // Propagate script template updates
         setupService.refreshMountModePathIfChanged(profiles: self.profileStore.profiles)  // Mode file moved out of /tmp
+        for profile in self.profileStore.profiles where profile.isMountMode {
+            SyncSetupService.tightenDirectoryIfLoose(atPath: profile.overlayRootPath)  // Cache Only overlay, 0700 (AC-SEC6)
+        }
         setupService.cleanupStaleMounts(mountProfiles: self.profileStore.profiles)  // Clean up stale mounts on startup
         detectAndResumeRunningSyncs()  // After cleanup, detect external syncs
         checkInitialState()

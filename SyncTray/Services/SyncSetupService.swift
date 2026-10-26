@@ -2284,8 +2284,12 @@ extension SyncSetupService {
                     #     is mounted `:ro` and is never touched.
                     # Partially-downloaded cache files are hidden via --exclude-from so a
                     # half-fetched file never presents as if it were complete.
-                    mkdir -p "$OVERLAY_PATH"
-                    mkdir -p "$CACHE_ONLY_CACHE_PATH"
+                    # The overlay holds the contents of every file saved while in Cache Only,
+                    # so its root is owner-only (0700), like the RC auth dir above. umask only
+                    # applies when mkdir creates a directory; chmod on every start fixes one an
+                    # earlier version (or the exclude-list writer above) left 0755.
+                    ( umask 077; mkdir -p "$OVERLAY_PATH" "$CACHE_ONLY_CACHE_PATH" )
+                    chmod 700 "$(dirname "$OVERLAY_PATH")" "$OVERLAY_PATH" 2>/dev/null
 
                     python3 -c "
             import os, sys
