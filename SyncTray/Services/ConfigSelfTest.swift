@@ -187,6 +187,7 @@ enum ConfigSelfTest {
             testSyncRunLockAcquire,
             testProfileSetRefusesBeforePersist,
             testReviewBranchGuardsPinned,
+            testResumeClearsStaleSessionLock,
             testSyncIncludeRules,
             testSyncIncludeFilterMerge,
             testSyncIncludeFoldersRealRclone,
@@ -10225,6 +10226,86 @@ enum ConfigSelfTest {
         }
 
         return report("AC-SR18", "review-branch-guards-pinned", true)
+    }
+
+    // MARK: - AC-SR19 — resume clears a paused bisync's stale session lock first
+
+    /// Pause SIGTERMs a running bisync and removes only the `/tmp` run lock; rclone can
+    /// exit without releasing its session `.lck`, which it never expires. Resume reloads
+    /// the `RunAtLoad` agent, so without a stale-only cleanup first the run it starts
+    /// fails "prior lock file found" until Unlock & Retry. Drives the real
+    /// `SyncManager.clearStaleLocksBeforeResume` against temp files with the real
+    /// `SyncRunLock.processIsAlive` (this process is the live holder; a PID above
+    /// macOS's PID range is the dead one), then pins that `resumeProfile` calls it
+    /// before `loadAgent`.
+    private static func testResumeClearsStaleSessionLock() -> Bool {
+        let id = "AC-SR19", slug = "resume-clears-stale-session-lock"
+        let dir = "\(selfTestRoot)/ac-sr19-resume"
+        try? FileManager.default.removeItem(atPath: dir)
+        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        let fm = FileManager.default
+        let runLockPath = "\(dir)/run.lock"
+        let sessionLockPath = "\(dir)/session.lck"
+        let siblingLockPath = "\(dir)/other-session.lck"  // another profile's lock — must survive
+        let deadPID: Int32 = 99_999_999
+        let livePID = getpid()
+        let rcloneLock: (Int32) -> String = {
+            "{\"Session\":\"s\",\"PID\":\"\($0)\",\"TimeRenewed\":\"t\",\"TimeExpires\":\"t\"}"
+        }
+        guard !SyncRunLock.processIsAlive(deadPID), SyncRunLock.processIsAlive(livePID) else {
+            return report(id, slug, false, "(fixture PIDs are not dead/live as assumed)")
+        }
+        func resume(_ mode: SyncMode, abort: Bool = false, registry: Bool = false) -> SyncRunLock.UnlockDecision? {
+            SyncManager.clearStaleLocksBeforeResume(
+                syncMode: mode, abortInFlight: abort, registryActive: registry,
+                runLockPath: runLockPath, sessionLockPath: sessionLockPath,
+                isAlive: SyncRunLock.processIsAlive)
+        }
+        func reset(session: Int32) {
+            try? fm.removeItem(atPath: runLockPath)   // pause already removed the run lock
+            try? rcloneLock(session).write(toFile: sessionLockPath, atomically: true, encoding: .utf8)
+            try? rcloneLock(deadPID).write(toFile: siblingLockPath, atomically: true, encoding: .utf8)
+        }
+
+        // The pause-left state: no run lock, session .lck held by a dead rclone → removed.
+        reset(session: deadPID)
+        guard resume(.bisync) == .allow, !fm.fileExists(atPath: sessionLockPath),
+              fm.fileExists(atPath: siblingLockPath) else {
+            return report(id, slug, false,
+                "(resume left a dead holder's session lock behind, or touched another profile's lock)")
+        }
+
+        // A live holder (rclone still shutting down) is never removed.
+        reset(session: livePID)
+        guard resume(.bisync) == .refuseSessionLockLive, fm.fileExists(atPath: sessionLockPath) else {
+            return report(id, slug, false, "(resume removed a session lock whose holder is live)")
+        }
+
+        // Stream (R7) and One-Way profiles, an abort in flight, or an active run token:
+        // nothing is touched, even a stale lock.
+        for (name, mode) in [("mount", SyncMode.mount), ("one-way", SyncMode.sync)] {
+            reset(session: deadPID)
+            guard resume(mode) == nil, fm.fileExists(atPath: sessionLockPath) else {
+                return report(id, slug, false, "(resume touched locks for a \(name) profile)")
+            }
+        }
+        reset(session: deadPID)
+        guard resume(.bisync, abort: true) == nil, fm.fileExists(atPath: sessionLockPath),
+              resume(.bisync, registry: true) == nil, fm.fileExists(atPath: sessionLockPath) else {
+            return report(id, slug, false, "(resume touched locks while an abort or a run token was active)")
+        }
+
+        // Wiring: resumeProfile clears the stale locks BEFORE it loads the RunAtLoad agent.
+        guard let managerSource = readSourceFile("Services/SyncManager.swift"),
+              let resumeFn = extractFunctionBody(startingAt: "func resumeProfile(_ profileId: UUID)", in: managerSource),
+              let clear = resumeFn.range(of: "Self.clearStaleLocksBeforeResume("),
+              let load = resumeFn.range(of: "setupService.loadAgent(for: profile)"),
+              clear.lowerBound < load.lowerBound else {
+            return report(id, slug, false,
+                "(resumeProfile no longer clears stale locks before loading the agent)")
+        }
+
+        return report(id, slug, true)
     }
 
     // MARK: - AC-AB1 — abort finds every process of the run, and only the run's
