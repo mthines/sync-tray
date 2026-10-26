@@ -412,7 +412,16 @@ final class SyncSetupService {
             cleanupBisyncCache(for: old)
             cleanupBisyncCache(for: new)
         }
-        try Self.requestInitialScheduledSync(from: old, to: new)
+        // Not rethrown: the agent is already unloaded and its plist deleted, and the CLI's
+        // `profile set` and launchd reconcile treat any error from here as a refusal and skip
+        // the reinstall, which would leave the profile with no agent at all. The app callers
+        // ignore it and install anyway. `requestInitialScheduledSync` has already written the
+        // visible profile error.
+        do {
+            try Self.requestInitialScheduledSync(from: old, to: new)
+        } catch {
+            SyncTraySettings.debugLog("Initial scheduled sync request failed for \(new.name): \(error)")
+        }
     }
 
     /// Remove only a profile's bisync lock file (`<session>.lck`), keeping its listings.
