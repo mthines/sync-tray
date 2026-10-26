@@ -186,6 +186,23 @@ final class TelemetryService {
     /// once (see `isDuplicateSyncFailure`).
     private var lastSyncFailureAt: [UUID: Date] = [:]
 
+    /// A failed run held until its exit code is known — see `recordSyncFailed`.
+    private struct PendingSyncFailure {
+        let profileName: String
+        let mode: SyncMode
+        let duration: TimeInterval
+        let filesChanged: Int
+        let errorMessage: String?
+        let localSyncPath: String?
+    }
+
+    /// Failed runs whose failure line stated no exit code, each with the timer that records
+    /// it without one once `duplicateSyncFailureWindow` passes. Main-thread state, like
+    /// `activeSyncSpans` (the timer runs on the main queue). The run's span stays in
+    /// `activeSyncSpans` meanwhile, so every path that ends a span or starts the next run
+    /// flushes this first (`flushPendingSyncFailure`).
+    private var pendingSyncFailures: [UUID: (failure: PendingSyncFailure, timeout: DispatchWorkItem)] = [:]
+
     // MARK: - State
 
     private var lastReportedProfileCount: Int = 0
@@ -661,7 +678,10 @@ final class TelemetryService {
         trigger: String = "scheduled"  // manual | directory_watch | scheduled | startup
     ) {
         guard SyncTraySettings.telemetryEnabled else { return }
-        // A new run: its failure is never a repeat of the previous run's.
+        // A new run: the previous run's failure, if still held for its exit code, is recorded
+        // now (its span would otherwise be ended below as "abandoned"), and its failure is
+        // never a repeat of the previous run's.
+        flushPendingSyncFailure(profileId: profileId, exitCode: nil)
         lastSyncFailureAt[profileId] = nil
         ensureSetup()
         guard let tracer = tracer else { return }
@@ -712,6 +732,9 @@ final class TelemetryService {
     ) {
         guard SyncTraySettings.telemetryEnabled else { return }
         ensureSetup()
+        // A failure still held for its exit code is an earlier run's: record it before this
+        // success takes the span.
+        flushPendingSyncFailure(profileId: profileId, exitCode: nil)
         // A run ended in success, so a failure after it belongs to a different run.
         lastSyncFailureAt[profileId] = nil
 
@@ -797,17 +820,31 @@ final class TelemetryService {
     /// within `duplicateSyncFailureWindow` would be dropped as a repeat. Called by
     /// `SyncManager.beginExclusiveRun`, which resets the app's own state the same way.
     func forgetLastSyncFailure(profileId: UUID) {
+        // A failure still waiting for its exit code belongs to the run before this one.
+        flushPendingSyncFailure(profileId: profileId, exitCode: nil)
         lastSyncFailureAt[profileId] = nil
     }
 
-    /// Called when a sync operation fails.
+    /// Called when a sync run fails, with the exit code its failure line states — nil when the
+    /// line states none.
+    ///
+    /// A failed bisync reports its end twice (see `isDuplicateSyncFailure`): rclone's own
+    /// "Failed to bisync: …" notice, which carries no exit code, then the script's "Bisync
+    /// failed with exit code N", which carries the real one. So a failure whose line states no
+    /// exit code is held (`pendingSyncFailures`) until the script's line supplies it
+    /// (`recordSyncFailureExitCode`) or `duplicateSyncFailureWindow` passes, and is recorded
+    /// only then (`finishSyncFailure`) — metrics, span and log together. That makes
+    /// `sync.exit_code` the script's real exit code, and a run a stop signal ended (143 after
+    /// Pause, logout or `kill`, 130 after Ctrl-C) `error.type=interrupted` on the
+    /// `synctray.sync.errors` counter as well as on the span. A failure that states its exit
+    /// code is recorded at once.
     func recordSyncFailed(
         profileId: UUID,
         profileName: String,
         mode: SyncMode,
         duration: TimeInterval,
         filesChanged: Int,
-        exitCode: Int,
+        exitCode: Int?,
         errorMessage: String?,
         localSyncPath: String? = nil
     ) {
@@ -822,6 +859,63 @@ final class TelemetryService {
             return
         }
         lastSyncFailureAt[profileId] = now
+        // A failure still held from an earlier run (its timer due but not yet run) is that
+        // run's, not this one's.
+        flushPendingSyncFailure(profileId: profileId, exitCode: nil)
+
+        let failure = PendingSyncFailure(
+            profileName: profileName,
+            mode: mode,
+            duration: duration,
+            filesChanged: filesChanged,
+            errorMessage: errorMessage,
+            localSyncPath: localSyncPath
+        )
+        if let exitCode {
+            finishSyncFailure(profileId: profileId, failure, exitCode: exitCode)
+            return
+        }
+        // Wait for the script's own end line, which states the real exit code, for the same
+        // window the duplicate check gives that pair of lines. A run that writes no such line
+        // (Force Sync's own exit line has no timestamp, so it is never parsed) is recorded
+        // without an exit code when the window passes.
+        let timeout = DispatchWorkItem { [weak self] in
+            self?.flushPendingSyncFailure(profileId: profileId, exitCode: nil)
+        }
+        pendingSyncFailures[profileId] = (failure, timeout)
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.duplicateSyncFailureWindow, execute: timeout)
+    }
+
+    /// The script's own end line of a failed run ("Bisync failed with exit code N") was read
+    /// after the run's failure had already been handled — the second of its two end lines
+    /// (`SyncManager.processLogEvent`'s repeat branch). Records the failure held for it with
+    /// that exit code; does nothing when none is held (the failure stated its exit code, or
+    /// its window passed).
+    func recordSyncFailureExitCode(profileId: UUID, exitCode: Int) {
+        flushPendingSyncFailure(profileId: profileId, exitCode: exitCode)
+    }
+
+    /// Record the failure held for `profileId`, if any, with `exitCode` (nil: no line stated
+    /// one). Called when the exit code arrives, when the window passes, and before anything
+    /// that ends the profile's span or starts its next run, so a held failure is never lost
+    /// and never mistaken for the next run's.
+    private func flushPendingSyncFailure(profileId: UUID, exitCode: Int?) {
+        guard let pending = pendingSyncFailures.removeValue(forKey: profileId) else { return }
+        pending.timeout.cancel()
+        finishSyncFailure(profileId: profileId, pending.failure, exitCode: exitCode)
+    }
+
+    /// Record one failed run: the `synctray.sync.*` metrics, then its span and the `Sync
+    /// failed` log. `exitCode` is nil when no log line stated it; `sync.exit_code` is then left
+    /// out rather than guessed.
+    private func finishSyncFailure(profileId: UUID, _ failure: PendingSyncFailure, exitCode: Int?) {
+        // Usage data was turned off while the failure was held: send nothing.
+        guard SyncTraySettings.telemetryEnabled else { return }
+        let profileName = failure.profileName
+        let mode = failure.mode
+        let duration = failure.duration
+        let filesChanged = failure.filesChanged
+        let errorMessage = failure.errorMessage
 
         let labels: [String: AttributeValue] = [
             "sync.mode": .string(mode.rawValue),
@@ -842,9 +936,10 @@ final class TelemetryService {
             )
         }
 
-        // Categorize error for the error counter
-        let errorType = Self.categorizeError(errorMessage)
-        let accessDenial = Self.accessDenialAttributes(for: errorMessage, localSyncPath: localSyncPath)
+        // Categorize error for the error counter: a stop signal's exit code first, then the
+        // run's first error.
+        let errorType = Self.categorizeSyncFailure(message: errorMessage, exitCode: exitCode)
+        let accessDenial = Self.accessDenialAttributes(for: errorMessage, localSyncPath: failure.localSyncPath)
         var errorCounterLabels: [String: AttributeValue] = [
             "sync.mode": .string(mode.rawValue),
             "synctray.profile.name": .string(profileName),
@@ -863,7 +958,9 @@ final class TelemetryService {
             span.setAttribute(key: "sync.result", value: .string("failure"))
             span.setAttribute(key: "sync.files_changed", value: .int(filesChanged))
             span.setAttribute(key: "sync.duration_s", value: .double(duration))
-            span.setAttribute(key: "sync.exit_code", value: .int(exitCode))
+            if let exitCode {
+                span.setAttribute(key: "sync.exit_code", value: .int(exitCode))
+            }
             span.setAttribute(key: "error.type", value: .string(errorType))
             for (key, value) in accessDenial {
                 span.setAttribute(key: key, value: value)
@@ -874,19 +971,22 @@ final class TelemetryService {
             span.status = .error(description: errorType)
             span.end()
 
+            var logAttributes: [String: AttributeValue] = [
+                "synctray.profile.id": .string(profileId.uuidString),
+                "synctray.profile.name": .string(profileName),
+                "sync.mode": .string(mode.rawValue),
+                "sync.result": .string("failure"),
+                "sync.duration_s": .double(duration),
+                "error.type": .string(errorType),
+                "error.operation": .string(errorOperation),
+            ]
+            if let exitCode {
+                logAttributes["sync.exit_code"] = .int(exitCode)
+            }
             emitLog(
                 severity: .error,
                 body: "Sync failed",
-                attributes: [
-                    "synctray.profile.id": .string(profileId.uuidString),
-                    "synctray.profile.name": .string(profileName),
-                    "sync.mode": .string(mode.rawValue),
-                    "sync.result": .string("failure"),
-                    "sync.exit_code": .int(exitCode),
-                    "sync.duration_s": .double(duration),
-                    "error.type": .string(errorType),
-                    "error.operation": .string(errorOperation),
-                ].merging(accessDenial) { current, _ in current },
+                attributes: logAttributes.merging(accessDenial) { current, _ in current },
                 spanContext: span.context
             )
         }
@@ -900,6 +1000,9 @@ final class TelemetryService {
     func recordSyncSkipped(profileId: UUID, profileName: String, reason: String) {
         guard SyncTraySettings.telemetryEnabled else { return }
         ensureSetup()
+        // A failure still held for its exit code ended the span's run already: record it as
+        // the failure it was, rather than closing its span as skipped.
+        flushPendingSyncFailure(profileId: profileId, exitCode: nil)
 
         if let span = activeSyncSpans.removeValue(forKey: profileId) {
             span.setAttribute(key: "sync.result", value: .string("skipped"))
@@ -2416,6 +2519,12 @@ final class TelemetryService {
     func shutdown() {
         guard SyncTraySettings.telemetryEnabled else { return }
 
+        // Record failures still held for their exit code before their spans would be ended
+        // below as app_shutdown — the run had already failed.
+        for profileId in Array(pendingSyncFailures.keys) {
+            flushPendingSyncFailure(profileId: profileId, exitCode: nil)
+        }
+
         // End any orphaned sync spans
         for (_, span) in activeSyncSpans {
             span.setAttribute(key: "sync.result", value: .string("app_shutdown"))
@@ -3288,6 +3397,18 @@ final class TelemetryService {
         return "other"
     }
 
+    /// `error.type` for a failed sync run: `interrupted` when its exit code says a stop signal
+    /// ended it (`SyncLogPatterns.isStopSignalExitCode` — rclone exits 128 + the signal after
+    /// its graceful shutdown, often without logging any error that names the stop), otherwise
+    /// the bucket of its first error (`categorizeError`). A nil exit code is one no log line
+    /// stated. Pure.
+    static func categorizeSyncFailure(message: String?, exitCode: Int?) -> String {
+        if let exitCode, SyncLogPatterns.isStopSignalExitCode(exitCode) {
+            return "interrupted"
+        }
+        return categorizeError(message)
+    }
+
     /// Categorize an error message into a low-cardinality type for metrics/attributes.
     /// Static and internal (pure — it only consults `SyncLogPatterns`) so `ConfigSelfTest`
     /// can assert the buckets directly.
@@ -3303,6 +3424,13 @@ final class TelemetryService {
     static func categorizeError(_ message: String?) -> String {
         guard let msg = message else { return "unknown" }
         let lower = msg.lowercased()
+        // A run that was stopped, not one that failed: a signal cancelled rclone's transfers
+        // ("context canceled") or bisync's graceful shutdown ran. Ahead of the critical check,
+        // which "Bisync interrupted. Must run --resync to recover." would otherwise hit through
+        // its "resync" and file as `out_of_sync`.
+        if SyncLogPatterns.isInterruptedError(msg) {
+            return "interrupted"
+        }
         if SyncLogPatterns.isCriticalError(msg) {
             if msg.contains("resync") || msg.contains("out of sync") {
                 return "out_of_sync"

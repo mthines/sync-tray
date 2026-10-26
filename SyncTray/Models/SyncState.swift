@@ -730,6 +730,31 @@ enum SyncLogPatterns {
             || lower.contains("not deleting directories as there were io errors")
     }
 
+    /// An error that says the run was stopped rather than that it failed: Go's
+    /// `context.Canceled` text ("context canceled", which rclone's transfers fail with when a
+    /// signal cancels the sync), rclone's own "Signal received: …" line, and bisync's
+    /// graceful-shutdown outcome ("Graceful shutdown failed." / "Bisync interrupted. Must run
+    /// --resync to recover.", from `cmd/bisync/operations.go`). `TelemetryService.categorizeError`
+    /// buckets it as `interrupted`, ahead of the critical check whose "resync" the last one
+    /// would otherwise hit. Matched case-insensitively.
+    static func isInterruptedError(_ message: String) -> Bool {
+        let lower = message.lowercased()
+        return lower.contains("context canceled")
+            || lower.contains("signal received:")
+            || lower.contains("bisync interrupted")
+            || lower.contains("graceful shutdown failed")
+    }
+
+    /// Whether a sync's exit code says a stop signal ended it rather than an error. rclone's
+    /// own exit codes are 0–10; on SIGHUP/SIGINT/SIGTERM it runs its exit handlers (bisync's
+    /// graceful shutdown) and exits with 128 + the signal (`lib/atexit` `exitCode`), and bash
+    /// reports a SIGKILLed rclone the same way — so 129 (HUP), 130 (INT: Ctrl-C), 137 (KILL)
+    /// and 143 (TERM: Pause, logout, `kill`) are a stopped run. Crash signals (134 SIGABRT,
+    /// 139 SIGSEGV, …) are not a stop and are categorized from the message as before.
+    static func isStopSignalExitCode(_ exitCode: Int) -> Bool {
+        [129, 130, 137, 143].contains(exitCode)
+    }
+
     /// Generic messages that don't provide useful error info
     static func isGenericAbortMessage(_ message: String) -> Bool {
         message.contains("Bisync aborted") || message.contains("Failed to bisync")

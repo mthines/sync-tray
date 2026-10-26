@@ -2123,7 +2123,19 @@ final class SyncManager: ObservableObject {
 
         // Terminate any in-flight run for this profile and clear its lock, so a
         // hung/slow sync can't keep holding the lock and block a later resume.
-        terminateRunningSync(for: profile)
+        let wasSyncing = profileStates[profileId] == .syncing
+        let signalledRun = terminateRunningSync(for: profile)
+
+        // The run Pause just stopped still reports its end in the log — rclone's own notice,
+        // the script's "Bisync failed with exit code 143" — and that is no more a failure
+        // than an aborted run's end: no error banner, no notification, no auto-fix `--resync`
+        // restarting what the user paused, no `synctray.sync.completed` failure. Give its
+        // lines the abort's run-end treatment (`wasRunAborted`), for as long as rclone can
+        // spend shutting down on SIGTERM. The next run the app starts or a genuine
+        // `.syncStarted` clears it early, exactly as after an abort.
+        if wasSyncing || signalledRun {
+            abortSuppressUntil[profileId] = Date().addingTimeInterval(SyncAbort.pauseRunEndSuppression)
+        }
 
         // Close any open telemetry span so it isn't later reported as abandoned.
         TelemetryService.shared.recordSyncSkipped(
@@ -2151,14 +2163,18 @@ final class SyncManager: ObservableObject {
     /// file PID) and remove the lock so a killed/stale run can't block the next
     /// start. Best-effort: signals the process group (launchd runs each job as
     /// its own group leader) so the bash script and its rclone child both stop.
-    /// Safe to call when nothing is running.
-    private func terminateRunningSync(for profile: SyncProfile) {
+    /// Safe to call when nothing is running. Returns whether a running sync was
+    /// found and signalled.
+    @discardableResult
+    private func terminateRunningSync(for profile: SyncProfile) -> Bool {
+        var signalled = false
         if let pid = detectRunningSyncPID(for: profile) {
             // Negative PID targets the whole process group; fall back to the
             // single process if it isn't a group leader.
             if kill(-pid, SIGTERM) != 0 {
                 kill(pid, SIGTERM)
             }
+            signalled = true
         }
         // Stop any external-sync completion poller watching this profile.
         syncCompletionPollers[profile.id]?.cancel()
@@ -2166,6 +2182,7 @@ final class SyncManager: ObservableObject {
         monitoringExternalSyncs.remove(profile.id)
         // Remove the lock file so the next run isn't blocked by a stale lock.
         try? FileManager.default.removeItem(atPath: profile.lockFilePath)
+        return signalled
     }
 
     /// Resume syncing for a specific profile (restarts directory watcher)
@@ -2242,8 +2259,9 @@ final class SyncManager: ObservableObject {
     }
 
     /// Whether the profile's most recent run was stopped by `abortSync` — true while the
-    /// abort is in flight and for `SyncAbort.trailingSuppression` after it finished. Run
-    /// launchers read it to report "aborted" instead of "failed".
+    /// abort is in flight and for `SyncAbort.trailingSuppression` after it finished — or by
+    /// Pause (`pauseProfile`), for `SyncAbort.pauseRunEndSuppression` after it signalled the
+    /// run. Run launchers read it to report "aborted" instead of "failed".
     func wasRunAborted(for profileId: UUID) -> Bool {
         SyncAbort.suppressesRunEnd(
             abortInFlight: isAborting(for: profileId),
@@ -3293,11 +3311,12 @@ final class SyncManager: ObservableObject {
             retryPendingExternalReinstallIfNeeded(for: profileId)
 
         case .syncFailed(let exitCode, let message):
-            // The run was stopped by `abortSync`: its non-zero exit is the abort, not a
-            // failure — no error, no notification, and above all no auto-fix `--resync`
-            // restarting what the user just stopped. `finishAbort` settles the state.
+            // The run was stopped by `abortSync` or by Pause: its non-zero exit is the stop,
+            // not a failure — no error, no notification, and above all no auto-fix `--resync`
+            // restarting what the user just stopped. `finishAbort` settles an abort's state;
+            // Pause already set `.paused` and closed the span.
             if wasRunAborted(for: profileId) {
-                SyncTraySettings.debugLog("Ignoring syncFailed (exit \(exitCode)) for '\(profileName)': the run was aborted")
+                SyncTraySettings.debugLog("Ignoring syncFailed (exit \(exitCode)) for '\(profileName)': the run was aborted or paused")
                 profileProgress[profileId] = nil
                 lastSeenErrorMessage[profileId] = nil
                 currentSyncChanges[profileId] = nil
@@ -3354,6 +3373,12 @@ final class SyncManager: ObservableObject {
                 break
             }
 
+            // The exit code this line actually states: the script's "Bisync failed with exit
+            // code N" states one; rclone's own "Failed to bisync: …" notice states none, and
+            // `LogParser` stands in 1 for it only so the error state has something to show.
+            // Telemetry takes only a stated one (`recordSyncFailed`).
+            let statedExitCode = SyncLogPatterns.extractExitCode(from: event.rawLine)
+
             // A failed bisync reports its end twice (#122). The repeat must not set the error,
             // notify, or record the failure again — see `syncFailureHandling`.
             let failureHandledAt = Date()
@@ -3368,6 +3393,11 @@ final class SyncManager: ObservableObject {
                 // notifying or recording anything again.
                 if exitCode > 0, case .error = profileStates[profileId] {
                     profileStates[profileId] = .error("Exit code \(exitCode)")
+                }
+                // …and give it to the run's failure, which telemetry holds until it knows the
+                // exit code (the failure is still counted once: this only completes it).
+                if let statedExitCode {
+                    TelemetryService.shared.recordSyncFailureExitCode(profileId: profileId, exitCode: statedExitCode)
                 }
                 if handling == .retryAutoFixOnly,
                    let storedError = profileErrors[profileId],
@@ -3404,7 +3434,7 @@ final class SyncManager: ObservableObject {
                 mode: profile?.syncMode ?? .bisync,
                 duration: failedDuration,
                 filesChanged: currentSyncChanges[profileId]?.count ?? 0,
-                exitCode: exitCode,
+                exitCode: statedExitCode,
                 errorMessage: profileErrors[profileId] ?? message,
                 localSyncPath: profile?.localSyncPath
             )
