@@ -730,22 +730,29 @@ enum SyncLogPatterns {
             || lower.contains("not deleting directories as there were io errors")
     }
 
-    /// An error that says the run was stopped rather than that it failed: Go's
-    /// `context.Canceled` text ("context canceled", which rclone's transfers fail with when a
-    /// signal cancels the sync), rclone's own "Signal received: …" line, and bisync's
-    /// graceful-shutdown outcome ("Graceful shutdown failed." / "Bisync interrupted. Must run
-    /// --resync to recover.", from `cmd/bisync/operations.go`). `TelemetryService.categorizeError`
-    /// buckets it as `interrupted`, ahead of the critical check whose "resync" the last one
-    /// would otherwise hit. Matched case-insensitively. Caveat: rclone also logs "context
-    /// canceled" for the transfers it cancels after some other error, and for Stream reads the
-    /// NFS client abandons, so a single `Sync error` line can read `interrupted` without a stop;
-    /// a failed run is still categorized from its first error, which comes before those.
+    /// An error that says the run was stopped rather than that it failed, in the two wordings
+    /// that reach `TelemetryService.categorizeError`, which buckets it as `interrupted`:
+    /// - Go's `context.Canceled` text ("context canceled"), which rclone's transfers fail with
+    ///   at ERROR when a signal cancels the sync, so `LogParser` surfaces it.
+    /// - bisync's "Bisync interrupted. Must run --resync to recover." (`cmd/bisync/operations.go`),
+    ///   matched ahead of the critical check whose "resync" it would otherwise hit. bisync logs
+    ///   it at NOTICE, which `LogParser` never surfaces; it arrives through
+    ///   `SyncManager.readLastErrorFromLog` (a run the app picked up from its lock), which admits
+    ///   NOTICE lines and keeps it as the profile's stored error, the one `Profile status`
+    ///   categorizes.
+    ///
+    /// Not matched, because no path brings them here: rclone's "Signal received: …" (INFO,
+    /// `lib/atexit`) and bisync's "Graceful shutdown failed." (NOTICE, always logged just before
+    /// the interrupted line, which that backwards scan reaches first and stops at). A stop that
+    /// logs neither is told by its exit code (`isStopSignalExitCode`). Log levels as of rclone
+    /// v1.73.2. Matched case-insensitively. Caveat: rclone also logs "context canceled" for the
+    /// transfers it cancels after some other error, and for Stream reads the NFS client
+    /// abandons, so a single `Sync error` line can read `interrupted` without a stop; a failed
+    /// run is still categorized from its first error, which comes before those.
     static func isInterruptedError(_ message: String) -> Bool {
         let lower = message.lowercased()
         return lower.contains("context canceled")
-            || lower.contains("signal received:")
             || lower.contains("bisync interrupted")
-            || lower.contains("graceful shutdown failed")
     }
 
     /// Whether a sync's exit code says a stop signal ended it rather than an error. The script

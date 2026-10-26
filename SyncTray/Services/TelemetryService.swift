@@ -3426,7 +3426,8 @@ final class TelemetryService {
         guard let msg = message else { return "unknown" }
         let lower = msg.lowercased()
         // A run that was stopped, not one that failed: a signal cancelled rclone's transfers
-        // ("context canceled") or bisync's graceful shutdown ran. Ahead of the critical check,
+        // ("context canceled") or bisync's graceful shutdown failed ("Bisync interrupted…",
+        // which arrives as a stored error read back from the log). Ahead of the critical check,
         // which "Bisync interrupted. Must run --resync to recover." would otherwise hit through
         // its "resync" and file as `out_of_sync`.
         if SyncLogPatterns.isInterruptedError(msg) {

@@ -9683,13 +9683,13 @@ enum ConfigSelfTest {
             }
         }
 
-        // rclone's cancellation wording (lib/atexit, cmd/bisync/operations.go), ahead of the
-        // critical check, whose "resync" would otherwise claim bisync's interrupted notice.
+        // rclone's cancellation wording that reaches categorizeError (cmd/bisync/operations.go),
+        // ahead of the critical check, whose "resync" would otherwise claim bisync's interrupted
+        // notice. rclone's "Signal received:" (INFO) and bisync's "Graceful shutdown failed."
+        // reach it on no path, so they are not matched.
         let messages: [(String, String)] = [
             ("Failed to copy: Post \"https://www.googleapis.com/upload\": context canceled", "interrupted"),
             ("Bisync interrupted. Must run --resync to recover.", "interrupted"),
-            ("Graceful shutdown failed.", "interrupted"),
-            ("Signal received: terminated", "interrupted"),
             // A deadline is a timeout, not a stop.
             ("Failed to copy: context deadline exceeded", "timeout"),
             ("Bisync critical error: out of sync - must run --resync", "out_of_sync"),
@@ -9699,6 +9699,17 @@ enum ConfigSelfTest {
             guard got == expected else {
                 return report(name, slug, false, "(categorizeError(\(message.debugDescription)) = \(got), expected \(expected))")
             }
+        }
+
+        // The path that keeps "bisync interrupted" live: bisync logs it at NOTICE, which
+        // LogParser never surfaces as an error, but readLastErrorFromLog (a run the app picked
+        // up from its lock) admits NOTICE lines and stores it as the profile's error, which
+        // `Profile status` categorizes. Read it back the way that scan does.
+        let interruptedNotice = #"{"time":"2026-10-25T17:43:58.120+01:00","level":"notice","msg":"Bisync interrupted. Must run --resync to recover.","source":"bisync/operations.go:167"}"#
+        guard let noticeMsg = SyncLogPatterns.extractErrorMessage(from: interruptedNotice),
+              TelemetryService.categorizeError(
+                  SyncLogPatterns.cleanErrorMessage(SyncLogPatterns.stripANSICodes(noticeMsg))) == "interrupted" else {
+            return report(name, slug, false, "(bisync's interrupted notice, read back as a stored error, is not interrupted)")
         }
 
         // Which end line states an exit code: the script's own, never rclone's notice.

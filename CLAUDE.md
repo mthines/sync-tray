@@ -1992,8 +1992,11 @@ lock files, rclone.conf and `ps` read off the main actor, only when telemetry is
   the `Sync failed` log and span also carry `error.operation`: `copy` / `delete` / `move` /
   `list` / `mkdir` / `other`.
 - A run that was stopped rather than failed is `error.type=interrupted`: rclone's cancellation
-  wording ("context canceled", "Signal received:", bisync's "Bisync interrupted" / "Graceful
-  shutdown failed", ahead of the critical check), and — for a failed run
+  wording that reaches `categorizeError` ("context canceled", an ERROR line, and bisync's
+  "Bisync interrupted", matched ahead of the critical check — a NOTICE line, so it arrives only
+  as the stored error `readLastErrorFromLog` reads back for a run picked up from its lock;
+  rclone's INFO "Signal received:" and bisync's "Graceful shutdown failed" reach it on no path
+  and are not matched), and — for a failed run
   (`categorizeSyncFailure`) — a stop signal's exit code, 129/130/137/141/143 (141: rclone died of
   SIGPIPE because the group signal killed the `tee` it logs through). The `Sync failed` log
   and span carry the script's real `sync.exit_code` (rclone's own "Failed to bisync" notice
