@@ -946,6 +946,14 @@ struct SetupWizardView: View {
             updatedProfile.syncMode = syncMode
             updatedProfile.syncDirection = syncDirection
 
+            // Refuse while a run is live, before anything is written: the reinstall below
+            // reloads the agent (RunAtLoad), which must not start next to a running sync.
+            // Matches ProfileDetailView.reinstallSync.
+            guard !syncManager.isRunLive(for: existingProfile) else {
+                errorMessage = "A sync is currently running for \(existingProfile.name); try again once it finishes."
+                isLoading = false
+                return
+            }
             do {
                 try SyncSetupService.requestInitialScheduledSync(from: existingProfile, to: updatedProfile)
             } catch {
@@ -955,6 +963,15 @@ struct SetupWizardView: View {
             }
             profileStore.update(updatedProfile)
             profileToInstall = updatedProfile
+            // `install(profile:)` below only runs `launchctl load`, which does nothing for an
+            // agent that is already loaded: the new plist and the RunAtLoad initial sync would
+            // wait for the next login. Tear down first, as Save does. Teardown errors are
+            // ignored as in ProfileDetailView.reinstallSync; install regenerates every file.
+            do {
+                try SyncSetupService.shared.uninstallForReinstall(from: existingProfile, to: updatedProfile)
+            } catch {
+                print("Failed to tear down profile before reinstall: \(error)")
+            }
         } else {
             // Create new profile
             var profile = SyncProfile(
