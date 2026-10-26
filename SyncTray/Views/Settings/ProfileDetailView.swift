@@ -27,6 +27,9 @@ struct ProfileDetailView: View {
     @State private var localSyncPath: String = ""
     @State private var isExternalDrive: Bool = false
     @State private var syncIntervalMinutes: Int = 5
+    @State private var syncOnLocalChanges: Bool = true
+    @State private var isScheduleValid: Bool = true
+    @State private var scheduleEditID = UUID()
     @State private var additionalRcloneFlags: String = ""
     @State private var syncMode: SyncMode = .bisync
     @State private var syncDirection: SyncDirection = .localToRemote
@@ -210,6 +213,8 @@ struct ProfileDetailView: View {
             localSyncPath != profile.localSyncPath ||
             computedDrivePath != profile.drivePathToMonitor ||
             syncIntervalMinutes != profile.syncIntervalMinutes ||
+            syncOnLocalChanges != profile.syncOnLocalChanges ||
+            (syncMode != .mount && !isScheduleValid) ||
             additionalRcloneFlags != profile.additionalRcloneFlags ||
             syncMode != profile.syncMode ||
             syncDirection != profile.syncDirection ||
@@ -1207,27 +1212,13 @@ struct ProfileDetailView: View {
 
     private var scheduleSection: some View {
         VStack(alignment: .leading, spacing: 12) {
-            VStack(alignment: .leading, spacing: 4) {
-                Text("Sync Interval")
-                    .font(.subheadline.weight(.medium))
-                Text("How often to run the sync (in minutes)")
-                    .font(.caption)
-                    .foregroundColor(.secondary)
-
-                HStack {
-                    Picker("", selection: $syncIntervalMinutes) {
-                        Text("1 minute").tag(1)
-                        Text("2 minutes").tag(2)
-                        Text("5 minutes").tag(5)
-                        Text("10 minutes").tag(10)
-                        Text("15 minutes").tag(15)
-                        Text("30 minutes").tag(30)
-                        Text("1 hour").tag(60)
-                    }
-                    .pickerStyle(.menu)
-                    .frame(width: 150)
-                    Spacer()
-                }
+            if syncMode != .mount {
+                SyncScheduleControls(
+                    syncOnLocalChanges: $syncOnLocalChanges,
+                    intervalMinutes: $syncIntervalMinutes,
+                    isValid: $isScheduleValid
+                )
+                .id(scheduleEditID)
             }
         }
         .padding()
@@ -2083,25 +2074,12 @@ struct ProfileDetailView: View {
         VStack(alignment: .leading, spacing: 16) {
             // Sync Interval (not applicable for mount mode)
             if syncMode != .mount {
-                VStack(alignment: .leading, spacing: 4) {
-                    Text("Sync Interval")
-                        .font(.subheadline.weight(.medium))
-                    Text("How often to run the sync")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-
-                    Picker("", selection: $syncIntervalMinutes) {
-                        Text("1 minute").tag(1)
-                        Text("2 minutes").tag(2)
-                        Text("5 minutes").tag(5)
-                        Text("10 minutes").tag(10)
-                        Text("15 minutes").tag(15)
-                        Text("30 minutes").tag(30)
-                        Text("1 hour").tag(60)
-                    }
-                    .pickerStyle(.menu)
-                    .frame(width: 150, alignment: .leading)
-                }
+                SyncScheduleControls(
+                    syncOnLocalChanges: $syncOnLocalChanges,
+                    intervalMinutes: $syncIntervalMinutes,
+                    isValid: $isScheduleValid
+                )
+                .id(scheduleEditID)
             } else {
                 // Mount mode info
                 VStack(alignment: .leading, spacing: 4) {
@@ -2250,7 +2228,7 @@ struct ProfileDetailView: View {
                 saveProfile()
             }
             .keyboardShortcut(.defaultAction)
-            .disabled(!hasChanges || mountFallbackCacheConflict)
+            .disabled(!hasChanges || mountFallbackCacheConflict || (syncMode != .mount && !isScheduleValid))
             .buttonStyle(.borderedProminent)
         }
     }
@@ -2264,6 +2242,9 @@ struct ProfileDetailView: View {
         localSyncPath = profile.localSyncPath
         isExternalDrive = !profile.drivePathToMonitor.isEmpty
         syncIntervalMinutes = profile.syncIntervalMinutes
+        syncOnLocalChanges = profile.syncOnLocalChanges
+        isScheduleValid = true
+        scheduleEditID = UUID()
         additionalRcloneFlags = profile.additionalRcloneFlags
         syncMode = profile.syncMode
         syncDirection = profile.syncDirection
@@ -2312,6 +2293,7 @@ struct ProfileDetailView: View {
         updatedProfile.localSyncPath = localSyncPath
         updatedProfile.drivePathToMonitor = computedDrivePath
         updatedProfile.syncIntervalMinutes = syncIntervalMinutes
+        updatedProfile.syncOnLocalChanges = syncOnLocalChanges
         updatedProfile.additionalRcloneFlags = additionalRcloneFlags
         updatedProfile.syncMode = syncMode
         updatedProfile.syncDirection = syncDirection
@@ -2423,6 +2405,7 @@ struct ProfileDetailView: View {
     }
 
     private func saveProfile() {
+        guard syncMode == .mount || isScheduleValid else { return }
         // Backstop for the disabled Save button: never persist a Stream profile whose
         // fallback resolves to a different remote path — it would duplicate the VFS cache.
         guard !mountFallbackCacheConflict else {
@@ -2506,7 +2489,8 @@ struct ProfileDetailView: View {
             filterChanged: SyncManager.syncFilterReconcileNeeded(from: currentProfile, to: updatedProfile),
             needsReinstall: needsReinstall,
             runLive: syncManager.isRunLive(for: currentProfile),
-            installed: isInstalled
+            installed: isInstalled,
+            syncOnLocalChanges: updatedProfile.syncOnLocalChanges
         )
 
         // A live run needs confirmation before SyncTray stops it — nothing is persisted until
@@ -2831,7 +2815,7 @@ struct ProfileDetailView: View {
     ///   `vfsCachePath` field can hold an unresolved, un-gated edit, so that
     ///   path must reinstall the ALREADY-PERSISTED profile, never derive one
     ///   from form state.
-    private func installSync(using overrideProfile: SyncProfile?) {
+    private func installSync(using overrideProfile: SyncProfile?, runInitialSync: Bool = true) {
         isInstalling = true
         installError = nil
 
@@ -2845,7 +2829,7 @@ struct ProfileDetailView: View {
         )
 
         // Check if this needs initial sync before we start
-        let needsResync = !setupService.hasExistingListings(for: currentProfile)
+        let needsResync = runInitialSync && !setupService.hasExistingListings(for: currentProfile)
 
         DispatchQueue.global(qos: .userInitiated).async {
             do {
@@ -3320,7 +3304,9 @@ struct ProfileDetailView: View {
         } catch {
             // Ignore uninstall errors
         }
-        installSync(using: overrideProfile)
+        // The script consumes a one-time request for a mode/folder change; an
+        // ordinary Save must not start a second initial/resync process.
+        installSync(using: overrideProfile, runInitialSync: (overrideProfile ?? currentProfile).syncOnLocalChanges)
     }
 
     /// - Parameters:

@@ -1290,8 +1290,10 @@ extension VFSCacheService {
             try? FileManager.default.removeItem(atPath: path)
             throw walkError
         }
+        // Owner-only: the list's directory is the Cache Only overlay root (AC-SEC6).
         try FileManager.default.createDirectory(
-            atPath: (path as NSString).deletingLastPathComponent, withIntermediateDirectories: true)
+            atPath: (path as NSString).deletingLastPathComponent, withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700])
         let body = lines.isEmpty ? "" : lines.joined(separator: "\n") + "\n"
         try body.write(toFile: path, atomically: true, encoding: .utf8)
         return excluded

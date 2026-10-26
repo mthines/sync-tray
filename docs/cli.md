@@ -230,6 +230,16 @@ A saved copy (`--output`) is created readable only by you.
 
 `sync` returns the sync script's own exit code.
 
+## Periodic backups
+
+```bash
+synctray profile set Projects syncOnLocalChanges false syncIntervalMinutes 10080
+```
+
+This selects weekly schedule-only backups. See [schedule-only configuration](configuration.md#schedule-only-state)
+for first-run/recovery semantics and the [user guide](user-guide.md#automatic-sync-and-longer-intervals)
+for behavior across sleep and restarts.
+
 ## Privacy
 
 CLI output goes only to your terminal.
