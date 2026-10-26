@@ -2127,7 +2127,7 @@ collecting never sends, a retry after a failed send never re-sends).
 | `~/.config/synctray/profiles/{shortId}.cacheonly.rclone.conf` | Mount mode only — chmod-0600 `union` remote config for the Cache-only overlay mount |
 | `{vfsCachePath}/vfs/{primaryRemoteName}/{path}/…` | Mount mode only — VFS cached file **data**, keyed by the profile's own primary remote name (see "Cache key" above) |
 | `{vfsCachePath}/vfsMeta/{primaryRemoteName}/{path}/…` | Mount mode only — VFS metadata sidecars, including the `--vfs-cache-mode full` downloaded byte-range list. Load-bearing for Cache Directory Migration: moving `vfs` without `vfsMeta` makes rclone re-download everything. |
-| `{vfsCachePath}/synctray-overlay/{shortId}/…` | Mount mode only — the Cache-only overlay: every file created or edited while in Cache Only, until uploaded |
+| `{vfsCachePath}/synctray-overlay/{shortId}/…` | Mount mode only — the Cache-only overlay: every file created or edited while in Cache Only, until uploaded. The `synctray-overlay` root is owner-only (0700): the script creates it under `umask 077` and `chmod 700`s it on every Cache Only start, the Swift writers create it 0700, and the app tightens an existing 0755 root at launch. Covered by `ConfigSelfTest` AC-SEC6. |
 | `{vfsCachePath}/synctray-overlay/{shortId}.manifest.json` | Mount mode only — Upload Now's manifest (path + size + mtime at upload time) |
 | `{vfsCachePath}/synctray-overlay/{shortId}.exclude.txt` | Mount mode only — partial-file exclude list, regenerated on every Cache-only mount start |
 | `{vfsCachePath}/synctray-overlay/{shortId}.vfscache` | Mount mode only — the Cache-only union mount's own small `--vfs-cache-mode writes` bookkeeping directory (never the streaming cache) |

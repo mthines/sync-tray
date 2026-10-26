@@ -126,6 +126,7 @@ enum ConfigSelfTest {
             testShimQuotesExecutablePath,
             testMountModeFileNotInSharedTmp,
             testLogAndProfileDirsOwnerOnly,
+            testCacheOnlyOverlayOwnerOnly,
             testRemoteFolderListingKeepsSpaces,
             testCLIRemoteFolders,
             testCLITelemetryConsent,
@@ -4765,6 +4766,63 @@ enum ConfigSelfTest {
         guard let appSource = readSourceFile("SyncTrayApp.swift"),
               appSource.contains("SyncSetupService.tightenPrivateDirectoriesIfLoose()") else {
             return report(name, slug, false, "(SyncTrayApp no longer tightens the directories at launch)")
+        }
+        return report(name, slug, true)
+    }
+
+    // MARK: - AC-SEC6 — the Cache Only overlay root is owner-only
+
+    /// The Cache Only overlay holds the contents of every file saved while in Cache Only,
+    /// next to its upload manifest, partial-file list and writes cache, all under
+    /// `{vfsCachePath}/synctray-overlay`. Earlier versions created that root with the
+    /// default mode (0755) and rclone writes saved files 0644, so on a Mac whose home
+    /// folder other accounts can traverse, they could read them (CWE-276). Asserts both
+    /// Swift writers create the root 0700, that the generated script's Cache Only mount
+    /// start leaves the root and the overlay 0700 both when it creates them and when an
+    /// earlier version left them 0755, and pins the launch-time tighten.
+    private static func testCacheOnlyOverlayOwnerOnly() -> Bool {
+        let name = "AC-SEC6", slug = "cache-only-overlay-owner-only"
+        let fm = FileManager.default
+        let root = "\(selfTestRoot)/sec6-\(UUID().uuidString)"
+        defer { try? fm.removeItem(atPath: root) }
+        func mode(_ path: String) -> Int? {
+            ((try? fm.attributesOfItem(atPath: path))?[.posixPermissions] as? Int).map { $0 & 0o777 }
+        }
+
+        let manifestProfile = mountFixtureProfile(localPath: "\(root)/m-mnt", cachePath: "\(root)/m-cache")
+        guard OverlaySyncService.saveManifest([:], path: manifestProfile.overlayManifestPath),
+              mode(manifestProfile.overlayRootPath) == 0o700 else {
+            return report(name, slug, false, "(saveManifest created the overlay root with mode \(String(describing: mode(manifestProfile.overlayRootPath))), not 0700)")
+        }
+        let listProfile = mountFixtureProfile(localPath: "\(root)/l-mnt", cachePath: "\(root)/l-cache")
+        guard (try? VFSCacheService.shared.writeCacheOnlyExcludeList(for: listProfile)) != nil,
+              mode(listProfile.overlayRootPath) == 0o700 else {
+            return report(name, slug, false, "(the exclude-list writer created the overlay root with mode \(String(describing: mode(listProfile.overlayRootPath))), not 0700)")
+        }
+
+        let local = "\(root)/mnt", cache = "\(root)/cache"
+        try? fm.createDirectory(atPath: local, withIntermediateDirectories: true)
+        try? fm.createDirectory(atPath: cache, withIntermediateDirectories: true)
+        let profile = mountFixtureProfile(localPath: local, cachePath: cache, streamCacheOnly: true)
+        // Cache Only writes a real file under ~/.config/synctray/profiles/ (see AC-CO1).
+        defer { try? fm.removeItem(atPath: profile.cacheOnlyConfigPath) }
+        for pass in ["created by the script", "left 0755 by an earlier version"] {
+            let result = dryRunMountScript(profile: profile, rcloneConfig: "")
+            guard result.mode == MountMode.cacheOnlyManual.rawValue else {
+                return report(name, slug, false, "(\(pass): mode=\(result.mode ?? "nil") log=\(result.log))")
+            }
+            let modes = [profile.overlayRootPath, profile.overlayPath, profile.cacheOnlyCachePath].map(mode)
+            guard modes == [0o700, 0o700, 0o700] else {
+                return report(name, slug, false, "(\(pass): overlay root/overlay/writes cache modes \(modes), not 0700)")
+            }
+            for dir in [profile.overlayRootPath, profile.overlayPath] {
+                try? fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: dir)
+            }
+        }
+
+        guard let managerSource = readSourceFile("Services/SyncManager.swift"),
+              managerSource.contains("SyncSetupService.tightenDirectoryIfLoose(atPath: profile.overlayRootPath)") else {
+            return report(name, slug, false, "(SyncManager no longer tightens the overlay root at launch)")
         }
         return report(name, slug, true)
     }
