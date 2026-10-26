@@ -1844,6 +1844,17 @@ has exited.
   The view's run launchers report "aborted" from `isAborting` (an app-launched run's abort
   cannot finish before its token is released), so a quick genuine failure of a run restarted
   right after an abort still reads as a failure.
+- **Pause gets the same run-end treatment.** Pause is not Abort (it unloads the agent and
+  SIGTERMs the run's process group in `terminateRunningSync`, without watching it exit).
+  Usually the script's bash and its `tee` die with the group and nothing more reaches the log,
+  but what does — rclone's notice or "context canceled" errors, the script's exit line from a
+  run Pause could not signal as a group — is the stop, not a failure. When a run was live
+  (decided before `launchctl unload`, which can stop the job by itself), `pauseProfile` sets the
+  same `abortSuppressUntil` window for `SyncAbort.pauseRunEndSuppression` (rclone's
+  `gracefulTimeout` plus `trailingSuppression`, 120 s), so `wasRunAborted` drops those lines
+  exactly as above: no error, no notification, no auto-fix `--resync`, no failure in telemetry.
+  Resume clears it before it loads the `RunAtLoad` agent (whose immediate run must report its
+  own failures), as do the events above. Covered by AC-AB5.
 - **Aborted initial sync.** `runResync` loads the launchd agent when an install's initial sync
   ends — but the agent is `RunAtLoad`, so loading it after an abort would restart the sync at
   once. The load is deferred (`deferAgentLoadAfterAbort`) and done by the next app-started run
@@ -1980,6 +1991,17 @@ lock files, rclone.conf and `ps` read off the main actor, only when telemetry is
   moved from `critical` to `directory_not_empty` (AC-TS2). The `Sync error` log and
   the `Sync failed` log and span also carry `error.operation`: `copy` / `delete` / `move` /
   `list` / `mkdir` / `other`.
+- A run that was stopped rather than failed is `error.type=interrupted`: rclone's cancellation
+  wording that reaches `categorizeError` ("context canceled", an ERROR line, and bisync's
+  "Bisync interrupted", matched ahead of the critical check — a NOTICE line, so it arrives only
+  as the stored error `readLastErrorFromLog` reads back for a run picked up from its lock;
+  rclone's INFO "Signal received:" and bisync's "Graceful shutdown failed" reach it on no path
+  and are not matched), and — for a failed run
+  (`categorizeSyncFailure`) — a stop signal's exit code, 129/130/137/141/143 (141: rclone died of
+  SIGPIPE because the group signal killed the `tee` it logs through). The `Sync failed` log
+  and span carry the script's real `sync.exit_code` (rclone's own "Failed to bisync" notice
+  states none, so the failure is held up to `duplicateSyncFailureWindow` for the script's "Bisync
+  failed with exit code N"), and leave it out when no line stated one (AC-TS8).
 - `Profile configuration` carries `config.local_path_kind` (`SyncPathKind.classify`: `desktop`,
   `documents`, `downloads`, `pictures`, `music`, `movies`, `public`, `icloud_drive`,
   `cloud_storage`, `library`, `home_root`, `home_other`, `external_volume`, `other`, `unknown`),

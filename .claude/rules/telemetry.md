@@ -130,6 +130,33 @@ timestamp, so it is never parsed); `SyncManager.beginExclusiveRun` calls
 notification and auto-fix (`SyncManager.syncFailureHandling`, AC-SF1; CLAUDE.md "A failed run
 is handled once").
 
+**A failed run is recorded with the script's real exit code.** rclone's notice states no exit
+code (`LogParser` stands in 1 for the UI), so `SyncManager` passes `recordSyncFailed` only an
+exit code the line itself states (`SyncLogPatterns.extractExitCode(from: event.rawLine)`). A
+failure without one is held in `pendingSyncFailures` — its span stays open — until the run's
+repeated end line, the script's "Bisync failed with exit code N", supplies it
+(`recordSyncFailureExitCode`, from `processLogEvent`'s repeat branch), or until
+`duplicateSyncFailureWindow` passes. Only then does `finishSyncFailure` record the metrics, the
+span and the `Sync failed` log, so the `synctray.sync.*` failure metrics can trail the run's end
+by up to 15 s. A failure that states its exit code is recorded at once. `sync.exit_code` is left
+out when no line stated one (Force Sync, whose exit line is never parsed), never guessed. A held
+failure is recorded first by anything that ends the profile's span or starts its next run —
+`recordSyncStarted`, `recordSyncCompleted`, `recordSyncSkipped`, `forgetLastSyncFailure`,
+`shutdown()` — so it is never lost or ended as `abandoned`/`skipped`/`app_shutdown`. The exit
+code is what makes a stopped run `error.type=interrupted` (see [Error
+categories](#error-categories)). Covered by AC-TS8.
+
+**A run Abort or Pause stopped is not a failure.** Abort (CLAUDE.md Critical Rule 9) and Pause
+both make `.syncFailed` drop the stopped run's end lines (`SyncManager.wasRunAborted`), so they
+record no failure: the span ends as `sync.result=skipped` with `sync.skip_reason`
+`aborted`/`paused`, and `synctray.sync.completed` is not incremented. Pause SIGTERMs the run's
+process group and opens the same window for `SyncAbort.pauseRunEndSuppression` (rclone's
+graceful shutdown plus the trailing backstop, 120 s); Resume ends it. Usually the group signal
+kills the script and its `tee` too, so nothing more reaches the log; the window covers what
+still does. Covered by AC-AB3–AC-AB5. Other stops (Ctrl-C on `synctray sync`, an external
+SIGTERM/SIGKILL) still count in `synctray.sync.completed{sync.result=failure}`; tell them apart
+by `error.type=interrupted` on `synctray.sync.errors` and on the `synctray sync` span.
+
 ## Per-profile Heartbeat Logs
 
 The 5-minute session heartbeat (`SyncManager.startSessionHeartbeat`) emits the aggregate
@@ -178,7 +205,7 @@ session `.lck` (`SyncRunLock.lockState`, pure):
 
 `error.type` (`TelemetryService.categorizeError`, pure) is a bounded bucket of an error
 message; the message itself never leaves the machine. Order: the `SyncLogPatterns` checks
-(`out_of_sync`/`critical`, `transient_all_files_changed`, `exclusive_mode_unsupported`,
+(`interrupted`, `out_of_sync`/`critical`, `transient_all_files_changed`, `exclusive_mode_unsupported`,
 `permission_denied` for EPERM, `io_errors_blocked_deletes`), then the specific buckets of
 `TelemetryService.specificErrorBuckets` (lowercased, first match wins), then the original
 generic checks (`file_not_found`, `permission_denied`, `timeout`, `network`), else `other`;
@@ -186,8 +213,19 @@ generic checks (`file_not_found`, `permission_denied`, `timeout`, `network`), el
 names a more specific cause (e.g. a rate-limit or auth phrase), which now wins; besides that,
 Go's "directory not empty" moved from `critical` to `directory_not_empty`.
 
+A failed run's `error.type` (`TelemetryService.categorizeSyncFailure`, pure — the `Sync failed`
+log and span and the `synctray.sync.errors` counter) checks the exit code the script logged
+first (`SyncLogPatterns.isStopSignalExitCode`): 129/130/143 — rclone itself got
+SIGHUP/SIGINT/SIGTERM and exited 128 + the signal after its graceful shutdown; 137 — rclone was
+SIGKILLed; 141 — rclone died of SIGPIPE because the `tee` it logs through was killed, which is
+what a stop signal to the whole process group looks like when the script survives it (Ctrl-C on
+`synctray sync`; a group SIGTERM/SIGHUP kills the script too, so no exit line is written). Those
+are `interrupted`; anything else, or no stated exit code, falls back to `categorizeError` of the
+run's first error. Crash signals (134, 139) are not a stop.
+
 | Bucket | Matches (lowercased) |
 |--------|----------------------|
+| `interrupted` | "context canceled" (Go's `context.Canceled`, what rclone's transfers fail with at ERROR when a signal cancels them) and "bisync interrupted" (bisync's NOTICE "Bisync interrupted. Must run --resync to recover." when its graceful shutdown fails; `LogParser` never surfaces a NOTICE line, so it arrives only as the stored error `readLastErrorFromLog` reads back for a run picked up from its lock, which `Profile status` categorizes) — ahead of the critical check, whose "resync" would claim it; plus a stop signal's exit code on a failed run (above). rclone's "Signal received:" (INFO) and bisync's "Graceful shutdown failed." (NOTICE, always logged just before the interrupted line, where that backwards scan stops) reach `categorizeError` on no path, so they are not matched; levels as of rclone v1.73.2. Not "context deadline exceeded", which stays `timeout`. Caveat: rclone also logs "context canceled" for transfers it cancels after another error, and for Stream reads the NFS client abandons, so a single `Sync error` line can read `interrupted` without a stop; a failed run is categorized from its first error, which comes before those |
 | `disk_full` | "no space left on device" |
 | `rate_limited` | "ratelimitexceeded", "userratelimitexceeded", "rate limit exceeded", "too many requests" — before `quota_exceeded`, since Google's per-minute limit says "Quota exceeded … rateLimitExceeded" |
 | `quota_exceeded` | "storagequotaexceeded", "quotaexceeded", "quota exceeded", "insufficient storage" |
@@ -391,7 +429,7 @@ rollout. No event is emitted on a fresh install.
 
 ### Logs
 All key lifecycle events are emitted as structured OTel logs:
-- Sync started/completed/failed (with profile context, duration, files changed; started carries `sync.trigger`: manual/directory_watch/scheduled/startup; failed — log and span — carries `error.type` and `error.operation`)
+- Sync started/completed/failed (with profile context, duration, files changed; started carries `sync.trigger`: manual/directory_watch/scheduled/startup; failed — log and span — carries `error.type`, `error.operation`, and `sync.exit_code` when a log line stated it — the script's real exit code, see "A failed run is recorded with the script's real exit code")
 - Mount/unmount success/failure
 - Directory watch triggers
 - Transport changes (primary ↔ fallback)
