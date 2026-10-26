@@ -177,6 +177,7 @@ enum ConfigSelfTest {
             testRemoteBackendType,
             testSyncProgressAttributes,
             testSyncFailureCountedOnce,
+            testStoppedRunTelemetry,
             testSyncFailureHandledOnce,
             testAutoFixRecurringResync,
             testAdditionalFlagsSplitParity,
@@ -197,6 +198,7 @@ enum ConfigSelfTest {
             testAbortEscalation,
             testAbortRunEndSuppression,
             testAbortWiringPinned,
+            testPauseRunEndSuppression,
             testRcloneErrorLinesNotFileChanges,
             testDiagnosticReportCode,
             testDiagnosticRedaction,
@@ -9609,9 +9611,19 @@ enum ConfigSelfTest {
               let check = offset(of: "Self.isDuplicateSyncFailure(", in: failed) else {
             return report(name, slug, false, "(recordSyncFailed does not call isDuplicateSyncFailure)")
         }
+        // The metrics are recorded by finishSyncFailure — at once, or once the run's exit code
+        // arrives (AC-TS8) — so recordSyncFailed decides before it reaches either path.
+        for step in ["finishSyncFailure(", "pendingSyncFailures[profileId] ="] {
+            guard let reached = offset(of: step, in: failed), check < reached else {
+                return report(name, slug, false, "(recordSyncFailed reaches \(step) before deciding the failure is not a repeat)")
+            }
+        }
+        guard let finish = body(of: "func finishSyncFailure(") else {
+            return report(name, slug, false, "(could not find finishSyncFailure)")
+        }
         for metric in ["syncCompletedCounter?.add", "syncErrorCounter?.add", "syncDurationHistogram?.record"] {
-            guard let recorded = offset(of: metric, in: failed), check < recorded else {
-                return report(name, slug, false, "(recordSyncFailed reaches \(metric) before deciding the failure is not a repeat)")
+            guard finish.contains(metric), !failed.contains(metric) else {
+                return report(name, slug, false, "(\(metric) is no longer recorded only by finishSyncFailure)")
             }
         }
         guard failed.contains("lastSyncFailureAt[profileId] = now") else {
@@ -9627,6 +9639,139 @@ enum ConfigSelfTest {
         guard let completed = body(of: "func recordSyncCompleted("),
               completed.contains("lastSyncFailureAt[profileId] = nil") else {
             return report(name, slug, false, "(recordSyncCompleted does not forget the last failure)")
+        }
+        return report(name, slug, true)
+    }
+
+    // MARK: - AC-TS8 — a stopped run is `interrupted`, and a failure carries the script's real exit code
+
+    /// A run a stop signal ended (Pause, logout, `kill`: 143; Ctrl-C: 130) was counted as an
+    /// ordinary failure, mostly `error.type=other`, and every failed bisync's span said
+    /// `sync.exit_code=1`: telemetry recorded rclone's own "Failed to bisync" notice, which
+    /// states no exit code (`LogParser` stands in 1), and dropped the script's "Bisync failed
+    /// with exit code N" as the run's repeated end line. Now a failure that states no exit
+    /// code is held until that line supplies one (or `duplicateSyncFailureWindow` passes), and
+    /// a stop signal's exit code, or rclone's cancellation wording, is `interrupted`.
+    private static func testStoppedRunTelemetry() -> Bool {
+        let name = "AC-TS8", slug = "stopped-run-interrupted-exit-code"
+
+        // Stop signals are a stop; rclone's own codes and crash signals are not.
+        for code in [129, 130, 137, 143] where !SyncLogPatterns.isStopSignalExitCode(code) {
+            return report(name, slug, false, "(exit code \(code) is not read as a stop signal)")
+        }
+        for code in [-1, 0, 1, 2, 3, 7, 9, 10, 128, 134, 139, 144, 255] where SyncLogPatterns.isStopSignalExitCode(code) {
+            return report(name, slug, false, "(exit code \(code) is read as a stop signal)")
+        }
+
+        // A failure's bucket: a stop signal's exit code first, then the run's first error.
+        let denied = "Failed to copy: open /Users/me/Sync/a.txt: permission denied"
+        let failures: [(message: String?, exitCode: Int?, expected: String, label: String)] = [
+            (denied, 143, "interrupted", "SIGTERM (Pause, logout, kill)"),
+            (denied, 130, "interrupted", "SIGINT (Ctrl-C)"),
+            (nil, 137, "interrupted", "SIGKILL with no error logged"),
+            (denied, 1, "permission_denied", "an ordinary failure"),
+            (denied, nil, "permission_denied", "no exit code stated"),
+            ("Bisync critical error: out of sync - must run --resync", 139, "out_of_sync", "a crash signal is not a stop"),
+            (nil, nil, "unknown", "nothing known"),
+        ]
+        for f in failures {
+            let got = TelemetryService.categorizeSyncFailure(message: f.message, exitCode: f.exitCode)
+            guard got == f.expected else {
+                return report(name, slug, false, "(\(f.label): categorizeSyncFailure = \(got), expected \(f.expected))")
+            }
+        }
+
+        // rclone's cancellation wording (lib/atexit, cmd/bisync/operations.go), ahead of the
+        // critical check, whose "resync" would otherwise claim bisync's interrupted notice.
+        let messages: [(String, String)] = [
+            ("Failed to copy: Post \"https://www.googleapis.com/upload\": context canceled", "interrupted"),
+            ("Bisync interrupted. Must run --resync to recover.", "interrupted"),
+            ("Graceful shutdown failed.", "interrupted"),
+            ("Signal received: terminated", "interrupted"),
+            // A deadline is a timeout, not a stop.
+            ("Failed to copy: context deadline exceeded", "timeout"),
+            ("Bisync critical error: out of sync - must run --resync", "out_of_sync"),
+        ]
+        for (message, expected) in messages {
+            let got = TelemetryService.categorizeError(message)
+            guard got == expected else {
+                return report(name, slug, false, "(categorizeError(\(message.debugDescription)) = \(got), expected \(expected))")
+            }
+        }
+
+        // Which end line states an exit code: the script's own, never rclone's notice.
+        let parser = LogParser()
+        guard let scriptEvent = parser.parse(line: "2026-10-25 17:44:01 - Bisync failed with exit code 143"),
+              case .syncFailed(let parsedCode, _) = scriptEvent.type, parsedCode == 143,
+              SyncLogPatterns.extractExitCode(from: scriptEvent.rawLine) == 143 else {
+            return report(name, slug, false, "(the script's end line no longer states its exit code)")
+        }
+        let notice: [String: Any] = ["level": "notice", "msg": "Failed to bisync: bisync aborted",
+                                     "source": "bisync/cmd.go:303", "time": "2026-10-25T17:44:00.9+01:00"]
+        guard let noticeData = try? JSONSerialization.data(withJSONObject: notice),
+              let noticeLine = String(data: noticeData, encoding: .utf8),
+              let noticeEvent = parser.parse(line: noticeLine),
+              case .syncFailed = noticeEvent.type,
+              SyncLogPatterns.extractExitCode(from: noticeEvent.rawLine) == nil else {
+            return report(name, slug, false, "(rclone's notice is read as stating an exit code)")
+        }
+
+        // Wiring, read from this build's own source.
+        guard let telemetry = readSourceFile("Services/TelemetryService.swift"),
+              let manager = readSourceFile("Services/SyncManager.swift") else {
+            return report(name, slug, false, "(could not read source files)")
+        }
+        guard let failed = extractFunctionBody(startingAt: "func recordSyncFailed(", in: telemetry),
+              let known = failed.range(of: "if let exitCode {"),
+              let finishNow = failed.range(of: "finishSyncFailure(profileId: profileId, failure, exitCode: exitCode)",
+                                           range: known.upperBound..<failed.endIndex),
+              let held = failed.range(of: "pendingSyncFailures[profileId] = (failure, timeout)",
+                                      range: finishNow.upperBound..<failed.endIndex),
+              failed[held.upperBound...].contains(
+                "DispatchQueue.main.asyncAfter(deadline: .now() + Self.duplicateSyncFailureWindow, execute: timeout)") else {
+            return report(name, slug, false, "(recordSyncFailed no longer holds a failure that states no exit code for the window)")
+        }
+        guard let finish = extractFunctionBody(startingAt: "func finishSyncFailure(", in: telemetry),
+              finish.contains("Self.categorizeSyncFailure(message: errorMessage, exitCode: exitCode)"),
+              finish.contains("if let exitCode {\n                span.setAttribute(key: \"sync.exit_code\""),
+              finish.contains("if let exitCode {\n                logAttributes[\"sync.exit_code\"]") else {
+            return report(name, slug, false, "(finishSyncFailure no longer buckets by exit code, or writes sync.exit_code when none is known)")
+        }
+        // Every path that ends the span or starts the next run records a held failure first.
+        let flushedBefore: [(String, String)] = [
+            ("func recordSyncStarted(", "activeSyncSpans.removeValue"),
+            ("func recordSyncCompleted(", "activeSyncSpans.removeValue"),
+            ("func recordSyncSkipped(", "activeSyncSpans.removeValue"),
+            ("func shutdown()", "for (_, span) in activeSyncSpans"),
+        ]
+        for (marker, spanEnd) in flushedBefore {
+            guard let fn = extractFunctionBody(startingAt: marker, in: telemetry),
+                  let flush = fn.range(of: "flushPendingSyncFailure("),
+                  let ends = fn.range(of: spanEnd),
+                  flush.upperBound <= ends.lowerBound else {
+                return report(name, slug, false, "(\(marker) can end the span before recording a held failure)")
+            }
+        }
+        guard let forget = extractFunctionBody(startingAt: "func forgetLastSyncFailure(", in: telemetry),
+              forget.contains("flushPendingSyncFailure(profileId: profileId, exitCode: nil)") else {
+            return report(name, slug, false, "(a recovery run's start no longer records the last run's held failure)")
+        }
+        // The app gives telemetry only an exit code the line states, and completes the held
+        // failure from the run's repeated end line before it remembers a new one.
+        guard let failedCase = manager.range(of: "case .syncFailed(let exitCode, let message):"),
+              let caseEnd = manager.range(of: "case .transportChanged(", range: failedCase.upperBound..<manager.endIndex) else {
+            return report(name, slug, false, "(could not find the syncFailed case)")
+        }
+        let caseBody = manager[failedCase.upperBound..<caseEnd.lowerBound]
+        guard caseBody.contains("let statedExitCode = SyncLogPatterns.extractExitCode(from: event.rawLine)"),
+              caseBody.contains("exitCode: statedExitCode,"),
+              let repeatBlock = caseBody.range(of: "if handling != .handle {"),
+              let completes = caseBody.range(
+                of: "TelemetryService.shared.recordSyncFailureExitCode(profileId: profileId, exitCode: statedExitCode)"),
+              let remember = caseBody.range(of: "lastHandledSyncFailureAt[profileId] = failureHandledAt"),
+              repeatBlock.upperBound <= completes.lowerBound,
+              completes.upperBound <= remember.lowerBound else {
+            return report(name, slug, false, "(syncFailed no longer gives telemetry the stated exit code, or the repeated end line's)")
         }
         return report(name, slug, true)
     }
@@ -10476,6 +10621,61 @@ enum ConfigSelfTest {
             return report("AC-AB4", "abort-wiring-pinned", false, "(the profile card no longer swaps Pause for Abort while a run is live)")
         }
         return report("AC-AB4", "abort-wiring-pinned", true)
+    }
+
+    // MARK: - AC-AB5 — a run Pause stops is not a failure either
+
+    /// Pause SIGTERMs a live run (`terminateRunningSync`) and closes its span as
+    /// `skipped/paused`, but the run's own end lines — rclone's notice, the script's "Bisync
+    /// failed with exit code 143" — still reached `.syncFailed` as a failure: an error banner,
+    /// a "Sync failed" notification, an auto-fix `--resync`, a `synctray.sync.completed`
+    /// failure. Pause now gives them the abort's run-end treatment (`wasRunAborted`), for as
+    /// long as rclone can spend shutting down on SIGTERM.
+    private static func testPauseRunEndSuppression() -> Bool {
+        let name = "AC-AB5", slug = "pause-run-end-suppression"
+        let window = SyncAbort.pauseRunEndSuppression
+        guard window >= SyncAbort.gracefulTimeout + SyncAbort.trailingSuppression else {
+            return report(name, slug, false,
+                "(the pause window (\(window) s) is shorter than rclone's graceful shutdown plus the trailing backstop)")
+        }
+        let pausedAt = Date(timeIntervalSince1970: 1_800_000_000)
+        let until = pausedAt.addingTimeInterval(window)
+        // bisync on SIGTERM: up to 30 s for in-flight transfers, then up to 60 s to wrap up,
+        // then the script's exit line, read one log-watcher poll later.
+        guard SyncAbort.suppressesRunEnd(abortInFlight: false, suppressUntil: until,
+                                         now: pausedAt.addingTimeInterval(SyncAbort.gracefulTimeout + 5)) else {
+            return report(name, slug, false, "(the end line of a run that used its whole graceful shutdown is not suppressed)")
+        }
+        guard !SyncAbort.suppressesRunEnd(abortInFlight: false, suppressUntil: until, now: until) else {
+            return report(name, slug, false, "(the pause window never ends)")
+        }
+
+        guard let manager = readSourceFile("Services/SyncManager.swift") else {
+            return report(name, slug, false, "(could not read SyncManager.swift)")
+        }
+        guard let pause = extractFunctionBody(startingAt: "func pauseProfile(_ profileId: UUID)", in: manager),
+              let terminate = pause.range(of: "let signalledRun = terminateRunningSync(for: profile)"),
+              let opens = pause.range(of: "abortSuppressUntil[profileId] = Date().addingTimeInterval(SyncAbort.pauseRunEndSuppression)"),
+              terminate.upperBound <= opens.lowerBound,
+              pause.contains("if wasSyncing || signalledRun {") else {
+            return report(name, slug, false, "(pauseProfile no longer gives the run it stopped the abort's run-end treatment)")
+        }
+        guard let terminateFn = extractFunctionBody(startingAt: "private func terminateRunningSync(", in: manager),
+              terminateFn.contains("signalled = true"),
+              terminateFn.contains("return signalled") else {
+            return report(name, slug, false, "(terminateRunningSync no longer reports whether it signalled a run)")
+        }
+        // The window works through wasRunAborted, which syncFailed checks before it records or
+        // notifies anything (AC-AB4 pins it ahead of auto-fix).
+        guard let failedCase = manager.range(of: "case .syncFailed(let exitCode, let message):"),
+              let suppressed = manager.range(of: "if wasRunAborted(for: profileId) {",
+                                             range: failedCase.upperBound..<manager.endIndex),
+              let recorded = manager.range(of: "TelemetryService.shared.recordSyncFailed(",
+                                           range: failedCase.upperBound..<manager.endIndex),
+              suppressed.upperBound <= recorded.lowerBound else {
+            return report(name, slug, false, "(syncFailed records a failure before checking whether the run was stopped)")
+        }
+        return report(name, slug, true)
     }
 
     // MARK: - AC-FC1 — rclone error lines that name a file are errors, not file changes
