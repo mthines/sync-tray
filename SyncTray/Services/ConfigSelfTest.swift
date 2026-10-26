@@ -9645,8 +9645,9 @@ enum ConfigSelfTest {
 
     // MARK: - AC-TS8 — a stopped run is `interrupted`, and a failure carries the script's real exit code
 
-    /// A run a stop signal ended (Pause, logout, `kill`: 143; Ctrl-C: 130) was counted as an
-    /// ordinary failure, mostly `error.type=other`, and every failed bisync's span said
+    /// A run a stop signal ended (Ctrl-C on `synctray sync`: 141, rclone dying of SIGPIPE once
+    /// the group signal killed its `tee`; rclone itself terminated or killed: 143 / 137) was
+    /// counted as an ordinary failure, mostly `error.type=other`, and every failed bisync's span said
     /// `sync.exit_code=1`: telemetry recorded rclone's own "Failed to bisync" notice, which
     /// states no exit code (`LogParser` stands in 1), and dropped the script's "Bisync failed
     /// with exit code N" as the run's repeated end line. Now a failure that states no exit
@@ -9656,7 +9657,7 @@ enum ConfigSelfTest {
         let name = "AC-TS8", slug = "stopped-run-interrupted-exit-code"
 
         // Stop signals are a stop; rclone's own codes and crash signals are not.
-        for code in [129, 130, 137, 143] where !SyncLogPatterns.isStopSignalExitCode(code) {
+        for code in [129, 130, 137, 141, 143] where !SyncLogPatterns.isStopSignalExitCode(code) {
             return report(name, slug, false, "(exit code \(code) is not read as a stop signal)")
         }
         for code in [-1, 0, 1, 2, 3, 7, 9, 10, 128, 134, 139, 144, 255] where SyncLogPatterns.isStopSignalExitCode(code) {
@@ -9666,9 +9667,10 @@ enum ConfigSelfTest {
         // A failure's bucket: a stop signal's exit code first, then the run's first error.
         let denied = "Failed to copy: open /Users/me/Sync/a.txt: permission denied"
         let failures: [(message: String?, exitCode: Int?, expected: String, label: String)] = [
-            (denied, 143, "interrupted", "SIGTERM (Pause, logout, kill)"),
-            (denied, 130, "interrupted", "SIGINT (Ctrl-C)"),
-            (nil, 137, "interrupted", "SIGKILL with no error logged"),
+            (denied, 141, "interrupted", "rclone died of SIGPIPE: the group signal killed its tee (Ctrl-C)"),
+            (denied, 143, "interrupted", "rclone itself got SIGTERM"),
+            (denied, 130, "interrupted", "rclone itself got SIGINT"),
+            (nil, 137, "interrupted", "rclone SIGKILLed with no error logged"),
             (denied, 1, "permission_denied", "an ordinary failure"),
             (denied, nil, "permission_denied", "no exit code stated"),
             ("Bisync critical error: out of sync - must run --resync", 139, "out_of_sync", "a crash signal is not a stop"),
@@ -9767,11 +9769,24 @@ enum ConfigSelfTest {
               caseBody.contains("exitCode: statedExitCode,"),
               let repeatBlock = caseBody.range(of: "if handling != .handle {"),
               let completes = caseBody.range(
-                of: "TelemetryService.shared.recordSyncFailureExitCode(profileId: profileId, exitCode: statedExitCode)"),
+                of: "TelemetryService.shared.recordSyncFailureExitCode(profileId: profileId, exitCode: statedExitCode)",
+                range: repeatBlock.upperBound..<caseBody.endIndex),
               let remember = caseBody.range(of: "lastHandledSyncFailureAt[profileId] = failureHandledAt"),
               repeatBlock.upperBound <= completes.lowerBound,
               completes.upperBound <= remember.lowerBound else {
             return report(name, slug, false, "(syncFailed no longer gives telemetry the stated exit code, or the repeated end line's)")
+        }
+        // A stopped run's line still completes a failure recorded before the stop.
+        guard let stated = caseBody.range(of: "let statedExitCode = SyncLogPatterns.extractExitCode(from: event.rawLine)"),
+              let stopped = caseBody.range(of: "if wasRunAborted(for: profileId) {"),
+              let handsOn = caseBody.range(
+                of: "TelemetryService.shared.recordSyncFailureExitCode(profileId: profileId, exitCode: statedExitCode)",
+                range: stopped.upperBound..<caseBody.endIndex),
+              let skipped = caseBody.range(of: "TelemetryService.shared.recordSyncSkipped(",
+                                           range: stopped.upperBound..<caseBody.endIndex),
+              stated.upperBound <= stopped.lowerBound,
+              handsOn.upperBound <= skipped.lowerBound else {
+            return report(name, slug, false, "(a stopped run's end line no longer completes the failure held before the stop)")
         }
         return report(name, slug, true)
     }
@@ -10634,10 +10649,6 @@ enum ConfigSelfTest {
     private static func testPauseRunEndSuppression() -> Bool {
         let name = "AC-AB5", slug = "pause-run-end-suppression"
         let window = SyncAbort.pauseRunEndSuppression
-        guard window >= SyncAbort.gracefulTimeout + SyncAbort.trailingSuppression else {
-            return report(name, slug, false,
-                "(the pause window (\(window) s) is shorter than rclone's graceful shutdown plus the trailing backstop)")
-        }
         let pausedAt = Date(timeIntervalSince1970: 1_800_000_000)
         let until = pausedAt.addingTimeInterval(window)
         // bisync on SIGTERM: up to 30 s for in-flight transfers, then up to 60 s to wrap up,
@@ -10654,11 +10665,23 @@ enum ConfigSelfTest {
             return report(name, slug, false, "(could not read SyncManager.swift)")
         }
         guard let pause = extractFunctionBody(startingAt: "func pauseProfile(_ profileId: UUID)", in: manager),
+              let live = pause.range(of: "let runWasLive = profileStates[profileId] == .syncing || isRunLive(for: profile)"),
+              let unload = pause.range(of: "setupService.unloadAgent(for: profile)"),
               let terminate = pause.range(of: "let signalledRun = terminateRunningSync(for: profile)"),
               let opens = pause.range(of: "abortSuppressUntil[profileId] = Date().addingTimeInterval(SyncAbort.pauseRunEndSuppression)"),
+              live.upperBound <= unload.lowerBound,
               terminate.upperBound <= opens.lowerBound,
-              pause.contains("if wasSyncing || signalledRun {") else {
+              pause.contains("if runWasLive || signalledRun {") else {
             return report(name, slug, false, "(pauseProfile no longer gives the run it stopped the abort's run-end treatment)")
+        }
+        // Resume loads the `RunAtLoad` agent, which starts a run at once: the window must not
+        // hide that run's failure.
+        guard let resume = extractFunctionBody(startingAt: "func resumeProfile(_ profileId: UUID)", in: manager),
+              let clears = resume.range(of: "abortSuppressUntil[profileId] = nil"),
+              let load = resume.range(of: "setupService.loadAgent(for: profile)"),
+              clears.upperBound <= load.lowerBound,
+              resume.contains("if !isAborting(for: profileId) {") else {
+            return report(name, slug, false, "(resumeProfile no longer ends the pause window before it restarts the profile)")
         }
         guard let terminateFn = extractFunctionBody(startingAt: "private func terminateRunningSync(", in: manager),
               terminateFn.contains("signalled = true"),

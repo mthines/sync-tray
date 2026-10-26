@@ -920,12 +920,14 @@ enum SyncAbort {
     /// as the aborted run's rather than a real failure. A backstop only: the abort reads the
     /// log to its end before it finishes, and the next run the app starts clears it early.
     static let trailingSuppression: TimeInterval = 30
-    /// How long after Pause signals a live run (`SyncManager.pauseProfile`) that run's log
-    /// lines get the same treatment as an aborted run's. Pause sends SIGTERM and does not
-    /// watch the run exit, and rclone's bisync spends up to `gracefulTimeout` shutting down on
-    /// that signal (30 s for in-flight transfers, then up to 60 s to save its state) before it
-    /// exits 143 and the script logs "Bisync failed with exit code 143" — so the window covers
-    /// that, plus the usual `trailingSuppression` backstop for the log watcher to read it.
+    /// How long after Pause stops a live run (`SyncManager.pauseProfile`) that run's log lines
+    /// get the same treatment as an aborted run's. Pause SIGTERMs the run's process group and
+    /// does not watch it exit. Usually the script's bash and its `tee` die with the group and
+    /// nothing more reaches the log; when something does (a run Pause could not signal as a
+    /// group, or an rclone still logging through a surviving `tee`), rclone's bisync can spend
+    /// up to `gracefulTimeout` shutting down first (30 s for in-flight transfers, then up to
+    /// 60 s to save its state) — so the window covers that, plus the usual
+    /// `trailingSuppression` backstop. Resume clears it, as does the next run the app starts.
     static let pauseRunEndSuppression: TimeInterval = gracefulTimeout + trailingSuppression
 
     /// Parse `ps -A -o pid=,ppid=,comm=` output. `comm` can be a full path containing

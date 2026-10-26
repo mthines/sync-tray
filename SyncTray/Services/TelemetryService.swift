@@ -834,8 +834,9 @@ final class TelemetryService {
     /// exit code is held (`pendingSyncFailures`) until the script's line supplies it
     /// (`recordSyncFailureExitCode`) or `duplicateSyncFailureWindow` passes, and is recorded
     /// only then (`finishSyncFailure`) — metrics, span and log together. That makes
-    /// `sync.exit_code` the script's real exit code, and a run a stop signal ended (143 after
-    /// Pause, logout or `kill`, 130 after Ctrl-C) `error.type=interrupted` on the
+    /// `sync.exit_code` the script's real exit code, and a run a stop signal ended (141 after
+    /// Ctrl-C on `synctray sync`, 143 / 137 when rclone itself was terminated or killed; see
+    /// `SyncLogPatterns.isStopSignalExitCode`) `error.type=interrupted` on the
     /// `synctray.sync.errors` counter as well as on the span. A failure that states its exit
     /// code is recorded at once.
     func recordSyncFailed(

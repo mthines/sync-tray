@@ -2115,6 +2115,11 @@ final class SyncManager: ObservableObject {
         directoryWatchers[profileId]?.stop()
         directoryWatchers.removeValue(forKey: profileId)
 
+        // Whether a run is live, decided before the unload below: `launchctl unload` can stop
+        // a launchd-started run by itself, whose EXIT trap then removes the lock that
+        // `terminateRunningSync` finds it by.
+        let runWasLive = profileStates[profileId] == .syncing || isRunLive(for: profile)
+
         // Actually stop scheduled syncs. Previously pause only set an in-memory
         // flag, so launchd kept firing the sync script every interval — the
         // "paused" profile still hammered the remote and the spinner never
@@ -2123,17 +2128,16 @@ final class SyncManager: ObservableObject {
 
         // Terminate any in-flight run for this profile and clear its lock, so a
         // hung/slow sync can't keep holding the lock and block a later resume.
-        let wasSyncing = profileStates[profileId] == .syncing
         let signalledRun = terminateRunningSync(for: profile)
 
-        // The run Pause just stopped still reports its end in the log — rclone's own notice,
-        // the script's "Bisync failed with exit code 143" — and that is no more a failure
-        // than an aborted run's end: no error banner, no notification, no auto-fix `--resync`
-        // restarting what the user paused, no `synctray.sync.completed` failure. Give its
-        // lines the abort's run-end treatment (`wasRunAborted`), for as long as rclone can
-        // spend shutting down on SIGTERM. The next run the app starts or a genuine
-        // `.syncStarted` clears it early, exactly as after an abort.
-        if wasSyncing || signalledRun {
+        // Whatever the run Pause just stopped still writes to the log — rclone's own notice or
+        // errors ("context canceled"), the script's "Bisync failed with exit code N" when the
+        // script outlives the signal — is no more a failure than an aborted run's end: no
+        // error banner, no notification, no auto-fix `--resync` restarting what the user
+        // paused, no `synctray.sync.completed` failure. Give those lines the abort's run-end
+        // treatment (`wasRunAborted`), for as long as rclone can spend shutting down on the
+        // signal. Resume, the next run the app starts, or a genuine `.syncStarted` clears it.
+        if runWasLive || signalledRun {
             abortSuppressUntil[profileId] = Date().addingTimeInterval(SyncAbort.pauseRunEndSuppression)
         }
 
@@ -2191,6 +2195,14 @@ final class SyncManager: ObservableObject {
               profile.isEnabled else { return }
 
         pausedProfiles.remove(profileId)
+
+        // The run Pause stopped has had its say: the agent is `RunAtLoad`, so loading it below
+        // starts a run at once, and Pause's run-end window must not hide that run's failure
+        // (its start line can be read after a quick failure, when its lock is already gone).
+        // An abort still in flight keeps its own suppression.
+        if !isAborting(for: profileId) {
+            abortSuppressUntil[profileId] = nil
+        }
 
         // Reload the launchd agent that pause unloaded so scheduled syncs run
         // again. (No-op if it somehow never unloaded.)
@@ -3311,6 +3323,12 @@ final class SyncManager: ObservableObject {
             retryPendingExternalReinstallIfNeeded(for: profileId)
 
         case .syncFailed(let exitCode, let message):
+            // The exit code this line actually states: the script's "Bisync failed with exit
+            // code N" states one; rclone's own "Failed to bisync: …" notice states none, and
+            // `LogParser` stands in 1 for it only so the error state has something to show.
+            // Telemetry takes only a stated one (`recordSyncFailed`).
+            let statedExitCode = SyncLogPatterns.extractExitCode(from: event.rawLine)
+
             // The run was stopped by `abortSync` or by Pause: its non-zero exit is the stop,
             // not a failure — no error, no notification, and above all no auto-fix `--resync`
             // restarting what the user just stopped. `finishAbort` settles an abort's state;
@@ -3322,6 +3340,11 @@ final class SyncManager: ObservableObject {
                 currentSyncChanges[profileId] = nil
                 syncStartTimes[profileId] = nil
                 logWatchers[profileId]?.setActivelySyncing(false)
+                // A failure the run recorded before the stop (held for its exit code) gets the
+                // exit code this line states, rather than none, before the span is closed.
+                if let statedExitCode {
+                    TelemetryService.shared.recordSyncFailureExitCode(profileId: profileId, exitCode: statedExitCode)
+                }
                 TelemetryService.shared.recordSyncSkipped(profileId: profileId, profileName: profileName, reason: "aborted")
                 // While the abort is still in flight it settles the state and retries any
                 // deferred reinstall itself, once every process of the run has exited.
@@ -3372,12 +3395,6 @@ final class SyncManager: ObservableObject {
                 retryPendingExternalReinstallIfNeeded(for: profileId)
                 break
             }
-
-            // The exit code this line actually states: the script's "Bisync failed with exit
-            // code N" states one; rclone's own "Failed to bisync: …" notice states none, and
-            // `LogParser` stands in 1 for it only so the error state has something to show.
-            // Telemetry takes only a stated one (`recordSyncFailed`).
-            let statedExitCode = SyncLogPatterns.extractExitCode(from: event.rawLine)
 
             // A failed bisync reports its end twice (#122). The repeat must not set the error,
             // notify, or record the failure again — see `syncFailureHandling`.

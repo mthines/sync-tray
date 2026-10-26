@@ -149,9 +149,11 @@ categories](#error-categories)). Covered by AC-TS8.
 **A run the user stopped is not a failure.** Abort (CLAUDE.md Critical Rule 9) and Pause both
 make `.syncFailed` drop the stopped run's end lines (`SyncManager.wasRunAborted`), so they
 record no failure: the span ends as `sync.result=skipped` with `sync.skip_reason`
-`aborted`/`paused`, and `synctray.sync.completed` is not incremented. Pause SIGTERMs the run
-and opens the same window for `SyncAbort.pauseRunEndSuppression` (rclone's graceful shutdown
-plus the trailing backstop, 120 s). Covered by AC-AB3–AC-AB5.
+`aborted`/`paused`, and `synctray.sync.completed` is not incremented. Pause SIGTERMs the run's
+process group and opens the same window for `SyncAbort.pauseRunEndSuppression` (rclone's
+graceful shutdown plus the trailing backstop, 120 s); Resume ends it. Usually the group signal
+kills the script and its `tee` too, so nothing more reaches the log; the window covers what
+still does. Covered by AC-AB3–AC-AB5.
 
 ## Per-profile Heartbeat Logs
 
@@ -210,15 +212,18 @@ names a more specific cause (e.g. a rate-limit or auth phrase), which now wins; 
 Go's "directory not empty" moved from `critical` to `directory_not_empty`.
 
 A failed run's `error.type` (`TelemetryService.categorizeSyncFailure`, pure — the `Sync failed`
-log and span and the `synctray.sync.errors` counter) checks its exit code first: 129/130/137/143
-(`SyncLogPatterns.isStopSignalExitCode` — SIGHUP, SIGINT, SIGKILL, SIGTERM; rclone exits 128 +
-the signal after its graceful shutdown, often with no error that names the stop) is
-`interrupted`; anything else, or no stated exit code, falls back to `categorizeError` of the
+log and span and the `synctray.sync.errors` counter) checks the exit code the script logged
+first (`SyncLogPatterns.isStopSignalExitCode`): 129/130/143 — rclone itself got
+SIGHUP/SIGINT/SIGTERM and exited 128 + the signal after its graceful shutdown; 137 — rclone was
+SIGKILLed; 141 — rclone died of SIGPIPE because the `tee` it logs through was killed, which is
+what a stop signal to the whole process group looks like when the script survives it (Ctrl-C on
+`synctray sync`; a group SIGTERM/SIGHUP kills the script too, so no exit line is written). Those
+are `interrupted`; anything else, or no stated exit code, falls back to `categorizeError` of the
 run's first error. Crash signals (134, 139) are not a stop.
 
 | Bucket | Matches (lowercased) |
 |--------|----------------------|
-| `interrupted` | "context canceled" (Go's `context.Canceled`, what rclone's transfers fail with when a signal cancels them), "signal received:" (rclone's `lib/atexit`), "bisync interrupted", "graceful shutdown failed" (bisync's shutdown outcome) — ahead of the critical check, whose "resync" would claim "Bisync interrupted. Must run --resync to recover."; plus a stop signal's exit code on a failed run (above). Not "context deadline exceeded", which stays `timeout` |
+| `interrupted` | "context canceled" (Go's `context.Canceled`, what rclone's transfers fail with when a signal cancels them), "signal received:" (rclone's `lib/atexit`), "bisync interrupted", "graceful shutdown failed" (bisync's shutdown outcome) — ahead of the critical check, whose "resync" would claim "Bisync interrupted. Must run --resync to recover."; plus a stop signal's exit code on a failed run (above). Not "context deadline exceeded", which stays `timeout`. Caveat: rclone also logs "context canceled" for transfers it cancels after another error, and for Stream reads the NFS client abandons, so a single `Sync error` line can read `interrupted` without a stop; a failed run is categorized from its first error, which comes before those |
 | `disk_full` | "no space left on device" |
 | `rate_limited` | "ratelimitexceeded", "userratelimitexceeded", "rate limit exceeded", "too many requests" — before `quota_exceeded`, since Google's per-minute limit says "Quota exceeded … rateLimitExceeded" |
 | `quota_exceeded` | "storagequotaexceeded", "quotaexceeded", "quota exceeded", "insufficient storage" |
