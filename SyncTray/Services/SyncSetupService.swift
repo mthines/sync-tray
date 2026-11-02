@@ -2377,6 +2377,8 @@ extension SyncSetupService {
                     # The secret lives in a 0600 file only this user can read (the app reads
                     # the same file — `SyncProfile.rcAuthPath(port:)`) and reaches rclone via
                     # RCLONE_RC_USER/RCLONE_RC_PASS, never argv, so `ps` can't reveal it.
+                    # It binds and is dialled on 127.0.0.1 only, never `localhost`:
+                    # `localhost` also resolves to ::1, which another local user could bind.
                     if [[ "$RC_PORT" != "0" && -n "$RC_PORT" ]]; then
                         RC_AUTH_FILE="$HOME/.local/state/synctray/rc/$RC_PORT.auth"
                         if [[ ! -s "$RC_AUTH_FILE" ]]; then
@@ -2393,7 +2395,7 @@ extension SyncSetupService {
                         if [[ -n "$RC_SECRET" ]]; then
                             export RCLONE_RC_USER="synctray"
                             export RCLONE_RC_PASS="$RC_SECRET"
-                            RCLONE_CMD+=(--rc "--rc-addr=localhost:$RC_PORT")
+                            RCLONE_CMD+=(--rc "--rc-addr=127.0.0.1:$RC_PORT")
                         else
                             # Never fall back to an open RC server — the mount still works
                             # without RC; only app-side cache warming/refresh is unavailable.

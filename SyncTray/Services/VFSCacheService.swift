@@ -122,10 +122,27 @@ final class VFSCacheService {
 
     /// Resolve the on-disk cache directory, preferring the mount's live RC report (which
     /// is fallback-aware) and falling back to the primary-remote path guess when RC is
-    /// unavailable (mount not up).
+    /// unavailable (mount not up). The RC path is only trusted inside the profile's
+    /// configured cache root (`--cache-dir`): the reply is only as trustworthy as whatever
+    /// answered on the RC port, and the Offline Files view lists and recursively deletes
+    /// under the directory returned here.
     func resolvedCacheDirectory(for profile: SyncProfile) async -> String? {
-        if let rc = await rcDiskCache(port: profile.rcPort) { return rc.path }
+        if let rc = await rcDiskCache(port: profile.rcPort),
+           Self.isPath(rc.path, inside: profile.vfsCachePath) { return rc.path }
         return cacheDirectory(for: profile)
+    }
+
+    /// Whether `path` lies strictly inside `root` once both are tilde-expanded,
+    /// standardised and symlink-resolved. Any remaining `..`, a relative path, or a root of
+    /// `/` is rejected.
+    static func isPath(_ path: String, inside root: String) -> Bool {
+        func canonical(_ p: String) -> String {
+            ((p as NSString).expandingTildeInPath as NSString).resolvingSymlinksInPath
+        }
+        let candidate = canonical(path), base = canonical(root)
+        guard candidate.hasPrefix("/"), base.hasPrefix("/"), base != "/",
+              !(candidate as NSString).pathComponents.contains("..") else { return false }
+        return candidate.hasPrefix(base.hasSuffix("/") ? base : base + "/")
     }
 
     /// RC-aware cache stats — scans the directory the live mount actually uses.
@@ -313,8 +330,12 @@ final class VFSCacheService {
     /// `SyncProfile.rcAuthPath(port:)` before rclone starts, so it always exists once the
     /// RC server is up. A missing file sends no header and the request fails with 401,
     /// which every caller already treats as "RC unavailable".
+    ///
+    /// Dialled on `127.0.0.1`, never `localhost`: rclone binds IPv4 loopback only, and
+    /// `localhost` also resolves to `::1`, which any other local user could bind to
+    /// receive this credential.
     static func rcRequest(_ endpoint: String, port: Int) -> URLRequest {
-        var request = URLRequest(url: URL(string: "http://localhost:\(port)/\(endpoint)")!)
+        var request = URLRequest(url: URL(string: "http://127.0.0.1:\(port)/\(endpoint)")!)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         if let header = rcAuthorizationHeader(port: port) {
