@@ -127,6 +127,7 @@ enum ConfigSelfTest {
             testMountModeFileNotInSharedTmp,
             testLogAndProfileDirsOwnerOnly,
             testCacheOnlyOverlayOwnerOnly,
+            testRemoteNamedFolderRevealedNotOpened,
             testRemoteFolderListingKeepsSpaces,
             testCLIRemoteFolders,
             testCLITelemetryConsent,
@@ -4824,6 +4825,32 @@ enum ConfigSelfTest {
         guard let managerSource = readSourceFile("Services/SyncManager.swift"),
               managerSource.contains("SyncSetupService.tightenDirectoryIfLoose(atPath: profile.overlayRootPath)") else {
             return report(name, slug, false, "(SyncManager no longer tightens the overlay root at launch)")
+        }
+        return report(name, slug, true)
+    }
+
+    // MARK: - AC-SEC7 — a remote-named folder is revealed in Finder, never opened
+
+    /// Clicking a Recent Changes row whose file is gone, and a file-change notification's
+    /// "Open Directory" action, show a folder whose name came from the remote. `NSWorkspace.open`
+    /// on a folder that is an `.app` bundle launches it, and rclone sets no quarantine flag, so
+    /// a shared or compromised remote could get its app run by that click (CWE-829). This host
+    /// can't drive LaunchServices, so it pins both call sites to `activateFileViewerSelecting`.
+    private static func testRemoteNamedFolderRevealedNotOpened() -> Bool {
+        let name = "AC-SEC7", slug = "remote-named-folder-revealed-not-opened"
+        guard let managerSource = readSourceFile("Services/SyncManager.swift"),
+              let finder = extractFunctionBody(startingAt: "func openFileInFinder(", in: managerSource),
+              let appSource = readSourceFile("SyncTrayApp.swift"),
+              let handler = extractFunctionBody(startingAt: "didReceive response: UNNotificationResponse", in: appSource) else {
+            return report(name, slug, false, "(could not read openFileInFinder or the notification response handler)")
+        }
+        guard !finder.contains("NSWorkspace.shared.open("),
+              finder.contains("activateFileViewerSelecting([URL(fileURLWithPath: parentDir)])") else {
+            return report(name, slug, false, "(openFileInFinder opens the parent folder instead of revealing it)")
+        }
+        guard !handler.contains("NSWorkspace.shared.open("),
+              handler.contains("activateFileViewerSelecting([url])") else {
+            return report(name, slug, false, "(the Open Directory action opens the folder instead of revealing it)")
         }
         return report(name, slug, true)
     }

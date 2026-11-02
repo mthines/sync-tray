@@ -1007,7 +1007,8 @@ final class SyncManager: ObservableObject {
             let fullPath = (profile.localSyncPath as NSString).appendingPathComponent(change.path)
             let parentDir = (fullPath as NSString).deletingLastPathComponent
             if FileManager.default.fileExists(atPath: parentDir) {
-                NSWorkspace.shared.open(URL(fileURLWithPath: parentDir))
+                // Reveal, never open: the folder name comes from the remote, and opening an `.app` folder launches it.
+                NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: parentDir)])
             }
         }
     }
