@@ -3945,7 +3945,10 @@ enum ConfigSelfTest {
     /// cross-origin form POST) can reach, so it must never run `--rc-no-auth`. Asserts the
     /// streaming command enables RC without `--rc-no-auth`, the script exported the RC
     /// password (env, never argv), the credential file is 0600, and the app's request
-    /// helper sends the matching Basic header.
+    /// helper sends the matching Basic header. Both sides use 127.0.0.1, never
+    /// `localhost` (which also resolves to ::1, bindable by another local user), and an
+    /// RC-reported cache path outside the cache's `vfs` tree (e.g. the Cache-only overlay)
+    /// is not trusted.
     private static func testRCAPIAuthenticated() -> Bool {
         let name = "AC-SEC2", slug = "rc-api-authenticated"
         let fm = FileManager.default
@@ -3956,6 +3959,25 @@ enum ConfigSelfTest {
         }
         let profile = mountFixtureProfile(localPath: local, cachePath: cache)
         defer { try? fm.removeItem(atPath: profile.cacheOnlyConfigPath) }
+        guard VFSCacheService.rcRequest("core/version", port: profile.rcPort).url?.host == "127.0.0.1" else {
+            return report(name, slug, false, "(app RC request does not dial 127.0.0.1)")
+        }
+        let inside = "\(cache)/vfs/synology", outside = "\(root)/outside", sibling = "\(cache)-evil"
+        let overlay = "\(cache)/synctray-overlay/abc"
+        for dir in [inside, outside, sibling, overlay] {
+            try? fm.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        }
+        try? fm.createSymbolicLink(atPath: "\(cache)/vfs/escape", withDestinationPath: outside)
+        guard VFSCacheService.isPath(inside, inside: cache),
+              VFSCacheService.isPath(inside, inside: "\(cache)/vfs"),
+              !VFSCacheService.isPath(overlay, inside: "\(cache)/vfs"),
+              !VFSCacheService.isPath(outside, inside: cache),
+              !VFSCacheService.isPath(sibling, inside: cache),
+              !VFSCacheService.isPath("\(cache)/vfs/../../outside", inside: cache),
+              !VFSCacheService.isPath("\(cache)/vfs/escape", inside: cache),
+              !VFSCacheService.isPath(cache, inside: cache) else {
+            return report(name, slug, false, "(RC cache-path containment check accepts a path outside the cache root)")
+        }
         let authPath = SyncProfile.rcAuthPath(port: profile.rcPort)
         guard !fm.fileExists(atPath: authPath) else {
             return report(name, slug, true, "(skipped: a real profile owns port \(profile.rcPort))")
@@ -3966,7 +3988,7 @@ enum ConfigSelfTest {
             return report(name, slug, false, "(fixture did not dry-run streaming: \(result.output) log=\(result.log))")
         }
         guard result.args.contains("--rc"),
-              result.args.contains("--rc-addr=localhost:\(profile.rcPort)"),
+              result.args.contains("--rc-addr=127.0.0.1:\(profile.rcPort)"),
               !result.args.contains("--rc-no-auth") else {
             return report(name, slug, false, "(RC flags wrong: \(result.args))")
         }
