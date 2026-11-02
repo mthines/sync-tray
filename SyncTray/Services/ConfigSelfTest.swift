@@ -3947,7 +3947,8 @@ enum ConfigSelfTest {
     /// password (env, never argv), the credential file is 0600, and the app's request
     /// helper sends the matching Basic header. Both sides use 127.0.0.1, never
     /// `localhost` (which also resolves to ::1, bindable by another local user), and an
-    /// RC-reported cache path outside the configured cache root is not trusted.
+    /// RC-reported cache path outside the cache's `vfs` tree (e.g. the Cache-only overlay)
+    /// is not trusted.
     private static func testRCAPIAuthenticated() -> Bool {
         let name = "AC-SEC2", slug = "rc-api-authenticated"
         let fm = FileManager.default
@@ -3962,11 +3963,14 @@ enum ConfigSelfTest {
             return report(name, slug, false, "(app RC request does not dial 127.0.0.1)")
         }
         let inside = "\(cache)/vfs/synology", outside = "\(root)/outside", sibling = "\(cache)-evil"
-        for dir in [inside, outside, sibling] {
+        let overlay = "\(cache)/synctray-overlay/abc"
+        for dir in [inside, outside, sibling, overlay] {
             try? fm.createDirectory(atPath: dir, withIntermediateDirectories: true)
         }
         try? fm.createSymbolicLink(atPath: "\(cache)/vfs/escape", withDestinationPath: outside)
         guard VFSCacheService.isPath(inside, inside: cache),
+              VFSCacheService.isPath(inside, inside: "\(cache)/vfs"),
+              !VFSCacheService.isPath(overlay, inside: "\(cache)/vfs"),
               !VFSCacheService.isPath(outside, inside: cache),
               !VFSCacheService.isPath(sibling, inside: cache),
               !VFSCacheService.isPath("\(cache)/vfs/../../outside", inside: cache),

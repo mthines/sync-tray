@@ -122,13 +122,16 @@ final class VFSCacheService {
 
     /// Resolve the on-disk cache directory, preferring the mount's live RC report (which
     /// is fallback-aware) and falling back to the primary-remote path guess when RC is
-    /// unavailable (mount not up). The RC path is only trusted inside the profile's
-    /// configured cache root (`--cache-dir`): the reply is only as trustworthy as whatever
-    /// answered on the RC port, and the Offline Files view lists and recursively deletes
-    /// under the directory returned here.
+    /// unavailable (mount not up). The RC path is only trusted inside `{vfsCachePath}/vfs`,
+    /// rclone's VFS cache tree: the reply is only as trustworthy as whatever answered on
+    /// the RC port, and the Offline Files view lists and recursively deletes under the
+    /// directory returned here — so the Cache-only overlay (`synctray-overlay/…`, unsynced
+    /// edits) and anything else under the cache root is never listed or deleted from a
+    /// forged reply.
     func resolvedCacheDirectory(for profile: SyncProfile) async -> String? {
+        let vfsRoot = (profile.vfsCachePath as NSString).appendingPathComponent(CacheTreeKind.content.rawValue)
         if let rc = await rcDiskCache(port: profile.rcPort),
-           Self.isPath(rc.path, inside: profile.vfsCachePath) { return rc.path }
+           Self.isPath(rc.path, inside: vfsRoot) { return rc.path }
         return cacheDirectory(for: profile)
     }
 
