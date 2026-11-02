@@ -1276,7 +1276,7 @@ is the separate, fail-closed schema-drift gate.
 | `ProfileListView.swift` | Sidebar list of profiles with add/delete controls |
 | `StatusHeaderView.swift` | Header showing current sync state and progress |
 | `SyncProgressDetailView.swift` | Detailed per-file transfer progress during sync |
-| `RecentChangesView.swift` | List of recently synced files |
+| `RecentChangesView.swift` | List of recently synced files. A click reveals the file — or, once it's gone, its folder — in Finder (`SyncManager.openFileInFinder`), and a file-change notification's "Open Directory" action does the same. Both use `activateFileViewerSelecting`, never `NSWorkspace.open`: the folder name comes from the remote, and opening a folder that is an `.app` bundle launches it (CWE-829). Covered by `ConfigSelfTest` AC-SEC7. |
 | `TelemetryOptInBanner.swift` | Dismissable banner prompting telemetry opt-in (consent-versioned) |
 | `TelemetryDetailsSheet.swift` | Full privacy disclosure sheet — reachable from wizard, banner, and settings; its "Diagnostic reports — only when you send one" section explains the manual-report carve-out |
 | `DiagnosticReportSheet.swift` | "Send Diagnostic Report" sheet — scope picker, disclosure, Preview / Save to Desktop / Send, then the report code with Copy. Opened from the "Last sync error" banner and footer of `ProfileDetailView` and from App Settings → Help & Feedback |
