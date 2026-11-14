@@ -1027,21 +1027,60 @@ final class TelemetryService {
 
     // MARK: - Mount Operations
 
-    /// Record a mount or unmount operation.
+    /// Which step of a mount or unmount failed: `mount.failure_stage` on the failed operation's
+    /// span and log (never a metric label). Bounded, and known from the code path alone:
+    /// - `agent_start`: `launchctl kickstart` of the profile's mount agent exited non-zero.
+    /// - `agent_exited`: the agent had no live process for `deadThreshold` polls before the
+    ///   volume attached, so the script or rclone exited (`SyncManager.MountPollDecision.failedDead`).
+    /// - `attach_timeout`: the agent stayed alive but no volume appeared within the poll's cap.
+    /// - `detach`: `diskutil unmount` and `unmount force` both failed (`SetupError.unmountFailed`).
+    /// Dash0 queries and check rules filter on these raw values, so don't rename them.
+    enum MountFailureStage: String, CaseIterable {
+        case agentStart = "agent_start"
+        case agentExited = "agent_exited"
+        case attachTimeout = "attach_timeout"
+        case detach
+    }
+
+    /// The attributes a failed mount or unmount adds to its span and log: `error.type`
+    /// (`categorizeMountFailure` of `errorMessage`, `unknown` without one) and, when the caller
+    /// knows it, `mount.failure_stage`. Pure; the message itself is never among them.
+    static func mountFailureAttributes(failureStage: MountFailureStage?, errorMessage: String?) -> [String: AttributeValue] {
+        var attributes: [String: AttributeValue] = [
+            "error.type": .string(categorizeMountFailure(errorMessage)),
+        ]
+        if let failureStage {
+            attributes["mount.failure_stage"] = .string(failureStage.rawValue)
+        }
+        return attributes
+    }
+
+    /// Record a mount or unmount operation. A failure also carries `mountFailureAttributes` on
+    /// its span and log, and its `error.type` joins the `synctray.mount.operations` counter's
+    /// labels (the stage does not). `errorMessage` is only classified, never sent.
     func recordMountOperation(
         profileId: UUID,
         profileName: String,
         operation: String,  // "mount" or "unmount"
-        result: String      // "success" or "failure"
+        result: String,     // "success" or "failure"
+        failureStage: MountFailureStage? = nil,
+        errorMessage: String? = nil
     ) {
         guard SyncTraySettings.telemetryEnabled else { return }
         ensureSetup()
 
-        mountOperationCounter?.add(value: 1, attribute: [
+        let succeeded = result == "success"
+        let failureAttributes = succeeded
+            ? [:]
+            : Self.mountFailureAttributes(failureStage: failureStage, errorMessage: errorMessage)
+
+        var counterLabels: [String: AttributeValue] = [
             "mount.operation": .string(operation),
             "mount.result": .string(result),
             "synctray.profile.name": .string(profileName),
-        ])
+        ]
+        counterLabels["error.type"] = failureAttributes["error.type"]
+        mountOperationCounter?.add(value: 1, attribute: counterLabels)
 
         guard let tracer = tracer else { return }
 
@@ -1052,18 +1091,28 @@ final class TelemetryService {
         span.setAttribute(key: "synctray.profile.name", value: .string(profileName))
         span.setAttribute(key: "mount.operation", value: .string(operation))
         span.setAttribute(key: "mount.result", value: .string(result))
-        span.status = result == "success" ? .ok : .error(description: "\(operation) failed")
+        for (key, value) in failureAttributes {
+            span.setAttribute(key: key, value: value)
+        }
+        // Category only, like the sync span: the raw message can carry paths and remote names.
+        if case let .string(errorType)? = failureAttributes["error.type"] {
+            span.status = .error(description: errorType)
+        } else {
+            span.status = succeeded ? .ok : .error(description: "\(operation) failed")
+        }
         span.end()
 
+        var logAttributes: [String: AttributeValue] = [
+            "synctray.profile.id": .string(profileId.uuidString),
+            "synctray.profile.name": .string(profileName),
+            "mount.operation": .string(operation),
+            "mount.result": .string(result),
+        ]
+        logAttributes.merge(failureAttributes) { current, _ in current }
         emitLog(
-            severity: result == "success" ? .info : .error,
+            severity: succeeded ? .info : .error,
             body: "\(operation.capitalized) \(result)",
-            attributes: [
-                "synctray.profile.id": .string(profileId.uuidString),
-                "synctray.profile.name": .string(profileName),
-                "mount.operation": .string(operation),
-                "mount.result": .string(result),
-            ],
+            attributes: logAttributes,
             spanContext: span.context
         )
     }
@@ -3546,6 +3595,9 @@ final class TelemetryService {
                              "certificate verify failed"]),
         ("auth_failed", ["invalid_grant", "token expired", "expired token", " oauth2:", "401 unauthorized",
                          "authentication failed", "couldn't fetch token", "failed to refresh token"]),
+        // rclone's "Failed to create file system for \"x:\": didn't find section in config file":
+        // the profile names a remote rclone.conf no longer has (deleted, renamed, or never saved).
+        ("remote_not_configured", ["didn't find section in config file"]),
         ("name_too_long", ["file name too long", "name too long", "path too long"]),
         ("invalid_name", ["illegal character", "invalid characters", "invalid name", "invalid file name",
                           "invalid filename"]),
@@ -3558,6 +3610,61 @@ final class TelemetryService {
         // whose case keeps it out of `isCriticalError`'s case-sensitive "not empty".
         ("directory_not_empty", ["directory not empty"]),
     ]
+
+    /// The mount-only `error.type` buckets `categorizeMountFailure` tries first, in order, each
+    /// against the LOWERCASED message. Each takes rclone's own wording AND the user-facing text
+    /// `SyncLogPatterns.cleanErrorMessage` rewrites it to, because the message a failed mount is
+    /// classified from is read back through `SyncManager.lastErrorInLog`, which cleans it:
+    /// - `mount_point_not_empty`: rclone mount's "Directory is not empty: <path> If you want to
+    ///   mount it anyway use: --allow-non-empty option" ("Mount point folder is not empty. …").
+    ///   `categorizeError` files it as `critical`, which says nothing about a mount.
+    /// - `mount_backend_unavailable`: the backend can't run on this Mac — the macFUSE backend with
+    ///   Homebrew's rclone ("… not supported on MacOS when rclone is installed via Homebrew",
+    ///   "… (Homebrew's rclone can't mount) …"), macFUSE missing ("macFUSE is required …"; the raw
+    ///   wording is matched in `categorizeMountFailure`, it takes two words), or the NFS backend's
+    ///   `mount` helper missing from PATH (`exec: "mount": executable file not found in $PATH`).
+    /// - `cache_dir_unwritable`: the sync script's VFS cache preflight refused the mount
+    ///   ("Error: VFS cache directory not writable: <path> - refusing to mount uncached") —
+    ///   usually a cache on an external drive that isn't attached.
+    /// - `rc_port_in_use`: an earlier rclone for this mount point still holds the RC port
+    ///   ("bind: address already in use") — the orphan the script clears before starting.
+    static let mountErrorBuckets: [(bucket: String, needles: [String])] = [
+        ("mount_point_not_empty", ["directory is not empty", "mount point folder is not empty"]),
+        ("mount_backend_unavailable", ["not supported on macos when rclone is installed via homebrew",
+                                       "homebrew's rclone can't mount", "macfuse is required",
+                                       "executable file not found in $path"]),
+        ("cache_dir_unwritable", ["vfs cache directory not writable"]),
+        ("rc_port_in_use", ["address already in use"]),
+    ]
+
+    /// `error.type` for a failed mount or unmount (`recordMountOperation`). Pure. In order:
+    /// 1. `unknown` for no message.
+    /// 2. The mount-only buckets of `mountErrorBuckets`.
+    /// 3. macFUSE missing in rclone's raw wording — the test `cleanErrorMessage` uses.
+    /// 4. `categorizeError`, so a mount that failed on DNS, auth, TLS, a timeout or a remote
+    ///    missing from rclone.conf gets the bucket a sync with the same error would.
+    /// 5. Except where that is `critical`: `isCriticalError` claims every message with rclone's
+    ///    generic mount wording ("FUSE", "failed to mount") before any named bucket is tried, so
+    ///    a named cause in it (`specificErrorBuckets`) is looked for, and `mount_failed` is the
+    ///    rest.
+    /// Never the message itself — only the bucket leaves the machine.
+    static func categorizeMountFailure(_ message: String?) -> String {
+        guard let message else { return "unknown" }
+        let lower = message.lowercased()
+        for (bucket, needles) in mountErrorBuckets where needles.contains(where: { lower.contains($0) }) {
+            return bucket
+        }
+        if lower.contains("fuse"), lower.contains("not found") || lower.contains("not installed") {
+            return "mount_backend_unavailable"
+        }
+        let shared = categorizeError(message)
+        guard shared == "critical" else { return shared }
+        let padded = " " + lower
+        for (bucket, needles) in specificErrorBuckets where needles.contains(where: { padded.contains($0) }) {
+            return bucket
+        }
+        return "mount_failed"
+    }
 
     /// Which rclone operation an error message is about, for the `error.operation` attribute
     /// on the `Sync error` log and the `Sync failed` log and span. A bounded label:
