@@ -1999,7 +1999,8 @@ lock files, rclone.conf and `ps` read off the main actor, only when telemetry is
 
 ### Error categories and folder / backend kinds
 - `error.type` (`categorizeError`) has specific buckets ahead of the generic ones: `rate_limited`,
-  `quota_exceeded`, `disk_full`, `auth_failed`, `tls_certificate`, `name_too_long`, `invalid_name`,
+  `quota_exceeded`, `disk_full`, `auth_failed`, `tls_certificate`, `remote_not_configured`
+  (rclone's "didn't find section in config file"), `name_too_long`, `invalid_name`,
   `checksum_mismatch`, `file_changed_during_transfer`, `file_busy`, `duplicate_object`,
   `directory_not_empty`, and more `network` / `timeout` phrasings ("no such host" is `network`,
   not `file_not_found`; a token refresh that timed out is `timeout`, not `auth_failed`). A
@@ -2008,6 +2009,12 @@ lock files, rclone.conf and `ps` read off the main actor, only when telemetry is
   moved from `critical` to `directory_not_empty` (AC-TS2). The `Sync error` log and
   the `Sync failed` log and span also carry `error.operation`: `copy` / `delete` / `move` /
   `list` / `mkdir` / `other`.
+- A failed mount or unmount carries `error.type` too (`categorizeMountFailure`: the mount-only
+  `mount_point_not_empty`, `mount_backend_unavailable`, `cache_dir_unwritable`, `rc_port_in_use`
+  and `mount_failed`, otherwise the sync buckets), plus `mount.failure_stage` — `agent_start`,
+  `agent_exited`, `attach_timeout` or `detach` — on the span and log. The message comes from the
+  latest mount attempt only: `SyncManager.lastErrorInLog(_:mountRun: true)` stops at that
+  attempt's "Starting mount" line (AC-TS9, AC-TS10; `.claude/rules/telemetry.md` "Mount failures").
 - A run that was stopped rather than failed is `error.type=interrupted`: rclone's cancellation
   wording that reaches `categorizeError` ("context canceled", an ERROR line, and bisync's
   "Bisync interrupted", matched ahead of the critical check — a NOTICE line, so it arrives only

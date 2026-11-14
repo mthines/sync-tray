@@ -764,6 +764,18 @@ final class SyncManager: ObservableObject {
         return .keepWaiting
     }
 
+    /// `mount.failure_stage` for a mount poll that ended without the volume attaching
+    /// (`ConfigSelfTest` AC-TS10): the agent exiting is `agent_exited`; anything else that isn't
+    /// `.established` is the cap running out, the same split `mountProfile`'s user-facing reason
+    /// makes. nil for `.established`.
+    nonisolated static func mountFailureStage(for decision: MountPollDecision) -> TelemetryService.MountFailureStage? {
+        switch decision {
+        case .established: return nil
+        case .failedDead: return .agentExited
+        case .failedTimeout, .keepWaiting: return .attachTimeout
+        }
+    }
+
     /// Staged status text for a `.mounting` profile, chosen by how long the mount
     /// has been establishing. Pure so the message buckets are unit-testable
     /// (`ConfigSelfTest` AC-MP1). The later buckets reassure the user that a slow
@@ -847,6 +859,17 @@ final class SyncManager: ObservableObject {
                     let failReason = decision == .failedDead
                         ? "Mount agent stopped before the volume attached"
                         : "Mount did not establish within 5 minutes"
+                    // What this attempt logged before it failed, for the failure's `error.type`
+                    // only (never shown, never sent). Read off the main actor: the log can be large.
+                    let logPath = profile.logPath
+                    let failureMessage: String?
+                    if established {
+                        failureMessage = nil
+                    } else {
+                        failureMessage = await Task.detached(priority: .utility) {
+                            SyncManager.readLastError(fromLogAt: logPath, mountRun: true)
+                        }.value
+                    }
                     await MainActor.run {
                         profileMountProgress[profile.id] = nil
                         // The mode switch (if any) is done once the remount settles,
@@ -881,7 +904,9 @@ final class SyncManager: ObservableObject {
                                 profileId: profile.id,
                                 profileName: profile.name,
                                 operation: "mount",
-                                result: "failure"
+                                result: "failure",
+                                failureStage: Self.mountFailureStage(for: decision),
+                                errorMessage: failureMessage
                             )
                         }
                     }
@@ -893,7 +918,8 @@ final class SyncManager: ObservableObject {
                             profileId: profile.id,
                             profileName: profile.name,
                             operation: "mount",
-                            result: "failure"
+                            result: "failure",
+                            failureStage: .agentStart
                         )
                     }
                 }
@@ -935,7 +961,9 @@ final class SyncManager: ObservableObject {
                         profileId: profile.id,
                         profileName: profile.name,
                         operation: "unmount",
-                        result: "failure"
+                        result: "failure",
+                        failureStage: .detach,
+                        errorMessage: error.localizedDescription
                     )
                 }
             }
@@ -2642,21 +2670,58 @@ final class SyncManager: ObservableObject {
 
     /// Read the last error message from a log file
     private func readLastErrorFromLog(_ logPath: String) -> String? {
+        Self.readLastError(fromLogAt: logPath)
+    }
+
+    /// `lastErrorInLog` of the log file at `logPath`; nil when it can't be read. Nonisolated so a
+    /// failed mount can read its profile's log off the main actor.
+    nonisolated static func readLastError(fromLogAt logPath: String, mountRun: Bool = false) -> String? {
         guard FileManager.default.fileExists(atPath: logPath),
               let data = FileManager.default.contents(atPath: logPath),
               let content = String(data: data, encoding: .utf8) else {
             return nil
         }
+        return lastErrorInLog(content, mountRun: mountRun)
+    }
 
+    /// The error a log's latest run failed on, read backwards from its end — the first critical
+    /// error, else the most recent one, cleaned for display (`SyncLogPatterns.cleanErrorMessage`)
+    /// and cut at 300 characters; nil when the latest run succeeded or logged no error. Pure.
+    ///
+    /// A sync run (`mountRun == false`) counts errors only once its "failed with exit code" line
+    /// is found, and stops at the start line of the run that failed.
+    ///
+    /// A mount attempt (`mountRun == true`, `ConfigSelfTest` AC-TS10) stops at its own "Starting
+    /// mount" line whether or not it failed, so an earlier attempt's error — KeepAlive restarts a
+    /// failing mount over and over in the same log — is never reported as this one's. It counts
+    /// errors without waiting for an exit line, which an attempt the app gave up on while rclone
+    /// was still running (attach timeout) doesn't have yet; skips NOTICE lines (rclone's NFS
+    /// server announces itself at NOTICE on every start) and go-nfs's benign exclusive-create
+    /// error; and reports the script's VFS cache preflight refusal, which ends an attempt before
+    /// rclone runs, as the failure.
+    nonisolated static func lastErrorInLog(_ content: String, mountRun: Bool = false) -> String? {
         // Look for error lines in reverse order (most recent first)
         let lines = content.components(separatedBy: .newlines).reversed()
         var errorMessages: [String] = []
         var criticalErrors: [String] = []  // Track critical/actionable errors separately
-        var foundFailedMarker = false
+        var foundFailedMarker = mountRun
 
         for line in lines {
-            // Stop when we hit a sync start marker (previous run)
-            if SyncLogPatterns.isSyncStarted(line) && foundFailedMarker {
+            if mountRun {
+                // The latest attempt's own start: nothing before it is this attempt's.
+                if SyncLogPatterns.isMountStarted(line) {
+                    break
+                }
+                if SyncLogPatterns.isMountCacheUnwritable(line) {
+                    return line.trimmingCharacters(in: .whitespaces)
+                }
+                // NOTICE is informational on a mount — rclone's NFS server logs "NFS Server
+                // running at …" on every start. A mount's failures are logged at ERROR/CRITICAL.
+                if line.contains("\"level\":\"notice\"") {
+                    continue
+                }
+            } else if SyncLogPatterns.isSyncStarted(line) && foundFailedMarker {
+                // Stop when we hit a sync start marker (previous run)
                 break
             }
 
@@ -2687,6 +2752,11 @@ final class SyncManager: ObservableObject {
 
             // Transient "all files were changed" error should not be shown
             if SyncLogPatterns.isTransientAllFilesChangedError(msg) {
+                continue
+            }
+
+            // go-nfs logs this at ERROR for every O_EXCL create on a working Stream mount.
+            if mountRun && SyncLogPatterns.isBenignNFSExclusiveCreateNotice(msg) {
                 continue
             }
 

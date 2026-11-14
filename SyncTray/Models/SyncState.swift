@@ -527,6 +527,22 @@ enum SyncLogPatterns {
         return lower.contains("starting bisync") || lower.contains("starting sync")
     }
 
+    /// The first line the sync script writes for every mount attempt ("… - Starting mount"),
+    /// ahead of its VFS cache preflight and of rclone. A mount never writes `isSyncStarted`'s
+    /// lines, so this is what keeps a backwards scan of a Stream profile's log inside its latest
+    /// attempt (`SyncManager.lastErrorInLog(_:mountRun:)`). Deliberately not part of
+    /// `isSyncStarted`, which `LogParser` turns into a sync start.
+    static func isMountStarted(_ message: String) -> Bool {
+        message.contains(" - Starting mount")
+    }
+
+    /// The sync script's VFS cache preflight refusing a mount ("… - Error: VFS cache directory
+    /// not writable: <path> - refusing to mount uncached"). It ends the attempt before rclone runs
+    /// and writes no "failed with exit code" line, so it is the attempt's failure on its own.
+    static func isMountCacheUnwritable(_ message: String) -> Bool {
+        message.contains("VFS cache directory not writable")
+    }
+
     /// The start line `SyncManager.performResync` writes for an auto-fix `--resync`. It still
     /// matches `isSyncStarted`; `isAutoFixResyncStart` lets the log pipeline tell that run's
     /// success apart from a normal bisync's (#123).
@@ -904,7 +920,15 @@ enum SyncLogPatterns {
         }
         // Check for rclone JSON error/notice messages
         else if isJSONErrorLine(line) {
-            // Parse the error message from JSON
+            // Decode the record, so a message with escaped quotes comes back whole: rclone quotes
+            // remote and file names (`Failed to create file system for \"gdrive:\": didn't find
+            // section in config file`), which the scan below cuts at the first `\"`.
+            if let data = line.data(using: .utf8),
+               let record = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+               let msg = record["msg"] as? String {
+                return msg
+            }
+            // Not a complete JSON object (e.g. something before the brace): scan for the field.
             if let msgRange = line.range(of: "\"msg\":\""),
                let endRange = line[msgRange.upperBound...].range(of: "\"") {
                 return String(line[msgRange.upperBound..<endRange.lowerBound])
@@ -916,6 +940,8 @@ enum SyncLogPatterns {
     /// Strip ANSI escape codes from a message
     static func stripANSICodes(_ message: String) -> String {
         var result = message
+        // A real ESC sequence, which a decoded JSON record (`extractErrorMessage`) carries.
+        result = result.replacingOccurrences(of: "\u{1B}\\[[0-9;]*[A-Za-z]", with: "", options: .regularExpression)
         result = result.replacingOccurrences(of: "\\u001b[", with: "")
         result = result.replacingOccurrences(of: #"\[\d+m"#, with: "", options: .regularExpression)
         result = result.replacingOccurrences(of: "[0m", with: "")

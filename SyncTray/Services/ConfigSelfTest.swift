@@ -178,6 +178,8 @@ enum ConfigSelfTest {
             testPermissionDeniedBlockedAccess,
             testTelemetryLockState,
             testTelemetryErrorCategories,
+            testMountErrorCategories,
+            testMountFailureLogAndWiring,
             testSyncPathKind,
             testRemoteBackendType,
             testSyncProgressAttributes,
@@ -9721,6 +9723,7 @@ enum ConfigSelfTest {
             ("Failed to create file system for \"gdrive:\": couldn't fetch token: invalid_grant: maybe token expired? - try refreshing with \"rclone config reconnect gdrive:\"", "auth_failed"),
             ("oauth2: cannot fetch token: 400 Bad Request", "auth_failed"),
             ("Failed to copy: HTTP 401 Unauthorized", "auth_failed"),
+            ("Failed to create file system for \"gdrive:\": didn't find section in config file", "remote_not_configured"),
             ("Get \"https://nas.local:5006/\": tls: failed to verify certificate: x509: certificate signed by unknown authority", "tls_certificate"),
             ("Failed to copy: open /Users/me/Sync/aaaaaaaa: file name too long", "name_too_long"),
             ("Failed to copy: invalidRequest: The provided name contains invalid characters", "invalid_name"),
@@ -9819,6 +9822,218 @@ enum ConfigSelfTest {
             guard got == expected else {
                 return report(name, slug, false, "(categorizeErrorOperation(\(input.debugDescription)) = \(got), expected \(expected))")
             }
+        }
+        return report(name, slug, true)
+    }
+
+    // MARK: - AC-TS9 — a failed mount gets an error.type: mount-only buckets first, then the sync buckets
+
+    private static func testMountErrorCategories() -> Bool {
+        let name = "AC-TS9", slug = "mount-error-categories"
+        let notEmpty = "Fatal error: Directory is not empty: /Users/me/Mount If you want to mount it anyway use: --allow-non-empty option"
+        let homebrew = "Fatal error: failed to mount FUSE fs: mount not supported on MacOS when rclone is installed via Homebrew. "
+            + "Please install the rclone binaries available at https://rclone.org/downloads/ instead if you want to use the rclone mount command"
+        let noMacFUSE = "Fatal error: failed to mount FUSE fs: fuse: macFUSE not installed"
+        // The message a failed mount is classified from comes back through `lastErrorInLog`, which
+        // rewrites these three for display; both forms must land in the same bucket.
+        for raw in [notEmpty, homebrew, noMacFUSE] where SyncLogPatterns.cleanErrorMessage(raw) == raw {
+            return report(name, slug, false, "(cleanErrorMessage no longer rewrites \(raw.debugDescription); revisit mountErrorBuckets)")
+        }
+        let checks: [(String?, String)] = [
+            // Mount-only buckets, in rclone's and the script's own wording…
+            (notEmpty, "mount_point_not_empty"),
+            (homebrew, "mount_backend_unavailable"),
+            (noMacFUSE, "mount_backend_unavailable"),
+            ("Fatal error: failed to mount NFS: exec: \"mount\": executable file not found in $PATH", "mount_backend_unavailable"),
+            ("2026-11-12 03:38:00 - Error: VFS cache directory not writable: /Volumes/Cache/rclone - refusing to mount uncached", "cache_dir_unwritable"),
+            ("Failed to start remote control: start server failed: listen tcp 127.0.0.1:5572: bind: address already in use", "rc_port_in_use"),
+            // …and as cleanErrorMessage rewrites them.
+            (SyncLogPatterns.cleanErrorMessage(notEmpty), "mount_point_not_empty"),
+            (SyncLogPatterns.cleanErrorMessage(homebrew), "mount_backend_unavailable"),
+            (SyncLogPatterns.cleanErrorMessage(noMacFUSE), "mount_backend_unavailable"),
+            // rclone's generic mount wording is `critical` to categorizeError; a named cause inside
+            // it wins, and the rest is mount_failed.
+            ("Fatal error: failed to mount NFS: dial tcp 10.0.0.5:445: i/o timeout", "timeout"),
+            ("Fatal error: failed to mount FUSE fs: couldn't fetch token: invalid_grant", "auth_failed"),
+            ("Fatal error: failed to mount NFS: unexpected response from the server", "mount_failed"),
+            // Everything else is bucketed exactly like a sync error.
+            ("Failed to create file system for \"truenas:\": didn't find section in config file", "remote_not_configured"),
+            ("Failed to create file system for \"nas:\": dial tcp: lookup nas.local: no such host", "network"),
+            ("Failed to create file system for \"nas:\": tls: failed to verify certificate: x509: certificate has expired", "tls_certificate"),
+            // A failed detach (SetupError.unmountFailed) reads "Failed to unmount", not "failed to mount".
+            ("Failed to unmount: something unexpected happened", "other"),
+            ("something unexpected happened", "other"),
+            (nil, "unknown"),
+        ]
+        for (input, expected) in checks {
+            let got = TelemetryService.categorizeMountFailure(input)
+            guard got == expected else {
+                return report(name, slug, false, "(categorizeMountFailure(\(input.debugDescription)) = \(got), expected \(expected))")
+            }
+        }
+        let covered = Set(checks.map { $0.1 })
+        for bucket in TelemetryService.mountErrorBuckets.map({ $0.bucket }) where !covered.contains(bucket) {
+            return report(name, slug, false, "(no case covers the \(bucket) mount bucket)")
+        }
+        // Outside rclone's mount wording, a mount and a sync with the same error share a bucket.
+        let syncParity: [String?] = [
+            "Failed to copy: googleapi: Error 403: User Rate Limit Exceeded., userRateLimitExceeded",
+            "Failed to copy: 507 Insufficient Storage",
+            "oauth2: cannot fetch token: 400 Bad Request",
+            "dial tcp 10.0.0.5:445: i/o timeout",
+            "Failed to copy: permission denied",
+            "context canceled",
+            "file not found",
+        ]
+        for input in syncParity where TelemetryService.categorizeMountFailure(input) != TelemetryService.categorizeError(input) {
+            return report(name, slug, false, "(categorizeMountFailure(\(input.debugDescription)) differs from categorizeError)")
+        }
+
+        // The attributes: bounded, exactly these keys, never the message.
+        let message = "Failed to create file system for \"truenas:\": didn't find section in config file"
+        let attrs = TelemetryService.mountFailureAttributes(failureStage: .agentExited, errorMessage: message)
+        guard attrs == ["error.type": .string("remote_not_configured"), "mount.failure_stage": .string("agent_exited")],
+              TelemetryService.mountFailureAttributes(failureStage: nil, errorMessage: nil) == ["error.type": .string("unknown")],
+              TelemetryService.mountFailureAttributes(failureStage: .detach, errorMessage: nil)
+                == ["error.type": .string("unknown"), "mount.failure_stage": .string("detach")] else {
+            return report(name, slug, false, "(wrong mount failure attributes)")
+        }
+        let preflight = "2026-11-12 03:38:00 - Error: VFS cache directory not writable: /Volumes/Cache/rclone - refusing to mount uncached"
+        let allValues = (TelemetryService.mountFailureAttributes(failureStage: .agentExited, errorMessage: preflight).values
+            .map { "\($0)" } + attrs.values.map { "\($0)" }).joined(separator: " ")
+        guard !allValues.contains("truenas"), !allValues.contains("/Volumes") else {
+            return report(name, slug, false, "(a mount failure attribute carried the message)")
+        }
+        // Dashboards and check rules filter on these exact values.
+        guard TelemetryService.MountFailureStage.allCases.map(\.rawValue)
+                == ["agent_start", "agent_exited", "attach_timeout", "detach"] else {
+            return report(name, slug, false, "(mount.failure_stage values changed)")
+        }
+        return report(name, slug, true)
+    }
+
+    // MARK: - AC-TS10 — a failed mount is classified from its own attempt's log, with its stage
+
+    private static func testMountFailureLogAndWiring() -> Bool {
+        let name = "AC-TS10", slug = "mount-failure-log-and-wiring"
+        // Two attempts in one Stream profile log, the way KeepAlive leaves them: the older one
+        // failed on a non-empty mount point (a critical error, the kind lastErrorInLog prefers),
+        // the latest on a remote rclone.conf no longer has.
+        let olderAttempt = [
+            "2026-11-12 03:38:00 - Starting mount",
+            "2026-11-12 03:38:00 - Mount backend: nfs (nfsmount)",
+            "2026/11/12 03:38:01 CRITICAL: Fatal error: Directory is not empty: /Users/me/Mount If you want to mount it anyway use: --allow-non-empty option",
+            "2026-11-12 03:38:01 - Sync failed with exit code 1",
+            "",
+        ]
+        let latestAttempt = [
+            "2026-11-12 03:39:00 - Starting mount",
+            "2026-11-12 03:39:00 - Mount backend: nfs (nfsmount)",
+            "2026-11-12 03:39:00 - Mount mode: streaming",
+            #"{"time":"2026-11-12T03:39:01+01:00","level":"critical","msg":"Failed to create file system for \"truenas:\": didn't find section in config file","source":"cmd/cmd.go:301"}"#,
+            "2026-11-12 03:39:01 - Sync failed with exit code 1",
+            "",
+        ]
+        func logText(_ attempts: [String]...) -> String { attempts.flatMap { $0 }.joined(separator: "\n") }
+        func mountError(_ content: String) -> String? { SyncManager.lastErrorInLog(content, mountRun: true) }
+
+        let latest = mountError(logText(olderAttempt, latestAttempt))
+        guard latest == "Failed to create file system for \"truenas:\": didn't find section in config file",
+              TelemetryService.categorizeMountFailure(latest) == "remote_not_configured" else {
+            return report(name, slug, false, "(the latest attempt read \(latest.debugDescription), not its own error)")
+        }
+        // The sync scan has no mount boundary and would report the older attempt's error — the
+        // reason a mount reads its log with mountRun.
+        let crossed = SyncManager.lastErrorInLog(logText(olderAttempt, latestAttempt))
+        guard TelemetryService.categorizeMountFailure(crossed) == "mount_point_not_empty" else {
+            return report(name, slug, false, "(the sync scan no longer crosses mount attempts: \(crossed.debugDescription); revisit this test)")
+        }
+        // A JSON record is decoded, so rclone's quotes around the remote name no longer cut the
+        // message at "for \" (above); a line that isn't a whole JSON object still falls back to
+        // scanning for the field.
+        guard SyncLogPatterns.extractErrorMessage(from: #"tee: {"level":"error","msg":"plain message","source":"x"}"#)
+                == "plain message" else {
+            return report(name, slug, false, "(extractErrorMessage lost its fallback for a line that isn't a JSON object)")
+        }
+        // Decoding turns rclone's escaped colour codes into real ESC sequences; none survive.
+        guard SyncLogPatterns.stripANSICodes("\u{1B}[31mFailed to copy\u{1B}[0m: permission denied")
+                == "Failed to copy: permission denied" else {
+            return report(name, slug, false, "(a real ESC colour sequence survived stripANSICodes)")
+        }
+        // A non-empty mount point read through the pipeline (cleaned for display) keeps its bucket.
+        guard TelemetryService.categorizeMountFailure(mountError(logText(olderAttempt))) == "mount_point_not_empty" else {
+            return report(name, slug, false, "(a non-empty mount point read back from the log lost its bucket)")
+        }
+        // The VFS cache preflight refuses before rclone runs and writes no exit line.
+        let refused = mountError(logText(olderAttempt, [
+            "2026-11-12 03:40:00 - Starting mount",
+            "2026-11-12 03:40:00 - Error: VFS cache directory not writable: /Volumes/Cache/rclone - refusing to mount uncached",
+        ]))
+        guard TelemetryService.categorizeMountFailure(refused) == "cache_dir_unwritable" else {
+            return report(name, slug, false, "(a preflight refusal read \(refused.debugDescription))")
+        }
+        // An attempt the app gave up on while rclone still ran (attach timeout) has no exit line;
+        // its errors still count, and an attempt that logged none borrows nothing from the last one.
+        let stillRunning = mountError(logText(olderAttempt, [
+            "2026-11-12 03:41:00 - Starting mount",
+            #"{"time":"2026-11-12T03:41:30+01:00","level":"error","msg":"Failed to create file system for nas: dial tcp 10.0.0.5:445: i/o timeout","source":"cmd/cmd.go:301"}"#,
+        ]))
+        guard TelemetryService.categorizeMountFailure(stillRunning) == "timeout" else {
+            return report(name, slug, false, "(an attempt with no exit line read \(stillRunning.debugDescription))")
+        }
+        let silent = mountError(logText(olderAttempt, [
+            "2026-11-12 03:42:00 - Starting mount",
+            "2026-11-12 03:42:00 - Mount backend: nfs (nfsmount)",
+            // rclone's NFS server logs this at NOTICE on every start; it is not a failure.
+            #"{"time":"2026-11-12T03:42:01+01:00","level":"notice","msg":"NFS Server running at 127.0.0.1:52311","source":"nfs/server.go:63"}"#,
+        ]))
+        guard silent == nil else {
+            return report(name, slug, false, "(an attempt that logged no error borrowed \(silent.debugDescription))")
+        }
+        // go-nfs's exclusive-create notice is not a mount failure.
+        let benign = mountError(logText(olderAttempt, [
+            "2026-11-12 03:43:00 - Starting mount",
+            #"{"time":"2026-11-12T03:43:01+01:00","level":"error","msg":"failing create to indicate lack of support for 'exclusive' mode.","source":"nfs.go:1"}"#,
+            "2026-11-12 03:43:02 - Sync failed with exit code 1",
+        ]))
+        guard benign == nil else {
+            return report(name, slug, false, "(the benign exclusive-create notice was read as the failure)")
+        }
+
+        // The poll decision maps to the same split as mountProfile's user-facing reason.
+        guard SyncManager.mountFailureStage(for: .failedDead) == .agentExited,
+              SyncManager.mountFailureStage(for: .failedTimeout) == .attachTimeout,
+              SyncManager.mountFailureStage(for: .keepWaiting) == .attachTimeout,
+              SyncManager.mountFailureStage(for: .established) == nil else {
+            return report(name, slug, false, "(wrong mount.failure_stage for a poll decision)")
+        }
+
+        // Wiring, read from this run's own source.
+        guard let managerSource = readSourceFile("Services/SyncManager.swift"),
+              let telemetrySource = readSourceFile("Services/TelemetryService.swift") else {
+            return report(name, slug, false, "(could not read source files)")
+        }
+        guard let mount = extractFunctionBody(startingAt: "    func mountProfile(_ profile: SyncProfile)", in: managerSource),
+              let detached = mount.range(of: "await Task.detached(priority: .utility) {"),
+              let read = mount.range(of: "SyncManager.readLastError(fromLogAt: logPath, mountRun: true)"),
+              detached.upperBound <= read.lowerBound,
+              let passed = mount.range(of: "errorMessage: failureMessage"),
+              read.upperBound <= passed.lowerBound,
+              mount.contains("failureStage: Self.mountFailureStage(for: decision)"),
+              mount.contains("failureStage: .agentStart") else {
+            return report(name, slug, false, "(mountProfile does not pass the stage and its attempt's log error, read off the main actor)")
+        }
+        guard let unmount = extractFunctionBody(startingAt: "    func unmountProfile(_ profile: SyncProfile)", in: managerSource),
+              unmount.contains("failureStage: .detach"),
+              unmount.contains("errorMessage: error.localizedDescription") else {
+            return report(name, slug, false, "(unmountProfile does not pass the detach stage)")
+        }
+        guard let record = extractFunctionBody(startingAt: "    func recordMountOperation(", in: telemetrySource),
+              record.contains("Self.mountFailureAttributes(failureStage: failureStage, errorMessage: errorMessage)"),
+              record.contains("span.status = .error(description: errorType)"),
+              !record.contains(".string(errorMessage"),
+              !record.contains("description: errorMessage") else {
+            return report(name, slug, false, "(recordMountOperation does not send only the bucket)")
         }
         return report(name, slug, true)
     }
