@@ -505,7 +505,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUserNoti
             // Open directory action
             if let urlString = userInfo["directoryPath"] as? String {
                 let url = URL(fileURLWithPath: urlString)
-                NSWorkspace.shared.open(url)
+                // Reveal, never open: the folder name comes from the remote, and opening an `.app` folder launches it.
+                NSWorkspace.shared.activateFileViewerSelecting([url])
             }
         }
         completionHandler()
