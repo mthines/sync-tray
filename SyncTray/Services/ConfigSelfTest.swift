@@ -205,6 +205,7 @@ enum ConfigSelfTest {
             testAbortWiringPinned,
             testPauseRunEndSuppression,
             testRcloneErrorLinesNotFileChanges,
+            testMacMetadataNotFileChanges,
             testDiagnosticReportCode,
             testDiagnosticRedaction,
             testDiagnosticReportBuilder,
@@ -11304,6 +11305,39 @@ enum ConfigSelfTest {
                   change.path == expected.path, change.operation == expected.operation else {
                 return report(name, slug, false, "(a genuine change for \(expected.path) no longer parses as \(expected.operation))")
             }
+        }
+        return report(name, slug, true)
+    }
+
+    // MARK: - AC-FC2 — macOS metadata files stay out of Recent Changes
+
+    /// Finder's `._*` sidecars, `.DS_Store` and the volume bookkeeping folders are never a
+    /// change worth showing (issue #134); files that only look similar still are.
+    private static func testMacMetadataNotFileChanges() -> Bool {
+        let name = "AC-FC2", slug = "mac-metadata-not-file-changes"
+        let metadata = [
+            "._example.zip", ".DS_Store", "Projects/.DS_Store", "Projects/._song.wav", ".localized",
+            ".fseventsd/0000000001", ".Spotlight-V100/Store-V2/index", ".Trashes/501/old.txt",
+            ".TemporaryItems/folders.501/tmp", ".DocumentRevisions-V100/PerUID/501/x",
+        ]
+        for path in metadata where !FileChange.isMacMetadata(path: path) {
+            return report(name, slug, false, "(\(path) was not treated as macOS metadata)")
+        }
+        let real = ["example.zip", "Projects/song.wav", "my._notes.txt", ".gitignore", "DS_Store", "Trashes/a.txt"]
+        for path in real where FileChange.isMacMetadata(path: path) {
+            return report(name, slug, false, "(\(path) was hidden as macOS metadata)")
+        }
+        let syncManagerPath = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
+            .appendingPathComponent("SyncManager.swift").path
+        guard let source = try? String(contentsOfFile: syncManagerPath, encoding: .utf8) else {
+            return report(name, slug, false, "(could not read SyncManager.swift)")
+        }
+        guard let caseRange = source.range(of: "case .fileChange(var change):"),
+              let guardRange = source.range(of: "guard !change.isMacMetadata else { break }",
+                                            range: caseRange.upperBound..<source.endIndex),
+              let recentRange = source.range(of: "addRecentChange(change)", range: caseRange.upperBound..<source.endIndex),
+              guardRange.lowerBound < recentRange.lowerBound else {
+            return report(name, slug, false, "(SyncManager no longer skips metadata before Recent Changes)")
         }
         return report(name, slug, true)
     }
