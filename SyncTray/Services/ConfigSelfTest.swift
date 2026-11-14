@@ -11318,7 +11318,7 @@ enum ConfigSelfTest {
         let metadata = [
             "._example.zip", ".DS_Store", "Projects/.DS_Store", "Projects/._song.wav", ".localized",
             ".fseventsd/0000000001", ".Spotlight-V100/Store-V2/index", ".Trashes/501/old.txt",
-            ".TemporaryItems/folders.501/tmp",
+            ".TemporaryItems/folders.501/tmp", ".DocumentRevisions-V100/PerUID/501/x",
         ]
         for path in metadata where !FileChange.isMacMetadata(path: path) {
             return report(name, slug, false, "(\(path) was not treated as macOS metadata)")

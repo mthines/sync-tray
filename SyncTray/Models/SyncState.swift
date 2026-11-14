@@ -493,9 +493,8 @@ struct FileChange: Identifiable, Equatable {
 
     /// Finder and Spotlight bookkeeping. On an NFS mount Finder writes and deletes `._*`
     /// sidecars around every copy, so these would crowd real files out of Recent Changes.
-    static let macMetadataNames: Set<String> = [
-        ".DS_Store", ".localized", ".fseventsd", ".Spotlight-V100", ".Trashes", ".TemporaryItems",
-    ]
+    static let macMetadataNames: Set<String> =
+        Set(SyncExcludeFilter.volumeSystemFolderNames).union([".DS_Store", ".localized"])
 
     static func isMacMetadata(path: String) -> Bool {
         path.split(separator: "/").contains { component in

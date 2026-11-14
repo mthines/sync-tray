@@ -231,8 +231,8 @@ for `.errorMessage`); rclone logs successful changes at INFO. Covered by `Config
 **macOS metadata is never a file change.** On an NFS mount Finder writes and then deletes
 AppleDouble `._*` sidecars around every copy (the mount has no xattrs), plus `.DS_Store`
 updates. `SyncManager`'s `.fileChange` case drops any change whose path has a component in
-`FileChange.macMetadataNames` (`.DS_Store`, `.localized`, `.fseventsd`, `.Spotlight-V100`,
-`.Trashes`, `.TemporaryItems`) or starting with `._` (`FileChange.isMacMetadata`), before
+`FileChange.macMetadataNames` (`.DS_Store`, `.localized`, and the volume system folders of
+`SyncExcludeFilter.volumeSystemFolderNames`) or starting with `._` (`FileChange.isMacMetadata`), before
 Recent Changes, notifications, `files_changed` and file-operation telemetry. Covered by
 `ConfigSelfTest` AC-FC2 (issue #134).
 
