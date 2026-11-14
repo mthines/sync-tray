@@ -9934,26 +9934,26 @@ enum ConfigSelfTest {
             "2026-11-12 03:39:01 - Sync failed with exit code 1",
             "",
         ]
-        func log(_ attempts: [String]...) -> String { attempts.flatMap { $0 }.joined(separator: "\n") }
+        func logText(_ attempts: [String]...) -> String { attempts.flatMap { $0 }.joined(separator: "\n") }
         func mountError(_ content: String) -> String? { SyncManager.lastErrorInLog(content, mountRun: true) }
 
-        let latest = mountError(log(olderAttempt, latestAttempt))
+        let latest = mountError(logText(olderAttempt, latestAttempt))
         guard latest == "Failed to create file system for truenas: didn't find section in config file",
               TelemetryService.categorizeMountFailure(latest) == "remote_not_configured" else {
             return report(name, slug, false, "(the latest attempt read \(latest.debugDescription), not its own error)")
         }
         // The sync scan has no mount boundary and would report the older attempt's error — the
         // reason a mount reads its log with mountRun.
-        let crossed = SyncManager.lastErrorInLog(log(olderAttempt, latestAttempt))
+        let crossed = SyncManager.lastErrorInLog(logText(olderAttempt, latestAttempt))
         guard TelemetryService.categorizeMountFailure(crossed) == "mount_point_not_empty" else {
             return report(name, slug, false, "(the sync scan no longer crosses mount attempts: \(crossed.debugDescription); revisit this test)")
         }
         // A non-empty mount point read through the pipeline (cleaned for display) keeps its bucket.
-        guard TelemetryService.categorizeMountFailure(mountError(log(olderAttempt))) == "mount_point_not_empty" else {
+        guard TelemetryService.categorizeMountFailure(mountError(logText(olderAttempt))) == "mount_point_not_empty" else {
             return report(name, slug, false, "(a non-empty mount point read back from the log lost its bucket)")
         }
         // The VFS cache preflight refuses before rclone runs and writes no exit line.
-        let refused = mountError(log(olderAttempt, [
+        let refused = mountError(logText(olderAttempt, [
             "2026-11-12 03:40:00 - Starting mount",
             "2026-11-12 03:40:00 - Error: VFS cache directory not writable: /Volumes/Cache/rclone - refusing to mount uncached",
         ]))
@@ -9962,14 +9962,14 @@ enum ConfigSelfTest {
         }
         // An attempt the app gave up on while rclone still ran (attach timeout) has no exit line;
         // its errors still count, and an attempt that logged none borrows nothing from the last one.
-        let stillRunning = mountError(log(olderAttempt, [
+        let stillRunning = mountError(logText(olderAttempt, [
             "2026-11-12 03:41:00 - Starting mount",
             #"{"time":"2026-11-12T03:41:30+01:00","level":"error","msg":"Failed to create file system for nas: dial tcp 10.0.0.5:445: i/o timeout","source":"cmd/cmd.go:301"}"#,
         ]))
         guard TelemetryService.categorizeMountFailure(stillRunning) == "timeout" else {
             return report(name, slug, false, "(an attempt with no exit line read \(stillRunning.debugDescription))")
         }
-        let silent = mountError(log(olderAttempt, [
+        let silent = mountError(logText(olderAttempt, [
             "2026-11-12 03:42:00 - Starting mount",
             "2026-11-12 03:42:00 - Mount backend: nfs (nfsmount)",
         ]))
@@ -9977,7 +9977,7 @@ enum ConfigSelfTest {
             return report(name, slug, false, "(an attempt that logged no error borrowed \(silent.debugDescription))")
         }
         // go-nfs's exclusive-create notice is not a mount failure.
-        let benign = mountError(log(olderAttempt, [
+        let benign = mountError(logText(olderAttempt, [
             "2026-11-12 03:43:00 - Starting mount",
             #"{"time":"2026-11-12T03:43:01+01:00","level":"error","msg":"failing create to indicate lack of support for 'exclusive' mode.","source":"nfs.go:1"}"#,
             "2026-11-12 03:43:02 - Sync failed with exit code 1",
