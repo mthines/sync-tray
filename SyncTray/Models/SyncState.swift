@@ -527,6 +527,22 @@ enum SyncLogPatterns {
         return lower.contains("starting bisync") || lower.contains("starting sync")
     }
 
+    /// The first line the sync script writes for every mount attempt ("… - Starting mount"),
+    /// ahead of its VFS cache preflight and of rclone. A mount never writes `isSyncStarted`'s
+    /// lines, so this is what keeps a backwards scan of a Stream profile's log inside its latest
+    /// attempt (`SyncManager.lastErrorInLog(_:mountRun:)`). Deliberately not part of
+    /// `isSyncStarted`, which `LogParser` turns into a sync start.
+    static func isMountStarted(_ message: String) -> Bool {
+        message.contains(" - Starting mount")
+    }
+
+    /// The sync script's VFS cache preflight refusing a mount ("… - Error: VFS cache directory
+    /// not writable: <path> - refusing to mount uncached"). It ends the attempt before rclone runs
+    /// and writes no "failed with exit code" line, so it is the attempt's failure on its own.
+    static func isMountCacheUnwritable(_ message: String) -> Bool {
+        message.contains("VFS cache directory not writable")
+    }
+
     /// The start line `SyncManager.performResync` writes for an auto-fix `--resync`. It still
     /// matches `isSyncStarted`; `isAutoFixResyncStart` lets the log pipeline tell that run's
     /// success apart from a normal bisync's (#123).
