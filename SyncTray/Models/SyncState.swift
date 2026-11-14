@@ -920,7 +920,15 @@ enum SyncLogPatterns {
         }
         // Check for rclone JSON error/notice messages
         else if isJSONErrorLine(line) {
-            // Parse the error message from JSON
+            // Decode the record, so a message with escaped quotes comes back whole: rclone quotes
+            // remote and file names (`Failed to create file system for \"gdrive:\": didn't find
+            // section in config file`), which the scan below cuts at the first `\"`.
+            if let data = line.data(using: .utf8),
+               let record = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+               let msg = record["msg"] as? String {
+                return msg
+            }
+            // Not a complete JSON object (e.g. something before the brace): scan for the field.
             if let msgRange = line.range(of: "\"msg\":\""),
                let endRange = line[msgRange.upperBound...].range(of: "\"") {
                 return String(line[msgRange.upperBound..<endRange.lowerBound])

@@ -9930,7 +9930,7 @@ enum ConfigSelfTest {
             "2026-11-12 03:39:00 - Starting mount",
             "2026-11-12 03:39:00 - Mount backend: nfs (nfsmount)",
             "2026-11-12 03:39:00 - Mount mode: streaming",
-            #"{"time":"2026-11-12T03:39:01+01:00","level":"error","msg":"Failed to create file system for truenas: didn't find section in config file","source":"cmd/cmd.go:301"}"#,
+            #"{"time":"2026-11-12T03:39:01+01:00","level":"critical","msg":"Failed to create file system for \"truenas:\": didn't find section in config file","source":"cmd/cmd.go:301"}"#,
             "2026-11-12 03:39:01 - Sync failed with exit code 1",
             "",
         ]
@@ -9938,7 +9938,7 @@ enum ConfigSelfTest {
         func mountError(_ content: String) -> String? { SyncManager.lastErrorInLog(content, mountRun: true) }
 
         let latest = mountError(logText(olderAttempt, latestAttempt))
-        guard latest == "Failed to create file system for truenas: didn't find section in config file",
+        guard latest == "Failed to create file system for \"truenas:\": didn't find section in config file",
               TelemetryService.categorizeMountFailure(latest) == "remote_not_configured" else {
             return report(name, slug, false, "(the latest attempt read \(latest.debugDescription), not its own error)")
         }
@@ -9947,6 +9947,13 @@ enum ConfigSelfTest {
         let crossed = SyncManager.lastErrorInLog(logText(olderAttempt, latestAttempt))
         guard TelemetryService.categorizeMountFailure(crossed) == "mount_point_not_empty" else {
             return report(name, slug, false, "(the sync scan no longer crosses mount attempts: \(crossed.debugDescription); revisit this test)")
+        }
+        // A JSON record is decoded, so rclone's quotes around the remote name no longer cut the
+        // message at "for \" (above); a line that isn't a whole JSON object still falls back to
+        // scanning for the field.
+        guard SyncLogPatterns.extractErrorMessage(from: #"tee: {"level":"error","msg":"plain message","source":"x"}"#)
+                == "plain message" else {
+            return report(name, slug, false, "(extractErrorMessage lost its fallback for a line that isn't a JSON object)")
         }
         // A non-empty mount point read through the pipeline (cleaned for display) keeps its bucket.
         guard TelemetryService.categorizeMountFailure(mountError(logText(olderAttempt))) == "mount_point_not_empty" else {

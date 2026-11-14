@@ -266,7 +266,9 @@ AC-TS10): the scan stops at that attempt's "Starting mount" line, so an earlier 
 waiting for an exit line (a timed-out attempt has none); it skips go-nfs's exclusive-create
 notice; and it reports the script's VFS cache preflight refusal, which writes no exit line, as
 the failure. The message is cleaned for display (`SyncLogPatterns.cleanErrorMessage`), so each
-mount bucket matches both rclone's wording and the rewritten text.
+mount bucket matches both rclone's wording and the rewritten text. A JSON log record is decoded
+(`SyncLogPatterns.extractErrorMessage`), so the quotes rclone puts around remote and file names
+no longer cut a message short; this also applies to the sync path's stored error.
 
 `categorizeMountFailure` order: `unknown` for no message; the mount-only buckets; macFUSE missing
 in rclone's raw wording ("fuse" + "not found"/"not installed", the test `cleanErrorMessage` uses);
