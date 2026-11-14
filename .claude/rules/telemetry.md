@@ -263,8 +263,8 @@ For `agent_exited` and `attach_timeout` the message is the latest mount attempt'
 read off the main actor from the profile's log (`SyncManager.lastErrorInLog(_:mountRun: true)`,
 AC-TS10): the scan stops at that attempt's "Starting mount" line, so an earlier attempt's error
 (KeepAlive restarts a failing mount in the same log) is never reported; it counts errors without
-waiting for an exit line (a timed-out attempt has none); it skips go-nfs's exclusive-create
-notice; and it reports the script's VFS cache preflight refusal, which writes no exit line, as
+waiting for an exit line (a timed-out attempt has none); it skips NOTICE lines (rclone's NFS
+server announces itself at NOTICE on every start) and go-nfs's exclusive-create error; and it reports the script's VFS cache preflight refusal, which writes no exit line, as
 the failure. The message is cleaned for display (`SyncLogPatterns.cleanErrorMessage`), so each
 mount bucket matches both rclone's wording and the rewritten text. A JSON log record is decoded
 (`SyncLogPatterns.extractErrorMessage`), so the quotes rclone puts around remote and file names

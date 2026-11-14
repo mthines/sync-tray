@@ -9955,6 +9955,11 @@ enum ConfigSelfTest {
                 == "plain message" else {
             return report(name, slug, false, "(extractErrorMessage lost its fallback for a line that isn't a JSON object)")
         }
+        // Decoding turns rclone's escaped colour codes into real ESC sequences; none survive.
+        guard SyncLogPatterns.stripANSICodes("\u{1B}[31mFailed to copy\u{1B}[0m: permission denied")
+                == "Failed to copy: permission denied" else {
+            return report(name, slug, false, "(a real ESC colour sequence survived stripANSICodes)")
+        }
         // A non-empty mount point read through the pipeline (cleaned for display) keeps its bucket.
         guard TelemetryService.categorizeMountFailure(mountError(logText(olderAttempt))) == "mount_point_not_empty" else {
             return report(name, slug, false, "(a non-empty mount point read back from the log lost its bucket)")
@@ -9979,6 +9984,8 @@ enum ConfigSelfTest {
         let silent = mountError(logText(olderAttempt, [
             "2026-11-12 03:42:00 - Starting mount",
             "2026-11-12 03:42:00 - Mount backend: nfs (nfsmount)",
+            // rclone's NFS server logs this at NOTICE on every start; it is not a failure.
+            #"{"time":"2026-11-12T03:42:01+01:00","level":"notice","msg":"NFS Server running at 127.0.0.1:52311","source":"nfs/server.go:63"}"#,
         ]))
         guard silent == nil else {
             return report(name, slug, false, "(an attempt that logged no error borrowed \(silent.debugDescription))")

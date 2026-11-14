@@ -940,6 +940,8 @@ enum SyncLogPatterns {
     /// Strip ANSI escape codes from a message
     static func stripANSICodes(_ message: String) -> String {
         var result = message
+        // A real ESC sequence, which a decoded JSON record (`extractErrorMessage`) carries.
+        result = result.replacingOccurrences(of: "\u{1B}\\[[0-9;]*[A-Za-z]", with: "", options: .regularExpression)
         result = result.replacingOccurrences(of: "\\u001b[", with: "")
         result = result.replacingOccurrences(of: #"\[\d+m"#, with: "", options: .regularExpression)
         result = result.replacingOccurrences(of: "[0m", with: "")

@@ -2695,9 +2695,10 @@ final class SyncManager: ObservableObject {
     /// mount" line whether or not it failed, so an earlier attempt's error — KeepAlive restarts a
     /// failing mount over and over in the same log — is never reported as this one's. It counts
     /// errors without waiting for an exit line, which an attempt the app gave up on while rclone
-    /// was still running (attach timeout) doesn't have yet; skips go-nfs's benign
-    /// exclusive-create notice; and reports the script's VFS cache preflight refusal, which ends
-    /// an attempt before rclone runs, as the failure.
+    /// was still running (attach timeout) doesn't have yet; skips NOTICE lines (rclone's NFS
+    /// server announces itself at NOTICE on every start) and go-nfs's benign exclusive-create
+    /// error; and reports the script's VFS cache preflight refusal, which ends an attempt before
+    /// rclone runs, as the failure.
     nonisolated static func lastErrorInLog(_ content: String, mountRun: Bool = false) -> String? {
         // Look for error lines in reverse order (most recent first)
         let lines = content.components(separatedBy: .newlines).reversed()
@@ -2713,6 +2714,11 @@ final class SyncManager: ObservableObject {
                 }
                 if SyncLogPatterns.isMountCacheUnwritable(line) {
                     return line.trimmingCharacters(in: .whitespaces)
+                }
+                // NOTICE is informational on a mount — rclone's NFS server logs "NFS Server
+                // running at …" on every start. A mount's failures are logged at ERROR/CRITICAL.
+                if line.contains("\"level\":\"notice\"") {
+                    continue
                 }
             } else if SyncLogPatterns.isSyncStarted(line) && foundFailedMarker {
                 // Stop when we hit a sync start marker (previous run)
