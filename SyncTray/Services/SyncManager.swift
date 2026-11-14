@@ -3717,6 +3717,7 @@ final class SyncManager: ObservableObject {
             )
 
         case .fileChange(var change):
+            guard !change.isMacMetadata else { break }
             change.profileName = profileName
             if currentSyncChanges[profileId] == nil {
                 currentSyncChanges[profileId] = []

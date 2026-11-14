@@ -491,6 +491,20 @@ struct FileChange: Identifiable, Equatable {
         (path as NSString).lastPathComponent
     }
 
+    /// Finder and Spotlight bookkeeping. On an NFS mount Finder writes and deletes `._*`
+    /// sidecars around every copy, so these would crowd real files out of Recent Changes.
+    static let macMetadataNames: Set<String> = [
+        ".DS_Store", ".localized", ".fseventsd", ".Spotlight-V100", ".Trashes", ".TemporaryItems",
+    ]
+
+    static func isMacMetadata(path: String) -> Bool {
+        path.split(separator: "/").contains { component in
+            component.hasPrefix("._") || macMetadataNames.contains(String(component))
+        }
+    }
+
+    var isMacMetadata: Bool { Self.isMacMetadata(path: path) }
+
     var directory: String {
         let dir = (path as NSString).deletingLastPathComponent
         return dir.isEmpty ? "/" : dir
