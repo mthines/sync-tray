@@ -234,13 +234,53 @@ run's first error. Crash signals (134, 139) are not a stop.
 | `timeout` | "context deadline exceeded", "deadline exceeded", "i/o timeout", "timed out", "handshake timeout" — ahead of `auth_failed`, so "oauth2: cannot fetch token: … i/o timeout" stays a timeout; plus the generic "timeout" |
 | `tls_certificate` | " x509:", " tls:", "certificate signed by", "certificate has expired", "certificate verify failed" (Go's error prefixes, not the bare words "x509" / "certificate", which would claim errors about a file named "x509.pem" or "…Certificate.pdf"; the two prefixes carry a leading space and are matched against the message with one leading space added, so a message starting with Go's prefix still matches while a path segment named `tls`/`x509` — "…/certs/tls: permission denied" — isn't claimed). Go's TLS alert "tls: bad certificate" is covered by " tls:", so there is no separate "bad certificate" needle, which a file named "Bad Certificate.pdf" would match |
 | `auth_failed` | "invalid_grant", "token expired", "expired token", " oauth2:", "401 unauthorized", "authentication failed", "couldn't fetch token", "failed to refresh token" — after `network`/`timeout`/`tls_certificate`, so a token refresh that failed on DNS, TLS or a timeout keeps that cause; the oauth2 prefix carries a leading space like the TLS prefixes, so a folder named `oauth2` — "…/x/oauth2: permission denied" — isn't claimed |
+| `remote_not_configured` | "didn't find section in config file" — rclone's "Failed to create file system for \"x:\": …" when the profile names a remote rclone.conf no longer has (deleted, renamed, or never saved) |
 | `name_too_long` | "file name too long", "name too long", "path too long" |
 | `invalid_name` | "illegal character", "invalid characters", "invalid name", "invalid file name", "invalid filename" (plural "characters": Go's JSON decoder says "invalid character '<' looking for beginning of value" when a proxy returns HTML, which stays `other`) |
 | `checksum_mismatch` | "corrupted on transfer", "hash differ", "hashes differ", "md5 differ", "sizes differ" |
 | `file_changed_during_transfer` | "source file is being updated", "changed size during" |
 | `file_busy` | "resource busy", "text file busy", "file is locked", "being used by another process" |
 | `duplicate_object` | "duplicate object found", "duplicate directory found" — rclone's own sync log phrases ("Duplicate object found in source - ignoring", "Duplicate directory found in destination - ignoring", from fs/march), so a folder or file named e.g. "Duplicate Files" isn't claimed |
-| `directory_not_empty` | Go's ENOTEMPTY "directory not empty" — split out of `critical`, whose "not empty" is there for rclone mount's "Directory is not empty" mount-point error (still `critical`) |
+| `directory_not_empty` | Go's ENOTEMPTY "directory not empty" — split out of `critical`, whose "not empty" is there for rclone mount's "Directory is not empty" mount-point error (still `critical` here; a failed mount files it as `mount_point_not_empty`, below) |
+
+### Mount failures
+
+A failed `synctray mount` / `synctray unmount` span and its `Mount failure` / `Unmount failure`
+log carry `error.type` (`TelemetryService.categorizeMountFailure`, pure; also a label on
+`synctray.mount.operations`) and, when the code path knows it, `mount.failure_stage`
+(`TelemetryService.MountFailureStage`; span/log only, never a metric label). The span status
+description is the `error.type`, as on the sync span. Built by `mountFailureAttributes`, which
+never includes the message (AC-TS9).
+
+| `mount.failure_stage` | Code path |
+|-----------------------|-----------|
+| `agent_start` | `launchctl kickstart` of the mount agent exited non-zero (`SyncSetupService.startAgent`) — no message, so `error.type=unknown` |
+| `agent_exited` | the agent had no live process for 3 polls before the volume attached (`MountPollDecision.failedDead`): the script or rclone exited |
+| `attach_timeout` | the agent stayed alive but no volume appeared within the 5-minute cap |
+| `detach` | `diskutil unmount` and `unmount force` both failed (`SetupError.unmountFailed`, its text classified) |
+
+For `agent_exited` and `attach_timeout` the message is the latest mount attempt's own error,
+read off the main actor from the profile's log (`SyncManager.lastErrorInLog(_:mountRun: true)`,
+AC-TS10): the scan stops at that attempt's "Starting mount" line, so an earlier attempt's error
+(KeepAlive restarts a failing mount in the same log) is never reported; it counts errors without
+waiting for an exit line (a timed-out attempt has none); it skips go-nfs's exclusive-create
+notice; and it reports the script's VFS cache preflight refusal, which writes no exit line, as
+the failure. The message is cleaned for display (`SyncLogPatterns.cleanErrorMessage`), so each
+mount bucket matches both rclone's wording and the rewritten text.
+
+`categorizeMountFailure` order: `unknown` for no message; the mount-only buckets; macFUSE missing
+in rclone's raw wording ("fuse" + "not found"/"not installed", the test `cleanErrorMessage` uses);
+then `categorizeError`, except that its `critical` (which `isCriticalError` gives every message
+with rclone's generic "FUSE" / "failed to mount" wording) is replaced by a named cause from
+`specificErrorBuckets` when the message has one, else `mount_failed`.
+
+| Mount bucket | Matches (lowercased) |
+|--------------|----------------------|
+| `mount_point_not_empty` | "directory is not empty" (rclone mount's mount-point error), "mount point folder is not empty" (its rewrite) |
+| `mount_backend_unavailable` | "not supported on macos when rclone is installed via homebrew", "homebrew's rclone can't mount" (its rewrite), "macfuse is required" (the rewrite of macFUSE missing), "executable file not found in $path" (the NFS backend's `mount` helper, or `fusermount`, missing) |
+| `cache_dir_unwritable` | "vfs cache directory not writable" — the sync script's VFS cache preflight refusing to mount uncached, usually a cache on an external drive that isn't attached |
+| `rc_port_in_use` | "address already in use" — an earlier rclone for the mount point still holds the RC port |
+| `mount_failed` | rclone's generic mount wording with no named cause |
 
 `error.operation` (`TelemetryService.categorizeErrorOperation`, pure) on the `Sync error` log and
 the `Sync failed` log and span says which rclone operation failed: `copy` | `delete` | `move`
@@ -365,7 +405,7 @@ rollout. No event is emitted on a fresh install.
 | `synctray.sync.errors` | Counter | Sync errors by type (`error.type`); a `permission_denied` failure also carries `error.access_denial` (`operation_not_permitted`/`permission_denied`) — the only access-denial attribute on the counter |
 | `synctray.app.profiles.active` | UpDownCounter | Number of active profiles |
 | `synctray.app.launch` | Counter | App launches |
-| `synctray.mount.operations` | Counter | Mount/unmount operations |
+| `synctray.mount.operations` | Counter | Mount/unmount operations; a failure also carries `error.type` ([Mount failures](#mount-failures)) |
 | `synctray.directory_watch.triggers` | Counter | Directory change triggers |
 | `synctray.transport.fallback_activations` | Counter | Fallback remote activations |
 | `synctray.sync.file_operations` | Counter | File operations by type + extension |
@@ -422,8 +462,8 @@ rollout. No event is emitted on a fresh install.
 | Span | Kind | Description |
 |------|------|-------------|
 | `synctray sync` | INTERNAL | Full sync lifecycle (start→complete/fail) |
-| `synctray mount` | INTERNAL | Mount operation |
-| `synctray unmount` | INTERNAL | Unmount operation |
+| `synctray mount` | INTERNAL | Mount operation; a failed one carries `error.type` and `mount.failure_stage` ([Mount failures](#mount-failures)) |
+| `synctray unmount` | INTERNAL | Unmount operation; a failed one carries `error.type` and `mount.failure_stage=detach` |
 | `synctray reinstall_detach` | INTERNAL | Pre-uninstall graceful volume detach for a mount-mode profile (fires on every `uninstall`, including settings-save reinstall) |
 | `synctray warm` | INTERNAL | Offline-file warming run for a profile's pinned folders (start→complete/cancel). Carries `warm.trigger`, `warm.outcome` (completed/cancelled), `warm.concurrency`, `warm.files`, `warm.bytes`, `warm.duration_seconds`, `warm.throughput_mbps`. Exports on end, so an in-progress warm shows only the "Offline warm started" log, not the span. Cancelled when the cache is cleared, the profile is unmounted, or a newer run supersedes it. |
 | `synctray cache_migration` | INTERNAL | Cache-directory move for a Stream profile (start→complete/cancel/fail). Carries `cache_migration.outcome`, `cache_migration.same_volume`, `cache_migration.files`, `cache_migration.bytes`, `cache_migration.duration_seconds`, `cache_migration.throughput_mbps`. Never carries a cache path, source/destination directory, or remote name — only the profile id and its display name, same carve-out as every other span here. |
@@ -431,7 +471,7 @@ rollout. No event is emitted on a fresh install.
 ### Logs
 All key lifecycle events are emitted as structured OTel logs:
 - Sync started/completed/failed (with profile context, duration, files changed; started carries `sync.trigger`: manual/directory_watch/scheduled/startup; failed — log and span — carries `error.type`, `error.operation`, and `sync.exit_code` when a log line stated it — the script's real exit code, see "A failed run is recorded with the script's real exit code")
-- Mount/unmount success/failure
+- Mount/unmount success/failure (a failure carries `error.type` and `mount.failure_stage`, see [Mount failures](#mount-failures))
 - Directory watch triggers
 - Transport changes (primary ↔ fallback)
 - Sync errors (with categorized error type and `error.operation` — see [Error categories](#error-categories))
