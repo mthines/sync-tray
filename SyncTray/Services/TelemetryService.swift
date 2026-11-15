@@ -3479,17 +3479,26 @@ final class TelemetryService {
     /// Static and internal (pure — it only consults `SyncLogPatterns`) so `ConfigSelfTest`
     /// can assert the buckets directly.
     ///
-    /// Order: the `SyncLogPatterns` checks first (unchanged), then the specific buckets in
-    /// `specificErrorBuckets` (matched on a lowercased copy), then the original generic
-    /// `not found` / `permission` / `timeout` / `network` checks on the raw message, exactly
-    /// as before. So a message the generic checks used to bucket keeps that bucket, except
-    /// when it also names a more specific cause — a rate-limit, quota or auth phrase, "no
-    /// such host" (`network`, not the `file_not_found` its "no such" used to give it), and so
-    /// on — which now wins; and Go's "directory not empty" moved from `critical` to
-    /// `directory_not_empty` (see below).
+    /// Order: bisync's `too_many_deletes` safety abort first, then the `SyncLogPatterns`
+    /// checks (unchanged), then the specific buckets in `specificErrorBuckets` (matched on a
+    /// lowercased copy), then the original generic `not found` / `permission` / `timeout` /
+    /// `network` checks on the raw message, exactly as before. So a message the generic checks
+    /// used to bucket keeps that bucket, except when it also names a more specific cause — a
+    /// rate-limit, quota or auth phrase, "no such host" (`network`, not the `file_not_found`
+    /// its "no such" used to give it), and so on — which now wins; and Go's "directory not
+    /// empty" moved from `critical` to `directory_not_empty` (see below).
     static func categorizeError(_ message: String?) -> String {
         guard let msg = message else { return "unknown" }
         let lower = msg.lowercased()
+        // bisync's --max-delete safety abort ("too many deletes (>50%, N of M) on Path1 …"): the
+        // prior listing lost most of its files on one side, so bisync refused to run. A state of
+        // the user's data, not a failed operation; it used to fall through to `other`. First,
+        // because the message quotes a remote path, and words in it ("…/resync-test",
+        // "…/critical") or a "Safety abort:" prefix would otherwise reach the critical and
+        // transient checks below.
+        if SyncLogPatterns.isTooManyDeletesError(msg) {
+            return "too_many_deletes"
+        }
         // A run that was stopped, not one that failed: a signal cancelled rclone's transfers
         // ("context canceled") or bisync's graceful shutdown failed ("Bisync interrupted…",
         // which arrives as a stored error read back from the log). Ahead of the critical check,
@@ -3678,9 +3687,13 @@ final class TelemetryService {
     /// "failed to rmdir" (rclone's rmdir/rmdirs failures, labelled `delete`), then "mkdir"
     /// as a word (Go's "mkdir <path>:", rclone's "… mkdir:") or "make directory"), and only
     /// then the bare words "copy", "delete" and "listing". The bare words can also come from
-    /// a file path inside the message, which is why they are the last resort. Pure.
+    /// a file path inside the message, which is why they are the last resort. bisync's
+    /// "too many deletes" safety abort is `other` before any of this: bisync aborts before
+    /// running an operation, so neither its "deletes" nor the remote path it quotes names one.
+    /// Pure.
     static func categorizeErrorOperation(_ message: String?) -> String {
         guard let lower = message?.lowercased() else { return "other" }
+        if SyncLogPatterns.isTooManyDeletesError(lower) { return "other" }
         if lower.contains("failed to copy") { return "copy" }
         if lower.contains("couldn't delete") { return "delete" }
         if lower.contains("failed to move") || lower.contains("couldn't move")

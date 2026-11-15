@@ -763,6 +763,21 @@ enum SyncLogPatterns {
             || lower.contains("not deleting directories as there were io errors")
     }
 
+    /// rclone bisync's `--max-delete` safety abort: more than the allowed share (50% by
+    /// default) of the files in the prior listing are gone on one side, so bisync stops before
+    /// it changes anything — "too many deletes (>50%, 12 of 20) on Path1 \"remote:path\". Run
+    /// with --force if desired." (`cmd/bisync/deltas.go`, which also has an "… after excluding
+    /// N tracked renames" variant), and the run then ends "Failed to bisync: too many deletes".
+    /// bisync keeps its listings as they were, so every later run aborts the same way until a
+    /// run with `--force` (the banner's Force Sync) or until the files come back. rclone logs
+    /// the abort with "Safety abort" as the log object, which `--use-json-log` keeps out of
+    /// `msg`. Single source for this match: the banner's Force Sync offer
+    /// (`ProfileDetailView.detectErrorAction`) and `TelemetryService.categorizeError`'s
+    /// `too_many_deletes` bucket.
+    static func isTooManyDeletesError(_ message: String) -> Bool {
+        message.lowercased().contains("too many deletes")
+    }
+
     /// An error that says the run was stopped rather than that it failed, in the two wordings
     /// that reach `TelemetryService.categorizeError`, which buckets it as `interrupted`:
     /// - Go's `context.Canceled` text ("context canceled"), which rclone's transfers fail with
