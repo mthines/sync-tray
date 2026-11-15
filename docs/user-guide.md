@@ -236,6 +236,7 @@ That covers scheduled syncs, mounts, the setup wizard, and the folder chooser. Y
 
 - Adding or editing a remote in the app works on an encrypted config. SyncTray has rclone write it, so the file stays encrypted.
 - If you already set `RCLONE_CONFIG_PASS` or your own `RCLONE_PASSWORD_COMMAND`, SyncTray leaves it alone. Background runs don't see your shell's environment, so store the password in SyncTray for those.
+- The Keychain keeps the password from other apps, not from programs you run yourself: any process running as your user can ask SyncTray for it (`synctray rclone-password get`). The encryption protects `rclone.conf` on disk and when you copy it elsewhere.
 - A development build isn't signed like the release, so macOS may ask once whether it may read the Keychain item.
 - SyncTray reads `~/.config/rclone/rclone.conf`. A different location set with `RCLONE_CONFIG` isn't used.
 

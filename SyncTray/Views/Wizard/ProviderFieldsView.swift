@@ -322,7 +322,12 @@ struct RemotePathStepView: View {
         Task {
             let result = await configService.testConnection(fullPath)
             // Resolve provider type for telemetry (low-cardinality, no PII)
-            let providerType = configService.readRemoteConfig(name: remoteNameClean)?.provider.rcloneType ?? "unknown"
+            // Detached: a plain Task inherits the main actor, and on an encrypted config
+            // this read runs `rclone config dump`.
+            let service = configService
+            let providerType = await Task.detached {
+                service.readRemoteConfig(name: remoteNameClean)?.provider.rcloneType ?? "unknown"
+            }.value
 
             await MainActor.run {
                 isTestingConnection = false

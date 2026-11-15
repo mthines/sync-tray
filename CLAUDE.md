@@ -892,15 +892,31 @@ the warmer reads as before — safe degradation.
 (`RcloneConfigPassword`: service `com.synctray.rclone-config`, `.dev` suffix on Debug builds,
 account `rclone.conf`) and never in a profile file, plist, log, telemetry or argv.
 
-- **How rclone gets it.** Every rclone child is built by `RcloneProcess.make`, which sets
+- **How rclone gets it.** The app's rclone children are built by `RcloneProcess.make` (or take `RcloneConfigPassword.rcloneEnvironment()`), which sets
   `RCLONE_PASSWORD_COMMAND="<SyncTray exe>" rclone-password get`. rclone runs it WITHOUT a shell (it splits the string itself: spaces, CSV-style double quotes with `""` for a literal quote), so the path is double-quoted — single quotes would be read as part of the path, which an end-to-end run caught. AC-EC2 drives real rclone against a hostile path.
   rclone only runs it when the config IS encrypted. The generated sync script exports the same
   command (so launchd runs work) unless `RCLONE_CONFIG_PASS` or the user's own
   `RCLONE_PASSWORD_COMMAND` is already set — theirs wins. The shared script is rewritten at every
   launch, so an app move or upgrade follows; setting or clearing the password needs no reinstall.
 - **Why the app binary, not `/usr/bin/security`.** The item's default access list trusts only the
-  signed SyncTray, so another process running as the user can't read it silently. An unsigned dev
-  build may show a Keychain prompt once.
+  signed SyncTray, so `security find-generic-password` from another process gets a Keychain prompt.
+  **This does not make the password private from the user's own processes:** `rclone-password get`
+  prints it to whoever runs it, so any process running as the same user can read it by running the
+  SyncTray binary. That is a conscious acceptance, the same boundary as the rest of this app (a
+  same-user process can already read `rclone.conf`'s encrypted blob, drive launchd, and run rclone
+  as the user); the encryption protects the file at rest and when copied elsewhere, not against
+  code already running as the user. An unsigned dev build may show a Keychain prompt once.
+- **A dev build repoints the shared script.** The generated script embeds the launching binary's
+  path in `RCLONE_PASSWORD_COMMAND`, and `~/.local/bin/synctray-sync.sh` is shared by release and
+  dev builds and rewritten whenever its content differs. After a Debug build is launched against
+  your real home, scheduled runs call the dev binary (and its `.dev` Keychain item) until the
+  release app is launched again and rewrites the script. Run dev builds with a sandbox home
+  (`HOME` + `CFFIXED_USER_HOME`) when you have an encrypted config and real profiles.
+- **Never block the main thread on it.** `readRemoteConfig`/`listRemotes` run rclone (and so the
+  password command) on an encrypted config. View-body code uses the non-blocking
+  `cachedRemoteConfig`; the wizard, `AddRemoteSheet` and `ProviderFieldsView` read off the main
+  thread. `computeFallbackRequiresCacheRebuild` (profile install) still reads synchronously, on
+  the caller's thread, only for profiles with a fallback.
 - **No direct parsing of an encrypted file.** `RcloneConfigService.configIsEncrypted()` looks for the
   `RCLONE_ENCRYPT_V0:` marker (rclone writes a comment line before it). When set, `readRemoteConfig`
   and telemetry's `readConfigContents` read `rclone config dump` instead (`dumpConfig`, cached 5 s),

@@ -9,8 +9,9 @@ import Security
 /// profile files, plists, logs, telemetry or process arguments.
 ///
 /// The command runs the SyncTray binary itself (`<exe> rclone-password get`), so the Keychain
-/// item's default access list trusts only the signed app — another process running as the user
-/// can't read it silently with `security find-generic-password`.
+/// item's default access list trusts only the signed app, so `security find-generic-password`
+/// from another process is prompted. It is not secret from the user's own processes: `get` prints
+/// the password to whoever runs it (see CLAUDE.md "Encrypted rclone.conf").
 enum RcloneConfigPassword {
     /// First bytes rclone writes to an encrypted config.
     static let encryptedMarker = "RCLONE_ENCRYPT_V0:"

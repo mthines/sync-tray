@@ -449,9 +449,13 @@ private struct EncryptedRcloneConfigSection: View {
     }
 
     private func remove() {
-        _ = RcloneConfigPassword.clear()
-        message = "Removed from the Keychain."
-        messageIsError = false
+        if RcloneConfigPassword.clear() {
+            message = "Removed from the Keychain."
+            messageIsError = false
+        } else {
+            message = "Couldn't remove the password from the Keychain."
+            messageIsError = true
+        }
         refresh()
     }
 }

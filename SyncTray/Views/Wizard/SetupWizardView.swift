@@ -18,6 +18,9 @@ struct SetupWizardView: View {
     @State private var wizardCompleted = false
     @State private var remoteConfig = RemoteConfiguration(name: "", provider: .googleDrive)
     @State private var selectedRemote: String = ""
+    /// Remotes already in rclone.conf, loaded off the main thread (on an encrypted config
+    /// listing them runs rclone and the password command).
+    @State private var existingRemotes: [String] = []
     @State private var remotePath: String = ""
     @State private var localPath: String = ""
     @State private var profileName: String = ""
@@ -262,7 +265,7 @@ struct SetupWizardView: View {
             }
 
             // Option to use existing remote
-            if !configService.listRemotes().isEmpty {
+            if !existingRemotes.isEmpty {
                 Divider()
                     .padding(.vertical, 8)
 
@@ -272,7 +275,7 @@ struct SetupWizardView: View {
 
                 Picker("Existing Remote", selection: $selectedRemote) {
                     Text("Configure new remote").tag("")
-                    ForEach(configService.listRemotes(), id: \.self) { remote in
+                    ForEach(existingRemotes, id: \.self) { remote in
                         Text(remote).tag(remote)
                     }
                 }
@@ -764,7 +767,11 @@ struct SetupWizardView: View {
             } else {
                 resolved = .missing
             }
-            await MainActor.run { self.rcloneAvailability = resolved }
+            let remotes = resolved == .missing ? [] : service.listRemotes()
+            await MainActor.run {
+                self.rcloneAvailability = resolved
+                self.existingRemotes = remotes
+            }
         }
     }
 

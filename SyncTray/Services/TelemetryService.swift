@@ -1187,6 +1187,7 @@ final class TelemetryService {
                 "config.allow_non_empty_mount": .bool(profile.allowNonEmptyMount),
                 // Whether rclone.conf is encrypted (`rclone config encryption`) — a bool only.
                 "config.rclone_config_encrypted": .bool(RcloneConfigService.shared.configIsEncrypted()),
+                "config.rclone_config_password_stored": .bool(RcloneConfigPassword.isStored),
                 "config.download_connections": .int(profile.isMountMode ? profile.downloadConnections : 0),
                 "config.has_bandwidth_limit": .bool(!profile.bandwidthLimit.isEmpty),
                 "config.mount_resilient": .string(profile.isMountMode ? String(profile.mountResilient) : "n/a"),
