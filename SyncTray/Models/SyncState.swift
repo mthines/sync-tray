@@ -773,7 +773,8 @@ enum SyncLogPatterns {
     /// the abort with "Safety abort" as the log object, which `--use-json-log` keeps out of
     /// `msg`. Single source for this match: the banner's Force Sync offer
     /// (`ProfileDetailView.detectErrorAction`) and `TelemetryService.categorizeError`'s
-    /// `too_many_deletes` bucket.
+    /// `too_many_deletes` bucket. Both check it before anything else, so a quoted path can't
+    /// send the banner and telemetry different ways (AC-TS2).
     static func isTooManyDeletesError(_ message: String) -> Bool {
         message.lowercased().contains("too many deletes")
     }

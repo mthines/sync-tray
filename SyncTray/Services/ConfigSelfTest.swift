@@ -9851,6 +9851,24 @@ enum ConfigSelfTest {
         for (input, expected) in tooManyDeletes where SyncLogPatterns.isTooManyDeletesError(input) != expected {
             return report(name, slug, false, "(isTooManyDeletesError(\(input.debugDescription)) != \(expected))")
         }
+
+        // The banner checks the safety abort first too, so a quoted path holding "not empty",
+        // "--resync" or "out of sync" still offers Force Sync — the action that matches the
+        // `too_many_deletes` telemetry reports. `detectErrorAction` is a private view method,
+        // so this pins its order in the source: the function's first `if` is the abort check,
+        // which catches a branch added above it whether it matches a substring or a
+        // `SyncLogPatterns` predicate.
+        guard let viewSource = readSourceFile("Views/Settings/ProfileDetailView.swift"),
+              let detectFn = extractFunctionBody(startingAt: "private func detectErrorAction(from error: String)", in: viewSource) else {
+            return report(name, slug, false, "(could not read detectErrorAction)")
+        }
+        let firstIf = detectFn.components(separatedBy: "\n")
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .first { $0.hasPrefix("if ") }
+        guard firstIf == "if SyncLogPatterns.isTooManyDeletesError(error) {",
+              detectFn.components(separatedBy: "isTooManyDeletesError(").count == 2 else {
+            return report(name, slug, false, "(detectErrorAction no longer checks the too-many-deletes abort first)")
+        }
         return report(name, slug, true)
     }
 
