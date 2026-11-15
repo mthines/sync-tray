@@ -886,6 +886,38 @@ different-size edit still does, since the size check fails). On the **fallback**
 primary-derived cache roots may not resolve, in which case the skip simply doesn't apply and
 the warmer reads as before — safe degradation.
 
+### Encrypted rclone.conf
+
+`rclone config encryption` configs work unattended. The password lives in the macOS Keychain
+(`RcloneConfigPassword`: service `com.synctray.rclone-config`, `.dev` suffix on Debug builds,
+account `rclone.conf`) and never in a profile file, plist, log, telemetry or argv.
+
+- **How rclone gets it.** Every rclone child is built by `RcloneProcess.make`, which sets
+  `RCLONE_PASSWORD_COMMAND="<SyncTray exe>" rclone-password get`. rclone runs it WITHOUT a shell (it splits the string itself: spaces, CSV-style double quotes with `""` for a literal quote), so the path is double-quoted — single quotes would be read as part of the path, which an end-to-end run caught. AC-EC2 drives real rclone against a hostile path.
+  rclone only runs it when the config IS encrypted. The generated sync script exports the same
+  command (so launchd runs work) unless `RCLONE_CONFIG_PASS` or the user's own
+  `RCLONE_PASSWORD_COMMAND` is already set — theirs wins. The shared script is rewritten at every
+  launch, so an app move or upgrade follows; setting or clearing the password needs no reinstall.
+- **Why the app binary, not `/usr/bin/security`.** The item's default access list trusts only the
+  signed SyncTray, so another process running as the user can't read it silently. An unsigned dev
+  build may show a Keychain prompt once.
+- **No direct parsing of an encrypted file.** `RcloneConfigService.configIsEncrypted()` looks for the
+  `RCLONE_ENCRYPT_V0:` marker (rclone writes a comment line before it). When set, `readRemoteConfig`
+  and telemetry's `readConfigContents` read `rclone config dump` instead (`dumpConfig`, cached 5 s),
+  and the script's `check_no_cert` reads the dump too. Plain-text configs keep the file reads.
+- **Remote add/edit.** On an encrypted config `addRemote`/`updateRemote` use
+  `rclone config create … --non-interactive --no-obscure` instead of appending text (which would
+  corrupt the file). The values are rclone arguments, so they show in `ps` for that moment. Plain-text
+  configs are unchanged.
+- **Errors.** `SyncLogPatterns.isRcloneConfigPasswordError` turns rclone's decrypt failures into the
+  banner action "Set rclone Password" (opens App Settings via `.selectAppSettings`), and
+  `categorizeError` files them under `config_decrypt_failed`. `synctray doctor` has an `rclone config`
+  check. Settings has an "Encrypted rclone config" row, shown only when the file is encrypted or a
+  password is stored; Save verifies the password against rclone first.
+- **Known limit.** The app still hard-codes `~/.config/rclone/rclone.conf`; an `RCLONE_CONFIG`
+  override isn't honoured.
+Covered by `ConfigSelfTest` AC-EC1–AC-EC6 (AC-EC4 drives real rclone against an encrypted fixture).
+
 ### Models/
 
 | File | Purpose |
@@ -1286,6 +1318,7 @@ Covered by `ConfigSelfTest` AC-CLI4 and AC-SEC3.
 | `synctray listremotes` | `rclone listremotes`, passthrough. |
 | `synctray remote folders <remote>[:path] [--json]` | List a remote's folders exactly as the profile editor's folder chooser and the setup wizard show them — same `rclone lsf --dirs-only` arguments (`RcloneConfigService.folderListingArguments`, including the remote's `no_check_certificate`) and the same parser (`parseDirectoryListing`), so names with spaces come out verbatim. Needs no profile. `--json` prints a JSON array, which makes leading/trailing spaces visible. Covered by `ConfigSelfTest` AC-CLI12 (and AC-RF1 for the parser). |
 | `synctray telemetry [status\|on\|off] [--json]` | Show or change whether usage data is shared — the same setting as the app's telemetry toggle (see "Privacy and consent" below). `status --json` prints `{"asked":…,"enabled":…}`. `on`/`off` count as answering the first-run question. |
+| `synctray rclone-password status\|set\|clear` (and `get`) | The Keychain password for an encrypted `rclone.conf` (see "Encrypted rclone.conf" below). `set` reads it from the terminal (no echo) or stdin — **never an argument** — and stores it only if `rclone config dump` accepts it. `status` prints `stored=… config_encrypted=…`. `get` prints just the password; it is what rclone runs, so it skips the telemetry consent question and records no event. |
 
 **Configure** (mutating — headless-capable, no running app required):
 

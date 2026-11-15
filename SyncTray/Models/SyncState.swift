@@ -575,6 +575,30 @@ enum SyncLogPatterns {
         message.lowercased().contains("prior lock file found")
     }
 
+    /// rclone could not open an encrypted rclone.conf: the password is missing, wrong or its
+    /// command failed. Unattended runs (launchd) hit this when no password is stored, so the
+    /// banner points at Settings instead of showing rclone's raw text.
+    static func isRcloneConfigPasswordError(_ message: String) -> Bool {
+        let lower = message.lowercased()
+        return lower.contains("unable to decrypt configuration")
+            || lower.contains("couldn't decrypt configuration")
+            || lower.contains("most likely wrong password")
+            || lower.contains("password command failed")
+            || lower.contains("failed to read password")
+            || lower.contains("failed to read line: eof") && lower.contains("configuration password")
+    }
+
+    /// What to tell the user when rclone can't open an encrypted rclone.conf.
+    static let rcloneConfigPasswordHint =
+        "rclone.conf is encrypted and SyncTray doesn't have its password. "
+        + "Add it under App Settings › Encrypted rclone config."
+
+    /// `message` unchanged, except rclone's decrypt failures (several raw log lines) become
+    /// `rcloneConfigPasswordHint`. For the places that show rclone's output to the user.
+    static func friendlyRcloneError(_ message: String) -> String {
+        isRcloneConfigPasswordError(message) ? rcloneConfigPasswordHint : message
+    }
+
     // MARK: - Error Categorization
 
     /// Transient "all files changed" error that should be ignored.

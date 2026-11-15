@@ -2611,22 +2611,34 @@ struct ProfileDetailView: View {
             }
 
             process.executableURL = URL(fileURLWithPath: path)
+
+            process.environment = RcloneConfigPassword.rcloneEnvironment()
+            let errPipe = Pipe()
             process.arguments = ["listremotes"]
             process.standardOutput = pipe
-            process.standardError = pipe
+            process.standardError = errPipe
 
             do {
                 try process.run()
+                let (data, errData) = RcloneConfigService.drainPipes(stdout: pipe, stderr: errPipe)
                 process.waitUntilExit()
-
-                let data = pipe.fileHandleForReading.readDataToEndOfFile()
                 let output = String(data: data, encoding: .utf8) ?? ""
 
-                let remotes = output
-                    .components(separatedBy: .newlines)
-                    .map { $0.trimmingCharacters(in: .whitespaces) }
-                    .filter { !$0.isEmpty }
-                    .map { $0.hasSuffix(":") ? String($0.dropLast()) : $0 }
+                // A failed run (e.g. an encrypted config with no password) lists nothing: its
+                // error text must not become dropdown entries.
+                guard process.terminationStatus == 0 else {
+                    let message = String(data: errData, encoding: .utf8) ?? ""
+                    DispatchQueue.main.async {
+                        availableRemotes = []
+                        isLoadingRemotes = false
+                        remotesError = SyncLogPatterns.isRcloneConfigPasswordError(message)
+                            ? SyncLogPatterns.rcloneConfigPasswordHint
+                            : "Couldn't list remotes: \(message.trimmingCharacters(in: .whitespacesAndNewlines))"
+                    }
+                    return
+                }
+
+                let remotes = RcloneConfigService.parseRemoteNames(output)
 
                 DispatchQueue.main.async {
                     availableRemotes = remotes
@@ -2667,6 +2679,8 @@ struct ProfileDetailView: View {
             }
 
             process.executableURL = URL(fileURLWithPath: path)
+
+            process.environment = RcloneConfigPassword.rcloneEnvironment()
             let remoteName = rcloneRemote.replacingOccurrences(of: ":", with: "")
             let skipCert = RcloneConfigService.shared.readRemoteConfig(name: remoteName)?.values["no_check_certificate"] == "true"
             process.arguments = RcloneConfigService.folderListingArguments("\(rcloneRemote):", skipCertCheck: skipCert)
@@ -2682,7 +2696,9 @@ struct ProfileDetailView: View {
                     let errorOutput = String(data: errData, encoding: .utf8) ?? "Unknown error"
                     DispatchQueue.main.async {
                         isLoadingFolders = false
-                        foldersError = "Failed to list folders: \(errorOutput)"
+                        foldersError = SyncLogPatterns.isRcloneConfigPasswordError(errorOutput)
+                            ? SyncLogPatterns.rcloneConfigPasswordHint
+                            : "Failed to list folders: \(errorOutput)"
                     }
                     return
                 }
@@ -3127,9 +3143,8 @@ struct ProfileDetailView: View {
                 let bareName = remote.hasSuffix(":") ? String(remote.dropLast()) : remote
                 let target = "\(bareName):\(path)"
 
-                let proc = Process()
+                let proc = RcloneProcess.make(rclonePath: rclone, arguments: [])
                 let errPipe = Pipe()
-                proc.executableURL = URL(fileURLWithPath: rclone)
                 var args = ["lsd", target, "--contimeout", "3s", "--timeout", "5s", "--retries", "1", "--low-level-retries", "1", "--max-depth", "0"]
                 if RcloneConfigService.shared.readRemoteConfig(name: bareName)?.values["no_check_certificate"] == "true" {
                     args.append("--no-check-certificate")
@@ -3396,6 +3411,8 @@ struct ProfileDetailView: View {
             }
 
             process.executableURL = URL(fileURLWithPath: path)
+
+            process.environment = RcloneConfigPassword.rcloneEnvironment()
             process.arguments = arguments
             process.standardOutput = pipe
             process.standardError = errorPipe
@@ -3733,6 +3750,7 @@ struct ProfileDetailView: View {
         case mountAnyway    // Enable non-empty mount and retry
         case excludeBlockedPath   // macOS blocked access: add the path to "Don't Sync", sync again
         case openPrivacySettings  // macOS blocked access: open Full Disk Access in System Settings
+        case openRclonePasswordSettings  // encrypted rclone.conf: open App Settings to store its password
 
         /// Bounded, low-cardinality id for telemetry (`recovery.action`).
         var telemetryName: String {
@@ -3747,6 +3765,7 @@ struct ProfileDetailView: View {
             case .mountAnyway: return "mount_anyway"
             case .excludeBlockedPath: return "exclude_blocked_path"
             case .openPrivacySettings: return "open_privacy_settings"
+            case .openRclonePasswordSettings: return "open_rclone_password_settings"
             }
         }
 
@@ -3772,6 +3791,8 @@ struct ProfileDetailView: View {
                 return "Exclude from Sync"
             case .openPrivacySettings:
                 return "Open Privacy Settings"
+            case .openRclonePasswordSettings:
+                return "Set rclone Password"
             }
         }
 
@@ -3796,6 +3817,8 @@ struct ProfileDetailView: View {
             case .excludeBlockedPath:
                 return "Syncing..."
             case .openPrivacySettings:
+                return "Opening..."
+            case .openRclonePasswordSettings:
                 return "Opening..."
             }
         }
@@ -3822,6 +3845,8 @@ struct ProfileDetailView: View {
                 return "minus.circle"
             case .openPrivacySettings:
                 return "lock.shield"
+            case .openRclonePasswordSettings:
+                return "key"
             }
         }
 
@@ -3847,11 +3872,17 @@ struct ProfileDetailView: View {
                 return "Add the blocked item to this profile's Don't Sync list, then sync again"
             case .openPrivacySettings:
                 return "Open System Settings › Privacy & Security › Full Disk Access"
+            case .openRclonePasswordSettings:
+                return "Open Settings to store the password for your encrypted rclone.conf in the Keychain"
             }
         }
     }
 
     private func detectErrorAction(from error: String) -> ErrorAction? {
+        // Encrypted rclone.conf that rclone couldn't open: the password lives in Settings
+        if SyncLogPatterns.isRcloneConfigPasswordError(error) {
+            return .openRclonePasswordSettings
+        }
         // Mount mode: folder is not empty
         if error.contains("is not empty") || error.contains("not empty") {
             return .mountAnyway
@@ -3914,7 +3945,8 @@ struct ProfileDetailView: View {
         // into a recovery action — not just the button tap — is covered (R1).
         // Open Privacy Settings is exempt: it only opens System Settings and starts
         // no run, so refusing it while a sync is live would block the fix for nothing.
-        guard action == .openPrivacySettings || !syncManager.isRunLive(for: profile) else {
+        guard action == .openPrivacySettings || action == .openRclonePasswordSettings
+                || !syncManager.isRunLive(for: profile) else {
             TelemetryService.shared.recordUserRecoveryAction(
                 profileId: profile.id,
                 profileName: profile.name,
@@ -3951,6 +3983,8 @@ struct ProfileDetailView: View {
             excludeBlockedPath()
         case .openPrivacySettings:
             openPrivacySettings()
+        case .openRclonePasswordSettings:
+            NotificationCenter.default.post(name: .selectAppSettings, object: nil)
         }
     }
 
@@ -4259,6 +4293,8 @@ struct ProfileDetailView: View {
             }
 
             process.executableURL = URL(fileURLWithPath: path)
+
+            process.environment = RcloneConfigPassword.rcloneEnvironment()
             process.arguments = arguments
             process.standardOutput = pipe
             process.standardError = errorPipe
@@ -5041,8 +5077,7 @@ struct RemoteFolderBrowserSheet: View {
                 DispatchQueue.main.async { self.isLoading = false; self.errorMessage = "rclone not found" }
                 return
             }
-            let proc = Process()
-            proc.executableURL = URL(fileURLWithPath: rclone)
+            let proc = RcloneProcess.make(rclonePath: rclone, arguments: [])
             let skipCert = RcloneConfigService.shared.readRemoteConfig(name: remote)?.values["no_check_certificate"] == "true"
             var args = ["lsf", "\(remote):\(path)", "--dirs-only", "--contimeout", "5s", "--timeout", "15s"]
             if skipCert { args.append("--no-check-certificate") }
@@ -5061,7 +5096,7 @@ struct RemoteFolderBrowserSheet: View {
                         self.isLoading = false
                         self.errorMessage = e.contains("directory not found")
                             ? "This folder doesn't exist on the remote."
-                            : (e.isEmpty ? "Couldn't list folders (remote unreachable?)." : e)
+                            : (e.isEmpty ? "Couldn't list folders (remote unreachable?)." : SyncLogPatterns.friendlyRcloneError(e))
                     }
                     return
                 }

@@ -1185,6 +1185,8 @@ final class TelemetryService {
                 // folder names themselves never leave the machine.
                 "config.sync_include_folder_count": .int(profile.isMountMode ? 0 : profile.syncIncludeFolders.count),
                 "config.allow_non_empty_mount": .bool(profile.allowNonEmptyMount),
+                // Whether rclone.conf is encrypted (`rclone config encryption`) — a bool only.
+                "config.rclone_config_encrypted": .bool(RcloneConfigService.shared.configIsEncrypted()),
                 "config.download_connections": .int(profile.isMountMode ? profile.downloadConnections : 0),
                 "config.has_bandwidth_limit": .bool(!profile.bandwidthLimit.isEmpty),
                 "config.mount_resilient": .string(profile.isMountMode ? String(profile.mountResilient) : "n/a"),
@@ -3227,6 +3229,11 @@ final class TelemetryService {
     static func categorizeError(_ message: String?) -> String {
         guard let msg = message else { return "unknown" }
         let lower = msg.lowercased()
+        // Ahead of the critical check: rclone logs these at CRITICAL, but the cause is the
+        // missing/wrong encrypted-config password, which is actionable, not "critical".
+        if SyncLogPatterns.isRcloneConfigPasswordError(msg) {
+            return "config_decrypt_failed"
+        }
         if SyncLogPatterns.isCriticalError(msg) {
             if msg.contains("resync") || msg.contains("out of sync") {
                 return "out_of_sync"

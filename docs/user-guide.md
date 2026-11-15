@@ -208,6 +208,39 @@ These live under **Advanced Options** in each profile.
 **External drive.** When a profile's local folder is on an external drive, turn on **Skip sync when drive is disconnected** in the profile.
 Syncs pause while the drive is unplugged and resume when it's back.
 
+## Encrypted rclone config
+
+If you've encrypted `rclone.conf` with `rclone config encryption`, rclone asks for a password before it can read your remotes.
+A scheduled sync or a mount runs in the background with no terminal, so it can't ask. Store the password once and SyncTray supplies it.
+
+**In the app**
+
+1. Open **Settings…** and click the gear in the sidebar.
+2. Find **Encrypted rclone config**. It appears only when your `rclone.conf` is encrypted or a password is already stored.
+3. Type the password and click **Save**. SyncTray checks it against rclone first and saves it only if it decrypts the config.
+4. The row now reads "Password stored in Keychain". **Update** replaces it and **Remove** deletes it.
+
+If a sync fails because rclone can't open the config, the error banner on the profile shows **Set rclone Password**, which jumps to this row.
+
+**From the terminal**
+
+```bash
+synctray rclone-password set      # asks without echoing
+synctray rclone-password status   # stored=true config_encrypted=true
+synctray doctor                   # "rclone config: encrypted, password unlocks it"
+```
+
+**How it works.** The password lives in your macOS Keychain, never in a profile, log, setting or command line.
+When SyncTray runs rclone it tells rclone to get the password by asking SyncTray (`RCLONE_PASSWORD_COMMAND`), and SyncTray reads it from the Keychain.
+That covers scheduled syncs, mounts, the setup wizard, and the folder chooser. You don't need to reinstall a profile after storing or removing the password.
+
+- Adding or editing a remote in the app works on an encrypted config. SyncTray has rclone write it, so the file stays encrypted.
+- If you already set `RCLONE_CONFIG_PASS` or your own `RCLONE_PASSWORD_COMMAND`, SyncTray leaves it alone. Background runs don't see your shell's environment, so store the password in SyncTray for those.
+- A development build isn't signed like the release, so macOS may ask once whether it may read the Keychain item.
+- SyncTray reads `~/.config/rclone/rclone.conf`. A different location set with `RCLONE_CONFIG` isn't used.
+
+If it doesn't work, see [Troubleshooting](troubleshooting.md#syncs-fail-with-unable-to-decrypt-configuration).
+
 ## App settings
 
 Open **Settings…** and click the gear in the sidebar.
@@ -215,5 +248,6 @@ Open **Settings…** and click the gear in the sidebar.
 - **Launch at Login.**
 - **Automatically recover from sync conflicts** — the two-way auto-fix described above.
 - **Share usage data** — off until you turn it on. Sends pseudonymous usage and error data, never file names, folder names, remote names, or credentials. **Learn more** shows exactly what's collected.
+- **Encrypted rclone config** — the Keychain password for an encrypted `rclone.conf`; shown only when it applies. See [Encrypted rclone config](#encrypted-rclone-config).
 - **Debug Logging** — verbose lines in the sync logs, for troubleshooting.
 - **Join the SyncTray community on Discord** — also in the menu bar under **Help & Feedback**.

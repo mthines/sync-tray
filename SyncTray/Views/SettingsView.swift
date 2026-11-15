@@ -54,6 +54,9 @@ struct SettingsView: View {
                 }
             }
         }
+        .onReceive(NotificationCenter.default.publisher(for: .selectAppSettings)) { _ in
+            selection = .appSettings
+        }
         .onReceive(NotificationCenter.default.publisher(for: .selectProfile)) { notification in
             if let profileId = notification.userInfo?["profileId"] as? UUID {
                 selection = .profile(profileId)

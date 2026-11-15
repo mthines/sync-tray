@@ -44,6 +44,7 @@ These commands are read-only.
 | `synctray logs <name\|id> [--follow]`      | Print the profile's sync log, or follow it like `tail -f`.                                             |
 | `synctray test-remote <name\|id>`          | Probe the profile's remote path with a hard timeout.                                                   |
 | `synctray listremotes`                     | Pass-through to `rclone listremotes`.                                                                  |
+| `synctray rclone-password status\|set\|clear` | Keychain password for an encrypted `rclone.conf`. `set` asks without echo (or reads stdin), never takes it as an argument, and refuses one that doesn't decrypt the config. |
 | `synctray help`                            | Print the usage summary.                                                                               |
 
 ### `doctor`

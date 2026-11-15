@@ -1660,18 +1660,8 @@ final class SyncManager: ObservableObject {
                         arguments.append(contentsOf: extra)
                     }
 
-                    let process = Process()
-                    process.executableURL = URL(fileURLWithPath: rclonePath)
-                    process.arguments = arguments
-
-                    // Merge fallback env-var overrides into the process environment
-                    if !extraEnv.isEmpty {
-                        var env = ProcessInfo.processInfo.environment
-                        for (key, value) in extraEnv {
-                            env[key] = value
-                        }
-                        process.environment = env
-                    }
+                    // Fallback env-var overrides are layered on the password environment
+                    let process = RcloneProcess.make(rclonePath: rclonePath, arguments: arguments, extraEnv: extraEnv)
 
                     // Route rclone output into the profile log file so the LogWatcher
                     // pipeline fires `.syncStarted` / `.syncCompleted` / `.syncFailed`.
@@ -4334,8 +4324,7 @@ final class SyncManager: ObservableObject {
     private func isRemoteReachable(_ remoteName: String, path: String) -> Bool {
         guard let arguments = Self.reachabilityProbeArguments(remote: remoteName, path: path) else { return false }
         guard let rclone = RcloneLocator.resolve() else { return false }
-        let proc = Process()
-        proc.executableURL = URL(fileURLWithPath: rclone)
+        let proc = RcloneProcess.make(rclonePath: rclone, arguments: [])
         proc.arguments = arguments
         proc.standardOutput = FileHandle.nullDevice
         proc.standardError = FileHandle.nullDevice

@@ -14,6 +14,89 @@ final class RcloneConfigService {
         "\(NSHomeDirectory())/.config/rclone/rclone.conf"
     }
 
+    // MARK: - Encrypted config
+
+    /// Whether rclone.conf is an encrypted config (`rclone config encryption`). An encrypted
+    /// file has no readable sections, so every direct read below goes through rclone instead.
+    func configIsEncrypted() -> Bool {
+        guard let handle = FileHandle(forReadingAtPath: configPath) else { return false }
+        defer { try? handle.close() }
+        // The marker is on the first non-comment line; a short head is enough.
+        let head = handle.readData(ofLength: 512)
+        return RcloneConfigPassword.isEncrypted(configContents: String(decoding: head, as: UTF8.self))
+    }
+
+    /// Run rclone with a hard timeout and the password environment. `environment` replaces
+    /// the default one when given (used to verify a candidate password).
+    func runRclone(
+        _ args: [String], timeout: TimeInterval, environment: [String: String]? = nil
+    ) -> (exitCode: Int32, stdout: String, stderr: String) {
+        guard let rclonePath = findRclonePath() else { return (127, "", "rclone not found") }
+        let proc = RcloneProcess.make(rclonePath: rclonePath, arguments: args)
+        if let environment { proc.environment = environment }
+        let outPipe = Pipe()
+        let errPipe = Pipe()
+        proc.standardOutput = outPipe
+        proc.standardError = errPipe
+        do { try proc.run() } catch { return (-1, "", "\(error)") }
+        let watchdog = DispatchWorkItem { if proc.isRunning { proc.terminate() } }
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + timeout, execute: watchdog)
+        let (out, err) = Self.drainPipes(stdout: outPipe, stderr: errPipe)
+        proc.waitUntilExit()
+        watchdog.cancel()
+        return (proc.terminationStatus, String(decoding: out, as: UTF8.self), String(decoding: err, as: UTF8.self))
+    }
+
+    private let dumpLock = NSLock()
+    private var cachedDump: (at: Date, remotes: [String: [String: String]])?
+
+    /// Every remote's settings via `rclone config dump` (decrypts an encrypted config).
+    /// Cached for a few seconds — a settings screen asks for several remotes in a row.
+    func dumpConfig() -> [String: [String: String]]? {
+        dumpLock.lock()
+        if let cached = cachedDump, Date().timeIntervalSince(cached.at) < 5 {
+            dumpLock.unlock()
+            return cached.remotes
+        }
+        dumpLock.unlock()
+        let result = runRclone(["config", "dump"], timeout: 15)
+        guard result.exitCode == 0,
+              let object = try? JSONSerialization.jsonObject(with: Data(result.stdout.utf8)) as? [String: Any]
+        else { return nil }
+        var remotes: [String: [String: String]] = [:]
+        for (name, raw) in object {
+            guard let fields = raw as? [String: Any] else { continue }
+            remotes[name] = fields.mapValues { "\($0)" }
+        }
+        dumpLock.lock()
+        cachedDump = (Date(), remotes)
+        dumpLock.unlock()
+        return remotes
+    }
+
+    private func invalidateDumpCache() {
+        dumpLock.lock()
+        cachedDump = nil
+        dumpLock.unlock()
+    }
+
+    /// `rclone config create|update` for an encrypted config, where the file can't be edited
+    /// as text. Values were already obscured by the caller, hence `--no-obscure`. NOTE: the
+    /// values are rclone arguments, so they are visible in `ps` for the moment rclone runs —
+    /// the cost of letting rclone own the encryption; plain-text configs keep the file path.
+    private func configCreateOrUpdate(_ verb: String, _ config: RemoteConfiguration) throws {
+        var args = ["config", verb, config.name]
+        if verb == "create" { args.append(config.provider.rcloneType) }
+        for (key, value) in config.values.sorted(by: { $0.key < $1.key }) where !value.isEmpty {
+            args += [key, value]
+        }
+        if let token = config.oauthToken { args += ["token", token] }
+        args += ["--non-interactive", "--no-obscure"]
+        let result = runRclone(args, timeout: 30)
+        invalidateDumpCache()
+        guard result.exitCode == 0 else { throw ConfigError.configWriteFailed }
+    }
+
     // MARK: - Rclone Path
 
     private func findRclonePath() -> String? {
@@ -29,10 +112,8 @@ final class RcloneConfigService {
     func getRcloneVersion() -> String? {
         guard let rclonePath = findRclonePath() else { return nil }
 
-        let process = Process()
+        let process = RcloneProcess.make(rclonePath: rclonePath, arguments: [])
         let pipe = Pipe()
-
-        process.executableURL = URL(fileURLWithPath: rclonePath)
         process.arguments = ["version"]
         process.standardOutput = pipe
         process.standardError = pipe
@@ -59,29 +140,36 @@ final class RcloneConfigService {
     func listRemotes() -> [String] {
         guard let rclonePath = findRclonePath() else { return [] }
 
-        let process = Process()
+        let process = RcloneProcess.make(rclonePath: rclonePath, arguments: [])
         let pipe = Pipe()
-
-        process.executableURL = URL(fileURLWithPath: rclonePath)
+        let errPipe = Pipe()
         process.arguments = ["listremotes"]
         process.standardOutput = pipe
-        process.standardError = pipe
+        process.standardError = errPipe
 
         do {
             try process.run()
+            let (data, _) = Self.drainPipes(stdout: pipe, stderr: errPipe)
             process.waitUntilExit()
-
-            let data = pipe.fileHandleForReading.readDataToEndOfFile()
-            if let output = String(data: data, encoding: .utf8) {
-                return output.components(separatedBy: "\n")
-                    .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-                    .filter { !$0.isEmpty }
+            // A failed run (e.g. an encrypted config with no password) has nothing to list;
+            // its error text is NOT a remote name.
+            guard process.terminationStatus == 0, let output = String(data: data, encoding: .utf8) else {
+                return []
             }
+            return Self.parseRemoteNames(output).map { $0 + ":" }
         } catch {
             return []
         }
 
         return []
+    }
+
+    /// Remote names from `rclone listremotes` stdout: only lines of the form `name:`.
+    static func parseRemoteNames(_ output: String) -> [String] {
+        output.components(separatedBy: .newlines)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { $0.hasSuffix(":") && $0.count > 1 && !$0.contains(" ") }
+            .map { String($0.dropLast()) }
     }
 
     /// Check if a remote name already exists
@@ -92,6 +180,13 @@ final class RcloneConfigService {
 
     /// Add a new remote to rclone config
     func addRemote(_ config: RemoteConfiguration) throws {
+        if configIsEncrypted() {
+            if listRemotes().contains(config.name) { throw ConfigError.remoteAlreadyExists(config.name) }
+            var configToWrite = config
+            obscurePasswordFields(&configToWrite)
+            try configCreateOrUpdate("create", configToWrite)
+            return
+        }
         // Read existing config
         var existingConfig = ""
         if FileManager.default.fileExists(atPath: configPath) {
@@ -170,6 +265,10 @@ final class RcloneConfigService {
     /// Read configuration for an existing remote from rclone.conf
     /// Returns a RemoteConfiguration pre-populated with the remote's current settings.
     func readRemoteConfig(name: String) -> RemoteConfiguration? {
+        if configIsEncrypted() {
+            guard var values = dumpConfig()?[name], let type = values.removeValue(forKey: "type") else { return nil }
+            return Self.remoteConfiguration(name: name, rcloneType: type, values: values)
+        }
         guard FileManager.default.fileExists(atPath: configPath),
               let content = try? String(contentsOfFile: configPath, encoding: .utf8) else {
             return nil
@@ -209,7 +308,14 @@ final class RcloneConfigService {
         }
 
         guard inSection, let type = rcloneType else { return nil }
+        return Self.remoteConfiguration(name: name, rcloneType: type, values: values)
+    }
 
+    /// Build a `RemoteConfiguration` from a remote's `type` and its other key/values — shared
+    /// by the plain-text parser and the `rclone config dump` reader.
+    static func remoteConfiguration(
+        name: String, rcloneType type: String, values: [String: String]
+    ) -> RemoteConfiguration {
         let provider = providerFromRcloneType(type, values: values)
         var config = RemoteConfiguration(name: name, provider: provider)
 
@@ -231,7 +337,14 @@ final class RcloneConfigService {
     /// call it off the main thread on a hot path. Used by telemetry's
     /// `RemoteBackendType.types(for:rcloneConfig:)`, which reads it once per snapshot.
     func readConfigContents() -> String? {
-        try? String(contentsOfFile: configPath, encoding: .utf8)
+        if configIsEncrypted() {
+            // Telemetry only looks up each remote's `type`, so render just that from the
+            // decrypted dump — no secrets are copied out of it.
+            guard let remotes = dumpConfig() else { return nil }
+            return remotes.keys.sorted().map { "[\($0)]\ntype = \(remotes[$0]?["type"] ?? "")" }
+                .joined(separator: "\n\n")
+        }
+        return try? String(contentsOfFile: configPath, encoding: .utf8)
     }
 
     /// The raw `type` value of the `[name]` section in rclone.conf text `content` — e.g.
@@ -262,7 +375,7 @@ final class RcloneConfigService {
     }
 
     /// Map rclone type string to RemoteProvider
-    private func providerFromRcloneType(_ type: String, values: [String: String]) -> RemoteProvider {
+    private static func providerFromRcloneType(_ type: String, values: [String: String]) -> RemoteProvider {
         switch type {
         case "drive":
             return .googleDrive
@@ -285,7 +398,7 @@ final class RcloneConfigService {
     }
 
     /// Detect whether a WebDAV remote is a Synology NAS based on config values
-    private func isSynologyRemote(values: [String: String]) -> Bool {
+    private static func isSynologyRemote(values: [String: String]) -> Bool {
         if let vendor = values["vendor"], vendor == "synology" {
             return true
         }
@@ -307,6 +420,15 @@ final class RcloneConfigService {
 
     /// Update an existing remote (delete old config section, write new one)
     func updateRemote(_ config: RemoteConfiguration) throws {
+        if configIsEncrypted() {
+            // `config update` only changes the keys it is given, so drop the section first to
+            // keep "delete + rewrite" semantics (a cleared field must really go away).
+            try deleteRemote(config.name)
+            var configToWrite = config
+            obscurePasswordFields(&configToWrite)
+            try configCreateOrUpdate("create", configToWrite)
+            return
+        }
         // Delete the existing remote first
         try deleteRemote(config.name)
 
@@ -337,9 +459,8 @@ final class RcloneConfigService {
             throw ConfigError.rcloneNotFound
         }
 
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: rclonePath)
-        process.arguments = ["config", "delete", name]
+        let process = RcloneProcess.make(rclonePath: rclonePath, arguments: ["config", "delete", name])
+        invalidateDumpCache()
 
         try process.run()
         process.waitUntilExit()
@@ -361,10 +482,8 @@ final class RcloneConfigService {
 
         return await withCheckedContinuation { continuation in
             DispatchQueue.global(qos: .userInitiated).async {
-                let process = Process()
+                let process = RcloneProcess.make(rclonePath: rclonePath, arguments: [])
                 let pipe = Pipe()
-
-                process.executableURL = URL(fileURLWithPath: rclonePath)
                 let remote = remotePath.contains(":") ? remotePath : "\(remotePath):"
                 var args = ["lsd", remote, "--contimeout", "10s"]
                 if skipCert {
@@ -407,11 +526,9 @@ final class RcloneConfigService {
         }
 
         DispatchQueue.global(qos: .userInitiated).async {
-            let process = Process()
+            let process = RcloneProcess.make(rclonePath: rclonePath, arguments: [])
             let outputPipe = Pipe()
             let errorPipe = Pipe()
-
-            process.executableURL = URL(fileURLWithPath: rclonePath)
             process.arguments = ["authorize", provider.rcloneType]
             process.standardOutput = outputPipe
             process.standardError = errorPipe
@@ -518,10 +635,8 @@ final class RcloneConfigService {
     private func isAlreadyObscured(_ value: String) -> Bool {
         guard let rclonePath = findRclonePath() else { return false }
 
-        let process = Process()
+        let process = RcloneProcess.make(rclonePath: rclonePath, arguments: [])
         let pipe = Pipe()
-
-        process.executableURL = URL(fileURLWithPath: rclonePath)
         process.arguments = ["reveal", value]
         process.standardOutput = pipe
         process.standardError = pipe
@@ -539,10 +654,8 @@ final class RcloneConfigService {
     func obscurePassword(_ password: String) -> String? {
         guard let rclonePath = findRclonePath() else { return nil }
 
-        let process = Process()
+        let process = RcloneProcess.make(rclonePath: rclonePath, arguments: [])
         let pipe = Pipe()
-
-        process.executableURL = URL(fileURLWithPath: rclonePath)
         process.arguments = ["obscure", password]
         process.standardOutput = pipe
 
@@ -601,11 +714,9 @@ final class RcloneConfigService {
 
         return await withCheckedContinuation { continuation in
             DispatchQueue.global(qos: .userInitiated).async {
-                let process = Process()
+                let process = RcloneProcess.make(rclonePath: rclonePath, arguments: [])
                 let pipe = Pipe()
                 let errPipe = Pipe()
-
-                process.executableURL = URL(fileURLWithPath: rclonePath)
                 let remotePath = remote.hasSuffix(":") ? remote : "\(remote):"
                 let remoteName = remote.replacingOccurrences(of: ":", with: "")
                 let skipCert = self.readRemoteConfig(name: remoteName)?.values["no_check_certificate"] == "true"
@@ -652,7 +763,9 @@ final class RcloneConfigService {
             case .deleteFailed(let name):
                 return "Failed to delete remote '\(name)'"
             case .connectionFailed(let error):
-                return "Connection failed: \(error)"
+                return SyncLogPatterns.isRcloneConfigPasswordError(error)
+                    ? SyncLogPatterns.rcloneConfigPasswordHint
+                    : "Connection failed: \(error)"
             case .oauthFailed(let error):
                 return "Authentication failed: \(error)"
             case .tokenExtractionFailed:
