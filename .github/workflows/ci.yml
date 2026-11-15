@@ -43,7 +43,8 @@ jobs:
     permissions:
       contents: read
       issues: write
-      pull-requests: read
+      # Reacting to a comment on a PR goes through the PR's issue-comment API.
+      pull-requests: write
     outputs:
       should_release: ${{ steps.detect.outputs.should_release }}
       is_beta: ${{ steps.detect.outputs.is_beta }}
@@ -174,9 +175,12 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          # Best effort, but say so when it fails — a swallowed error is how a missing
+          # 👀 went unnoticed.
           gh api -X POST \
             "/repos/${{ github.repository }}/issues/comments/${{ github.event.comment.id }}/reactions" \
-            -f content=eyes >/dev/null 2>&1 || true
+            -f content=eyes >/dev/null \
+            || echo "::warning::Could not add the 👀 reaction to the /beta comment"
 
   # ===========================================================================
   # test — compile the Debug build as a smoke test. SyncTray has no XCTest
@@ -521,3 +525,37 @@ jobs:
               issue_number: parseInt(prNumber),
               body: body.split('\n').map(line => line.trim()).join('\n')
             });
+
+  # ===========================================================================
+  # beta-result — close the loop on a `/beta` comment: swap the 👀 for 🚀 when
+  # the beta was published, or 👎 when the build failed. Only runs for a real
+  # beta request (is_beta), and never changes the run's own result.
+  # ===========================================================================
+  beta-result:
+    needs: [detect-changes, version, release-macos]
+    if: always() && github.event_name == 'issue_comment' && needs.detect-changes.outputs.is_beta == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+      pull-requests: write
+    steps:
+      - name: React with the outcome
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          COMMENT_ID: ${{ github.event.comment.id }}
+          VERSION_RESULT: ${{ needs.version.result }}
+          RELEASE_RESULT: ${{ needs.release-macos.result }}
+        run: |
+          if [ "$VERSION_RESULT" = "success" ] && [ "$RELEASE_RESULT" = "success" ]; then
+            CONTENT="rocket"
+          else
+            CONTENT="-1"
+          fi
+          API="/repos/${{ github.repository }}/issues/comments/${COMMENT_ID}/reactions"
+          # Drop the 👀 this run added (ours only), then add the outcome.
+          EYES_ID=$(gh api "$API" --jq '[.[] | select(.content == "eyes" and .user.login == "github-actions[bot]")][0].id // empty' 2>/dev/null || true)
+          if [ -n "$EYES_ID" ]; then
+            gh api -X DELETE "$API/$EYES_ID" >/dev/null 2>&1 || true
+          fi
+          gh api -X POST "$API" -f content="$CONTENT" >/dev/null \
+            || echo "::warning::Could not add the $CONTENT reaction to the /beta comment"
