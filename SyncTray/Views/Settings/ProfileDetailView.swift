@@ -3987,7 +3987,7 @@ struct ProfileDetailView: View {
         }
 
         // Too many deletes - offer force sync to override safety limit
-        if error.contains("too many deletes") {
+        if SyncLogPatterns.isTooManyDeletesError(error) {
             return .forceSync
         }
 
