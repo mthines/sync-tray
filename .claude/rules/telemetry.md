@@ -89,8 +89,9 @@ TelemetryService.shared.recordFileOperation(
 
 ## Profile Configuration Snapshots (RUM)
 
-On app launch and every profile save, a structured log captures the user's chosen configuration:
+On app launch, every profile save, and whenever telemetry is switched on while the app runs (`SyncManager.setupTelemetryOptInObserver` watches `UserDefaults` for the off → on change — Settings toggle, opt-in banner, setup wizard, or a `settings.json` edit such as `synctray telemetry on`; AC-TS7), a structured log captures the user's chosen configuration:
 - `config.sync_mode`, `config.sync_direction`, `config.sync_interval_bucket`
+- `config.sync_interval_long_bucket` (`61min-6h`/`6h-1d`/`1d-1w`/`>1w`; `n/a` at 60 minutes or less — splits `config.sync_interval_bucket`'s `>60min`, whose values stay unchanged), `config.sync_on_local_changes` (true/false — false is Schedule only; `n/a` for mount)
 - `config.has_fallback`, `config.has_external_drive`, `config.is_enabled`, `config.is_muted`
 - Mount-specific: `config.mount_backend` (nfs/macfuse), `config.mount_at_startup` (true/false), `config.stream_cache_only` (true/false; `n/a` for non-mount — the union-overlay Cache-only mount toggle), `config.vfs_cache_mode`, `config.has_pinned_directories`, `config.pinned_directory_count`, `config.download_connections` (parallel `--transfers`/warm concurrency, 1–16; `0` for non-mount profiles), `config.has_bandwidth_limit` (bool — whether an rclone `--bwlimit` cap is set; presence only, never the rate value; all modes), `config.mount_resilient` (true/false — the bounded rclone `--timeout` hard mount that stops a stalled backend freezing Finder without the soft-mount sticky-EPERM downside; `n/a` for non-mount), `config.cache_fs_type` (bucketed filesystem of the VFS cache volume: apfs/hfs/exfat/fat/ntfs/network/other/unknown; `n/a` for non-mount), `config.cache_volume` (internal/external/unknown; `n/a` for non-mount)
 - `config.rclone_config_encrypted` (bool — whether rclone.conf is encrypted; never the password or the file's contents; all modes), `config.rclone_config_password_stored` (bool — whether SyncTray holds a password in the Keychain; presence only, attributes-only query, never the value; with the previous one it tells "encrypted, no password stored" apart)
@@ -115,6 +116,48 @@ For operations with real duration (like syncs), use the `activeSyncSpans` patter
 The span exports only when it ends, so a long run is otherwise invisible until it finishes —
 the heartbeat's `Sync progress` log (below) covers the time in between and carries the open
 span's context.
+
+**A failed run is counted once.** A failed bisync reports its end twice: rclone's "Failed to
+bisync: …" notice, then the wrapper's "Bisync failed with exit code N" (sync script and
+auto-fix resync) — each a `.syncFailed`. `recordSyncFailed` therefore records nothing for a
+failure that repeats one recorded for the same profile within
+`TelemetryService.duplicateSyncFailureWindow` (15 s), unless a run started or a success was
+recorded in between (`isDuplicateSyncFailure`, pure). Without it,
+`synctray.sync.completed{sync.result=failure}` and `synctray.sync.errors` counted every failed
+bisync twice and `synctray.sync.duration` got a second, 0 s sample. Force Sync and the profile
+editor's resync log no start and report a failure once (Force Sync's own exit line has no
+timestamp, so it is never parsed); `SyncManager.beginExclusiveRun` calls
+`forgetLastSyncFailure` when one of them starts, so theirs always counts. Covered by
+`ConfigSelfTest` AC-TS6. The app applies the same rule to the error state, the "Sync failed"
+notification and auto-fix (`SyncManager.syncFailureHandling`, AC-SF1; CLAUDE.md "A failed run
+is handled once").
+
+**A failed run is recorded with the script's real exit code.** rclone's notice states no exit
+code (`LogParser` stands in 1 for the UI), so `SyncManager` passes `recordSyncFailed` only an
+exit code the line itself states (`SyncLogPatterns.extractExitCode(from: event.rawLine)`). A
+failure without one is held in `pendingSyncFailures` — its span stays open — until the run's
+repeated end line, the script's "Bisync failed with exit code N", supplies it
+(`recordSyncFailureExitCode`, from `processLogEvent`'s repeat branch), or until
+`duplicateSyncFailureWindow` passes. Only then does `finishSyncFailure` record the metrics, the
+span and the `Sync failed` log, so the `synctray.sync.*` failure metrics can trail the run's end
+by up to 15 s. A failure that states its exit code is recorded at once. `sync.exit_code` is left
+out when no line stated one (Force Sync, whose exit line is never parsed), never guessed. A held
+failure is recorded first by anything that ends the profile's span or starts its next run —
+`recordSyncStarted`, `recordSyncCompleted`, `recordSyncSkipped`, `forgetLastSyncFailure`,
+`shutdown()` — so it is never lost or ended as `abandoned`/`skipped`/`app_shutdown`. The exit
+code is what makes a stopped run `error.type=interrupted` (see [Error
+categories](#error-categories)). Covered by AC-TS8.
+
+**A run Abort or Pause stopped is not a failure.** Abort (CLAUDE.md Critical Rule 9) and Pause
+both make `.syncFailed` drop the stopped run's end lines (`SyncManager.wasRunAborted`), so they
+record no failure: the span ends as `sync.result=skipped` with `sync.skip_reason`
+`aborted`/`paused`, and `synctray.sync.completed` is not incremented. Pause SIGTERMs the run's
+process group and opens the same window for `SyncAbort.pauseRunEndSuppression` (rclone's
+graceful shutdown plus the trailing backstop, 120 s); Resume ends it. Usually the group signal
+kills the script and its `tee` too, so nothing more reaches the log; the window covers what
+still does. Covered by AC-AB3–AC-AB5. Other stops (Ctrl-C on `synctray sync`, an external
+SIGTERM/SIGKILL) still count in `synctray.sync.completed{sync.result=failure}`; tell them apart
+by `error.type=interrupted` on `synctray.sync.errors` and on the `synctray sync` span.
 
 ## Per-profile Heartbeat Logs
 
@@ -164,7 +207,7 @@ session `.lck` (`SyncRunLock.lockState`, pure):
 
 `error.type` (`TelemetryService.categorizeError`, pure) is a bounded bucket of an error
 message; the message itself never leaves the machine. Order: the `SyncLogPatterns` checks
-(`out_of_sync`/`critical`, `transient_all_files_changed`, `exclusive_mode_unsupported`,
+(`interrupted`, `out_of_sync`/`critical`, `transient_all_files_changed`, `exclusive_mode_unsupported`,
 `permission_denied` for EPERM, `io_errors_blocked_deletes`), then the specific buckets of
 `TelemetryService.specificErrorBuckets` (lowercased, first match wins), then the original
 generic checks (`file_not_found`, `permission_denied`, `timeout`, `network`), else `other`;
@@ -172,8 +215,19 @@ generic checks (`file_not_found`, `permission_denied`, `timeout`, `network`), el
 names a more specific cause (e.g. a rate-limit or auth phrase), which now wins; besides that,
 Go's "directory not empty" moved from `critical` to `directory_not_empty`.
 
+A failed run's `error.type` (`TelemetryService.categorizeSyncFailure`, pure — the `Sync failed`
+log and span and the `synctray.sync.errors` counter) checks the exit code the script logged
+first (`SyncLogPatterns.isStopSignalExitCode`): 129/130/143 — rclone itself got
+SIGHUP/SIGINT/SIGTERM and exited 128 + the signal after its graceful shutdown; 137 — rclone was
+SIGKILLed; 141 — rclone died of SIGPIPE because the `tee` it logs through was killed, which is
+what a stop signal to the whole process group looks like when the script survives it (Ctrl-C on
+`synctray sync`; a group SIGTERM/SIGHUP kills the script too, so no exit line is written). Those
+are `interrupted`; anything else, or no stated exit code, falls back to `categorizeError` of the
+run's first error. Crash signals (134, 139) are not a stop.
+
 | Bucket | Matches (lowercased) |
 |--------|----------------------|
+| `interrupted` | "context canceled" (Go's `context.Canceled`, what rclone's transfers fail with at ERROR when a signal cancels them) and "bisync interrupted" (bisync's NOTICE "Bisync interrupted. Must run --resync to recover." when its graceful shutdown fails; `LogParser` never surfaces a NOTICE line, so it arrives only as the stored error `readLastErrorFromLog` reads back for a run picked up from its lock, which `Profile status` categorizes) — ahead of the critical check, whose "resync" would claim it; plus a stop signal's exit code on a failed run (above). rclone's "Signal received:" (INFO) and bisync's "Graceful shutdown failed." (NOTICE, always logged just before the interrupted line, where that backwards scan stops) reach `categorizeError` on no path, so they are not matched; levels as of rclone v1.73.2. Not "context deadline exceeded", which stays `timeout`. Caveat: rclone also logs "context canceled" for transfers it cancels after another error, and for Stream reads the NFS client abandons, so a single `Sync error` line can read `interrupted` without a stop; a failed run is categorized from its first error, which comes before those |
 | `disk_full` | "no space left on device" |
 | `rate_limited` | "ratelimitexceeded", "userratelimitexceeded", "rate limit exceeded", "too many requests" — before `quota_exceeded`, since Google's per-minute limit says "Quota exceeded … rateLimitExceeded" |
 | `quota_exceeded` | "storagequotaexceeded", "quotaexceeded", "quota exceeded", "insufficient storage" |
@@ -181,6 +235,7 @@ Go's "directory not empty" moved from `critical` to `directory_not_empty`.
 | `timeout` | "context deadline exceeded", "deadline exceeded", "i/o timeout", "timed out", "handshake timeout" — ahead of `auth_failed`, so "oauth2: cannot fetch token: … i/o timeout" stays a timeout; plus the generic "timeout" |
 | `tls_certificate` | " x509:", " tls:", "certificate signed by", "certificate has expired", "certificate verify failed" (Go's error prefixes, not the bare words "x509" / "certificate", which would claim errors about a file named "x509.pem" or "…Certificate.pdf"; the two prefixes carry a leading space and are matched against the message with one leading space added, so a message starting with Go's prefix still matches while a path segment named `tls`/`x509` — "…/certs/tls: permission denied" — isn't claimed). Go's TLS alert "tls: bad certificate" is covered by " tls:", so there is no separate "bad certificate" needle, which a file named "Bad Certificate.pdf" would match |
 | `auth_failed` | "invalid_grant", "token expired", "expired token", " oauth2:", "401 unauthorized", "authentication failed", "couldn't fetch token", "failed to refresh token" — after `network`/`timeout`/`tls_certificate`, so a token refresh that failed on DNS, TLS or a timeout keeps that cause; the oauth2 prefix carries a leading space like the TLS prefixes, so a folder named `oauth2` — "…/x/oauth2: permission denied" — isn't claimed |
+| `remote_not_configured` | "didn't find section in config file" — rclone's "Failed to create file system for \"x:\": …" when the profile names a remote rclone.conf no longer has (deleted, renamed, or never saved) |
 | `name_too_long` | "file name too long", "name too long", "path too long" |
 | `invalid_name` | "illegal character", "invalid characters", "invalid name", "invalid file name", "invalid filename" (plural "characters": Go's JSON decoder says "invalid character '<' looking for beginning of value" when a proxy returns HTML, which stays `other`) |
 | `checksum_mismatch` | "corrupted on transfer", "hash differ", "hashes differ", "md5 differ", "sizes differ" |
@@ -188,7 +243,48 @@ Go's "directory not empty" moved from `critical` to `directory_not_empty`.
 | `file_busy` | "resource busy", "text file busy", "file is locked", "being used by another process" |
 | `duplicate_object` | "duplicate object found", "duplicate directory found" — rclone's own sync log phrases ("Duplicate object found in source - ignoring", "Duplicate directory found in destination - ignoring", from fs/march), so a folder or file named e.g. "Duplicate Files" isn't claimed |
 | `config_decrypt_failed` | rclone couldn't open an encrypted rclone.conf ("unable to decrypt configuration", "most likely wrong password", "password command failed") — checked first, ahead of `critical`, because rclone logs it at CRITICAL but the cause is a missing/wrong stored password (`SyncLogPatterns.isRcloneConfigPasswordError`) |
-| `directory_not_empty` | Go's ENOTEMPTY "directory not empty" — split out of `critical`, whose "not empty" is there for rclone mount's "Directory is not empty" mount-point error (still `critical`) |
+| `directory_not_empty` | Go's ENOTEMPTY "directory not empty" — split out of `critical`, whose "not empty" is there for rclone mount's "Directory is not empty" mount-point error (still `critical` here; a failed mount files it as `mount_point_not_empty`, below) |
+
+### Mount failures
+
+A failed `synctray mount` / `synctray unmount` span and its `Mount failure` / `Unmount failure`
+log carry `error.type` (`TelemetryService.categorizeMountFailure`, pure; also a label on
+`synctray.mount.operations`) and, when the code path knows it, `mount.failure_stage`
+(`TelemetryService.MountFailureStage`; span/log only, never a metric label). The span status
+description is the `error.type`, as on the sync span. Built by `mountFailureAttributes`, which
+never includes the message (AC-TS9).
+
+| `mount.failure_stage` | Code path |
+|-----------------------|-----------|
+| `agent_start` | `launchctl kickstart` of the mount agent exited non-zero (`SyncSetupService.startAgent`) — no message, so `error.type=unknown` |
+| `agent_exited` | the agent had no live process for 3 polls before the volume attached (`MountPollDecision.failedDead`): the script or rclone exited |
+| `attach_timeout` | the agent stayed alive but no volume appeared within the 5-minute cap |
+| `detach` | `diskutil unmount` and `unmount force` both failed (`SetupError.unmountFailed`, its text classified) |
+
+For `agent_exited` and `attach_timeout` the message is the latest mount attempt's own error,
+read off the main actor from the profile's log (`SyncManager.lastErrorInLog(_:mountRun: true)`,
+AC-TS10): the scan stops at that attempt's "Starting mount" line, so an earlier attempt's error
+(KeepAlive restarts a failing mount in the same log) is never reported; it counts errors without
+waiting for an exit line (a timed-out attempt has none); it skips NOTICE lines (rclone's NFS
+server announces itself at NOTICE on every start) and go-nfs's exclusive-create error; and it reports the script's VFS cache preflight refusal, which writes no exit line, as
+the failure. The message is cleaned for display (`SyncLogPatterns.cleanErrorMessage`), so each
+mount bucket matches both rclone's wording and the rewritten text. A JSON log record is decoded
+(`SyncLogPatterns.extractErrorMessage`), so the quotes rclone puts around remote and file names
+no longer cut a message short; this also applies to the sync path's stored error.
+
+`categorizeMountFailure` order: `unknown` for no message; the mount-only buckets; macFUSE missing
+in rclone's raw wording ("fuse" + "not found"/"not installed", the test `cleanErrorMessage` uses);
+then `categorizeError`, except that its `critical` (which `isCriticalError` gives every message
+with rclone's generic "FUSE" / "failed to mount" wording) is replaced by a named cause from
+`specificErrorBuckets` when the message has one, else `mount_failed`.
+
+| Mount bucket | Matches (lowercased) |
+|--------------|----------------------|
+| `mount_point_not_empty` | "directory is not empty" (rclone mount's mount-point error), "mount point folder is not empty" (its rewrite) |
+| `mount_backend_unavailable` | "not supported on macos when rclone is installed via homebrew", "homebrew's rclone can't mount" (its rewrite), "macfuse is required" (the rewrite of macFUSE missing), "executable file not found in $path" (the NFS backend's `mount` helper, or `fusermount`, missing) |
+| `cache_dir_unwritable` | "vfs cache directory not writable" — the sync script's VFS cache preflight refusing to mount uncached, usually a cache on an external drive that isn't attached |
+| `rc_port_in_use` | "address already in use" — an earlier rclone for the mount point still holds the RC port |
+| `mount_failed` | rclone's generic mount wording with no named cause |
 
 `error.operation` (`TelemetryService.categorizeErrorOperation`, pure) on the `Sync error` log and
 the `Sync failed` log and span says which rclone operation failed: `copy` | `delete` | `move`
@@ -214,7 +310,7 @@ Log/span only — never a metric label.
   [Error categories](#error-categories) for the buckets
 - A `permission_denied` failure also carries bounded `error.access_denial`
   (`operation_not_permitted` = EPERM/macOS privacy, `permission_denied` = EACCES/file
-  permissions), `error.blocked_path.kind` (`volume_system_folder` / `photos_library` / `other`)
+  permissions), `error.blocked_path.kind` (`volume_system_folder` / `photos_library` / `photo_booth_library` / `other`)
   and `error.blocked_path.in_sync_folder` from `TelemetryService.accessDenialAttributes` —
   derived from the message, never the path itself
 - **Carve-out:** `vcs.repository.url.full` (the *source code* repository's origin
@@ -313,7 +409,7 @@ rollout. No event is emitted on a fresh install.
 | `synctray.sync.errors` | Counter | Sync errors by type (`error.type`); a `permission_denied` failure also carries `error.access_denial` (`operation_not_permitted`/`permission_denied`) — the only access-denial attribute on the counter |
 | `synctray.app.profiles.active` | UpDownCounter | Number of active profiles |
 | `synctray.app.launch` | Counter | App launches |
-| `synctray.mount.operations` | Counter | Mount/unmount operations |
+| `synctray.mount.operations` | Counter | Mount/unmount operations; a failure also carries `error.type` ([Mount failures](#mount-failures)) |
 | `synctray.directory_watch.triggers` | Counter | Directory change triggers |
 | `synctray.transport.fallback_activations` | Counter | Fallback remote activations |
 | `synctray.sync.file_operations` | Counter | File operations by type + extension |
@@ -328,19 +424,19 @@ rollout. No event is emitted on a fresh install.
 | `synctray.directory_watch.filtered` | Counter | Directory watch events filtered out (out_of_scope, phantom, metadata) |
 | `synctray.sync.resumed_external` | Counter | Externally-started syncs detected and resumed at app startup |
 | `synctray.app.settings_opened` | Counter | Settings window opens |
-| `synctray.sync.auto_fix_triggered` | Counter | Automatic --resync recovery attempts (`result`: `triggered`, `gave_up_backoff`, `skipped_drive_not_mounted`, or `blocked_already_running` — the single-run guard refused because another run already held the profile's lock) |
+| `synctray.sync.auto_fix_triggered` | Counter | Automatic --resync recovery attempts (`result`: `triggered`, `recurred` — started again although the last resync succeeded and the next sync was out of sync anyway, `gave_up_recurring` — stopped after `AutoFixRecurrence.limit` such recurrences, `gave_up_backoff`, `skipped_drive_not_mounted`, or `blocked_already_running` — the single-run guard refused because another run already held the profile's lock) |
 | `synctray.offline.pin_operations` | Counter | Offline pin/unpin operations from Finder or in-app UI (`action`: `pin` or `unpin`) |
 | `synctray.wizard.step` | Counter | Onboarding funnel events (`wizard.outcome`: started/provider_selected/remote_ready/folder_chosen/created/abandoned; `wizard.abandoned_at_step`, `provider.type`) |
 | `synctray.remote.oauth` | Counter | OAuth auth outcomes during remote setup (`result`: success/failure/cancelled; `provider.type`) |
-| `synctray.recovery.user_action` | Counter | User-initiated sync recovery actions (`recovery.action`: force_sync/resync/retry/…; `recovery.result`: `started` or `blocked_already_running` — the single-run guard refused because another run already held the profile's lock) — distinct from automatic auto-fix |
-| `synctray.setting.changed` | Counter | App-wide preference changes (`setting.name`: auto_fix/launch_at_login/debug_logging/telemetry; `setting.enabled`) |
+| `synctray.recovery.user_action` | Counter | User-initiated sync recovery actions (`recovery.action`: force_sync/resync/retry/exclude_blocked_path/…; `recovery.result`: `started`, `staged` — the `exclude_blocked_path` banner action only stages the pattern into the form's "Don't Sync" list, no run started, see `apply_sync_filter` below for when it actually applies — or `blocked_already_running` — the single-run guard refused because another run already held the profile's lock) — distinct from automatic auto-fix |
+| `synctray.setting.changed` | Counter | App-wide preference changes (`setting.name`: auto_fix/launch_at_login/debug_logging/telemetry, or menu_bar_icon_color/menu_bar_icon_monochrome/menu_bar_icon_custom with `setting.enabled=true` for the Menu Bar Icon style just chosen — the picked colors are never sent; `setting.enabled`) |
 | `synctray.offline.extension_setup` | Counter | Finder-extension enable funnel (`offline.extension_action`: prompt_shown/open_settings/rechecked/enabled) |
 | `synctray.offline.cache_clear` | Counter | Cache-clear operations (`offline.preserve_pinned`: whether pinned folders were kept) |
 | `synctray.rclone.discovery` | Counter | rclone binary discovery at launch (`rclone.discovery_source`: candidate_path/login_shell/not_found; `rclone.location`: homebrew/usr_local/nix_system/nix_per_user/nix_profile/usr_bin/other/none) |
 | `synctray.mount.reinstall_detach` | Counter | Pre-uninstall volume detach attempts for mount-mode profiles, reached on every `SyncSetupService.uninstall` (including the settings-save reinstall path) — `mount.result`: `not_mounted`/`success`/`success_forced`/`failure` |
 | `synctray.mount.reinstall_detach.duration` | Histogram | Time taken to gracefully detach a mounted volume before reinstall (seconds) — regression signal for the "settings change freezes an active Stream mount" failure mode; only recorded when the profile was actually mounted |
 | `synctray.mount.cache_only_fallback` | Counter | Cache Only was requested (`streamCacheOnly`) but the mount settled on streaming — the silent script fallback when the partial-file exclude list can't be built. The "I enabled Cache Only but it's still streaming/downloading" case; invisible without this. Emitted once at the mode-change edge by `SyncManager.reconcileMountStatesOffMain`, guarded by `resumingFromCacheOnly` so a legitimate drain-and-resume flip isn't counted |
-| `synctray.cli.invoked` | Counter | Headless `synctray` CLI invocations (`cli.command`: bounded verb — doctor/status/offline-status/profiles/logs/test-remote/listremotes/remote-folders/telemetry-status/telemetry-on/telemetry-off/sync/mount/unmount/reinstall/install/cache-move/profile-create/profile-show/profile-set/profile-enable/profile-disable/profile-delete/profile-list/report/report-send/rclone-password-set/rclone-password-clear/rclone-password-status/help, or `(other)`; `cli.result`: ok/error). Never carries args, paths, profile names, or remotes. Recorded once per run by `runMeasured`, then flushed via `flushForExit` before the process exits |
+| `synctray.cli.invoked` | Counter | Headless `synctray` CLI invocations (`cli.command`: bounded verb — doctor/status/offline-status/profiles/logs/test-remote/listremotes/remote-folders/telemetry-status/telemetry-on/telemetry-off/settings-show/settings-get/settings-set/sync/mount/unmount/reinstall/install/cache-move/profile-create/profile-show/profile-set/profile-enable/profile-disable/profile-delete/profile-list/report/report-send/rclone-password-set/rclone-password-clear/rclone-password-status/help, or `(other)`; `cli.result`: ok/error). Never carries args, paths, profile names, or remotes. Recorded once per run by `runMeasured`, then flushed via `flushForExit` before the process exits |
 | `synctray.offline.warm.duration` | Histogram | Duration of an offline-file warming run, seconds (`warm.trigger`: manual/startup/finder_pin; `warm.outcome`: completed/cancelled) |
 | `synctray.offline.warm.throughput` | Histogram | Average read throughput of a warming run, MB/s — the primary signal for slow-fallback diagnosis (the SFTP fallback caps aggregate throughput) |
 | `synctray.offline.warm.files` | Counter | Files warmed into the VFS content cache (`warm.outcome`: completed/cancelled) |
@@ -370,16 +466,16 @@ rollout. No event is emitted on a fresh install.
 | Span | Kind | Description |
 |------|------|-------------|
 | `synctray sync` | INTERNAL | Full sync lifecycle (start→complete/fail) |
-| `synctray mount` | INTERNAL | Mount operation |
-| `synctray unmount` | INTERNAL | Unmount operation |
+| `synctray mount` | INTERNAL | Mount operation; a failed one carries `error.type` and `mount.failure_stage` ([Mount failures](#mount-failures)) |
+| `synctray unmount` | INTERNAL | Unmount operation; a failed one carries `error.type` and `mount.failure_stage=detach` |
 | `synctray reinstall_detach` | INTERNAL | Pre-uninstall graceful volume detach for a mount-mode profile (fires on every `uninstall`, including settings-save reinstall) |
 | `synctray warm` | INTERNAL | Offline-file warming run for a profile's pinned folders (start→complete/cancel). Carries `warm.trigger`, `warm.outcome` (completed/cancelled), `warm.concurrency`, `warm.files`, `warm.bytes`, `warm.duration_seconds`, `warm.throughput_mbps`. Exports on end, so an in-progress warm shows only the "Offline warm started" log, not the span. Cancelled when the cache is cleared, the profile is unmounted, or a newer run supersedes it. |
 | `synctray cache_migration` | INTERNAL | Cache-directory move for a Stream profile (start→complete/cancel/fail). Carries `cache_migration.outcome`, `cache_migration.same_volume`, `cache_migration.files`, `cache_migration.bytes`, `cache_migration.duration_seconds`, `cache_migration.throughput_mbps`. Never carries a cache path, source/destination directory, or remote name — only the profile id and its display name, same carve-out as every other span here. |
 
 ### Logs
 All key lifecycle events are emitted as structured OTel logs:
-- Sync started/completed/failed (with profile context, duration, files changed; started carries `sync.trigger`: manual/directory_watch/scheduled/startup; failed — log and span — carries `error.type` and `error.operation`)
-- Mount/unmount success/failure
+- Sync started/completed/failed (with profile context, duration, files changed; started carries `sync.trigger`: manual/directory_watch/scheduled/startup; failed — log and span — carries `error.type`, `error.operation`, and `sync.exit_code` when a log line stated it — the script's real exit code, see "A failed run is recorded with the script's real exit code")
+- Mount/unmount success/failure (a failure carries `error.type` and `mount.failure_stage`, see [Mount failures](#mount-failures))
 - Directory watch triggers
 - Transport changes (primary ↔ fallback)
 - Sync errors (with categorized error type and `error.operation` — see [Error categories](#error-categories))
@@ -406,12 +502,13 @@ All key lifecycle events are emitted as structured OTel logs:
 - Sync precondition failures: script_not_found, config_not_found (setup issue detection)
 - Resumed external syncs: syncs detected running at startup (launchd overlap detection)
 - App upgraded: `service.version` changed since the previous launch (deployment markers)
-- Auto-fix: automatic --resync triggered (`triggered`), suppressed by backoff (`gave_up_backoff`), skipped because the external drive is not mounted (`skipped_drive_not_mounted`), or blocked because the single-run guard found another run already holding the profile's lock (`blocked_already_running` — CLAUDE.md "One Run Per Profile")
+- Auto-fix: automatic --resync triggered (`triggered`), triggered again after a resync that did not stick (`recurred`), stopped because resyncs keep not sticking (`gave_up_recurring`), suppressed by backoff (`gave_up_backoff`), skipped because the external drive is not mounted (`skipped_drive_not_mounted`), or blocked because the single-run guard found another run already holding the profile's lock (`blocked_already_running` — CLAUDE.md "One Run Per Profile")
 - Offline pin operations: directory pinned or unpinned via Finder right-click or in-app UI (`offline.action`, `offline.path_count`)
 - Wizard step: onboarding funnel events (`wizard.outcome`, `wizard.abandoned_at_step`, `provider.type`) — new-profile flow only, not edit mode
 - OAuth outcome: OAuth auth result during remote setup (`result`, `provider.type`)
-- User recovery action: user-initiated recovery from the error banner (`recovery.action`, `recovery.result`: `started` or `blocked_already_running` when the single-run guard refused) — distinct from automatic auto-fix
-- Setting changed: app-wide preference toggled (`setting.name`, `setting.enabled`); the telemetry opt-out is recorded just before telemetry disables
+- User recovery action: user-initiated recovery from the error banner (`recovery.action`, `recovery.result`: `started`, `staged` for `exclude_blocked_path` — it only stages the pattern, see `apply_sync_filter` below — or `blocked_already_running` when the single-run guard refused) — distinct from automatic auto-fix
+- Apply sync filter (`profile.operation = "apply_sync_filter"`, via `recordProfileLifecycleOperation`): the staged "Don't Sync" Save follow-up (CLAUDE.md "Don't Sync" patterns / Rule 9's `stopRunThenSync`) — `profile.operation.result` is `sync_now` (nothing was running, Sync Now started immediately), `stop_requested` (a live run is being stopped first, behind the "Stop the Current Sync and Apply?" confirm), `restarted` (the stop finished and Sync Now started), or `not_restarted` (the stop gave up before Sync Now could run, OR the profile was deleted or disabled while the stop was in progress — either way the already-saved filter still applies from the next scheduled run, if the profile still exists and is enabled)
+- Setting changed: app-wide preference toggled (`setting.name`, `setting.enabled`); the telemetry opt-out is recorded just before telemetry disables. A Menu Bar Icon style change records `menu_bar_icon_<style>` with `setting.enabled=true`
 - Offline extension setup: Finder-extension enable-funnel steps (`offline.extension_action`)
 - Offline cache clear: cache cleared, with whether pinned folders were preserved (`offline.preserve_pinned`)
 - rclone discovery: where rclone was found at launch, or a warn-level "rclone not found" (`rclone.discovery_source`, `rclone.location`) — measures install-location coverage, e.g. nix-darwin (issue #53). Never emits the raw path.

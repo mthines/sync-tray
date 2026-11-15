@@ -126,7 +126,7 @@ SyncTray finds rclone from Homebrew, `/usr/local/bin`, `/usr/bin`, and nix insta
 1. **Launch SyncTray.** The icon appears in the menu bar. A yellow gear means there's nothing set up yet.
 2. **Open Settings → +** to start the setup wizard.
 3. **Pick or connect a remote.** The wizard can connect Google Drive, Dropbox, OneDrive, Synology, SMB, WebDAV, and SFTP for you, or reuse any remote you already set up with `rclone config`.
-4. **Choose the folders, the mode, and how often to sync** (every 1 minute to 1 hour; 5 minutes by default).
+4. **Choose the folders, the mode, and how often to sync** (from 1 minute to 365 days; 5 minutes by default). Choose **Schedule only** for periodic backups, or **On local changes + schedule** for continuous sync.
 5. **Install.** SyncTray creates the local folder, runs the first sync (or mounts the remote), and schedules the rest.
 
 <p align="center">
@@ -161,7 +161,7 @@ SyncTray's profile files never contain credentials.
 
 **Does it sync when the app is closed?**
 Yes. Scheduled syncs and mounts run as launchd agents.
-While the app is open, a local change also triggers a sync about 5 seconds after you stop editing.
+By default, while the app is open, a local change also triggers a sync about 5 seconds after you stop editing. Choose **Schedule only** to check and transfer files only when your interval is due.
 
 **What does it send home?**
 Nothing, unless you turn on **Share usage data** in App Settings.

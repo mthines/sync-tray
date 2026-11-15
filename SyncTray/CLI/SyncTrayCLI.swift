@@ -83,6 +83,36 @@ struct RclonePasswordAccess {
         })
 }
 
+/// One app-wide setting's value, typed by its key: a `SafeKey` is on/off, a
+/// `StringKey` a validated string (`AppSettingsFileStore`).
+enum AppSettingValue: Equatable {
+    case bool(Bool)
+    case string(String)
+
+    /// The CLI's `key=value` rendering.
+    var text: String {
+        switch self {
+        case .bool(let value): return value ? "true" : "false"
+        case .string(let value): return value
+        }
+    }
+
+    /// The `settings.json` / `--json` value.
+    var jsonValue: Any {
+        switch self {
+        case .bool(let value): return value
+        case .string(let value): return value
+        }
+    }
+}
+
+/// `settings [show] [--json]` | `settings get <key>` | `settings set <key> <value> [...]`.
+enum SettingsAction: Equatable {
+    case show(json: Bool)
+    case get(key: String)
+    case set([ProfileAssignment])
+}
+
 /// Parsed CLI subcommand — the pure, testable result of `SyncTrayCLI.parse`.
 enum CLICommand: Equatable {
     case doctor
@@ -92,6 +122,7 @@ enum CLICommand: Equatable {
     case remoteFolders(target: String, json: Bool)
     case telemetry(TelemetryAction)
     case rclonePassword(RclonePasswordAction)
+    case settings(SettingsAction)
     case profiles
     case status(target: String?, json: Bool, wait: StatusWait?)
     case offlineStatus(target: String?, json: Bool)
@@ -219,6 +250,10 @@ struct CLIEnvironment {
     var readStdin: () -> String?
     /// Read a file's contents as UTF-8 text. `nil` if missing/unreadable.
     var readFile: (String) -> String?
+    /// Whether a PID belongs to a live process — the same liveness check the app's single-run
+    /// guard uses (`SyncRunLock.processIsAlive`), injected so `doctor`'s lock-liveness judgment
+    /// (D4) is testable without real PIDs.
+    var processIsAlive: (Int32) -> Bool
     /// Sample a Stream profile's runtime facts (mount table, rclone process,
     /// pending overlay uploads) for `status`. Never called for sync profiles.
     var probeMount: (SyncProfile) -> MountProbe
@@ -239,6 +274,15 @@ struct CLIEnvironment {
     /// setting, the consent version (so the app's banner doesn't ask again) and
     /// `settings.json` (so a running app applies it live).
     var setTelemetryEnabled: (Bool) -> Void
+    /// Every app-wide setting (`AppSettingsFileStore.allKeyNames`) with its
+    /// current value — the values the app uses, not just what the file says.
+    var readAppSettings: () -> [String: AppSettingValue] = { [:] }
+    /// Apply already-validated settings everywhere the app reads them and to
+    /// `settings.json` (so a running app applies them live). `nil` on success,
+    /// otherwise the error message.
+    var writeAppSettings: ([String: AppSettingValue]) -> String? = { _ in
+        "settings aren't available here"
+    }
     /// Whether a person is at the keyboard: stdin and stderr are terminals and `CI`
     /// is unset. The first-run telemetry question is only ever asked then.
     var isInteractiveTerminal: () -> Bool
@@ -302,6 +346,8 @@ enum SyncTrayCLI {
                                    Manage the Keychain password for an encrypted rclone.conf
                                    (set reads it from the terminal or stdin, never from arguments).
                                    `get` prints it; it is what rclone's password command runs.
+      settings [show] [--json]     Show the values the app uses (the keys of settings.json)
+      settings get <key>           Print one app-wide setting
 
     Support:
       report [name|id] [--lines N] [--output <path>]
@@ -323,6 +369,8 @@ enum SyncTrayCLI {
                                    Edit fields on an existing profile and reconcile
       install <name|id>            Install an enabled profile's launchd agent (idempotent)
       reinstall <name|id>          Regenerate script+plist and reinstall the agent
+      settings set <key> <value> [<key> <value> ...]
+                                   Change app-wide settings; a running app applies them live
 
     Operate:
       sync <name|id>                          Run a sync now and wait for it to finish
@@ -333,7 +381,7 @@ enum SyncTrayCLI {
 
     profile set keys: name, rcloneRemote, remotePath, localSyncPath,
       drivePathToMonitor, additionalRcloneFlags, syncMode (bisync|sync|mount),
-      syncDirection (localToRemote|remoteToLocal), syncIntervalMinutes,
+      syncDirection (localToRemote|remoteToLocal), syncIntervalMinutes, syncOnLocalChanges,
       fallbackRemote, fallbackRemotePath, mountBackend (nfs|macfuse),
       vfsCacheMode (off|minimal|writes|full), vfsCacheMaxSize, vfsCacheMaxAge,
       vfsCachePath, allowNonEmptyMount, mountAtStartup,
@@ -347,6 +395,11 @@ enum SyncTrayCLI {
       localSyncPath — when non-empty, only these folders sync; an entry with
       a '.' or '..' segment is rejected).
       Use enable/disable for isEnabled.
+
+    settings keys: debugLoggingEnabled, autoFixSyncIssues, telemetryEnabled,
+      launchAtLogin (true|false), menuBarIconStyle (color|monochrome|custom),
+      menuBarIconSyncingColor, menuBarIconIdleColor (#RRGGBB, or '' for the
+      default color; used by the custom style).
 
     Profiles author JSON against schema/profile.schema.json under the config
     directory; the same file an agent can drop in or edit directly.
@@ -453,6 +506,10 @@ enum SyncTrayCLI {
             let sub = argv.dropFirst().first(where: { !$0.hasPrefix("-") }) ?? ""
             return sub == "folders" ? "remote-folders" : "(other)"
         }
+        if first == "settings" {
+            let sub = argv.dropFirst().first(where: { !$0.hasPrefix("-") }) ?? "show"
+            return ["show", "get", "set"].contains(sub) ? "settings-\(sub)" : "(other)"
+        }
         if first == "offline" {
             let sub = argv.dropFirst().first(where: { !$0.hasPrefix("-") }) ?? ""
             return sub == "status" ? "offline-status" : "(other)"
@@ -515,6 +572,8 @@ enum SyncTrayCLI {
                 return .success(.rclonePassword(action))
             }
             return .failure(CLIUsageError(message: "usage: synctray rclone-password <get|set|clear|status>"))
+        case "settings":
+            return parseSettings(rest)
 
         case "remote":
             let flags = parseFlags(rest, valueFlags: [])
@@ -717,6 +776,52 @@ enum SyncTrayCLI {
         return .success(.cacheMove(target: target, destination: destination, includeOverlapping: includeOverlapping))
     }
 
+    static let settingsUsage = "usage: synctray settings [show] [--json] | settings get <key> | settings set <key> <value> [<key> <value> ...]"
+
+    /// Parse `settings`. `set` takes raw positional pairs (like `profile set`) so a
+    /// value may be empty (`''` resets a color) or start with `#`.
+    private static func parseSettings(_ rest: [String]) -> Result<CLICommand, CLIUsageError> {
+        let usageError = CLIUsageError(message: settingsUsage)
+        switch rest.first {
+        case nil, "show", "--json":
+            let flags = rest.first == "show" ? Array(rest.dropFirst()) : rest
+            guard flags.allSatisfy({ $0 == "--json" }), flags.count <= 1 else { return .failure(usageError) }
+            return .success(.settings(.show(json: flags.contains("--json"))))
+        case "get":
+            guard rest.count == 2 else { return .failure(usageError) }
+            return .success(.settings(.get(key: rest[1])))
+        case "set":
+            let pairs = Array(rest.dropFirst())
+            guard !pairs.isEmpty, pairs.count % 2 == 0 else { return .failure(usageError) }
+            let assignments = stride(from: 0, to: pairs.count, by: 2).map {
+                ProfileAssignment(key: pairs[$0], value: pairs[$0 + 1])
+            }
+            return .success(.settings(.set(assignments)))
+        default:
+            return .failure(usageError)
+        }
+    }
+
+    /// Validate one `settings set` value for `key`. Pure — the self-test drives it.
+    static func parseAppSetting(key: String, value: String) -> Result<AppSettingValue, CLIUsageError> {
+        if AppSettingsFileStore.SafeKey(rawValue: key) != nil {
+            switch value.lowercased() {
+            case "true", "1", "yes", "on": return .success(.bool(true))
+            case "false", "0", "no", "off": return .success(.bool(false))
+            default: return .failure(CLIUsageError(message: "\(key) must be true or false, got \"\(value)\""))
+            }
+        }
+        if let stringKey = AppSettingsFileStore.StringKey(rawValue: key) {
+            guard let normalized = stringKey.normalize(value) else {
+                return .failure(CLIUsageError(
+                    message: "\(key) must be \(stringKey.allowedValues), got \"\(value)\""))
+            }
+            return .success(.string(normalized))
+        }
+        return .failure(CLIUsageError(
+            message: "unknown setting \"\(key)\" (keys: \(AppSettingsFileStore.allKeyNames.joined(separator: ", ")))"))
+    }
+
     static let reportUsage = "usage: synctray report [<name|shortId>] [--lines N] [--output <path>] [--send [--yes|-y] [--json]]"
 
     /// Parse `report`. Strict about flags (an unknown one is a usage error rather than
@@ -784,6 +889,8 @@ enum SyncTrayCLI {
             return runTelemetry(action, env: env)
         case .rclonePassword(let action):
             return runRclonePassword(action, env: env)
+        case .settings(let action):
+            return runSettings(action, env: env)
         case .profiles:
             return runProfiles(env: env)
         case .status(let target, let json, let wait):
@@ -915,18 +1022,20 @@ enum SyncTrayCLI {
             )
         }
 
+        let lockExists = env.fileExists(profile.lockFilePath)
         checks.append(
-            env.fileExists(profile.lockFilePath)
-                ? DoctorCheck(name: label, status: .warn, detail: "stale lock file present")
-                : DoctorCheck(name: label, status: .ok, detail: "no stale lock")
+            lockCheck(
+                label: label,
+                exists: lockExists,
+                contents: lockExists ? env.readFile(profile.lockFilePath) : nil,
+                isMount: profile.syncMode == .mount,
+                isAlive: env.processIsAlive
+            )
         )
 
-        let (remoteExit, _, remoteErr) = env.runRclone(["lsd", profile.fullRemotePath], 5)
-        checks.append(
-            remoteExit == 0
-                ? DoctorCheck(name: label, status: .ok, detail: "remote reachable")
-                : DoctorCheck(name: label, status: .fail, detail: "remote unreachable: \(remoteErr)")
-        )
+        let probe = remoteProbe(for: profile, env: env)
+        let probeStatus: DoctorCheck.Status = !probe.reachable ? .fail : (probe.pathMissing ? .warn : .ok)
+        checks.append(DoctorCheck(name: label, status: probeStatus, detail: probe.detail))
 
         return checks
     }
@@ -981,6 +1090,90 @@ enum SyncTrayCLI {
         }
     }
 
+    /// Judge a profile's `/tmp` run lock by its holder's liveness (plan D4) rather than mere
+    /// existence — a live holder is `ok` ("sync running (PID n)", or "mount running" for a
+    /// Stream profile), a dead holder is `warn` "stale lock file (PID n not running)", an
+    /// unparseable-but-present lock is `warn` "stale lock file (no PID recorded)", and the
+    /// absence of a lock file at all is `ok` "no stale lock". Reuses
+    /// `SyncRunLock.parseHolder`/`isLive` so `doctor` and the app's own single-run guard can
+    /// never disagree about whether a lock is live. Exposed (not `private`) for `ConfigSelfTest`.
+    static func lockCheck(label: String, exists: Bool, contents: String?, isMount: Bool, isAlive: (Int32) -> Bool) -> DoctorCheck {
+        guard exists else {
+            return DoctorCheck(name: label, status: .ok, detail: "no stale lock")
+        }
+        let holder = SyncRunLock.parseHolder(contents)
+        let live = SyncRunLock.isLive(holder, isAlive: isAlive)
+        switch holder {
+        case .pid(let pid):
+            return live
+                ? DoctorCheck(name: label, status: .ok, detail: "\(isMount ? "mount" : "sync") running (PID \(pid))")
+                : DoctorCheck(name: label, status: .warn, detail: "stale lock file (PID \(pid) not running)")
+        case .pending where live:
+            return DoctorCheck(name: label, status: .ok, detail: "sync starting")
+        case .pending, .none, .unreadable:
+            return DoctorCheck(name: label, status: .warn, detail: "stale lock file (no PID recorded)")
+        }
+    }
+
+    /// Hard watchdog for the `doctor`/`test-remote` reachability probe — matches the sync
+    /// script's own `remote_path_reachable 15`.
+    static let remoteProbeTimeout: TimeInterval = 15
+
+    /// The single reachability probe shared by `doctor` and `test-remote` (plan D5): `lsjson
+    /// --stat <remote>:<path>` — never `lsd`, which lists the whole directory and can hang for
+    /// minutes on a large remote folder. Exit 0/3/4 means reachable (the remote answered); 3/4
+    /// ("not found") also sets `pathMissing`, which `doctor` reports as a warning — a missing path
+    /// is normal before a Two-Way profile's first sync, but is also how a typo looks; a watchdog timeout is reported by name rather than as a bare non-zero exit;
+    /// the error text prefers an ERROR/CRITICAL stderr line over rclone's shared-client_id
+    /// NOTICE line.
+    static func remoteProbe(for profile: SyncProfile, env: CLIEnvironment) -> (reachable: Bool, pathMissing: Bool, detail: String) {
+        guard var arguments = SyncManager.reachabilityProbeArguments(remote: profile.rcloneRemote, path: profile.remotePath) else {
+            return (false, false, "remote unreachable: no remote configured")
+        }
+        if env.remoteSkipsCertCheck(profile.primaryRemoteName) {
+            arguments.append("--no-check-certificate")
+        }
+        let (exit, _, stderr) = env.runRclone(arguments, remoteProbeTimeout)
+        if SyncManager.reachabilityProbeSucceeded(exitCode: exit) {
+            return exit == 0
+                ? (true, false, "remote reachable")
+                : (true, true, "remote reachable, but path not found: \(profile.remotePath)")
+        }
+        if exit == CLIEnvironment.rcloneTimedOutExitCode {
+            return (false, false, "remote unreachable: timed out after \(Int(remoteProbeTimeout))s")
+        }
+        if let summary = rcloneFailureSummary(stderr: stderr) {
+            return (false, false, "remote unreachable: \(summary)")
+        }
+        return (false, false, "remote unreachable: rclone exited \(exit)")
+    }
+
+    /// Picks the single most useful line from rclone's plain-text stderr: the last ERROR/
+    /// CRITICAL line (an actual failure), else the last non-empty line that isn't a NOTICE/INFO/
+    /// DEBUG log (rclone's shared-client_id NOTICE is the classic false lead), else `nil` — the
+    /// caller falls back to "rclone exited N". Strips rclone's own `YYYY/MM/DD HH:MM:SS ` prefix.
+    static func rcloneFailureSummary(stderr: String) -> String? {
+        let lines = stderr
+            .components(separatedBy: "\n")
+            .map(stripRcloneTimestampPrefix)
+            .filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
+        guard !lines.isEmpty else { return nil }
+        if let line = lines.last(where: { $0.contains("ERROR") || $0.contains("CRITICAL") }) {
+            return line
+        }
+        if let line = lines.last(where: { !$0.contains("NOTICE") && !$0.contains("INFO") && !$0.contains("DEBUG") }) {
+            return line
+        }
+        return nil
+    }
+
+    /// Strips rclone's leading `YYYY/MM/DD HH:MM:SS ` timestamp from a log line, if present.
+    private static func stripRcloneTimestampPrefix(_ line: String) -> String {
+        let pattern = #"^\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2} "#
+        guard let range = line.range(of: pattern, options: .regularExpression) else { return line }
+        return String(line[range.upperBound...])
+    }
+
     // MARK: - test-remote
 
     private static func runTestRemote(_ target: String, env: CLIEnvironment) -> Int32 {
@@ -992,12 +1185,15 @@ enum SyncTrayCLI {
         // Prints the remote name to the user's own terminal — fine. It is NEVER
         // a telemetry attribute: the CLI records only the bounded command verb
         // (see `runMeasured`), never a remote name, path, or profile name.
-        let (exit, _, err) = env.runRclone(["lsd", profile.fullRemotePath], 10)
-        if exit == 0 {
-            env.stdout("reachable: \(profile.fullRemotePath)\n")
+        let probe = remoteProbe(for: profile, env: env)
+        if probe.reachable {
+            env.stdout("reachable: \(profile.fullRemotePath)\(probe.pathMissing ? " (path not found)" : "")\n")
             return 0
         } else {
-            env.stderr("unreachable: \(err.isEmpty ? "rclone exited \(exit)" : err)\n")
+            let detail = probe.detail.hasPrefix("remote unreachable: ")
+                ? String(probe.detail.dropFirst("remote unreachable: ".count))
+                : probe.detail
+            env.stderr("unreachable: \(detail)\n")
             return 1
         }
     }
@@ -1093,6 +1289,56 @@ enum SyncTrayCLI {
             env.stdout("Usage data: \(enabled ? "on" : "off"). The SyncTray app uses the same setting.\n")
         }
         return 0
+    }
+
+    // MARK: - settings
+
+    private static func runSettings(_ action: SettingsAction, env: CLIEnvironment) -> Int32 {
+        switch action {
+        case .show(let json):
+            let current = env.readAppSettings()
+            if json {
+                var object: [String: Any] = [:]
+                for (key, value) in current { object[key] = value.jsonValue }
+                guard let data = try? JSONSerialization.data(
+                    withJSONObject: object, options: [.prettyPrinted, .sortedKeys]) else { return 1 }
+                env.stdout(String(decoding: data, as: UTF8.self) + "\n")
+            } else {
+                for key in AppSettingsFileStore.allKeyNames {
+                    if let value = current[key] { env.stdout("\(key)=\(value.text)\n") }
+                }
+            }
+            return 0
+
+        case .get(let key):
+            guard AppSettingsFileStore.allKeyNames.contains(key) else {
+                env.stderr("error: unknown setting \"\(key)\" (keys: \(AppSettingsFileStore.allKeyNames.joined(separator: ", ")))\n")
+                return 65  // EX_DATAERR
+            }
+            guard let value = env.readAppSettings()[key] else { return 1 }
+            env.stdout(value.text + "\n")
+            return 0
+
+        case .set(let assignments):
+            // Validate everything first — one bad value writes nothing.
+            var values: [String: AppSettingValue] = [:]
+            for assignment in assignments {
+                switch parseAppSetting(key: assignment.key, value: assignment.value) {
+                case .success(let value): values[assignment.key] = value
+                case .failure(let error):
+                    env.stderr("error: \(error.message)\n")
+                    return 65  // EX_DATAERR
+                }
+            }
+            if let error = env.writeAppSettings(values) {
+                env.stderr("error: \(error)\n")
+                return 1
+            }
+            for key in AppSettingsFileStore.allKeyNames {
+                if let value = values[key] { env.stdout("\(key)=\(value.text)\n") }
+            }
+            return 0
+        }
     }
 
     // MARK: - profiles
@@ -1825,7 +2071,9 @@ enum SyncTrayCLI {
 
         // Ints (with range validation where the model clamps).
         case "syncIntervalMinutes":
-            guard let n = int(value), n >= 1 else { return "syncIntervalMinutes must be an integer ≥ 1" }
+            guard let n = int(value), (1...SyncProfile.maximumSyncIntervalMinutes).contains(n) else {
+                return "syncIntervalMinutes must be an integer in 1...\(SyncProfile.maximumSyncIntervalMinutes)"
+            }
             profile.syncIntervalMinutes = n
         case "downloadConnections":
             guard let n = int(value), (1...16).contains(n) else { return "downloadConnections must be an integer in 1...16" }
@@ -1844,6 +2092,9 @@ enum SyncTrayCLI {
         case "isMuted":
             guard let b = bool(value) else { return "isMuted must be true or false" }
             profile.isMuted = b
+        case "syncOnLocalChanges":
+            guard let b = bool(value) else { return "syncOnLocalChanges must be true or false" }
+            profile.syncOnLocalChanges = b
         case "mountAtStartup":
             guard let b = bool(value) else { return "mountAtStartup must be true or false" }
             profile.mountAtStartup = b
@@ -2087,6 +2338,7 @@ extension CLIEnvironment {
                 catch { return "\(error)" }
             },
             deleteProfileFile: { profile in
+                SyncSetupService.removeScheduleState(for: profile)
                 let path = "\(SyncProfile.configDirectory)/\(profile.shortId).profile.json"
                 try? FileManager.default.removeItem(atPath: path)
                 // Clean up a legacy "(Offline)" browse point too, if the retired feature
@@ -2096,7 +2348,7 @@ extension CLIEnvironment {
             runSyncScript: { configPath in
                 let (exit, _) = CLIEnvironment.runProcess(
                     launchPath: "/bin/bash",
-                    args: [SyncProfile.sharedScriptPath, configPath],
+                    args: [SyncProfile.sharedScriptPath, configPath, "--manual"],
                     timeout: 3600  // a large repo's first bisync can run for minutes
                 )
                 return exit
@@ -2114,6 +2366,7 @@ extension CLIEnvironment {
                 return String(data: data, encoding: .utf8)
             },
             readFile: { try? String(contentsOfFile: $0, encoding: .utf8) },
+            processIsAlive: { SyncRunLock.processIsAlive($0) },
             probeMount: { profile in CLIEnvironment.probeMountProcess(profile) },
             warmEstimate: { dir, profile in VFSCacheService.shared.estimateWarmWork(dir, for: profile) },
             remoteSkipsCertCheck: { name in
@@ -2127,6 +2380,8 @@ extension CLIEnvironment {
                 )
             },
             setTelemetryEnabled: { enabled in CLIEnvironment.setTelemetryEnabledProcess(enabled) },
+            readAppSettings: { CLIEnvironment.readAppSettingsProcess() },
+            writeAppSettings: { values in CLIEnvironment.writeAppSettingsProcess(values) },
             isInteractiveTerminal: {
                 isatty(STDIN_FILENO) == 1 && isatty(STDERR_FILENO) == 1
                     && (ProcessInfo.processInfo.environment["CI"] ?? "").isEmpty
@@ -2177,6 +2432,72 @@ extension CLIEnvironment {
         if enabled, changed {
             TelemetryService.shared.recordSettingChanged(name: "telemetry", enabled: true)
         }
+    }
+
+    /// Real implementation of `readAppSettings`: the values the app uses
+    /// (UserDefaults, and SMAppService for launch at login).
+    fileprivate static func readAppSettingsProcess() -> [String: AppSettingValue] {
+        var result: [String: AppSettingValue] = [:]
+        let loginItem = SMAppService.mainApp.status == .enabled
+        for (key, value) in AppSettingsFileStore.currentSafeSettings(isLoginItemEnabled: loginItem) {
+            result[key.rawValue] = .bool(value)
+        }
+        for (key, value) in AppSettingsFileStore.currentStringSettings() {
+            result[key.rawValue] = .string(value)
+        }
+        return result
+    }
+
+    /// Real implementation of `writeAppSettings`: the same writes the app's
+    /// settings window makes, then `settings.json` so a running app applies them
+    /// live. Telemetry goes through `setTelemetryEnabledProcess` (consent version,
+    /// opt-out event); launch at login registers the login item directly, so it
+    /// also takes effect when the app isn't running.
+    fileprivate static func writeAppSettingsProcess(_ values: [String: AppSettingValue]) -> String? {
+        // launchAtLogin first: it is the only write that can fail, so a failure
+        // returns before anything else has changed. telemetryEnabled next — it
+        // sends its opt-out event and writes settings.json itself — then the rest.
+        func applyRank(_ key: String) -> Int {
+            switch AppSettingsFileStore.SafeKey(rawValue: key) {
+            case .launchAtLogin?: return 0
+            case .telemetryEnabled?: return 1
+            default: return 2
+            }
+        }
+        let ordered = values.sorted { (applyRank($0.key), $0.key) < (applyRank($1.key), $1.key) }
+        var fileValues: [String: Any] = [:]
+        for (key, value) in ordered {
+            switch (AppSettingsFileStore.SafeKey(rawValue: key), value) {
+            case (.telemetryEnabled?, .bool(let enabled)):
+                setTelemetryEnabledProcess(enabled)  // writes settings.json itself
+                continue
+            case (.launchAtLogin?, .bool(let enabled)):
+                // Already in that state: skip, as SettingsReconciler does — a
+                // redundant unregister() throws and would block the other keys.
+                do {
+                    if enabled != (SMAppService.mainApp.status == .enabled) {
+                        if enabled { try SMAppService.mainApp.register() } else { try SMAppService.mainApp.unregister() }
+                    }
+                } catch {
+                    return "couldn't \(enabled ? "enable" : "disable") launch at login: \(error.localizedDescription)"
+                }
+            case (.debugLoggingEnabled?, .bool(let enabled)):
+                SyncTraySettings.debugLoggingEnabled = enabled
+            case (.autoFixSyncIssues?, .bool(let enabled)):
+                SyncTraySettings.autoFixSyncIssues = enabled
+            case (nil, .string(let text)) where AppSettingsFileStore.StringKey(rawValue: key) != nil:
+                UserDefaults.standard.set(text, forKey: key)
+            default:
+                return "invalid value for \(key)"
+            }
+            fileValues[key] = value.jsonValue
+        }
+        guard !fileValues.isEmpty else { return nil }
+        let written = AppSettingsFileStore.updateSettingsFile(
+            values: fileValues,
+            isLoginItemEnabled: SMAppService.mainApp.status == .enabled
+        )
+        return written ? nil : "couldn't write \(AppSettingsFileStore.settingsFilePath)"
     }
 
     /// Real implementation of `probeMount`. The process check matches `ps` output
@@ -2311,6 +2632,14 @@ extension CLIEnvironment {
         return finalResult
     }
 
+    /// Sentinel exit code `runRcloneProcess` reports when its own watchdog fired and killed the
+    /// process, rather than rclone exiting on its own — GNU `timeout`'s convention (rclone's own
+    /// exit codes are 0–10, so 124 can never collide with a real rclone outcome). Callers that
+    /// already treat any non-zero exit as failure (e.g. `OverlaySyncService`) are unaffected;
+    /// `SyncTrayCLI.remoteProbe` is the one caller that reports this case by name ("timed out
+    /// after Ns").
+    static let rcloneTimedOutExitCode: Int32 = 124
+
     /// Run rclone at its located path with a hard process-level watchdog —
     /// mirrors `RcloneLocator.resolveViaLoginShell`'s timeout pattern, since
     /// SMB/WebDAV remotes can hang past rclone's own `--timeout`. Internal (not
@@ -2337,7 +2666,13 @@ extension CLIEnvironment {
             return (-1, "", "\(error)")
         }
 
-        let watchdog = DispatchWorkItem { if proc.isRunning { proc.terminate() } }
+        var watchdogFired = false
+        let watchdog = DispatchWorkItem {
+            if proc.isRunning {
+                watchdogFired = true
+                proc.terminate()
+            }
+        }
         DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + timeout, execute: watchdog)
 
         // An unreachable remote fills stderr — the very output test-remote/doctor
@@ -2348,7 +2683,7 @@ extension CLIEnvironment {
         watchdog.cancel()
 
         return (
-            proc.terminationStatus,
+            watchdogFired ? rcloneTimedOutExitCode : proc.terminationStatus,
             String(decoding: outData, as: UTF8.self),
             String(decoding: errData, as: UTF8.self)
         )

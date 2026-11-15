@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 import CryptoKit
 import os.log
@@ -219,5 +220,143 @@ struct SyncTraySettings {
         defaults.removeObject(forKey: Keys.syncDirectoryPath)
         defaults.removeObject(forKey: Keys.hasCompletedSetup)
         defaults.removeObject(forKey: Keys.isScheduledSyncInstalled)
+    }
+}
+
+// MARK: - Menu Bar Icon Appearance
+
+/// How the menu bar status icon is drawn (App Settings → Menu Bar Icon).
+///
+/// An accessibility setting. The default ring — a blue arc over a faint gray track —
+/// can have very little contrast: macOS tints a translucent menu bar with the
+/// wallpaper, so a blue wallpaper puts the blue arc on a blue background.
+enum MenuBarIconStyle: String, CaseIterable, Identifiable {
+    /// The default: a blue ring while syncing, a gray ring when idle, and colored
+    /// symbols for the paused, error, drive and setup states.
+    case color
+    /// A template image: macOS draws every state in the menu bar's own text color
+    /// (black or white, following the wallpaper and dark mode), the way Apple's own
+    /// menu bar icons are drawn. The highest-contrast choice.
+    case monochrome
+    /// The ring in two colors the user picks: one for syncing, one for idle.
+    case custom
+
+    var id: String { rawValue }
+
+    var displayName: String {
+        switch self {
+        case .color: return "Color"
+        case .monochrome: return "Monochrome"
+        case .custom: return "Custom"
+        }
+    }
+
+    var caption: String {
+        switch self {
+        case .color:
+            return "Blue while syncing, gray when idle, colored symbols for other states."
+        case .monochrome:
+            return "Drawn in the menu bar's own text color, like Apple's icons. Easiest to see on any wallpaper."
+        case .custom:
+            return "Pick the ring's colors. Paused, error, and drive symbols keep their usual colors."
+        }
+    }
+}
+
+/// Everything the menu bar icon renderer needs, resolved from the stored preference
+/// so the drawing code never reads UserDefaults itself.
+struct MenuBarIconAppearance {
+    /// UserDefaults keys. `SyncTrayApp` reads them with `@AppStorage`, so the menu bar
+    /// icon redraws as soon as `AppSettingsView` (which writes them) changes one.
+    /// Mirrored to `settings.json` as `AppSettingsFileStore.StringKey`, whose raw values
+    /// must equal these keys, and changeable with `synctray settings set`.
+    static let styleKey = "menuBarIconStyle"
+    static let syncingColorKey = "menuBarIconSyncingColor"
+    static let idleColorKey = "menuBarIconIdleColor"
+
+    static let defaultStyle: MenuBarIconStyle = .color
+    /// The `.color` style's colors, and the fallback for an unset or unreadable custom color.
+    static let defaultSyncingColor = NSColor.systemBlue
+    static let defaultIdleColor = NSColor.gray
+    /// Opacity of the unfilled part of the ring.
+    static let trackOpacity: CGFloat = 0.4
+
+    /// The arc drawn while syncing.
+    let syncingColor: NSColor
+    /// The full ring drawn when idle.
+    let idleColor: NSColor
+    /// The unfilled part of the ring behind the syncing arc.
+    let trackColor: NSColor
+    /// Draw as a template image: macOS supplies the color (the menu bar's text color)
+    /// and only the alpha of what is drawn matters.
+    let isTemplate: Bool
+    /// Whether the paused, error, drive and setup symbols keep their status colors.
+    let usesStatusColors: Bool
+
+    /// The look before this setting existed, and what an unset preference resolves to.
+    static let standard = MenuBarIconAppearance.resolve(
+        style: MenuBarIconAppearance.defaultStyle, syncingHex: "", idleHex: ""
+    )
+
+    static func resolve(style: MenuBarIconStyle, syncingHex: String, idleHex: String) -> MenuBarIconAppearance {
+        switch style {
+        case .color:
+            return MenuBarIconAppearance(
+                syncingColor: defaultSyncingColor,
+                idleColor: defaultIdleColor,
+                trackColor: NSColor.gray.withAlphaComponent(trackOpacity),
+                isTemplate: false,
+                usesStatusColors: true
+            )
+        case .monochrome:
+            // Any opaque color works here: a template image keeps only the alpha.
+            return MenuBarIconAppearance(
+                syncingColor: .black,
+                idleColor: .black,
+                trackColor: NSColor.black.withAlphaComponent(trackOpacity),
+                isTemplate: true,
+                usesStatusColors: false
+            )
+        case .custom:
+            let syncing = color(fromHex: syncingHex) ?? defaultSyncingColor
+            return MenuBarIconAppearance(
+                syncingColor: syncing,
+                idleColor: color(fromHex: idleHex) ?? defaultIdleColor,
+                // The track follows the syncing color, so a light color picked for a dark
+                // or saturated menu bar isn't paired with a gray track that disappears.
+                trackColor: syncing.withAlphaComponent(trackOpacity),
+                isTemplate: false,
+                usesStatusColors: true
+            )
+        }
+    }
+
+    /// Parses `#RRGGBB` (the `#` optional, either case) into an opaque sRGB color.
+    /// Returns nil for anything else, including an empty string (an unset color).
+    static func color(fromHex hex: String) -> NSColor? {
+        var digits = hex.trimmingCharacters(in: .whitespacesAndNewlines)
+        if digits.hasPrefix("#") { digits.removeFirst() }
+        guard digits.count == 6,
+              digits.allSatisfy({ $0.isHexDigit }),
+              let value = UInt32(digits, radix: 16) else { return nil }
+        return NSColor(
+            srgbRed: CGFloat((value >> 16) & 0xFF) / 255,
+            green: CGFloat((value >> 8) & 0xFF) / 255,
+            blue: CGFloat(value & 0xFF) / 255,
+            alpha: 1
+        )
+    }
+
+    /// `#RRGGBB` for a color, converted to sRGB first; opacity is dropped. Returns nil
+    /// for a color with no sRGB equivalent, such as a pattern image.
+    static func hexString(from color: NSColor) -> String? {
+        guard let srgb = color.usingColorSpace(.sRGB) else { return nil }
+        func byte(_ component: CGFloat) -> Int {
+            Int((min(max(component, 0), 1) * 255).rounded())
+        }
+        return String(
+            format: "#%02X%02X%02X",
+            byte(srgb.redComponent), byte(srgb.greenComponent), byte(srgb.blueComponent)
+        )
     }
 }

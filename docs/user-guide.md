@@ -30,11 +30,49 @@ You can have as many as you like.
 
 Profiles are stored as files in `~/.config/synctray/profiles/`, so you can also create and edit them from a script or an AI agent — see [Agent setup](agent-setup.md).
 
+## Automatic sync and longer intervals
+
+In setup or profile settings, choose **On local changes + schedule** (the default)
+or **Schedule only**. The default also syncs about five seconds after local editing
+stops while the app is open. Schedule only leaves edits, temporary large files,
+moves and deletions alone until the interval is due. This applies to both two-way
+and one-way profiles; Stream profiles still run continuously.
+
+Choose a preset up to **2 weeks**, or **Custom…** with a whole number of minutes,
+hours, days or weeks (1 minute to 365 days). These are elapsed intervals: one week
+means seven days, rather than a specific weekday or clock time.
+
+Creating a schedule-only profile, switching an existing profile to Schedule only,
+or changing its folders/direction starts one sync immediately. After that, the
+interval runs from each attempt's start. Ordinary saves, login, restart and
+interval edits keep the saved attempt time. **Sync Now** runs immediately and
+restarts the interval. Exclusion-pattern edits take effect on the next scheduled
+or manual run, without starting a sync merely because you saved them.
+
+Failed attempts also start the interval. If a two-way run needs repair, the app
+can run its usual bounded auto-fix immediately as part of that same attempt,
+respecting the global Auto-fix setting and backoff. It never repairs an old failure
+just because you reopened the app. Other failures wait until the next interval;
+use Sync Now to retry sooner.
+
+The background agent checks eligibility locally every quarter interval, bounded
+between **1 and 15 minutes**. Weekly profiles check every 15 minutes. An idle check
+loads configuration once, without scanning files, contacting the remote or taking
+the sync run lock. It never wakes the Mac. After sleep, restart or reconnecting an
+external drive, one overdue sync runs on the next check (up to 15 minutes later);
+missed intervals never queue multiple runs. A disconnected drive does not consume
+an attempt; network failures do.
+
+A future attempt time caused by correcting the clock is reset to now, so it delays
+at most one interval. Missing history or changed folders starts an initial sync;
+invalid or unwritable history shows an error in the profile, including the reason.
+Sync Now can rebuild corrupt history after a storage/permission issue is resolved.
+
 ## Two-way sync
 
 For files you edit in more than one place.
-SyncTray runs `rclone bisync` on your schedule, every 1 minute to 1 hour (5 minutes by default).
-While the app is open, a local change also starts a sync about 5 seconds after you stop editing.
+SyncTray runs `rclone bisync` on your schedule, from every 1 minute to every 365 days (5 minutes by default).
+With **On local changes + schedule**, local changes also trigger a sync about five seconds after editing stops while the app is open.
 
 - **Conflicts keep both copies.** When a file changed on both sides, the newer version keeps the name and the other is renamed with a `sync-conflict-<date>` suffix.
 - **Mass deletions stop.** If a run would delete more than half of the files, it stops instead. The profile shows **Delete from Remote** to go ahead, or **Restore from Remote** to bring the files back.
@@ -156,7 +194,7 @@ Skip files by pattern — for example `*.rpp-bak` for every Reaper backup, or `*
 
 - Matching files stop syncing. Nothing is deleted on either side.
 - Patterns are case-sensitive: `*` matches within one folder name, `?` one character, and `**` any number of folders.
-- Changes apply from the next sync, with no re-sync.
+- Changes apply when you press **Save** — editing the list alone doesn't sync anything. Save offers to stop a running sync and apply right away, or starts a sync immediately when the profile is idle.
 - On a two-way profile, add broad patterns in steps. Excluding more than half of the files at once trips the [mass-deletion stop](#two-way-sync).
 
 ### Sync Only These Folders
@@ -178,8 +216,8 @@ Sync only the folders you list and leave everything else alone.
 
 | Icon                        | State             | Meaning                               |
 | --------------------------- | ----------------- | ------------------------------------- |
-| Gray sync arrows            | Idle              | Everything is up to date              |
-| Blue sync arrows            | Syncing           | A sync is running                     |
+| Gray ring                   | Idle              | Everything is up to date              |
+| Blue ring filling up        | Syncing           | A sync is running, with its progress  |
 | Gray pause circle           | Paused            | The profile is paused                 |
 | Red warning triangle        | Error             | The last sync failed — open the log   |
 | Orange drive with an X      | Drive not mounted | The profile's external drive is unplugged |
@@ -190,6 +228,7 @@ Sync only the folders you list and leave everything else alone.
 </p>
 
 - **Live progress:** bytes, file counts, and the files in flight, for syncs and for streamed files.
+- **Hard to see the icon?** Change its colors in [App settings](#app-settings) → **Menu Bar Icon**.
 - **Recent changes:** the last 20 transferred files, each marked copied, updated, deleted, or renamed. Click one to show it in Finder.
 - **Notifications** are batched: up to 3 files are listed by name, more are summarized. Click to open the folder. Mute a profile from its bell icon.
 - **View Log** opens the profile's sync log.
@@ -247,6 +286,10 @@ If it doesn't work, see [Troubleshooting](troubleshooting.md#syncs-fail-with-una
 Open **Settings…** and click the gear in the sidebar.
 
 - **Launch at Login.**
+- **Menu Bar Icon** — how the menu bar icon is drawn, for when it's hard to see against your wallpaper:
+  - **Color** (default): blue while syncing, gray when idle.
+  - **Monochrome**: drawn in the menu bar's own text color, black or white, like Apple's icons. The easiest to see on any wallpaper or in dark mode.
+  - **Custom**: pick the ring's color while syncing and when idle. Paused, error, and drive symbols keep their usual colors.
 - **Automatically recover from sync conflicts** — the two-way auto-fix described above.
 - **Share usage data** — off until you turn it on. Sends pseudonymous usage and error data, never file names, folder names, remote names, or credentials. **Learn more** shows exactly what's collected.
 - **Encrypted rclone config** — the Keychain password for an encrypted `rclone.conf`; shown only when it applies. See [Encrypted rclone config](#encrypted-rclone-config).

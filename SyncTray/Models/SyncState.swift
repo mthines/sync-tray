@@ -491,6 +491,19 @@ struct FileChange: Identifiable, Equatable {
         (path as NSString).lastPathComponent
     }
 
+    /// Finder and Spotlight bookkeeping. On an NFS mount Finder writes and deletes `._*`
+    /// sidecars around every copy, so these would crowd real files out of Recent Changes.
+    static let macMetadataNames: Set<String> =
+        Set(SyncExcludeFilter.volumeSystemFolderNames).union([".DS_Store", ".localized"])
+
+    static func isMacMetadata(path: String) -> Bool {
+        path.split(separator: "/").contains { component in
+            component.hasPrefix("._") || macMetadataNames.contains(String(component))
+        }
+    }
+
+    var isMacMetadata: Bool { Self.isMacMetadata(path: path) }
+
     var directory: String {
         let dir = (path as NSString).deletingLastPathComponent
         return dir.isEmpty ? "/" : dir
@@ -514,6 +527,38 @@ enum SyncLogPatterns {
         return lower.contains("starting bisync") || lower.contains("starting sync")
     }
 
+    /// The first line the sync script writes for every mount attempt ("… - Starting mount"),
+    /// ahead of its VFS cache preflight and of rclone. A mount never writes `isSyncStarted`'s
+    /// lines, so this is what keeps a backwards scan of a Stream profile's log inside its latest
+    /// attempt (`SyncManager.lastErrorInLog(_:mountRun:)`). Deliberately not part of
+    /// `isSyncStarted`, which `LogParser` turns into a sync start.
+    static func isMountStarted(_ message: String) -> Bool {
+        message.contains(" - Starting mount")
+    }
+
+    /// The sync script's VFS cache preflight refusing a mount ("… - Error: VFS cache directory
+    /// not writable: <path> - refusing to mount uncached"). It ends the attempt before rclone runs
+    /// and writes no "failed with exit code" line, so it is the attempt's failure on its own.
+    static func isMountCacheUnwritable(_ message: String) -> Bool {
+        message.contains("VFS cache directory not writable")
+    }
+
+    /// The start line `SyncManager.performResync` writes for an auto-fix `--resync`. It still
+    /// matches `isSyncStarted`; `isAutoFixResyncStart` lets the log pipeline tell that run's
+    /// success apart from a normal bisync's (#123).
+    static let autoFixResyncStartLine = "Starting bisync (auto-fix --resync)"
+
+    static func isAutoFixResyncStart(_ line: String) -> Bool {
+        line.contains(autoFixResyncStartLine)
+    }
+
+    /// bisync's final check-sync listing comparison found a file on one side only ("Path1 file
+    /// not found in Path2", "Path2 file not found in Path1"). rclone names the file only in the
+    /// JSON line's `object`.
+    static func isCheckSyncMismatch(_ message: String) -> Bool {
+        message.contains("file not found in Path")
+    }
+
     /// Patterns indicating sync completed successfully
     static func isSyncCompleted(_ message: String) -> Bool {
         let lower = message.lowercased()
@@ -522,10 +567,14 @@ enum SyncLogPatterns {
                lower.contains("sync complete")
     }
 
+    static func isScheduleCheckFailed(_ message: String) -> Bool {
+        message.lowercased().contains("schedule check failed:")
+    }
+
     /// Patterns indicating sync failed
     static func isSyncFailed(_ message: String) -> Bool {
         let lower = message.lowercased()
-        return lower.contains("bisync failed") ||
+        return isScheduleCheckFailed(message) || lower.contains("bisync failed") ||
                lower.contains("failed with exit code") ||
                lower.contains("failed to bisync")
     }
@@ -738,6 +787,47 @@ enum SyncLogPatterns {
             || lower.contains("not deleting directories as there were io errors")
     }
 
+    /// An error that says the run was stopped rather than that it failed, in the two wordings
+    /// that reach `TelemetryService.categorizeError`, which buckets it as `interrupted`:
+    /// - Go's `context.Canceled` text ("context canceled"), which rclone's transfers fail with
+    ///   at ERROR when a signal cancels the sync, so `LogParser` surfaces it.
+    /// - bisync's "Bisync interrupted. Must run --resync to recover." (`cmd/bisync/operations.go`),
+    ///   matched ahead of the critical check whose "resync" it would otherwise hit. bisync logs
+    ///   it at NOTICE, which `LogParser` never surfaces; it arrives through
+    ///   `SyncManager.readLastErrorFromLog` (a run the app picked up from its lock), which admits
+    ///   NOTICE lines and keeps it as the profile's stored error, the one `Profile status`
+    ///   categorizes.
+    ///
+    /// Not matched, because no path brings them here: rclone's "Signal received: …" (INFO,
+    /// `lib/atexit`) and bisync's "Graceful shutdown failed." (NOTICE, always logged just before
+    /// the interrupted line, which that backwards scan reaches first and stops at). A stop that
+    /// logs neither is told by its exit code (`isStopSignalExitCode`). Log levels as of rclone
+    /// v1.73.2. Matched case-insensitively. Caveat: rclone also logs "context canceled" for the
+    /// transfers it cancels after some other error, and for Stream reads the NFS client
+    /// abandons, so a single `Sync error` line can read `interrupted` without a stop; a failed
+    /// run is still categorized from its first error, which comes before those.
+    static func isInterruptedError(_ message: String) -> Bool {
+        let lower = message.lowercased()
+        return lower.contains("context canceled")
+            || lower.contains("bisync interrupted")
+    }
+
+    /// Whether a sync's exit code says a stop signal ended it rather than an error. The script
+    /// logs rclone's exit code (`${PIPESTATUS[0]}` of `rclone … 2>&1 | tee -a $LOG_FILE`), and
+    /// rclone's own codes are 0–10. A stop shows up as:
+    /// - 129 / 130 / 143 — rclone itself got SIGHUP / SIGINT / SIGTERM: it runs its exit
+    ///   handlers (bisync's graceful shutdown) and exits 128 + the signal (`lib/atexit`).
+    /// - 137 — rclone was SIGKILLed (bash reports 128 + 9).
+    /// - 141 — rclone died of SIGPIPE writing its log: the `tee` it writes through was killed,
+    ///   which happens when the stop signal hits the run's whole process group (Ctrl-C on
+    ///   `synctray sync`). A group SIGTERM or SIGHUP kills the script's bash too, so no exit
+    ///   line is written at all.
+    /// Crash signals (134 SIGABRT, 139 SIGSEGV, …) are not a stop and are categorized from the
+    /// message as before.
+    static func isStopSignalExitCode(_ exitCode: Int) -> Bool {
+        [129, 130, 137, 141, 143].contains(exitCode)
+    }
+
     /// Generic messages that don't provide useful error info
     static func isGenericAbortMessage(_ message: String) -> Bool {
         message.contains("Bisync aborted") || message.contains("Failed to bisync")
@@ -854,7 +944,15 @@ enum SyncLogPatterns {
         }
         // Check for rclone JSON error/notice messages
         else if isJSONErrorLine(line) {
-            // Parse the error message from JSON
+            // Decode the record, so a message with escaped quotes comes back whole: rclone quotes
+            // remote and file names (`Failed to create file system for \"gdrive:\": didn't find
+            // section in config file`), which the scan below cuts at the first `\"`.
+            if let data = line.data(using: .utf8),
+               let record = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+               let msg = record["msg"] as? String {
+                return msg
+            }
+            // Not a complete JSON object (e.g. something before the brace): scan for the field.
             if let msgRange = line.range(of: "\"msg\":\""),
                let endRange = line[msgRange.upperBound...].range(of: "\"") {
                 return String(line[msgRange.upperBound..<endRange.lowerBound])
@@ -866,6 +964,8 @@ enum SyncLogPatterns {
     /// Strip ANSI escape codes from a message
     static func stripANSICodes(_ message: String) -> String {
         var result = message
+        // A real ESC sequence, which a decoded JSON record (`extractErrorMessage`) carries.
+        result = result.replacingOccurrences(of: "\u{1B}\\[[0-9;]*[A-Za-z]", with: "", options: .regularExpression)
         result = result.replacingOccurrences(of: "\\u001b[", with: "")
         result = result.replacingOccurrences(of: #"\[\d+m"#, with: "", options: .regularExpression)
         result = result.replacingOccurrences(of: "[0m", with: "")

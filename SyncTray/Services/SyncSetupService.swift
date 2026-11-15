@@ -1,4 +1,5 @@
 import Foundation
+import Darwin
 
 /// Service for generating and managing sync scripts and launchd configuration
 final class SyncSetupService {
@@ -26,6 +27,8 @@ final class SyncSetupService {
         \(SyncExcludeFilter.volumeSystemFoldersSection)
 
         \(SyncExcludeFilter.photosLibrarySection)
+
+        \(SyncExcludeFilter.DefaultExclude.photoBoothLibrary.section)
 
         # Windows thumbs/previews
         - Thumbs.db
@@ -409,6 +412,16 @@ final class SyncSetupService {
             cleanupBisyncCache(for: old)
             cleanupBisyncCache(for: new)
         }
+        // Not rethrown: the agent is already unloaded and its plist deleted, and the CLI's
+        // `profile set` and launchd reconcile treat any error from here as a refusal and skip
+        // the reinstall, which would leave the profile with no agent at all. The app callers
+        // ignore it and install anyway. `requestInitialScheduledSync` has already written the
+        // visible profile error.
+        do {
+            try Self.requestInitialScheduledSync(from: old, to: new)
+        } catch {
+            SyncTraySettings.debugLog("Initial scheduled sync request failed for \(new.name): \(error)")
+        }
     }
 
     /// Remove only a profile's bisync lock file (`<session>.lck`), keeping its listings.
@@ -443,6 +456,170 @@ final class SyncSetupService {
         ["bisync", remote, localPath,
          "--resync", "--resync-mode", "newer",
          "--verbose", "--use-json-log", "--stats", "2s"]
+    }
+
+    /// Splits a profile's `additionalRcloneFlags` into rclone arguments exactly as the sync
+    /// script's `split_additional_flags` does: Python's `shlex.split` (POSIX quoting, never
+    /// evaluated), then on each token `os.path.expandvars` followed by `os.path.expanduser`,
+    /// plus `expanduser` on the value of a `--flag=~/path` token. Returns `nil` where the
+    /// script refuses to run rclone: an unbalanced quote, or a trailing backslash.
+    ///
+    /// The auto-fix resync used to split on whitespace instead, so a quoted value
+    /// (`--exclude "some dir/**"`) or a `~` / `$VAR` path gave the resync different filters
+    /// than the scheduled run — the resync converged on one file set and the next bisync
+    /// found a file the resync never listed (#123). `ConfigSelfTest` AC-AF2 checks this
+    /// against the script's own splitter. Pure (environment and home lookups are injected).
+    static func splitAdditionalFlags(
+        _ flags: String,
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        userHome: (String) -> String? = { FileManager.default.homeDirectory(forUser: $0)?.path }
+    ) -> [String]? {
+        guard let tokens = shlexSplit(flags) else { return nil }
+        func expandUser(_ path: String) -> String {
+            // posixpath.expanduser
+            guard path.hasPrefix("~") else { return path }
+            let afterTilde = path.index(after: path.startIndex)
+            let slash = path[afterTilde...].firstIndex(of: "/") ?? path.endIndex
+            let name = String(path[afterTilde..<slash])
+            let home: String
+            if name.isEmpty {
+                guard let envHome = environment["HOME"] ?? userHome(NSUserName()) else { return path }
+                home = envHome
+            } else {
+                guard let found = userHome(name) else { return path }
+                home = found
+            }
+            var trimmed = Substring(home)
+            while trimmed.hasSuffix("/") { trimmed = trimmed.dropLast() }
+            let result = String(trimmed) + String(path[slash...])
+            return result.isEmpty ? "/" : result
+        }
+        return tokens.map { token in
+            var tok = expandUser(expandVariables(token, environment: environment))
+            if let eq = tok.firstIndex(of: "=") {
+                let flag = tok[..<eq], value = tok[tok.index(after: eq)...]
+                if flag.hasPrefix("-"), value.hasPrefix("~") {
+                    tok = String(flag) + "=" + expandUser(String(value))
+                }
+            }
+            return tok
+        }
+    }
+
+    /// Python's `shlex.split(s)` (posix, whitespace-split, no comments), scalar for scalar.
+    /// `nil` where shlex raises: "No closing quotation" / "No escaped character".
+    private static func shlexSplit(_ s: String) -> [String]? {
+        let whitespace: Set<Unicode.Scalar> = [" ", "\t", "\r", "\n"]
+        var tokens: [String] = []
+        var token = String.UnicodeScalarView()
+        var quoted = false
+        // " ": between tokens. "a": in a word. "'" / "\"": in a quote.
+        var state: Unicode.Scalar = " "
+        var escaped = false          // the previous scalar was an active backslash
+        var escapeReturn: Unicode.Scalar = "a"
+        func finishToken() {
+            tokens.append(String(token))
+            token = String.UnicodeScalarView()
+            quoted = false
+        }
+        for c in s.unicodeScalars {
+            if escaped {
+                // Inside double quotes a backslash only escapes `"` and `\`; elsewhere it is kept.
+                if escapeReturn == "\"", c != "\\", c != "\"" { token.append("\\") }
+                token.append(c)
+                escaped = false
+                state = escapeReturn
+                continue
+            }
+            switch state {
+            case "'":
+                quoted = true
+                if c == "'" { state = "a" } else { token.append(c) }
+            case "\"":
+                quoted = true
+                if c == "\"" {
+                    state = "a"
+                } else if c == "\\" {
+                    escapeReturn = "\""
+                    escaped = true
+                } else {
+                    token.append(c)
+                }
+            case "a":
+                if whitespace.contains(c) {
+                    state = " "
+                    finishToken()
+                } else if c == "'" || c == "\"" {
+                    state = c
+                } else if c == "\\" {
+                    escapeReturn = "a"
+                    escaped = true
+                } else {
+                    token.append(c)
+                }
+            default:
+                if whitespace.contains(c) { continue }
+                if c == "'" || c == "\"" {
+                    state = c
+                } else if c == "\\" {
+                    escapeReturn = "a"
+                    escaped = true
+                } else {
+                    token.append(c)
+                    state = "a"
+                }
+            }
+        }
+        if escaped { return nil }                       // "No escaped character"
+        if state == "'" || state == "\"" { return nil }  // "No closing quotation"
+        if state == "a", !token.isEmpty || quoted { finishToken() }
+        return tokens
+    }
+
+    /// Python's `posixpath.expandvars`: `$name` (ASCII letters, digits, `_`) and `${…}` are
+    /// replaced from `environment`; an unset name, or an unclosed `${`, stays literal, and a
+    /// substituted value is not scanned again.
+    private static func expandVariables(_ s: String, environment: [String: String]) -> String {
+        guard s.unicodeScalars.contains("$") else { return s }
+        let lower: ClosedRange<Unicode.Scalar> = "a"..."z"
+        let upper: ClosedRange<Unicode.Scalar> = "A"..."Z"
+        let digits: ClosedRange<Unicode.Scalar> = "0"..."9"
+        func isWord(_ c: Unicode.Scalar) -> Bool {
+            lower.contains(c) || upper.contains(c) || digits.contains(c) || c == "_"
+        }
+        let scalars = Array(s.unicodeScalars)
+        var out = String.UnicodeScalarView()
+        var i = 0
+        while i < scalars.count {
+            guard scalars[i] == "$", i + 1 < scalars.count else {
+                out.append(scalars[i]); i += 1; continue
+            }
+            var j = i + 1
+            var name: String?
+            if isWord(scalars[j]) {
+                while j < scalars.count, isWord(scalars[j]) { j += 1 }
+                name = String(String.UnicodeScalarView(scalars[(i + 1)..<j]))
+            } else if scalars[j] == "{" {
+                guard let close = scalars[(j + 1)...].firstIndex(of: "}") else {
+                    // An unclosed `${` keeps the rest literal, as current CPython does
+                    // (`\$(\w+|\{[^}]*\}?)`). Pythons before that fix (macOS's own 3.9)
+                    // still expand a later `$name` here; no real flag value has this shape.
+                    out.append(contentsOf: scalars[i...])
+                    break
+                }
+                name = String(String.UnicodeScalarView(scalars[(j + 1)..<close]))
+                j = close + 1
+            }
+            if let name, let value = environment[name] {
+                out.append(contentsOf: value.unicodeScalars)
+            } else if name != nil {
+                out.append(contentsOf: scalars[i..<j])
+            } else {
+                out.append(scalars[i]); j = i + 1
+            }
+            i = j
+        }
+        return String(out)
     }
 
     /// rclone bisync's working directory on macOS (`os.UserCacheDir()/rclone/bisync`).
@@ -754,6 +931,15 @@ enum SyncAbort {
     /// as the aborted run's rather than a real failure. A backstop only: the abort reads the
     /// log to its end before it finishes, and the next run the app starts clears it early.
     static let trailingSuppression: TimeInterval = 30
+    /// How long after Pause stops a live run (`SyncManager.pauseProfile`) that run's log lines
+    /// get the same treatment as an aborted run's. Pause SIGTERMs the run's process group and
+    /// does not watch it exit. Usually the script's bash and its `tee` die with the group and
+    /// nothing more reaches the log; when something does (a run Pause could not signal as a
+    /// group, or an rclone still logging through a surviving `tee`), rclone's bisync can spend
+    /// up to `gracefulTimeout` shutting down first (30 s for in-flight transfers, then up to
+    /// 60 s to save its state) — so the window covers that, plus the usual
+    /// `trailingSuppression` backstop. Resume clears it, as does the next run the app starts.
+    static let pauseRunEndSuppression: TimeInterval = gracefulTimeout + trailingSuppression
 
     /// Parse `ps -A -o pid=,ppid=,comm=` output. `comm` can be a full path containing
     /// spaces, so only the first two fields split on whitespace. Malformed lines are
@@ -1377,14 +1563,157 @@ extension SyncSetupService {
                 python3 -c "import json,sys; d=json.load(open('$CONFIG_FILE')); print(d.get('$1', '$2'))"
             }
 
-            REMOTE=$(parse_json "remote" "")
-            LOCAL_PATH=$(parse_json "localPath" "")
-            LOG_FILE=$(parse_json "logPath" "")
-            LOCK_FILE=$(parse_json "lockFile" "")
-            DRIVE_PATH=$(parse_json "drivePath" "")
+            # Inspect eligibility before taking the sync lock. Idle checks load the
+            # config once and never contend with Sync Now / Save. Only a due/manual
+            # run takes the run lock and rechecks + records its attempt below.
+            schedule_check() {
+                python3 - "$CONFIG_FILE" "${2:-}" "${SYNCTRAY_DRY_RUN:-}" "$1" <<'SYNCTRAY_SCHEDULE'
+            import fcntl, json, os, sys, tempfile, time
+            def emit(key, value):
+                sys.stdout.buffer.write((key + '\\0' + str(value) + '\\0').encode())
+            def write_state(path, state):
+                fd, tmp = tempfile.mkstemp(prefix='.schedule-', dir=os.path.dirname(path))
+                try:
+                    with os.fdopen(fd, 'w') as f:
+                        json.dump(state, f)
+                        f.flush()
+                        os.fsync(f.fileno())
+                    os.replace(tmp, path)
+                finally:
+                    if os.path.exists(tmp):
+                        os.unlink(tmp)
+            try:
+                with open(sys.argv[1]) as f:
+                    config = json.load(f)
+                fields = {'REMOTE': ('remote', ''), 'LOCAL_PATH': ('localPath', ''),
+                          'LOG_FILE': ('logPath', ''), 'LOCK_FILE': ('lockFile', ''),
+                          'DRIVE_PATH': ('drivePath', ''), 'SYNC_MODE': ('syncMode', 'bisync')}
+                for name, (key, default) in fields.items():
+                    emit(name, config.get(key, default))
+                if config.get('syncMode', 'bisync') == 'mount' or config.get('syncOnLocalChanges', True) is not False:
+                    emit('SCHEDULE_STATUS', 0)
+                    sys.exit(0)
+                path = config.get('scheduleStatePath', '')
+                if not path:
+                    raise ValueError('schedule state path is missing')
+                interval = config.get('syncIntervalMinutes', 5)
+                if type(interval) is not int or not 1 <= interval <= 525600:
+                    raise ValueError('invalid sync interval')
+                identity = [config['remote'], config['localPath'], config['syncMode'], config['syncDirection']]
+                manual = sys.argv[2] == '--manual'
+                dry = sys.argv[3] == '1'
+                commit = sys.argv[4] == 'commit'
+                now = int(time.time())
+                # This short metadata lock is separate from the run lock/UI liveness.
+                # It serializes clock correction with real attempt writes, so an idle
+                # check cannot overwrite an attempt that just started in another process.
+                os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+                with os.fdopen(os.open(path + '.lock', os.O_CREAT | os.O_RDWR, 0o600), 'r+') as metadata:
+                    fcntl.flock(metadata, fcntl.LOCK_EX)
+                    state = {}
+                    try:
+                        with open(path) as f:
+                            state = json.load(f)
+                        if not isinstance(state, dict):
+                            raise ValueError('schedule history is not an object')
+                    except FileNotFoundError:
+                        pass
+                    except (ValueError, TypeError):
+                        if not manual:
+                            raise ValueError('schedule history is invalid; use Sync Now to rebuild it')
+                        state = {}
+                    request = ''
+                    try:
+                        with open(path + '.request') as f:
+                            request = f.read().strip()
+                    except FileNotFoundError:
+                        pass
+                    last = state.get('lastAttempt') if state.get('identity') == identity else None
+                    if type(last) is not int or last < 0:
+                        last = None
+                    if last is not None and last > now:
+                        last = now
+                        state['lastAttempt'] = now
+                        if not dry:
+                            write_state(path, state)
+                    pending = bool(request) and request != state.get('requestToken', '')
+                    due = manual or pending or last is None or now >= last + interval * 60
+                    if due and commit and not dry:
+                        write_state(path, {'identity': identity, 'lastAttempt': now, 'requestToken': request})
+                    emit('SCHEDULE_STATUS', 0 if due else 10)
+            except Exception as error:
+                emit('SCHEDULE_ERROR', str(error))
+                emit('SCHEDULE_STATUS', 1)
+                print('SyncTray schedule check failed: %s' % error, file=sys.stderr)
+            SYNCTRAY_SCHEDULE
+            }
+
+            read_schedule() {
+                local key value
+                SCHEDULE_STATUS=1
+                SCHEDULE_ERROR="Unable to read schedule configuration"
+                # NUL-delimited values preserve paths literally; no eval or shell
+                # interpolation of configuration values. Names come from the fixed map.
+                while IFS= read -r -d '' key && IFS= read -r -d '' value; do
+                    case "$key" in
+                        REMOTE|LOCAL_PATH|LOG_FILE|LOCK_FILE|DRIVE_PATH|SYNC_MODE|SCHEDULE_STATUS|SCHEDULE_ERROR)
+                            printf -v "$key" '%s' "$value" ;;
+                    esac
+                done < <(schedule_check "$1" "${2:-}")
+                if [[ "$SCHEDULE_STATUS" == "10" ]]; then
+                    return 10
+                elif [[ "$SCHEDULE_STATUS" != "0" ]]; then
+                    ERROR_LINE="$(date '+%Y-%m-%d %H:%M:%S') - Schedule check failed: $SCHEDULE_ERROR"
+                    if [[ -n "$LOG_FILE" ]]; then
+                        echo "$ERROR_LINE" >> "$LOG_FILE"
+                    fi
+                    echo "$ERROR_LINE" >&2
+                    return 1
+                fi
+                return 0
+            }
+
+            read_schedule inspect "${2:-}"
+            SCHEDULE_RESULT=$?
+            if [[ $SCHEDULE_RESULT -eq 10 ]]; then exit 0; fi
+            if [[ $SCHEDULE_RESULT -ne 0 ]]; then exit 1; fi
+
+            if [[ -z "$REMOTE" || -z "$LOCAL_PATH" ]]; then
+                echo "Error: Invalid config - missing remote or localPath"
+                exit 1
+            fi
+
+            # A disconnected drive is checked only once an attempt is actually due.
+            if [[ -n "$DRIVE_PATH" && ! -d "$DRIVE_PATH" ]]; then
+                echo "$(date '+%Y-%m-%d %H:%M:%S') - Drive not mounted, skipping sync" >> "$LOG_FILE"
+                exit 0
+            fi
+
+            acquire_lock() {
+                ( set -o noclobber; echo $$ > "$LOCK_FILE" ) 2>/dev/null
+            }
+            if ! acquire_lock; then
+                PID=$(cat "$LOCK_FILE" 2>/dev/null)
+                if [[ -n "$PID" ]] && ps -p "$PID" > /dev/null 2>&1; then
+                    echo "$(date '+%Y-%m-%d %H:%M:%S') - Sync already running (PID $PID), skipping" >> "$LOG_FILE"
+                    exit 0
+                fi
+                echo "$(date '+%Y-%m-%d %H:%M:%S') - Removing stale lock (PID ${PID:-unknown} not running)" >> "$LOG_FILE"
+                rm -f "$LOCK_FILE"
+                if ! acquire_lock; then
+                    echo "$(date '+%Y-%m-%d %H:%M:%S') - Could not acquire lock, skipping" >> "$LOG_FILE"
+                    exit 0
+                fi
+            fi
+            trap 'rm -f "$LOCK_FILE"' EXIT
+
+            read_schedule commit "${2:-}"
+            SCHEDULE_RESULT=$?
+            if [[ $SCHEDULE_RESULT -eq 10 ]]; then exit 0; fi
+            if [[ $SCHEDULE_RESULT -ne 0 ]]; then exit 1; fi
+
             ADDITIONAL_FLAGS=$(parse_json "additionalFlags" "")
             FILTER_FILE=$(parse_json "filterPath" "")
-            SYNC_MODE=$(parse_json "syncMode" "bisync")
             SYNC_DIRECTION=$(parse_json "syncDirection" "localToRemote")
             FALLBACK_REMOTE=$(parse_json "fallbackRemote" "")
             FALLBACK_PATH=$(parse_json "fallbackRemotePath" "")
@@ -1440,11 +1769,6 @@ extension SyncSetupService {
             # Mount resilience (mount mode). Default true, matching the Swift model default
             # so a config that predates the field hardens on its next mount.
             MOUNT_RESILIENT=$(parse_json "mountResilient" "true")
-
-            if [[ -z "$REMOTE" || -z "$LOCAL_PATH" ]]; then
-                echo "Error: Invalid config - missing remote or localPath"
-                exit 1
-            fi
 
             # Find rclone binary. Cover the common package-manager locations,
             # including nix-darwin's system and per-user profiles which live outside
@@ -1553,37 +1877,7 @@ extension SyncSetupService {
                 [[ $rc -eq 0 || $rc -eq 3 || $rc -eq 4 ]]
             }
 
-            # Check if drive is mounted (if configured)
-            if [[ -n "$DRIVE_PATH" && ! -d "$DRIVE_PATH" ]]; then
-                echo "$(date '+%Y-%m-%d %H:%M:%S') - Drive not mounted, skipping sync" >> "$LOG_FILE"
-                exit 0
-            fi
 
-            # Acquire the lock ATOMICALLY. `set -o noclobber` makes the '>'
-            # redirection fail if the file already exists, so the check and the
-            # write are a single atomic step — closing the check-then-write
-            # (TOCTOU) race where two launchd/manual runs could both pass the
-            # old `[[ -f ]]` test and start concurrently. The PID is still stored
-            # as the file's contents, so the app's lock readers are unchanged.
-            acquire_lock() {
-                ( set -o noclobber; echo $$ > "$LOCK_FILE" ) 2>/dev/null
-            }
-
-            if ! acquire_lock; then
-                PID=$(cat "$LOCK_FILE" 2>/dev/null)
-                if [[ -n "$PID" ]] && ps -p "$PID" > /dev/null 2>&1; then
-                    echo "$(date '+%Y-%m-%d %H:%M:%S') - Sync already running (PID $PID), skipping" >> "$LOG_FILE"
-                    exit 0
-                fi
-                # Lock owner is gone — reclaim the stale lock and retry once.
-                echo "$(date '+%Y-%m-%d %H:%M:%S') - Removing stale lock (PID ${PID:-unknown} not running)" >> "$LOG_FILE"
-                rm -f "$LOCK_FILE"
-                if ! acquire_lock; then
-                    echo "$(date '+%Y-%m-%d %H:%M:%S') - Could not acquire lock, skipping" >> "$LOG_FILE"
-                    exit 0
-                fi
-            fi
-            trap 'rm -f "$LOCK_FILE"' EXIT
 
             # Ensure local sync directory exists
             mkdir -p "$LOCAL_PATH"
@@ -2092,6 +2386,8 @@ extension SyncSetupService {
                     # The secret lives in a 0600 file only this user can read (the app reads
                     # the same file — `SyncProfile.rcAuthPath(port:)`) and reaches rclone via
                     # RCLONE_RC_USER/RCLONE_RC_PASS, never argv, so `ps` can't reveal it.
+                    # It binds and is dialled on 127.0.0.1 only, never `localhost`:
+                    # `localhost` also resolves to ::1, which another local user could bind.
                     if [[ "$RC_PORT" != "0" && -n "$RC_PORT" ]]; then
                         RC_AUTH_FILE="$HOME/.local/state/synctray/rc/$RC_PORT.auth"
                         if [[ ! -s "$RC_AUTH_FILE" ]]; then
@@ -2108,7 +2404,7 @@ extension SyncSetupService {
                         if [[ -n "$RC_SECRET" ]]; then
                             export RCLONE_RC_USER="synctray"
                             export RCLONE_RC_PASS="$RC_SECRET"
-                            RCLONE_CMD+=(--rc "--rc-addr=localhost:$RC_PORT")
+                            RCLONE_CMD+=(--rc "--rc-addr=127.0.0.1:$RC_PORT")
                         else
                             # Never fall back to an open RC server — the mount still works
                             # without RC; only app-side cache warming/refresh is unavailable.
@@ -2127,8 +2423,12 @@ extension SyncSetupService {
                     #     is mounted `:ro` and is never touched.
                     # Partially-downloaded cache files are hidden via --exclude-from so a
                     # half-fetched file never presents as if it were complete.
-                    mkdir -p "$OVERLAY_PATH"
-                    mkdir -p "$CACHE_ONLY_CACHE_PATH"
+                    # The overlay holds the contents of every file saved while in Cache Only,
+                    # so its root is owner-only (0700), like the RC auth dir above. umask only
+                    # applies when mkdir creates a directory; chmod on every start fixes one an
+                    # earlier version (or the exclude-list writer above) left 0755.
+                    ( umask 077; mkdir -p "$OVERLAY_PATH" "$CACHE_ONLY_CACHE_PATH" )
+                    chmod 700 "$(dirname "$OVERLAY_PATH")" "$OVERLAY_PATH" 2>/dev/null
 
                     python3 -c "
             import os, sys
@@ -2542,6 +2842,84 @@ extension SyncSetupService {
         ]
     }
 
+    /// Metadata operations never hold the sync run lock by themselves. The shell uses
+    /// the same short flock so a clock correction cannot overwrite a newer attempt.
+    private static func withScheduleMetadataLock(path: String, action: () throws -> Void) throws {
+        let parent = (path as NSString).deletingLastPathComponent
+        try FileManager.default.createDirectory(atPath: parent, withIntermediateDirectories: true,
+                                                attributes: [.posixPermissions: 0o700])
+        let fd = Darwin.open(path + ".lock", O_CREAT | O_RDWR, 0o600)
+        guard fd >= 0 else { throw POSIXError(.init(rawValue: errno) ?? .EIO) }
+        defer { Darwin.close(fd) }
+        guard flock(fd, LOCK_EX) == 0 else { throw POSIXError(.init(rawValue: errno) ?? .EIO) }
+        defer { flock(fd, LOCK_UN) }
+        try action()
+    }
+
+    /// An explicit switch or folder/direction change requests exactly one initial run.
+    /// Ordinary saves and interval edits preserve the existing attempt time.
+    static func needsInitialScheduledSync(from old: SyncProfile, to new: SyncProfile) -> Bool {
+        !new.isMountMode && !new.syncOnLocalChanges
+            && (old.syncOnLocalChanges || old.scheduleIdentity != new.scheduleIdentity)
+    }
+
+    static func requestInitialScheduledSync(from old: SyncProfile, to new: SyncProfile,
+                                            statePath: String? = nil) throws {
+        guard needsInitialScheduledSync(from: old, to: new) else { return }
+        let path = statePath ?? new.scheduleStatePath
+        do {
+            try withScheduleMetadataLock(path: path) {
+                try Data(UUID().uuidString.utf8).write(to: URL(fileURLWithPath: path + ".request"), options: .atomic)
+                try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: path + ".request")
+            }
+        } catch {
+            recordScheduleError(for: new, error: error)
+            throw error
+        }
+    }
+
+    /// Direct setup/manual recovery runs share the shell's cadence. Automatic recovery
+    /// belongs to the failing attempt; its caller deliberately does not advance this time.
+    static func recordSyncAttempt(for profile: SyncProfile, at date: Date = Date(), statePath: String? = nil) throws {
+        guard !profile.isMountMode, !profile.syncOnLocalChanges else { return }
+        let path = statePath ?? profile.scheduleStatePath
+        try withScheduleMetadataLock(path: path) {
+            let request = (try? String(contentsOfFile: path + ".request", encoding: .utf8)) ?? ""
+            let state: [String: Any] = ["identity": profile.scheduleIdentity,
+                                        "lastAttempt": Int(date.timeIntervalSince1970),
+                                        "requestToken": request.trimmingCharacters(in: .whitespacesAndNewlines)]
+            try JSONSerialization.data(withJSONObject: state, options: [.sortedKeys])
+                .write(to: URL(fileURLWithPath: path), options: .atomic)
+            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: path)
+        }
+    }
+
+    /// Direct setup/manual writers use the same visible profile error as the shell.
+    static func recordScheduleError(for profile: SyncProfile, error: Error) {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
+        let line = "\(formatter.string(from: Date())) - Schedule check failed: \(error.localizedDescription)\n"
+        guard let data = line.data(using: .utf8) else { return }
+        do {
+            if !FileManager.default.fileExists(atPath: profile.logPath) {
+                try data.write(to: URL(fileURLWithPath: profile.logPath), options: .atomic)
+            } else {
+                let handle = try FileHandle(forWritingTo: URL(fileURLWithPath: profile.logPath))
+                defer { try? handle.close() }
+                try handle.seekToEnd()
+                try handle.write(contentsOf: data)
+            }
+        } catch { SyncTraySettings.debugLog("Could not write schedule error: \(error)") }
+    }
+
+    /// Only deletion removes cadence history; disabling/reinstalling keeps it.
+    static func removeScheduleState(for profile: SyncProfile, statePath: String? = nil) {
+        let path = statePath ?? profile.scheduleStatePath
+        for suffix in ["", ".request", ".lock"] {
+            try? FileManager.default.removeItem(atPath: path + suffix)
+        }
+    }
+
     /// Generate profile-specific JSON config.
     /// Not private — `ConfigSelfTest` calls this directly to verify the
     /// derived config's key set stays frozen (AC-2) without going through
@@ -2558,6 +2936,8 @@ extension SyncSetupService {
             "additionalFlags": profile.additionalRcloneFlags,
             "filterPath": profile.filterFilePath,
             "syncIntervalMinutes": profile.syncIntervalMinutes,
+            "syncOnLocalChanges": profile.syncOnLocalChanges,
+            "scheduleStatePath": profile.scheduleStatePath,
             "syncMode": profile.syncMode.rawValue,
             "syncDirection": profile.syncDirection.rawValue,
             "fallbackRemote": profile.fallbackRemote,
@@ -2587,7 +2967,7 @@ extension SyncSetupService {
         return "{}"
     }
 
-    private func generateLaunchdPlist(for profile: SyncProfile) -> String {
+    func generateLaunchdPlist(for profile: SyncProfile) -> String {
         let scriptPath = SyncProfile.sharedScriptPath
         let configPath = profile.configPath
         let logDir = (profile.logPath as NSString).deletingLastPathComponent
@@ -2637,7 +3017,11 @@ extension SyncSetupService {
                 """
         } else {
             // Sync modes: use StartInterval for periodic execution
-            let intervalSeconds = profile.syncIntervalMinutes * 60
+            // Schedule-only checks are cheap local due-time checks. Polling avoids
+            // losing a week-long timer when launchd reloads at login or after sleep.
+            let intervalSeconds = profile.syncOnLocalChanges
+                ? min(max(1, profile.syncIntervalMinutes), SyncProfile.maximumSyncIntervalMinutes) * 60
+                : profile.scheduleCheckIntervalSeconds
             return """
                 <?xml version="1.0" encoding="UTF-8"?>
                 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -2868,34 +3252,71 @@ enum SyncExcludeFilter {
     static let includeBeginMarker = "# >>> SyncTray \"Sync Only These Folders\" (managed: edit them in SyncTray's profile settings)"
     static let includeEndMarker = "# <<< SyncTray \"Sync Only These Folders\""
 
-    /// The default rule that keeps Apple Photos libraries out of every Two-Way and One-Way
-    /// sync. A `.photoslibrary` is a live database package that macOS privacy controls won't
-    /// let other apps read, so syncing a folder that holds one (typically `~/Pictures`) failed
-    /// every run with "operation not permitted" — and rclone then also refused to propagate
-    /// any deletion ("not deleting files as there were IO errors"). Copying it file by file
-    /// while Photos has it open can produce an inconsistent copy anyway.
+    /// A default "never sync this" rule for a macOS package/library that privacy controls won't
+    /// let other apps read — written into every new filter file as part of
+    /// `SyncSetupService.defaultExcludeFilter`, and added once to existing filters by a
+    /// `ProfileMigration` built on `DefaultExcludeMigration.apply(_:in:hasEntry:logTag:)`. It is
+    /// ordinary user content, not a managed block: the user can delete the line to sync a
+    /// library they have granted Full Disk Access to.
     ///
-    /// Written into every new filter file as part of `SyncSetupService.defaultExcludeFilter`,
-    /// and added once to existing ones by `MigrationV5PhotosLibraryExclude`
-    /// (`addingPhotosLibraryDefault(to:)`). It is ordinary user content, not a managed block:
-    /// the user can delete it to sync a library they have granted access to.
-    static let photosLibraryRule = "- *.photoslibrary/**"
-    static let photosLibrarySection = """
-        # Apple Photos libraries: a live database macOS doesn't let other apps read
-        \(photosLibraryRule)
-        """
+    /// `.photosLibrary` and `.photoBoothLibrary` are the two instances today (migrations v5 and v8); a
+    /// future TCC-blocked default follows the same shape.
+    struct DefaultExclude {
+        /// The raw `- …` rclone rule line.
+        let rule: String
+        /// `rule` plus its explanatory comment, as written into the default filter.
+        let section: String
+        /// Case-insensitive substring that means "this filter already mentions this library" —
+        /// either because the default is already there, or because the user wrote their own
+        /// rule for it, which is theirs to keep. Checked against `existing.lowercased()`.
+        let mentionToken: String
+        /// Whether a filesystem entry (as walked by `DefaultExcludeMigration.containsEntry`) IS
+        /// this kind of library. Must be checked before any package-content skip, since a
+        /// `.photoslibrary` and `Photo Booth Library` are themselves packages.
+        let matchesEntry: (URL) -> Bool
 
-    /// `existing` with `photosLibrarySection` added at the top of the user's own rules —
-    /// right below the managed "Don't Sync" head block and above any hand-written `+`
-    /// include, since rclone applies the first rule that matches. Returns nil when nothing
-    /// should change: the file already mentions `.photoslibrary` (the default is already
-    /// there, or the user wrote their own rule for it, which is theirs to keep).
-    ///
-    /// The head block is re-emitted exactly as found, so a later `merged(existing:patterns:)`
-    /// with the same patterns returns this output unchanged.
-    static func addingPhotosLibraryDefault(to existing: String) -> String? {
-        guard !existing.lowercased().contains(".photoslibrary") else { return nil }
-        return insertingDefaultSection(photosLibrarySection, into: existing)
+        /// A `.photoslibrary` is a live database package that macOS privacy controls won't let
+        /// other apps read, so syncing a folder that holds one (typically `~/Pictures`) failed
+        /// every run with "operation not permitted" — and rclone then also refused to propagate
+        /// any deletion ("not deleting files as there were IO errors"). Copying it file by file
+        /// while Photos has it open can produce an inconsistent copy anyway.
+        static let photosLibrary = DefaultExclude(
+            rule: "- *.photoslibrary/**",
+            section: """
+                # Apple Photos libraries: a live database macOS doesn't let other apps read
+                - *.photoslibrary/**
+                """,
+            mentionToken: ".photoslibrary",
+            matchesEntry: { $0.pathExtension.lowercased() == "photoslibrary" }
+        )
+
+        /// `Photo Booth Library` is a macOS package with no file extension (unlike
+        /// `.photoslibrary`), so it needs a name match rather than an extension glob. Same TCC
+        /// denial shape: `open … Photo Booth Library: operation not permitted` on every run.
+        static let photoBoothLibrary = DefaultExclude(
+            rule: "- Photo Booth Library/**",
+            section: """
+                # Apple Photo Booth library: macOS doesn't let other apps read it
+                - Photo Booth Library/**
+                """,
+            mentionToken: "photo booth library",
+            matchesEntry: { $0.lastPathComponent.caseInsensitiveCompare("Photo Booth Library") == .orderedSame }
+        )
+    }
+
+    /// Back-compat wrapper — see `DefaultExclude.photosLibrary`.
+    static let photosLibraryRule = DefaultExclude.photosLibrary.rule
+    /// Back-compat wrapper — see `DefaultExclude.photosLibrary`.
+    static let photosLibrarySection = DefaultExclude.photosLibrary.section
+
+    /// `existing` with `def.section` added at the top of the user's own rules — right below the
+    /// managed "Don't Sync" head block and above any hand-written `+` include, since rclone
+    /// applies the first rule that matches. Returns nil when nothing should change: the file
+    /// already mentions `def.mentionToken` (the default is already there, or the user wrote
+    /// their own rule for it, which is theirs to keep).
+    static func addingDefault(_ def: DefaultExclude, to existing: String) -> String? {
+        guard !existing.lowercased().contains(def.mentionToken) else { return nil }
+        return insertingDefaultSection(def.section, into: existing)
     }
 
     /// The folders macOS creates at the root of every volume it mounts (an external drive, a
@@ -2957,6 +3378,11 @@ enum SyncExcludeFilter {
             return output + "\n"
         }
         return output + "\n\n" + userContent
+    }
+
+    /// Back-compat wrapper — see `addingDefault(_:to:)` with `.photosLibrary`.
+    static func addingPhotosLibraryDefault(to existing: String) -> String? {
+        addingDefault(.photosLibrary, to: existing)
     }
 
     /// The "Don't Sync" pattern that excludes exactly `blockedPath` — a local path rclone

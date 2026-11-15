@@ -8,7 +8,7 @@ They are the source of truth: edit one, and the running app applies the change w
 | Path                                         | Contents                                                              | Edit it? |
 | -------------------------------------------- | --------------------------------------------------------------------- | -------- |
 | `profiles/{shortId}.profile.json`            | One profile: folders, remote, mode, schedule, and every setting       | Yes      |
-| `settings.json`                              | App settings: launch at login, usage data, debug logging, auto-fix    | Yes      |
+| `settings.json`                              | App settings: launch at login, usage data, debug logging, auto-fix, menu bar icon | Yes      |
 | `schema/profile.schema.json`                 | JSON Schema for profile files                                         | No — rewritten at every launch |
 | `schema/settings.schema.json`                | JSON Schema for `settings.json`                                       | No — rewritten at every launch |
 | `profiles/{shortId}.json`                    | A subset of the profile, generated for the sync script                | No — generated |
@@ -62,7 +62,8 @@ To start it, set `"isEnabled": true` in the file, or run `synctray profile enabl
 | `isEnabled`               | `false`                | all              | Whether the launchd agent is installed and running                               |
 | `syncMode`                | `bisync`               | all              | `bisync` (two-way), `sync` (one-way), or `mount` (Stream)                        |
 | `syncDirection`           | `localToRemote`        | one-way          | `localToRemote` or `remoteToLocal`                                               |
-| `syncIntervalMinutes`     | `5`                    | two-way, one-way | Minutes between scheduled syncs                                                  |
+| `syncOnLocalChanges`      | `true`                 | two-way, one-way | Sync on local changes as well as the schedule; `false` enables schedule-only      |
+| `syncIntervalMinutes`     | `5`                    | two-way, one-way | Minutes between scheduled syncs (1–525600); with schedule-only, minimum time between attempts                                                  |
 | `isMuted`                 | `false`                | all              | Mute change notifications                                                        |
 | `drivePathToMonitor`      | `""`                   | all              | External drive to watch; syncs skip while it's unplugged                        |
 | `additionalRcloneFlags`   | `""`                   | all              | Extra flags for every rclone command, split like a shell would — never evaluated |
@@ -107,6 +108,14 @@ The schema is authoritative: when this table and [`profile.schema.json`](../Sync
 | `telemetryEnabled`     | Share pseudonymous usage data (off until you opt in)                |
 | `autoFixSyncIssues`    | Run a safe resync by itself when two-way sync reports it's out of sync (on by default) |
 | `debugLoggingEnabled`  | Write verbose debug lines to the sync logs                          |
+| `menuBarIconStyle`     | How the menu bar icon is drawn: `color` (default), `monochrome` (the menu bar's own text color, easiest to see), or `custom` |
+| `menuBarIconSyncingColor` | The `custom` style's ring color while syncing, as `#RRGGBB`; `""` for the default blue |
+| `menuBarIconIdleColor` | The `custom` style's ring color when idle, as `#RRGGBB`; `""` for the default gray |
+
+An invalid value is ignored and the setting keeps its current value.
+An edit made while the app isn't running is applied at its next launch. Launch applies only the keys changed outside the app since it last wrote the file, so a change made in the app without a file write (such as turning on usage data from the banner) is never reverted. It never applies `launchAtLogin`, so a stale file can't undo a change made in System Settings.
+While the app is running, an edit applies right away, and likewise only the keys you changed, so a stale value in the file never reverts a change made in the app.
+`synctray settings set <key> <value>` changes the same settings from the terminal.
 
 ## Files SyncTray creates
 
@@ -123,3 +132,39 @@ The schema is authoritative: when this table and [`profile.schema.json`](../Sync
 
 Uninstalling with `brew uninstall --zap --cask synctray` removes `~/.config/synctray`, the logs, and the launch agents.
 Your synced folders, rclone's config, and the Stream cache are left in place.
+
+### Schedule-only state
+
+With `syncOnLocalChanges: false`, the first attempt runs immediately. Switching
+from the default mode or changing folders/mode/direction requests one initial
+attempt, even when recent history exists. Ordinary saves and interval-only edits
+preserve history. The interval is measured from the last attempt's **start**,
+including failed and manual attempts; `synctray sync` explicitly overrides it.
+
+The agent checks eligibility every quarter interval, between 60 and 900 seconds
+(one Python config read per idle check). Idle checks never take the `/tmp` run
+lock or scan files/probe the remote. A due/manual run acquires the run lock,
+rechecks eligibility, and atomically records the attempt. Two overdue checks can
+therefore start only one sync. An unavailable external drive is checked only
+when due and does not consume the attempt; a network failure does.
+
+Runtime files under `~/.local/state/synctray/schedules/` are private to the user:
+
+| File | Purpose |
+| --- | --- |
+| `{shortId}.json` | Last attempt timestamp, folder/mode/direction identity, and consumed initial-sync request |
+| `{shortId}.json.request` | One-time token for an explicit switch/folder change; retained so retries can check whether it was consumed |
+| `{shortId}.json.lock` | Brief metadata lock shared by clock correction and attempt writers; not the sync run lock or UI liveness |
+
+History survives app/agent restarts, disable/enable and reinstalls. Deleting a
+profile removes all three files. A future `lastAttempt` is clamped to now and
+persisted once, rather than moving the due time on every check. Missing history
+or a different identity is due immediately. Invalid/unwritable state stops the
+automatic run and produces a profile error with the underlying reason in its
+sync log; Sync Now can rebuild corrupt state after any permission issue is fixed.
+
+For schedule-only two-way sync, Auto-fix remains available for a live failure of
+the current attempt, with the existing setting, backoff, recurrence and single-run
+guards. Historical failures replayed after restarting the app are ineligible.
+Recovery is part of the original attempt and does not advance its cadence again.
+See the [user guide](user-guide.md#automatic-sync-and-longer-intervals) for examples.

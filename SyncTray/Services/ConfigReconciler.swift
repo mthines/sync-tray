@@ -12,6 +12,20 @@ enum ProfileReconcileAction: Equatable {
     case reinstall
 }
 
+/// What a Save that changed the "Don't Sync" filter should do next (plan D7), once the
+/// caller has already handled the pre-existing reinstall-while-live refusal (that case never
+/// reaches this decision).
+enum FilterSaveFollowUp: Equatable {
+    /// Nothing filter-related changed, a reinstall is needed (its own agent load will start the
+    /// sync), or the profile isn't installed — no follow-up action.
+    case none
+    /// The filter changed and no run is live — write it and start Sync Now immediately.
+    case syncNow
+    /// The filter changed while a run is live — confirm with the user, then stop the run
+    /// gracefully and start Sync Now once it has ended (`SyncManager.stopRunThenSync`).
+    case confirmStopThenSync
+}
+
 /// Outcome of considering an external `*.profile.json` write against an
 /// UNKNOWN profile id — i.e. a potential CREATE, not an edit.
 enum ExternalCreateOutcome: Equatable {
@@ -75,6 +89,7 @@ extension SyncManager {
             current.remotePath != updated.remotePath ||
             current.localSyncPath != updated.localSyncPath ||
             current.syncIntervalMinutes != updated.syncIntervalMinutes ||
+            current.syncOnLocalChanges != updated.syncOnLocalChanges ||
             current.additionalRcloneFlags != updated.additionalRcloneFlags ||
             current.syncMode != updated.syncMode ||
             current.syncDirection != updated.syncDirection ||
@@ -159,11 +174,43 @@ extension SyncManager {
                 || current.syncIncludeFolders != updated.syncIncludeFolders)
     }
 
+    /// Decide what a Save that changed the "Don't Sync" filter should do next (plan D7),
+    /// composing `syncFilterReconcileNeeded`'s result with whether a reinstall is needed and
+    /// whether the profile's run is currently live. Pure — no I/O.
+    ///
+    /// The `needsReinstall && runLive` refusal (today's "press Abort to stop it first" alert) is
+    /// decided and acted on by the caller BEFORE this is reached — see plan D8: extending
+    /// stop-then-apply to a reinstall-needing Save is explicitly out of scope, so that case is
+    /// never passed in here with `runLive: true` in practice. If it were, this still returns
+    /// `.none` (no follow-up), matching the "a reinstall is needed" row below regardless of
+    /// `runLive`.
+    ///
+    /// | needsReinstall | filterChanged && installed | runLive | Result |
+    /// | --- | --- | --- | --- |
+    /// | true | any | any | `.none` (the reinstall's own agent load starts the sync, or the refusal already handled it) |
+    /// | false | true | false | `.syncNow` |
+    /// | false | true | true | `.confirmStopThenSync` |
+    /// | false | false | any | `.none` |
+    nonisolated static func filterSaveFollowUp(
+        filterChanged: Bool,
+        needsReinstall: Bool,
+        runLive: Bool,
+        installed: Bool,
+        syncOnLocalChanges: Bool = true
+    ) -> FilterSaveFollowUp {
+        // Schedule-only filter edits take effect on the next scheduled/manual run.
+        guard syncOnLocalChanges else { return .none }
+        guard !needsReinstall else { return .none }
+        guard filterChanged, installed else { return .none }
+        return runLive ? .confirmStopThenSync : .syncNow
+    }
+
     /// Decide whether an edit should rewrite the exclude filter file and, if so, invoke
     /// `write`. Pure decision + injected side effect (same idiom as
     /// `applyWarmReconcileIfNeeded`), so `ConfigSelfTest` covers the trigger with a spy. Both
-    /// the in-app editor (`updateSyncExcludePatterns`) and the external-edit watcher
-    /// (`applyExternalProfileEdit`) go through here, so they fire on the same conditions.
+    /// the in-app editor's Save path (`ProfileDetailView.applyFilterSaveAndFollowUp`) and the
+    /// external-edit watcher (`applyExternalProfileEdit`) go through here, so they fire on the
+    /// same conditions.
     nonisolated static func applySyncFilterReconcileIfNeeded(
         from current: SyncProfile,
         to updated: SyncProfile,
@@ -171,18 +218,6 @@ extension SyncManager {
     ) {
         guard syncFilterReconcileNeeded(from: current, to: updated) else { return }
         write(updated)
-    }
-
-    /// In-app "Don't Sync" edit: persist the new patterns, then rewrite the filter file
-    /// through the same gate an external edit uses. Applies from the next sync; no reinstall.
-    /// A failed write is recorded in `syncFilterErrors`, which the editor shows.
-    func updateSyncExcludePatterns(_ patterns: [String], for profileId: UUID) {
-        guard let current = profileStore.profile(for: profileId) else { return }
-        var updated = current
-        updated.syncExcludePatterns = patterns
-        guard updated != current else { return }
-        profileStore.update(updated)
-        applySyncFilterReconcile(from: current, to: updated)
     }
 
     /// Rewrite the filter file when an edit needs it (the `applySyncFilterReconcileIfNeeded`
@@ -203,9 +238,9 @@ extension SyncManager {
     }
 
     /// In-app "Sync Only These Folders" edit: persist the new folder list, then rewrite the
-    /// filter file through the same gate `updateSyncExcludePatterns` uses — a bisync profile
-    /// whose compiled rules actually change picks up the resync-pending marker there, never a
-    /// reinstall. Applies from the next sync.
+    /// filter file through the same `applySyncFilterReconcile` gate the staged "Don't Sync"
+    /// Save path uses — a bisync profile whose compiled rules actually change picks up the
+    /// resync-pending marker there, never a reinstall. Applies from the next sync.
     func updateSyncIncludeFolders(_ folders: [String], for profileId: UUID) {
         guard let current = profileStore.profile(for: profileId) else { return }
         var updated = current

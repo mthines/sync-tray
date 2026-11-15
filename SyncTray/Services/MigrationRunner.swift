@@ -49,6 +49,7 @@ enum MigrationRunner {
         MigrationV5PhotosLibraryExclude(),
         MigrationV6VolumeSystemFoldersExclude(),
         MigrationV7VolumeSystemFolderResyncFromListings(),
+        MigrationV8PhotoBoothLibraryExclude(),
     ]
 
     /// Run all pending migrations. Call this once at app startup,
@@ -378,45 +379,30 @@ struct MigrationV4Retired: ProfileMigration {
     func migrateUserDefaults(_ defaults: UserDefaults) throws {}
 }
 
-// MARK: - Migration V5: exclude Apple Photos libraries from existing profiles
+// MARK: - Shared default-exclude migration body (v5 Photos, v8 Photo Booth, …)
 
-/// Adds the Photos-library default rule (`SyncExcludeFilter.photosLibraryRule`) to the exclude
-/// filter of every existing Two-Way and One-Way profile. New filter files get it from
-/// `SyncSetupService.defaultExcludeFilter`; this covers files written before it was a default,
-/// which are otherwise only re-created from the defaults when a profile is disabled and
-/// re-enabled.
+/// Shared body for a "add a default TCC-blocked-library exclude rule to every existing
+/// Two-Way/One-Way filter" migration. `MigrationV5PhotosLibraryExclude` and
+/// `MigrationV8PhotoBoothLibraryExclude` are both thin wrappers over `apply(_:in:hasEntry:logTag:)`
+/// and `containsEntry(under:matching:)`, so the two migrations can't drift apart.
 ///
 /// Per profile (read from its raw `{shortId}.profile.json`, before `ProfileStore` loads):
 /// - Stream (mount) profiles have no sync filter and are skipped.
 /// - A missing filter file is left missing — the next install writes it from the defaults,
 ///   which already carry the rule.
-/// - A filter that already mentions `.photoslibrary` (the default, or the user's own rule) or
+/// - A filter that already mentions `def.mentionToken` (the default, or the user's own rule) or
 ///   isn't readable UTF-8 is left exactly as it is.
-/// - On a Two-Way profile whose local folder actually holds a `.photoslibrary`, the
+/// - On a Two-Way profile whose local folder actually holds a matching entry, the
 ///   resync-pending marker is written right after the filter (the same filter-then-marker,
 ///   roll-back-on-failure order `SyncSetupService.writeExcludeFilter` uses). A library the
 ///   profile used to sync would otherwise vanish from bisync's listings at once, which counts
 ///   as deletions against `--max-delete` and, for a library holding over half the profile's
-///   files, would stop every run at the safety abort. Profiles without a library get no
+///   files, would stop every run at the safety abort. Profiles without a matching entry get no
 ///   marker: the rule matches nothing there, so there is nothing to resync.
 ///
 /// Per-profile failures are logged and skipped, never thrown: one unwritable filter must not
 /// hold back the schema version (and every later migration) forever.
-struct MigrationV5PhotosLibraryExclude: ProfileMigration {
-    let version = 5
-    let description = "Exclude Apple Photos libraries (*.photoslibrary) from existing Two-Way and One-Way profiles"
-
-    /// Overridable for self-test isolation; defaults to the real profiles directory.
-    var profilesDirectoryOverride: String?
-
-    private var profilesDirectory: String { profilesDirectoryOverride ?? SyncProfile.configDirectory }
-
-    func migrateUserDefaults(_ defaults: UserDefaults) throws {
-        let outcome = Self.addPhotosLibraryExclude(in: profilesDirectory)
-        print("[SyncTray] Migration v5: added the Photos-library exclude to \(outcome.updated.count) profile(s), "
-            + "scheduled \(outcome.resyncScheduled.count) resync(s), \(outcome.failed.count) failure(s)")
-    }
-
+enum DefaultExcludeMigration {
     /// Short ids of the profiles each step touched, so `ConfigSelfTest` can assert exactly
     /// what changed.
     struct Outcome: Equatable {
@@ -425,14 +411,17 @@ struct MigrationV5PhotosLibraryExclude: ProfileMigration {
         var failed: [String] = []
     }
 
-    /// Apply the migration to every `*.profile.json` in `directory`. Idempotent: a second pass
-    /// finds the rule already present and changes nothing.
-    /// - Parameter hasPhotosLibrary: whether a local sync folder holds a `.photoslibrary`;
-    ///   injectable so `ConfigSelfTest` doesn't depend on the machine's real folders.
+    /// Apply `def` to every `*.profile.json` in `directory`. Idempotent: a second pass finds the
+    /// rule already present (via `def.mentionToken`) and changes nothing.
+    /// - Parameter hasEntry: whether a local sync folder holds a matching library; injectable so
+    ///   `ConfigSelfTest` doesn't depend on the machine's real folders.
+    /// - Parameter logTag: bracketed log prefix, e.g. `[MigrationV5]`.
     @discardableResult
-    static func addPhotosLibraryExclude(
+    static func apply(
+        _ def: SyncExcludeFilter.DefaultExclude,
         in directory: String,
-        hasPhotosLibrary: (String) -> Bool = { MigrationV5PhotosLibraryExclude.containsPhotosLibrary(under: $0) }
+        hasEntry: (String) -> Bool,
+        logTag: String
     ) -> Outcome {
         var outcome = Outcome()
         let fm = FileManager.default
@@ -452,19 +441,19 @@ struct MigrationV5PhotosLibraryExclude: ProfileMigration {
             let filterPath = (directory as NSString).appendingPathComponent("\(shortId)-exclude.txt")
             guard fm.fileExists(atPath: filterPath),
                   let existing = try? String(contentsOfFile: filterPath, encoding: .utf8),
-                  let updated = SyncExcludeFilter.addingPhotosLibraryDefault(to: existing) else { continue }
+                  let updated = SyncExcludeFilter.addingDefault(def, to: existing) else { continue }
 
             do {
                 try updated.write(toFile: filterPath, atomically: true, encoding: .utf8)
             } catch {
-                SyncTraySettings.debugLog("[MigrationV5] could not update \(filterPath): \(error.localizedDescription)")
+                SyncTraySettings.debugLog("\(logTag) could not update \(filterPath): \(error.localizedDescription)")
                 outcome.failed.append(shortId)
                 continue
             }
 
             let localPath = (dict["localSyncPath"] as? String) ?? ""
             if syncMode == SyncMode.bisync.rawValue, !localPath.isEmpty,
-               hasPhotosLibrary((localPath as NSString).expandingTildeInPath) {
+               hasEntry((localPath as NSString).expandingTildeInPath) {
                 let markerPath = (directory as NSString).appendingPathComponent("\(shortId).resync-pending")
                 do {
                     try UUID().uuidString.write(toFile: markerPath, atomically: true, encoding: .utf8)
@@ -474,7 +463,7 @@ struct MigrationV5PhotosLibraryExclude: ProfileMigration {
                     // rule in place but no resync scheduled (the schema version still advances,
                     // so the profile simply keeps its old filter).
                     try? existing.write(toFile: filterPath, atomically: true, encoding: .utf8)
-                    SyncTraySettings.debugLog("[MigrationV5] could not schedule a resync for \(shortId): \(error.localizedDescription)")
+                    SyncTraySettings.debugLog("\(logTag) could not schedule a resync for \(shortId): \(error.localizedDescription)")
                     outcome.failed.append(shortId)
                     continue
                 }
@@ -484,11 +473,15 @@ struct MigrationV5PhotosLibraryExclude: ProfileMigration {
         return outcome
     }
 
-    /// Whether `root` holds a `.photoslibrary` package within `maxDepth` folder levels. Hidden
-    /// entries and package contents are skipped, symlinks aren't followed, and the walk stops
-    /// after `maxEntries` entries so a huge tree can't stall launch; anything unreadable
-    /// (including a folder macOS won't let the app list) counts as "not found".
-    static func containsPhotosLibrary(under root: String, maxDepth: Int = 3, maxEntries: Int = 20_000) -> Bool {
+    /// Whether `root` holds an entry matching `def.matchesEntry` within `maxDepth` folder
+    /// levels. The match check runs BEFORE the package-content skip, since both a
+    /// `.photoslibrary` and `Photo Booth Library` are themselves packages. Hidden entries are
+    /// skipped, symlinks aren't followed, and the walk stops after `maxEntries` entries so a huge
+    /// tree can't stall launch; anything unreadable (including a folder macOS won't let the app
+    /// list) counts as "not found".
+    static func containsEntry(
+        under root: String, matching def: SyncExcludeFilter.DefaultExclude, maxDepth: Int = 3, maxEntries: Int = 20_000
+    ) -> Bool {
         let fm = FileManager.default
         let keys: [URLResourceKey] = [.isDirectoryKey, .isSymbolicLinkKey, .isPackageKey]
         var queue: [(url: URL, depth: Int)] = [(URL(fileURLWithPath: root, isDirectory: true), 0)]
@@ -500,7 +493,7 @@ struct MigrationV5PhotosLibraryExclude: ProfileMigration {
             for entry in entries {
                 seen += 1
                 if seen > maxEntries { return false }
-                if entry.pathExtension.lowercased() == "photoslibrary" { return true }
+                if def.matchesEntry(entry) { return true }
                 guard depth + 1 < maxDepth,
                       let values = try? entry.resourceValues(forKeys: Set(keys)),
                       values.isDirectory == true, values.isSymbolicLink != true,
@@ -509,6 +502,49 @@ struct MigrationV5PhotosLibraryExclude: ProfileMigration {
             }
         }
         return false
+    }
+}
+
+// MARK: - Migration V5: exclude Apple Photos libraries from existing profiles
+
+/// Adds the Photos-library default rule (`SyncExcludeFilter.photosLibraryRule`) to the exclude
+/// filter of every existing Two-Way and One-Way profile. New filter files get it from
+/// `SyncSetupService.defaultExcludeFilter`; this covers files written before it was a default,
+/// which are otherwise only re-created from the defaults when a profile is disabled and
+/// re-enabled. See `DefaultExcludeMigration` for the shared body this wraps.
+struct MigrationV5PhotosLibraryExclude: ProfileMigration {
+    let version = 5
+    let description = "Exclude Apple Photos libraries (*.photoslibrary) from existing Two-Way and One-Way profiles"
+
+    /// Overridable for self-test isolation; defaults to the real profiles directory.
+    var profilesDirectoryOverride: String?
+
+    private var profilesDirectory: String { profilesDirectoryOverride ?? SyncProfile.configDirectory }
+
+    func migrateUserDefaults(_ defaults: UserDefaults) throws {
+        let outcome = Self.addPhotosLibraryExclude(in: profilesDirectory)
+        print("[SyncTray] Migration v5: added the Photos-library exclude to \(outcome.updated.count) profile(s), "
+            + "scheduled \(outcome.resyncScheduled.count) resync(s), \(outcome.failed.count) failure(s)")
+    }
+
+    /// Back-compat alias — see `DefaultExcludeMigration.Outcome`.
+    typealias Outcome = DefaultExcludeMigration.Outcome
+
+    /// Apply the migration to every `*.profile.json` in `directory`. Idempotent: a second pass
+    /// finds the rule already present and changes nothing.
+    /// - Parameter hasPhotosLibrary: whether a local sync folder holds a `.photoslibrary`;
+    ///   injectable so `ConfigSelfTest` doesn't depend on the machine's real folders.
+    @discardableResult
+    static func addPhotosLibraryExclude(
+        in directory: String,
+        hasPhotosLibrary: (String) -> Bool = { containsPhotosLibrary(under: $0) }
+    ) -> Outcome {
+        DefaultExcludeMigration.apply(.photosLibrary, in: directory, hasEntry: hasPhotosLibrary, logTag: "[MigrationV5]")
+    }
+
+    /// Back-compat wrapper — see `DefaultExcludeMigration.containsEntry(under:matching:)`.
+    static func containsPhotosLibrary(under root: String, maxDepth: Int = 3, maxEntries: Int = 20_000) -> Bool {
+        DefaultExcludeMigration.containsEntry(under: root, matching: .photosLibrary, maxDepth: maxDepth, maxEntries: maxEntries)
     }
 }
 
@@ -779,5 +815,49 @@ struct MigrationV7VolumeSystemFolderResyncFromListings: ProfileMigration {
             }
         }
         return outcome
+    }
+}
+
+// MARK: - Migration V8: exclude the Apple Photo Booth library from existing profiles
+
+/// Adds the Photo Booth default rule (`SyncExcludeFilter.DefaultExclude.photoBoothLibrary`) to
+/// the exclude filter of every existing Two-Way and One-Way profile, mirroring
+/// `MigrationV5PhotosLibraryExclude` exactly (see plan decision D3): same filter-then-marker
+/// write order with rollback on marker failure, same Stream/missing-filter/already-mentioned
+/// skips, same per-profile failure handling. See `DefaultExcludeMigration` for the shared body.
+struct MigrationV8PhotoBoothLibraryExclude: ProfileMigration {
+    let version = 8
+    let description = "Exclude the Apple Photo Booth library (Photo Booth Library) from existing Two-Way and One-Way profiles"
+
+    /// Overridable for self-test isolation; defaults to the real profiles directory.
+    var profilesDirectoryOverride: String?
+
+    private var profilesDirectory: String { profilesDirectoryOverride ?? SyncProfile.configDirectory }
+
+    func migrateUserDefaults(_ defaults: UserDefaults) throws {
+        let outcome = Self.addPhotoBoothLibraryExclude(in: profilesDirectory)
+        print("[SyncTray] Migration v8: added the Photo Booth-library exclude to \(outcome.updated.count) profile(s), "
+            + "scheduled \(outcome.resyncScheduled.count) resync(s), \(outcome.failed.count) failure(s)")
+    }
+
+    /// Back-compat alias — see `DefaultExcludeMigration.Outcome`.
+    typealias Outcome = DefaultExcludeMigration.Outcome
+
+    /// Apply the migration to every `*.profile.json` in `directory`. Idempotent: a second pass
+    /// finds the rule already present and changes nothing.
+    /// - Parameter hasPhotoBoothLibrary: whether a local sync folder holds a `Photo Booth
+    ///   Library`; injectable so `ConfigSelfTest` doesn't depend on the machine's real folders.
+    @discardableResult
+    static func addPhotoBoothLibraryExclude(
+        in directory: String,
+        hasPhotoBoothLibrary: (String) -> Bool = { containsPhotoBoothLibrary(under: $0) }
+    ) -> Outcome {
+        DefaultExcludeMigration.apply(.photoBoothLibrary, in: directory, hasEntry: hasPhotoBoothLibrary, logTag: "[MigrationV8]")
+    }
+
+    /// Whether `root` holds a `Photo Booth Library` package within `maxDepth` folder levels —
+    /// see `DefaultExcludeMigration.containsEntry(under:matching:)`.
+    static func containsPhotoBoothLibrary(under root: String, maxDepth: Int = 3, maxEntries: Int = 20_000) -> Bool {
+        DefaultExcludeMigration.containsEntry(under: root, matching: .photoBoothLibrary, maxDepth: maxDepth, maxEntries: maxEntries)
     }
 }

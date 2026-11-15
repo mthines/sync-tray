@@ -37,7 +37,13 @@
     "syncIntervalMinutes": {
       "type": "integer",
       "minimum": 1,
-      "description": "Minutes between scheduled syncs (sync/bisync modes)."
+      "maximum": 525600,
+      "description": "Minutes between scheduled syncs (1 minute to 365 days). With syncOnLocalChanges=false, the minimum time between attempts, including failed and manual attempts."
+    },
+    "syncOnLocalChanges": {
+      "type": "boolean",
+      "default": true,
+      "description": "Sync/bisync modes only. True syncs on local file changes as well as the schedule. False syncs once initially or after a switch/folder change, then only when the persisted interval is due. Sync Now overrides the interval; live failures may use bounded automatic repair."
     },
     "additionalRcloneFlags": {
       "type": "string",

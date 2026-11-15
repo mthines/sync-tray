@@ -183,8 +183,10 @@ struct OverlaySyncService {
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .secondsSince1970
         guard let data = try? encoder.encode(manifest) else { return false }
+        // Owner-only: the manifest's directory is the Cache Only overlay root (AC-SEC6).
         try? fileManager.createDirectory(
-            atPath: (path as NSString).deletingLastPathComponent, withIntermediateDirectories: true)
+            atPath: (path as NSString).deletingLastPathComponent, withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700])
         return (try? data.write(to: URL(fileURLWithPath: path), options: .atomic)) != nil
     }
 

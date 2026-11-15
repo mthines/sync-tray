@@ -42,15 +42,18 @@ These commands are read-only.
 | `synctray profiles`                        | One line per profile: name, short id, mode, `enabled=`, `remote=`. `profile list` is an alias.         |
 | `synctray profile show <name\|id>`         | The profile's full config as pretty JSON — the same shape as its `.profile.json`.                      |
 | `synctray logs <name\|id> [--follow]`      | Print the profile's sync log, or follow it like `tail -f`.                                             |
-| `synctray test-remote <name\|id>`          | Probe the profile's remote path with a hard timeout.                                                   |
+| `synctray test-remote <name\|id>`          | Probe the profile's remote path with a hard timeout. A path that doesn't exist yet prints `(path not found)`. |
 | `synctray listremotes`                     | Pass-through to `rclone listremotes`.                                                                  |
 | `synctray rclone-password status\|set\|clear` | Keychain password for an encrypted `rclone.conf`. `set` asks without echo (or reads stdin), never takes it as an argument, and refuses one that doesn't decrypt the config. |
+| `synctray settings [show] [--json]`        | The value the app uses for every app-wide setting (the same keys as `settings.json`), as `key=value` lines or a JSON object. |
+| `synctray settings get <key>`              | One app-wide setting's value.                                                                          |
 | `synctray help`                            | Print the usage summary.                                                                               |
 
 ### `doctor`
 
 Prints one `[ok]`, `[warn]`, or `[fail]` line per check and exits `1` if any check failed.
 Warnings never fail the run.
+A remote that answers but has no folder at the profile's path is a warning (`remote reachable, but path not found: <path>`): normal before a Two-Way profile's first sync, and otherwise a sign of a typo in the remote path.
 
 ```console
 $ synctray doctor
@@ -130,6 +133,7 @@ If the app is running, it sees the same file change and ends up in the same stat
 | `synctray profile delete <name\|id>`                     | Remove the agent (unmounting first for Stream) and delete the profile file.          |
 | `synctray install <name\|id>`                            | Install an enabled profile's agent again, for example after it went missing. Never changes `isEnabled`. |
 | `synctray reinstall <name\|id>`                          | Regenerate the script and launchd plist and reinstall the agent. Remounts a mounted Stream profile. |
+| `synctray settings set <key> <value> [...]`              | Change app-wide settings (see [`settings set`](#settings-set)). A running app applies them live. |
 
 ### `profile create`
 
@@ -162,6 +166,22 @@ Booleans accept `true`/`false`, `yes`/`no`, `on`/`off`, or `1`/`0`.
 A `vfsCachePath` change only re-points the cache — use `cache move` to bring the cached files along.
 Use `profile enable` and `profile disable` for `isEnabled`.
 `id` can't be changed.
+
+### `settings set`
+
+Takes one or more `key value` pairs, the keys of [Configuration files → `settings.json`](configuration.md#settingsjson).
+Every value is validated first, so an unknown key or a bad value exits `65` and changes nothing.
+
+```console
+$ synctray settings set menuBarIconStyle custom menuBarIconIdleColor '#FF9500'
+menuBarIconStyle=custom
+menuBarIconIdleColor=#FF9500
+```
+
+Booleans accept `true`/`false`, `yes`/`no`, `on`/`off`, or `1`/`0`.
+Colors are `#RRGGBB` (the `#` is optional); `''` goes back to the default color.
+The change is saved where the app reads it and in `settings.json`, so it applies whether or not the app is running.
+`launchAtLogin` registers or removes the login item right away.
 
 ## Operate
 
@@ -210,6 +230,16 @@ A saved copy (`--output`) is created readable only by you.
 | `66` | The input file or stdin couldn't be read                                |
 
 `sync` returns the sync script's own exit code.
+
+## Periodic backups
+
+```bash
+synctray profile set Projects syncOnLocalChanges false syncIntervalMinutes 10080
+```
+
+This selects weekly schedule-only backups. See [schedule-only configuration](configuration.md#schedule-only-state)
+for first-run/recovery semantics and the [user guide](user-guide.md#automatic-sync-and-longer-intervals)
+for behavior across sleep and restarts.
 
 ## Privacy
 

@@ -166,6 +166,10 @@ final class LogParser {
     }
 
     private func parseEventType(from message: String) -> ParsedLogEvent.EventType {
+        if SyncLogPatterns.isScheduleCheckFailed(message) {
+            return .syncFailed(exitCode: 1, message: message)
+        }
+
         if SyncLogPatterns.isSyncStarted(message) {
             return .syncStarted
         }
