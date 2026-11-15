@@ -130,9 +130,19 @@ struct SyncProfile: Identifiable, Codable, Equatable {
 
     // MARK: - Computed Paths
 
-    /// Shared script path (single script for all profiles)
+    /// Shared script path (single script for all profiles).
+    ///
+    /// Debug builds use their own directory, like their `.dev` bundle id: the script embeds
+    /// the launching binary's path (the rclone password command), so a script shared with the
+    /// installed release would send the release profiles' scheduled runs to a dev binary and
+    /// its `.dev` Keychain item whenever a dev build launched. The file NAME stays the same
+    /// (process identification matches on it).
     static var sharedScriptPath: String {
-        "\(NSHomeDirectory())/.local/bin/synctray-sync.sh"
+        #if DEBUG
+        return "\(NSHomeDirectory())/.local/bin/synctray-dev/synctray-sync.sh"
+        #else
+        return "\(NSHomeDirectory())/.local/bin/synctray-sync.sh"
+        #endif
     }
 
     /// Profile config directory

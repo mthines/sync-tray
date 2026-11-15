@@ -914,17 +914,18 @@ account `rclone.conf`) and never in a profile file, plist, log, telemetry or arg
   same-user process can already read `rclone.conf`'s encrypted blob, drive launchd, and run rclone
   as the user); the encryption protects the file at rest and when copied elsewhere, not against
   code already running as the user. An unsigned dev build may show a Keychain prompt once.
-- **A dev build repoints the shared script.** The generated script embeds the launching binary's
-  path in `RCLONE_PASSWORD_COMMAND`, and `~/.local/bin/synctray-sync.sh` is shared by release and
-  dev builds and rewritten whenever its content differs. After a Debug build is launched against
-  your real home, scheduled runs call the dev binary (and its `.dev` Keychain item) until the
-  release app is launched again and rewrites the script. Run dev builds with a sandbox home
-  (`HOME` + `CFFIXED_USER_HOME`) when you have an encrypted config and real profiles.
+- **Dev and release builds have separate shared scripts.** The generated script embeds the
+  launching binary's path in `RCLONE_PASSWORD_COMMAND`, so a script shared by both would send the
+  release profiles' scheduled runs to a dev binary (and its `.dev` Keychain item) whenever a Debug
+  build launched. `SyncProfile.sharedScriptPath` is therefore
+  `~/.local/bin/synctray-dev/synctray-sync.sh` in Debug builds and `~/.local/bin/synctray-sync.sh`
+  in Release; the file NAME is the same (process identification matches on it). Agents a dev build
+  installs point at the dev script; the release agents are never touched by it.
 - **Never block the main thread on it.** `readRemoteConfig`/`listRemotes` run rclone (and so the
   password command) on an encrypted config. View-body code uses the non-blocking
   `cachedRemoteConfig`; the wizard, `AddRemoteSheet` and `ProviderFieldsView` read off the main
-  thread. `computeFallbackRequiresCacheRebuild` (profile install) still reads synchronously, on
-  the caller's thread, only for profiles with a fallback.
+  thread; `computeFallbackRequiresCacheRebuild` (profile install) uses `cachedRemoteConfig` on the
+  main thread and treats a cold cache as "unreadable" (the safe REMOTE-swap default).
 - **No direct parsing of an encrypted file.** `RcloneConfigService.configIsEncrypted()` looks for the
   `RCLONE_ENCRYPT_V0:` marker (rclone writes a comment line before it). When set, `readRemoteConfig`
   and telemetry's `readConfigContents` read `rclone config dump` instead (`dumpConfig`, cached 5 s),
@@ -2190,7 +2191,7 @@ collecting never sends, a retry after a failed send never re-sends).
 | `~/.config/synctray/profiles/{shortId}-exclude.txt` | Exclude filter (user-editable; SyncTray owns two managed blocks — the "Don't Sync" exclude block at the TOP and, when `syncIncludeFolders` is non-empty, the "Sync Only These Folders" include block at the BOTTOM) |
 | `~/.config/synctray/profiles/{shortId}.resync-pending` | Two-Way (bisync) profiles only, created only when `syncIncludeFolders` changes (or once by migration v5, for a profile whose folder holds a Photos library, by migration v6 or v7, for one whose bisync listings hold a volume system folder, or by migration v8, for one holding a Photo Booth library) — a UUID token the sync script reads to schedule a safe `--resync --resync-mode newer` instead of a plain bisync, removed only after every required bisync session (see `.resync-pending.consumed`) has consumed it with an unchanged token |
 | `~/.config/synctray/profiles/{shortId}.resync-pending.consumed` | Two-Way (bisync) profiles only — per-token record of which bisync session(s) have already run their one-time resync for the current `.resync-pending` token; deleted together with the marker once every required session (primary, and the fallback's own session on a full remote swap) has consumed it |
-| `~/.local/bin/synctray-sync.sh` | Shared sync script (all profiles) |
+| `~/.local/bin/synctray-sync.sh` | Shared sync script (all profiles). Debug builds use `~/.local/bin/synctray-dev/synctray-sync.sh` instead |
 | `~/Library/LaunchAgents/com.synctray.sync.{shortId}.plist` | launchd schedule |
 | `~/.local/log/synctray-sync-{shortId}.log` | Sync logs. `~/.local/log` and `~/.config/synctray/profiles/` are created owner-only (0700) — the logs name every synced file, the profile JSON names remotes, local paths and extra rclone flags — and a directory an earlier version left 0755 is tightened at launch (`SyncSetupService.tightenPrivateDirectoriesIfLoose`). Covered by `ConfigSelfTest` AC-SEC5. |
 | `/tmp/synctray-sync-{shortId}.lock` | Lock file (prevents concurrent syncs) |

@@ -2815,8 +2815,15 @@ extension SyncSetupService {
         let fallbackName = profile.fallbackRemote.hasSuffix(":")
             ? String(profile.fallbackRemote.dropLast())
             : profile.fallbackRemote
-        guard let primaryConfig = configService.readRemoteConfig(name: primaryName),
-              let fallbackConfig = configService.readRemoteConfig(name: fallbackName) else {
+        // On the main thread (an install started from the UI) an encrypted config must not run
+        // `rclone config dump` here: serve the last dump the editor already warmed, and treat
+        // a cold cache like an unreadable config (the safe default below).
+        func read(_ name: String) -> RemoteConfiguration? {
+            Thread.isMainThread ? configService.cachedRemoteConfig(name: name)
+                                : configService.readRemoteConfig(name: name)
+        }
+        guard let primaryConfig = read(primaryName),
+              let fallbackConfig = read(fallbackName) else {
             // Cannot read config — default to safe behaviour (force REMOTE swap, no cache poisoning)
             return true
         }
