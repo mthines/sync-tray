@@ -10007,6 +10007,15 @@ enum ConfigSelfTest {
             ("Duplicate object found in source - ignoring", "duplicate_object"),
             ("Duplicate directory found in destination - ignoring", "duplicate_object"),
             ("Failed to rmdir: remove /Users/me/Sync/old: directory not empty", "directory_not_empty"),
+            // bisync's --max-delete safety abort, as `--use-json-log` puts it in `msg` (rclone logs
+            // "Safety abort" as the object), its rename-aware variant and the run's closing notice.
+            ("too many deletes (>50%, 12 of 20) on Path1 \"sftp:Obsidian/.obsidian\". Run with --force if desired.", "too_many_deletes"),
+            ("too many deletes (>50%, 12 of 20 after excluding 2 tracked renames) on Path2 \"/Users/me/Sync\". Run with --force if desired.", "too_many_deletes"),
+            ("Failed to bisync: too many deletes", "too_many_deletes"),
+            // Ahead of the critical and transient checks: a quoted path with their words, or a
+            // "Safety abort:" prefix, doesn't move it to out_of_sync / critical / transient.
+            ("too many deletes (>50%, 3 of 4) on Path1 \"nas:critical/resync-notes\". Run with --force if desired.", "too_many_deletes"),
+            ("Safety abort: too many deletes (>50%, 3 of 4) on Path2 \"/Users/me/Sync\". Run with --force if desired.", "too_many_deletes"),
             // More network / timeout phrasings.
             ("Failed to copy: Post \"https://www.googleapis.com/upload\": dial tcp: lookup www.googleapis.com: no such host", "network"),
             ("Failed to copy: read tcp 10.0.0.2:52311->142.250.0.1:443: read: connection reset by peer", "network"),
@@ -10087,6 +10096,11 @@ enum ConfigSelfTest {
             ("open /Users/me/Sync/mkdir.sh: permission denied", "other"),
             ("RenameDir mkdir: permission denied", "mkdir"),
             ("mkdir metadata: failed make directory: permission denied", "mkdir"),
+            // bisync's safety abort runs no operation: neither its "deletes" nor an operation
+            // word in the path it quotes makes it a failed delete (or copy).
+            ("too many deletes (>50%, 12 of 20) on Path1 \"sftp:Obsidian/.obsidian\". Run with --force if desired.", "other"),
+            ("Failed to bisync: too many deletes", "other"),
+            ("too many deletes (>50%, 3 of 4) on Path1 \"nas:To Delete/copy\". Run with --force if desired.", "other"),
             ("something unexpected happened", "other"),
             (nil, "other"),
         ]
@@ -10095,6 +10109,38 @@ enum ConfigSelfTest {
             guard got == expected else {
                 return report(name, slug, false, "(categorizeErrorOperation(\(input.debugDescription)) = \(got), expected \(expected))")
             }
+        }
+
+        // The shared predicate behind the bucket and the banner's Force Sync offer: only the
+        // safety abort, in any case — not a failed delete, nor rclone's IO-error delete notice.
+        let tooManyDeletes: [(String, Bool)] = [
+            ("too many deletes (>50%, 12 of 20) on Path1 \"sftp:Obsidian/.obsidian\". Run with --force if desired.", true),
+            ("Failed to bisync: too many deletes", true),
+            ("Failed to bisync: Too Many Deletes", true),
+            ("Couldn't delete: remove /Users/me/Sync/old.txt: permission denied", false),
+            ("Failed to sync with 2 errors: last error was: not deleting files as there were IO errors", false),
+            ("Bisync critical error: out of sync - must run --resync", false),
+        ]
+        for (input, expected) in tooManyDeletes where SyncLogPatterns.isTooManyDeletesError(input) != expected {
+            return report(name, slug, false, "(isTooManyDeletesError(\(input.debugDescription)) != \(expected))")
+        }
+
+        // The banner checks the safety abort first too, so a quoted path holding "not empty",
+        // "--resync" or "out of sync" still offers Force Sync — the action that matches the
+        // `too_many_deletes` telemetry reports. `detectErrorAction` is a private view method,
+        // so this pins its order in the source: the function's first `if` is the abort check,
+        // which catches a branch added above it whether it matches a substring or a
+        // `SyncLogPatterns` predicate.
+        guard let viewSource = readSourceFile("Views/Settings/ProfileDetailView.swift"),
+              let detectFn = extractFunctionBody(startingAt: "private func detectErrorAction(from error: String)", in: viewSource) else {
+            return report(name, slug, false, "(could not read detectErrorAction)")
+        }
+        let firstIf = detectFn.components(separatedBy: "\n")
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .first { $0.hasPrefix("if ") }
+        guard firstIf == "if SyncLogPatterns.isTooManyDeletesError(error) {",
+              detectFn.components(separatedBy: "isTooManyDeletesError(").count == 2 else {
+            return report(name, slug, false, "(detectErrorAction no longer checks the too-many-deletes abort first)")
         }
         return report(name, slug, true)
     }

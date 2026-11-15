@@ -2056,9 +2056,13 @@ lock files, rclone.conf and `ps` read off the main actor, only when telemetry is
   not `file_not_found`; a token refresh that timed out is `timeout`, not `auth_failed`). A
   message the old buckets matched keeps its bucket unless it also names a more specific cause
   (e.g. a rate-limit or auth phrase), which now wins; besides that, Go's "directory not empty"
-  moved from `critical` to `directory_not_empty` (AC-TS2). The `Sync error` log and
+  moved from `critical` to `directory_not_empty` (AC-TS2). bisync's `--max-delete` safety abort
+  ("too many deletes …", `SyncLogPatterns.isTooManyDeletesError`, the same match that offers the
+  banner's Force Sync) is `too_many_deletes`, checked before everything else — in
+  `categorizeError` and in the banner's `detectErrorAction` alike — since the message quotes a
+  remote path; it used to be `other`. The `Sync error` log and
   the `Sync failed` log and span also carry `error.operation`: `copy` / `delete` / `move` /
-  `list` / `mkdir` / `other`.
+  `list` / `mkdir` / `other` (the safety abort is `other`: bisync runs no operation before it).
 - A failed mount or unmount carries `error.type` too (`categorizeMountFailure`: the mount-only
   `mount_point_not_empty`, `mount_backend_unavailable`, `cache_dir_unwritable`, `rc_port_in_use`
   and `mount_failed`, otherwise the sync buckets), plus `mount.failure_stage` — `agent_start`,

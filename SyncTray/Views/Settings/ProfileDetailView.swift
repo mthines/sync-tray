@@ -4000,10 +4000,20 @@ struct ProfileDetailView: View {
     }
 
     private func detectErrorAction(from error: String) -> ErrorAction? {
+        // Too many deletes - offer force sync to override safety limit. First, like
+        // `TelemetryService.categorizeError`'s `too_many_deletes` bucket: the abort quotes a
+        // remote path, and words in it ("not empty", "--resync", "out of sync", …) would
+        // otherwise reach the checks below and offer a different action than the one telemetry
+        // reports. Pinned by AC-TS2.
+        if SyncLogPatterns.isTooManyDeletesError(error) {
+            return .forceSync
+        }
+
         // Encrypted rclone.conf that rclone couldn't open: the password lives in Settings
         if SyncLogPatterns.isRcloneConfigPasswordError(error) {
             return .openRclonePasswordSettings
         }
+
         // Mount mode: folder is not empty
         if error.contains("is not empty") || error.contains("not empty") {
             return .mountAnyway
@@ -4034,11 +4044,6 @@ struct ProfileDetailView: View {
         // (unlock → cleanup → --resync) is the correct recovery.
         if error.contains("Access test failed") {
             return .smartFix
-        }
-
-        // Too many deletes - offer force sync to override safety limit
-        if error.contains("too many deletes") {
-            return .forceSync
         }
 
         // Generic bisync errors - offer smart fix

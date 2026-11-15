@@ -206,7 +206,8 @@ session `.lck` (`SyncRunLock.lockState`, pure):
 ## Error categories
 
 `error.type` (`TelemetryService.categorizeError`, pure) is a bounded bucket of an error
-message; the message itself never leaves the machine. Order: the `SyncLogPatterns` checks
+message; the message itself never leaves the machine. Order: `too_many_deletes`, then the
+`SyncLogPatterns` checks
 (`interrupted`, `out_of_sync`/`critical`, `transient_all_files_changed`, `exclusive_mode_unsupported`,
 `permission_denied` for EPERM, `io_errors_blocked_deletes`), then the specific buckets of
 `TelemetryService.specificErrorBuckets` (lowercased, first match wins), then the original
@@ -227,6 +228,7 @@ run's first error. Crash signals (134, 139) are not a stop.
 
 | Bucket | Matches (lowercased) |
 |--------|----------------------|
+| `too_many_deletes` | "too many deletes" (`SyncLogPatterns.isTooManyDeletesError`, the same match that offers the banner's Force Sync, which `ProfileDetailView.detectErrorAction` also checks first — pinned by AC-TS2) — bisync's `--max-delete` safety abort: more than 50% of the prior listing is gone on one side, so bisync stops before changing anything ("too many deletes (>50%, 12 of 20) on Path1 \"remote:path\". Run with --force if desired.", then "Failed to bisync: too many deletes"), and repeats on every run until a run with `--force` or until the files come back. rclone logs it with "Safety abort" as the log object, which `--use-json-log` keeps out of `msg`. Checked first, because the message quotes a remote path whose words ("…/resync-test", "…/critical") or a "Safety abort:" prefix would otherwise reach the critical and transient checks. Used to fall through to `other` |
 | `interrupted` | "context canceled" (Go's `context.Canceled`, what rclone's transfers fail with at ERROR when a signal cancels them) and "bisync interrupted" (bisync's NOTICE "Bisync interrupted. Must run --resync to recover." when its graceful shutdown fails; `LogParser` never surfaces a NOTICE line, so it arrives only as the stored error `readLastErrorFromLog` reads back for a run picked up from its lock, which `Profile status` categorizes) — ahead of the critical check, whose "resync" would claim it; plus a stop signal's exit code on a failed run (above). rclone's "Signal received:" (INFO) and bisync's "Graceful shutdown failed." (NOTICE, always logged just before the interrupted line, where that backwards scan stops) reach `categorizeError` on no path, so they are not matched; levels as of rclone v1.73.2. Not "context deadline exceeded", which stays `timeout`. Caveat: rclone also logs "context canceled" for transfers it cancels after another error, and for Stream reads the NFS client abandons, so a single `Sync error` line can read `interrupted` without a stop; a failed run is categorized from its first error, which comes before those |
 | `disk_full` | "no space left on device" |
 | `rate_limited` | "ratelimitexceeded", "userratelimitexceeded", "rate limit exceeded", "too many requests" — before `quota_exceeded`, since Google's per-minute limit says "Quota exceeded … rateLimitExceeded" |
@@ -294,7 +296,9 @@ listing"/"failed to list"/"error reading source/destination directory" (rclone's
 errors, root directory included), "failed to rmdir" (rclone's rmdir/rmdirs failures, labelled
 `delete`), "mkdir" as a word (Go's "mkdir <path>:", rclone's "… mkdir:") or "make directory"), the
 bare words "copy"/"delete"/"listing" last, since a file path in the message can contain them.
-Log/span only — never a metric label.
+bisync's "too many deletes" safety abort is `other` ahead of all of these: bisync aborts before
+running any operation, so neither its "deletes" nor the remote path it quotes names one (it used
+to read as `delete`). Log/span only — never a metric label.
 
 ## Rules
 
