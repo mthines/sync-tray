@@ -3026,9 +3026,27 @@ struct ProfileDetailView: View {
     /// - Pre-fill suggested path when one applies
     private func applyFallbackAutoConfig() {
         guard !fallbackRemote.isEmpty, !rcloneRemote.isEmpty else { return }
-        let primaryType = rcloneType(for: rcloneRemote)
-        let fallbackType = rcloneType(for: fallbackRemote)
+        // Resolve both types off the main thread with a real (blocking) read: on an encrypted
+        // config that runs `rclone config dump`, and the render-path cache can be empty right
+        // after a remote was added. Apply the result back on main if the selection still stands.
+        let primaryName = rcloneRemote
+        let fallbackName = fallbackRemote
+        DispatchQueue.global(qos: .userInitiated).async {
+            func type(_ name: String) -> String? {
+                let bare = name.hasSuffix(":") ? String(name.dropLast()) : name
+                guard !bare.isEmpty else { return nil }
+                return RcloneConfigService.shared.readRemoteConfig(name: bare)?.provider.rcloneType
+            }
+            let primaryType = type(primaryName)
+            let fallbackType = type(fallbackName)
+            DispatchQueue.main.async {
+                guard self.rcloneRemote == primaryName, self.fallbackRemote == fallbackName else { return }
+                self.applyFallbackAutoConfig(primaryType: primaryType, fallbackType: fallbackType)
+            }
+        }
+    }
 
+    private func applyFallbackAutoConfig(primaryType: String?, fallbackType: String?) {
         guard let primary = primaryType, let fallback = fallbackType else { return }
 
         // Mount mode shares one VFS cache across both remotes, so the fallback must resolve

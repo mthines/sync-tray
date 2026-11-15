@@ -75,6 +75,7 @@ final class RcloneConfigService {
     }
 
     private var dumpRefreshInFlight = false
+    private var lastDumpRefreshStart = Date.distantPast
 
     /// `readRemoteConfig` for code that runs while a SwiftUI view renders. On an encrypted
     /// config it never waits for rclone: it serves the last dump (whatever its age) and
@@ -84,9 +85,16 @@ final class RcloneConfigService {
         guard configIsEncrypted() else { return readRemoteConfig(name: name) }
         dumpLock.lock()
         let cached = cachedDump
-        let stale = cached.map { Date().timeIntervalSince($0.at) >= 5 } ?? true
-        let startRefresh = stale && !dumpRefreshInFlight
-        if startRefresh { dumpRefreshInFlight = true }
+        // A view re-renders on every state change, so refresh rarely: at most once a minute,
+        // and never within 30 s of the last attempt (a failed dump caches nothing, so without
+        // that, "no password stored" would re-run the password command on every render).
+        let age = cached.map { Date().timeIntervalSince($0.at) } ?? .infinity
+        let sinceAttempt = Date().timeIntervalSince(lastDumpRefreshStart)
+        let startRefresh = !dumpRefreshInFlight && sinceAttempt >= 30 && age >= 60
+        if startRefresh {
+            dumpRefreshInFlight = true
+            lastDumpRefreshStart = Date()
+        }
         dumpLock.unlock()
         if startRefresh {
             DispatchQueue.global(qos: .utility).async { [weak self] in
@@ -103,6 +111,7 @@ final class RcloneConfigService {
     private func invalidateDumpCache() {
         dumpLock.lock()
         cachedDump = nil
+        lastDumpRefreshStart = .distantPast  // an edit makes the next lookup refresh at once
         dumpLock.unlock()
     }
 
