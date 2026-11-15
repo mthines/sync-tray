@@ -1337,7 +1337,8 @@ extension SyncSetupService {
     /// generated script IS the test for the mount branch's mode-selection and command logic.
     func generateSyncScript() -> String {
         // How rclone gets the config password of an encrypted rclone.conf with no terminal.
-        // Doubly quoted: the command itself already single-quotes the executable path.
+        // Shell-quoted once more here: the command itself already double-quotes the executable
+        // path for rclone's own argument splitting.
         let passwordCommandExport = RcloneConfigPassword.currentExecutablePath.map {
             "export RCLONE_PASSWORD_COMMAND=" + RcloneConfigPassword.shellQuote(
                 RcloneConfigPassword.passwordCommand(executablePath: $0))

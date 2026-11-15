@@ -74,6 +74,32 @@ final class RcloneConfigService {
         return remotes
     }
 
+    private var dumpRefreshInFlight = false
+
+    /// `readRemoteConfig` for code that runs while a SwiftUI view renders. On an encrypted
+    /// config it never waits for rclone: it serves the last dump (whatever its age) and
+    /// refreshes it in the background, so the main thread never blocks on `config dump` and
+    /// the password command. Returns nil until the first dump has landed.
+    func cachedRemoteConfig(name: String) -> RemoteConfiguration? {
+        guard configIsEncrypted() else { return readRemoteConfig(name: name) }
+        dumpLock.lock()
+        let cached = cachedDump
+        let stale = cached.map { Date().timeIntervalSince($0.at) >= 5 } ?? true
+        let startRefresh = stale && !dumpRefreshInFlight
+        if startRefresh { dumpRefreshInFlight = true }
+        dumpLock.unlock()
+        if startRefresh {
+            DispatchQueue.global(qos: .utility).async { [weak self] in
+                _ = self?.dumpConfig()
+                self?.dumpLock.lock()
+                self?.dumpRefreshInFlight = false
+                self?.dumpLock.unlock()
+            }
+        }
+        guard var values = cached?.remotes[name], let type = values.removeValue(forKey: "type") else { return nil }
+        return Self.remoteConfiguration(name: name, rcloneType: type, values: values)
+    }
+
     private func invalidateDumpCache() {
         dumpLock.lock()
         cachedDump = nil
@@ -164,11 +190,12 @@ final class RcloneConfigService {
         return []
     }
 
-    /// Remote names from `rclone listremotes` stdout: only lines of the form `name:`.
+    /// Remote names from `rclone listremotes` stdout: only lines of the form `name:`. Names may
+    /// contain spaces. Callers pass stdout only, after an exit-0 check, so error text never gets here.
     static func parseRemoteNames(_ output: String) -> [String] {
         output.components(separatedBy: .newlines)
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .filter { $0.hasSuffix(":") && $0.count > 1 && !$0.contains(" ") }
+            .filter { $0.hasSuffix(":") && $0.count > 1 }
             .map { String($0.dropLast()) }
     }
 
@@ -181,7 +208,8 @@ final class RcloneConfigService {
     /// Add a new remote to rclone config
     func addRemote(_ config: RemoteConfiguration) throws {
         if configIsEncrypted() {
-            if listRemotes().contains(config.name) { throw ConfigError.remoteAlreadyExists(config.name) }
+            // `rclone config create` silently REPLACES an existing remote, so refuse here.
+            if remoteExists(config.name) { throw ConfigError.remoteAlreadyExists(config.name) }
             var configToWrite = config
             obscurePasswordFields(&configToWrite)
             try configCreateOrUpdate("create", configToWrite)
@@ -421,9 +449,8 @@ final class RcloneConfigService {
     /// Update an existing remote (delete old config section, write new one)
     func updateRemote(_ config: RemoteConfiguration) throws {
         if configIsEncrypted() {
-            // `config update` only changes the keys it is given, so drop the section first to
-            // keep "delete + rewrite" semantics (a cleared field must really go away).
-            try deleteRemote(config.name)
+            // `config create` replaces the whole section, so a cleared field really goes away.
+            // No delete first: if `create` failed or timed out, the remote would be lost.
             var configToWrite = config
             obscurePasswordFields(&configToWrite)
             try configCreateOrUpdate("create", configToWrite)

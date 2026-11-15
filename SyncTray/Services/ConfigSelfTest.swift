@@ -3867,10 +3867,11 @@ enum ConfigSelfTest {
                 return report(name, slug, false, "(false positive: \(message))")
             }
         }
-        // The remote dropdown once listed rclone's error lines as remotes.
-        guard RcloneConfigService.parseRemoteNames("gdrive:\nsyn-sftp:\n") == ["gdrive", "syn-sftp"],
-              RcloneConfigService.parseRemoteNames(hits.joined(separator: "\n")).isEmpty else {
-            return report(name, slug, false, "(parseRemoteNames accepted error text as remotes)")
+        // Remote names may contain spaces (rclone allows them); lines that aren't `name:` are
+        // not remotes. Error text is kept out by reading stdout only after an exit-0 check.
+        guard RcloneConfigService.parseRemoteNames("gdrive:\nsyn-sftp:\nmy nas:\n") == ["gdrive", "syn-sftp", "my nas"],
+              RcloneConfigService.parseRemoteNames("not a remote\n:\n").isEmpty else {
+            return report(name, slug, false, "(parseRemoteNames wrong)")
         }
         let raw = hits.joined(separator: "\n")
         guard SyncLogPatterns.friendlyRcloneError(raw) == SyncLogPatterns.rcloneConfigPasswordHint,

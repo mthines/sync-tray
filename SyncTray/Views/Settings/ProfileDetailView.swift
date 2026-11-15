@@ -2943,7 +2943,8 @@ struct ProfileDetailView: View {
     private func rcloneType(for remoteName: String) -> String? {
         let bare = remoteName.hasSuffix(":") ? String(remoteName.dropLast()) : remoteName
         guard !bare.isEmpty else { return nil }
-        return RcloneConfigService.shared.readRemoteConfig(name: bare)?.provider.rcloneType
+        // Called while the view renders: must never block on rclone (encrypted configs).
+        return RcloneConfigService.shared.cachedRemoteConfig(name: bare)?.provider.rcloneType
     }
 
     /// Heuristic: given a primary path under a primary protocol, suggest a fallback path
