@@ -334,12 +334,22 @@ struct AddRemoteSheet: View {
 
     private func loadExistingRemote() {
         step = .credentials
-        guard let remoteName = editingRemoteName,
-              let existing = configService.readRemoteConfig(name: remoteName) else {
-            errorMessage = "Could not load remote configuration for \"\(editingRemoteName ?? "unknown")\""
+        guard let remoteName = editingRemoteName else {
+            errorMessage = "Could not load remote configuration for \"unknown\""
             return
         }
-        remoteConfig = existing
+        // Off the main thread: on an encrypted config this runs `rclone config dump`.
+        let service = configService
+        DispatchQueue.global(qos: .userInitiated).async {
+            let existing = service.readRemoteConfig(name: remoteName)
+            DispatchQueue.main.async {
+                guard let existing else {
+                    errorMessage = "Could not load remote configuration for \"\(remoteName)\""
+                    return
+                }
+                remoteConfig = existing
+            }
+        }
     }
 
     private func startOAuth() {

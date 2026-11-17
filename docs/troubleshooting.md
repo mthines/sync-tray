@@ -105,6 +105,16 @@ When Cache Only can't build its list of partly cached files, the mount falls bac
 `synctray status <name>` shows `cache_only_fallback=true` in that case, and the sync log says "Cache Only unavailable".
 Before switching, `synctray offline status <name>` shows how much of the profile is cached.
 
+## Syncs fail with "unable to decrypt configuration"
+
+Your `rclone.conf` is encrypted (`rclone config encryption`), and scheduled syncs and mounts have no terminal to ask for its password.
+Store the password once: **Settings → Encrypted rclone config**, or `synctray rclone-password set` (it asks without echoing and refuses a password that doesn't decrypt the config).
+SyncTray keeps it in your macOS Keychain and hands rclone a `RCLONE_PASSWORD_COMMAND` that asks SyncTray for it, so it never lands in a profile, plist, log or process argument.
+`synctray doctor` shows an `rclone config` line that fails until rclone can open the file.
+
+If you already supply `RCLONE_CONFIG_PASS` or your own `RCLONE_PASSWORD_COMMAND`, SyncTray leaves it alone. launchd jobs don't see your shell's environment, so for scheduled runs store the password in SyncTray.
+A development build isn't signed like the release, so macOS may ask once whether it may read the Keychain item.
+
 ## The Finder "Available Offline" menu is missing
 
 1. Enable the extension once under **System Settings → General → Login Items & Extensions → Extensions** (it's listed as **SyncTray Offline**).

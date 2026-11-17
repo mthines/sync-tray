@@ -124,6 +124,12 @@ enum ConfigSelfTest {
             testAdditionalFlagsSplitting,
             testRCAPIAuthenticated,
             testShimQuotesExecutablePath,
+            testEncryptedConfigDetectionAndEnvironment,
+            testPasswordCommandQuoting,
+            testScriptExportsPasswordCommand,
+            testEncryptedConfigRealRclone,
+            testRclonePasswordCLI,
+            testEncryptedConfigErrorHandling,
             testMountModeFileNotInSharedTmp,
             testLogAndProfileDirsOwnerOnly,
             testCacheOnlyOverlayOwnerOnly,
@@ -2048,6 +2054,7 @@ enum ConfigSelfTest {
             VFSCacheService.WarmEstimate(files: 0, bytes: 0, cachedFiles: 0, cachedBytes: 0)
         },
         remoteSkipsCertCheck: @escaping (String) -> Bool = { _ in false },
+        rclonePassword: RclonePasswordAccess = .inert,
         telemetryConsent: @escaping () -> TelemetryConsentState = { TelemetryConsentState(enabled: false, answered: true) },
         setTelemetryEnabled: @escaping (Bool) -> Void = { _ in },
         isInteractiveTerminal: @escaping () -> Bool = { false },
@@ -2083,6 +2090,7 @@ enum ConfigSelfTest {
             probeMount: probeMount,
             warmEstimate: warmEstimate,
             remoteSkipsCertCheck: remoteSkipsCertCheck,
+            rclonePassword: rclonePassword,
             telemetryConsent: telemetryConsent,
             setTelemetryEnabled: setTelemetryEnabled,
             isInteractiveTerminal: isInteractiveTerminal,
@@ -4065,6 +4073,271 @@ enum ConfigSelfTest {
         }
         guard !fm.fileExists(atPath: marker) else {
             return report(name, slug, false, "(the executable path was executed as shell code)")
+        }
+        return report(name, slug, true)
+    }
+
+
+    // MARK: - AC-EC1…EC5 — encrypted rclone.conf
+
+    /// AC-EC1: an encrypted config is recognised (rclone writes a comment line BEFORE the
+    /// marker), and the password environment never overrides one the user already supplies.
+    private static func testEncryptedConfigDetectionAndEnvironment() -> Bool {
+        let name = "AC-EC1", slug = "encrypted-config-detection-and-env"
+        let encrypted = "# Encrypted rclone configuration File\n\nRCLONE_ENCRYPT_V0:\nabc\n"
+        guard RcloneConfigPassword.isEncrypted(configContents: encrypted),
+              RcloneConfigPassword.isEncrypted(configContents: "RCLONE_ENCRYPT_V0:\nabc"),
+              !RcloneConfigPassword.isEncrypted(configContents: "[drive]\ntype = drive\n"),
+              !RcloneConfigPassword.isEncrypted(configContents: "") else {
+            return report(name, slug, false, "(isEncrypted misclassified a fixture)")
+        }
+        let exe = "/Applications/SyncTray.app/Contents/MacOS/SyncTray"
+        let added = RcloneConfigPassword.environment(base: ["PATH": "/bin"], executablePath: exe)
+        guard added["RCLONE_PASSWORD_COMMAND"] == "\"\(exe)\" rclone-password get" else {
+            return report(name, slug, false, "(command not added: \(added))")
+        }
+        let withPass = RcloneConfigPassword.environment(base: ["RCLONE_CONFIG_PASS": "x"], executablePath: exe)
+        let withCommand = RcloneConfigPassword.environment(base: ["RCLONE_PASSWORD_COMMAND": "pass show rclone"], executablePath: exe)
+        guard withPass["RCLONE_PASSWORD_COMMAND"] == nil,
+              withCommand["RCLONE_PASSWORD_COMMAND"] == "pass show rclone" else {
+            return report(name, slug, false, "(a user-supplied password was overridden)")
+        }
+        guard RcloneConfigPassword.environment(base: [:], executablePath: nil)["RCLONE_PASSWORD_COMMAND"] == nil else {
+            return report(name, slug, false, "(command added without an executable path)")
+        }
+        return report(name, slug, true)
+    }
+
+    /// AC-EC2: rclone itself runs the password command (no shell), so drive the REAL rclone:
+    /// a stub at a hostile path (spaces, `'`, `"`, `$(…)`) must receive `rclone-password get`
+    /// verbatim, hand back the password that decrypts a fixture config, and execute nothing.
+    private static func testPasswordCommandQuoting() -> Bool {
+        let name = "AC-EC2", slug = "password-command-runs-in-real-rclone"
+        guard let rclone = RcloneLocator.resolve() else {
+            return report(name, slug, true, "(skipped: rclone not installed)")
+        }
+        let fm = FileManager.default
+        let root = "\(selfTestRoot)/ec2-\(UUID().uuidString)"
+        let appDir = "\(root)/a b'c\"d$(touch PWNED)`touch PWNED`"
+        let executable = "\(appDir)/SyncTray"
+        let argsLog = "\(root)/args.log"
+        let script = "#!/bin/sh\nprintf '%s ' \"$@\" > '\(argsLog)'\necho ec2-password\n"
+        guard (try? fm.createDirectory(atPath: appDir, withIntermediateDirectories: true)) != nil,
+              (try? script.write(toFile: executable, atomically: true, encoding: .utf8)) != nil,
+              (try? fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: executable)) != nil else {
+            return report(name, slug, false, "(could not create the stub)")
+        }
+        let conf = "\(root)/rclone.conf"
+        func run(_ args: [String], env extra: [String: String], stdin: String? = nil) -> (Int32, String) {
+            let proc = RcloneProcess.make(rclonePath: rclone, arguments: args, extraEnv: extra)
+            let out = Pipe()
+            proc.standardOutput = out
+            proc.standardError = out
+            let input = Pipe()
+            proc.standardInput = input
+            proc.currentDirectoryURL = URL(fileURLWithPath: root)
+            guard (try? proc.run()) != nil else { return (-1, "") }
+            if let stdin { input.fileHandleForWriting.write(Data(stdin.utf8)) }
+            try? input.fileHandleForWriting.close()
+            let data = out.fileHandleForReading.readDataToEndOfFile()
+            proc.waitUntilExit()
+            return (proc.terminationStatus, String(decoding: data, as: UTF8.self))
+        }
+        let setup = ["RCLONE_CONFIG": conf, "RCLONE_PASSWORD_COMMAND": "echo ec2-password"]
+        guard run(["config", "create", "loc", "alias", "remote=/tmp"], env: setup).0 == 0,
+              run(["config", "encryption", "set"], env: setup, stdin: "ec2-password\nec2-password\n").0 == 0 else {
+            return report(name, slug, false, "(could not build an encrypted fixture)")
+        }
+        // The production command string, with RCLONE_PASSWORD_COMMAND built exactly as the app does.
+        let env = RcloneConfigPassword.environment(base: ["RCLONE_CONFIG": conf], executablePath: executable)
+        let dump = run(["config", "dump"], env: ["RCLONE_CONFIG": conf,
+            "RCLONE_PASSWORD_COMMAND": env["RCLONE_PASSWORD_COMMAND"] ?? ""])
+        guard dump.0 == 0, dump.1.contains("\"loc\"") else {
+            return report(name, slug, false, "(rclone could not run the password command: \(dump.1))")
+        }
+        guard (try? String(contentsOfFile: argsLog, encoding: .utf8)) == "rclone-password get " else {
+            return report(name, slug, false, "(stub got unexpected args)")
+        }
+        guard !fm.fileExists(atPath: "\(root)/PWNED") else {
+            return report(name, slug, false, "(the path was executed as shell code)")
+        }
+        return report(name, slug, true)
+    }
+
+    /// AC-EC3: the generated script exports the password command (so launchd runs can open
+    /// an encrypted config), yields to a user-supplied password, and no longer greps the
+    /// rclone.conf file for `no_check_certificate` (it reads `config dump`).
+    private static func testScriptExportsPasswordCommand() -> Bool {
+        let name = "AC-EC3", slug = "script-exports-password-command"
+        let script = SyncSetupService.shared.generateSyncScript()
+        guard !script.contains("done < \"$rclone_conf\""), script.contains("config dump 2>/dev/null | python3") else {
+            return report(name, slug, false, "(check_no_cert still reads rclone.conf as text)")
+        }
+        let profile = mountFixtureProfile(
+            localPath: "\(selfTestRoot)/ec3-mnt", cachePath: "\(selfTestRoot)/ec3-cache")
+        unsetenv("RCLONE_CONFIG_PASS")
+        unsetenv("RCLONE_PASSWORD_COMMAND")
+        let plain = dryRunMountScript(profile: profile, rcloneConfig: "")
+        guard plain.output.contains("SYNCTRAY_DRY_RUN_PASSWORD_COMMAND=set") else {
+            return report(name, slug, false, "(no password command exported: \(plain.output))")
+        }
+        setenv("RCLONE_CONFIG_PASS", "user-supplied", 1)
+        let supplied = dryRunMountScript(profile: profile, rcloneConfig: "")
+        unsetenv("RCLONE_CONFIG_PASS")
+        guard !supplied.output.contains("SYNCTRAY_DRY_RUN_PASSWORD_COMMAND=set") else {
+            return report(name, slug, false, "(overrode the user's RCLONE_CONFIG_PASS)")
+        }
+        return report(name, slug, true)
+    }
+
+    /// AC-EC4: with REAL rclone — an encrypted config opens through the password command,
+    /// `config dump` yields the remote's type, and the shared builder rebuilds a
+    /// `RemoteConfiguration` from it. A locked config without a password fails.
+    private static func testEncryptedConfigRealRclone() -> Bool {
+        let name = "AC-EC4", slug = "encrypted-config-real-rclone"
+        guard let rclone = RcloneLocator.resolve() else {
+            return report(name, slug, true, "(skipped: rclone not installed)")
+        }
+        let dir = "\(selfTestRoot)/ec4-\(UUID().uuidString)"
+        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        let conf = "\(dir)/rclone.conf"
+        func run(_ args: [String], env extra: [String: String], stdin: String? = nil) -> (Int32, String) {
+            let proc = RcloneProcess.make(rclonePath: rclone, arguments: args, extraEnv: extra)
+            let out = Pipe()
+            proc.standardOutput = out
+            proc.standardError = Pipe()
+            let input = Pipe()
+            proc.standardInput = input
+            guard (try? proc.run()) != nil else { return (-1, "") }
+            if let stdin { input.fileHandleForWriting.write(Data(stdin.utf8)) }
+            try? input.fileHandleForWriting.close()
+            let data = out.fileHandleForReading.readDataToEndOfFile()
+            proc.waitUntilExit()
+            return (proc.terminationStatus, String(decoding: data, as: UTF8.self))
+        }
+        // `echo` is the fixture password command; the real Keychain is never touched.
+        let base = ["RCLONE_CONFIG": conf, "RCLONE_PASSWORD_COMMAND": "echo ec4-password"]
+        guard run(["config", "create", "loc", "alias", "remote=/tmp"], env: base).0 == 0,
+              run(["config", "encryption", "set"], env: base, stdin: "ec4-password\nec4-password\n").0 == 0,
+              let text = try? String(contentsOfFile: conf, encoding: .utf8),
+              RcloneConfigPassword.isEncrypted(configContents: text) else {
+            return report(name, slug, false, "(could not build an encrypted fixture config)")
+        }
+        let dump = run(["config", "dump"], env: base)
+        guard dump.0 == 0,
+              let object = (try? JSONSerialization.jsonObject(with: Data(dump.1.utf8))) as? [String: [String: Any]],
+              var values = (object["loc"]?.mapValues { "\($0)" }),
+              let type = values.removeValue(forKey: "type"), type == "alias" else {
+            return report(name, slug, false, "(config dump did not decrypt: \(dump.1))")
+        }
+        let remote = RcloneConfigService.remoteConfiguration(name: "loc", rcloneType: type, values: values)
+        guard remote.name == "loc", remote.values["remote"] == "/tmp" else {
+            return report(name, slug, false, "(RemoteConfiguration not rebuilt from the dump)")
+        }
+        let wrong = run(["config", "dump"], env: ["RCLONE_CONFIG": conf, "RCLONE_PASSWORD_COMMAND": "echo wrong"])
+        guard wrong.0 != 0 else {
+            return report(name, slug, false, "(a wrong password still decrypted the config)")
+        }
+        return report(name, slug, true)
+    }
+
+    /// AC-EC5: `rclone-password` parses with no argument that could carry a secret, `get`
+    /// prints only the password (exit 1 with a hint when none), `set` refuses a password that
+    /// doesn't decrypt, and `doctor` fails an encrypted config that can't be opened.
+    private static func testRclonePasswordCLI() -> Bool {
+        let name = "AC-EC5", slug = "cli-rclone-password"
+        for argv in [["rclone-password"], ["rclone-password", "set", "hunter2"], ["rclone-password", "bogus"]] {
+            if case .success = SyncTrayCLI.parse(argv) {
+                return report(name, slug, false, "(parse accepted \(argv))")
+            }
+        }
+        guard case .success(.rclonePassword(.get)) = SyncTrayCLI.parse(["rclone-password", "get"]),
+              case .success(.rclonePassword(.set)) = SyncTrayCLI.parse(["rclone-password", "set"]) else {
+            return report(name, slug, false, "(valid forms did not parse)")
+        }
+        final class Box { var out = "", err = "", stored: String?; var cleared = false }
+        func access(_ box: Box, encrypted: Bool, secret: String?, accepts: String) -> RclonePasswordAccess {
+            RclonePasswordAccess(
+                isStored: { box.stored != nil }, read: { box.stored },
+                store: { box.stored = $0; return true }, clear: { box.cleared = true; box.stored = nil; return true },
+                readSecret: { _ in secret }, configIsEncrypted: { encrypted }, verify: { $0 == accepts })
+        }
+        let box = Box()
+        func run(_ action: RclonePasswordAction, _ access: RclonePasswordAccess) -> Int32 {
+            box.out = ""; box.err = ""
+            let env = fakeCLIEnvironment(rclonePassword: access, stdout: { box.out += $0 }, stderr: { box.err += $0 })
+            return SyncTrayCLI.run(.rclonePassword(action), env: env)
+        }
+        guard run(.get, access(box, encrypted: true, secret: nil, accepts: "pw")) == 1, box.out.isEmpty,
+              box.err.contains("rclone-password set") else {
+            return report(name, slug, false, "(get with nothing stored: out=\(box.out) err=\(box.err))")
+        }
+        guard run(.set, access(box, encrypted: true, secret: "wrong", accepts: "pw")) == 1, box.stored == nil else {
+            return report(name, slug, false, "(a wrong password was stored)")
+        }
+        guard run(.set, access(box, encrypted: false, secret: "pw", accepts: "pw")) == 1, box.stored == nil else {
+            return report(name, slug, false, "(stored a password for an unencrypted config)")
+        }
+        guard run(.set, access(box, encrypted: true, secret: "pw", accepts: "pw")) == 0, box.stored == "pw" else {
+            return report(name, slug, false, "(the right password was not stored)")
+        }
+        guard run(.get, access(box, encrypted: true, secret: nil, accepts: "pw")) == 0, box.out == "pw\n" else {
+            return report(name, slug, false, "(get did not print only the password: \(box.out))")
+        }
+        // doctor: plain ok; encrypted + nothing stored fail; stored + opens ok; stored + can't open fail.
+        func doctor(encrypted: Bool, stored: Bool, dumpExit: Int32) -> DoctorCheck? {
+            let env = fakeCLIEnvironment(
+                runRclone: { args, _ in args.first == "config" ? (dumpExit, "", "") : (0, "rclone v1", "") },
+                rclonePassword: RclonePasswordAccess(
+                    isStored: { stored }, read: { nil }, store: { _ in true }, clear: { true },
+                    readSecret: { _ in nil }, configIsEncrypted: { encrypted }, verify: { _ in true }))
+            return SyncTrayCLI.doctorChecks(env: env).first { $0.name == "rclone config" }
+        }
+        guard doctor(encrypted: false, stored: false, dumpExit: 1)?.status == .ok,
+              doctor(encrypted: true, stored: false, dumpExit: 1)?.status == .fail,
+              doctor(encrypted: true, stored: true, dumpExit: 0)?.status == .ok,
+              doctor(encrypted: true, stored: true, dumpExit: 1)?.status == .fail else {
+            return report(name, slug, false, "(doctor matrix wrong)")
+        }
+        return report(name, slug, true)
+    }
+
+
+    /// AC-EC6: rclone's "can't open the encrypted config" failures are recognised (the banner
+    /// then offers the password setting), get their own telemetry bucket ahead of
+    /// `critical`, and a leaked `RCLONE_CONFIG_PASS` is redacted from diagnostic reports.
+    private static func testEncryptedConfigErrorHandling() -> Bool {
+        let name = "AC-EC6", slug = "encrypted-config-errors"
+        let hits = [
+            "Failed to load config file \"/Users/me/.config/rclone/rclone.conf\": unable to decrypt configuration: most likely wrong password",
+            "CRITICAL: Couldn't decrypt configuration, most likely wrong password.",
+            "Failed to configure: password command failed: exit status 1",
+        ]
+        for message in hits {
+            guard SyncLogPatterns.isRcloneConfigPasswordError(message),
+                  TelemetryService.categorizeError(message) == "config_decrypt_failed" else {
+                return report(name, slug, false, "(not recognised: \(message))")
+            }
+        }
+        for message in ["Failed to copy: permission denied", "directory not empty", "CRITICAL: bisync out of sync"] {
+            guard !SyncLogPatterns.isRcloneConfigPasswordError(message) else {
+                return report(name, slug, false, "(false positive: \(message))")
+            }
+        }
+        // Remote names may contain spaces (rclone allows them); lines that aren't `name:` are
+        // not remotes. Error text is kept out by reading stdout only after an exit-0 check.
+        guard RcloneConfigService.parseRemoteNames("gdrive:\nsyn-sftp:\nmy nas:\n") == ["gdrive", "syn-sftp", "my nas"],
+              RcloneConfigService.parseRemoteNames("not a remote\n:\n").isEmpty else {
+            return report(name, slug, false, "(parseRemoteNames wrong)")
+        }
+        let raw = hits.joined(separator: "\n")
+        guard SyncLogPatterns.friendlyRcloneError(raw) == SyncLogPatterns.rcloneConfigPasswordHint,
+              SyncLogPatterns.friendlyRcloneError("directory not found") == "directory not found" else {
+            return report(name, slug, false, "(friendlyRcloneError wrong)")
+        }
+        let redacted = DiagnosticRedactor.redact("RCLONE_CONFIG_PASS=hunter2 rclone lsd x:")
+        guard !redacted.contains("hunter2") else {
+            return report(name, slug, false, "(RCLONE_CONFIG_PASS leaked: \(redacted))")
         }
         return report(name, slug, true)
     }

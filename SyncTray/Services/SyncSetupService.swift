@@ -1443,8 +1443,7 @@ extension SyncSetupService {
     /// Run rclone with given args, return exit code (or -1 on launch failure).
     /// Adds connection/operation timeouts so unreachable remotes fail within ~15s.
     private func runRcloneSimple(rclonePath: String, args: [String], skipCert: Bool) -> Int32 {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: rclonePath)
+        let process = RcloneProcess.make(rclonePath: rclonePath, arguments: [])
         var fullArgs = args + ["--contimeout", "5s", "--timeout", "15s", "--retries", "1", "--low-level-retries", "1"]
         if skipCert { fullArgs.append("--no-check-certificate") }
         process.arguments = fullArgs
@@ -1523,6 +1522,13 @@ extension SyncSetupService {
     /// through `install`/`launchctl` — this codebase has no XCTest target, so exercising the
     /// generated script IS the test for the mount branch's mode-selection and command logic.
     func generateSyncScript() -> String {
+        // How rclone gets the config password of an encrypted rclone.conf with no terminal.
+        // Shell-quoted once more here: the command itself already double-quotes the executable
+        // path for rclone's own argument splitting.
+        let passwordCommandExport = RcloneConfigPassword.currentExecutablePath.map {
+            "export RCLONE_PASSWORD_COMMAND=" + RcloneConfigPassword.shellQuote(
+                RcloneConfigPassword.passwordCommand(executablePath: $0))
+        } ?? "# (no executable path known - an encrypted rclone.conf needs RCLONE_CONFIG_PASS)"
         return """
             #!/bin/bash
             # SyncTray Sync Script
@@ -1536,6 +1542,14 @@ extension SyncSetupService {
             # "exec: \\"mount\\": executable file not found in $PATH". Prepend the
             # system sbin dirs so both backends resolve their helpers.
             export PATH="/sbin:/usr/sbin:/usr/bin:/bin:$PATH"
+
+            # An encrypted rclone.conf needs its password, and a launchd run has no terminal to
+            # ask. rclone only runs this command when the config IS encrypted, and it fetches
+            # the password from the Keychain itself, so it never appears in a file or in argv.
+            # A password the user already supplies (RCLONE_CONFIG_PASS or their own command) wins.
+            if [[ -z "${RCLONE_CONFIG_PASS:-}" && -z "${RCLONE_PASSWORD_COMMAND:-}" ]]; then
+                \(passwordCommandExport)
+            fi
 
             CONFIG_FILE="$1"
 
@@ -1786,23 +1800,18 @@ extension SyncSetupService {
                 exit 1
             fi
 
-            # Helper: check if a remote has no_check_certificate set in rclone config
+            # Helper: check if a remote has no_check_certificate set in rclone config. Reads
+            # `rclone config dump` (not the file), so it also works on an encrypted rclone.conf.
             check_no_cert() {
-                local remote_name="$1"
-                local rclone_conf="$HOME/.config/rclone/rclone.conf"
-                if [[ -f "$rclone_conf" ]]; then
-                    local in_section=false
-                    while IFS= read -r line; do
-                        if [[ "$line" == "[$remote_name]" ]]; then
-                            in_section=true
-                        elif [[ "$line" =~ ^\\[.+\\]$ ]] && $in_section; then
-                            break
-                        elif $in_section && [[ "$line" == *"no_check_certificate"*"="*"true"* ]]; then
-                            echo "--no-check-certificate"
-                            return
-                        fi
-                    done < "$rclone_conf"
-                fi
+                "$RCLONE_BIN" config dump 2>/dev/null | python3 -c "
+            import json, sys
+            try:
+                remote = json.load(sys.stdin).get(sys.argv[1], {})
+                if str(remote.get('no_check_certificate', '')).lower() == 'true':
+                    print('--no-check-certificate')
+            except Exception:
+                pass
+            " "$1"
             }
 
             # Re-emit one remote's stored rclone config as RCLONE_CONFIG_<NAME>_<KEY> export
@@ -2731,6 +2740,7 @@ extension SyncSetupService {
                 # argument (AC-SEC1).
                 printf 'SYNCTRAY_DRY_RUN_ARG=%s\\n' "${RCLONE_CMD[@]}"
                 echo "SYNCTRAY_DRY_RUN_RC_AUTH=${RCLONE_RC_PASS:+set}"
+                echo "SYNCTRAY_DRY_RUN_PASSWORD_COMMAND=${RCLONE_PASSWORD_COMMAND:+set}"
                 echo "SYNCTRAY_DRY_RUN_ENV_OVERRIDES=$(env | grep -c '^RCLONE_CONFIG_' || true)"
                 rm -f "$LOCK_FILE"
                 trap - EXIT
@@ -2805,8 +2815,15 @@ extension SyncSetupService {
         let fallbackName = profile.fallbackRemote.hasSuffix(":")
             ? String(profile.fallbackRemote.dropLast())
             : profile.fallbackRemote
-        guard let primaryConfig = configService.readRemoteConfig(name: primaryName),
-              let fallbackConfig = configService.readRemoteConfig(name: fallbackName) else {
+        // On the main thread (an install started from the UI) an encrypted config must not run
+        // `rclone config dump` here: serve the last dump the editor already warmed, and treat
+        // a cold cache like an unreadable config (the safe default below).
+        func read(_ name: String) -> RemoteConfiguration? {
+            Thread.isMainThread ? configService.cachedRemoteConfig(name: name)
+                                : configService.readRemoteConfig(name: name)
+        }
+        guard let primaryConfig = read(primaryName),
+              let fallbackConfig = read(fallbackName) else {
             // Cannot read config — default to safe behaviour (force REMOTE swap, no cache poisoning)
             return true
         }

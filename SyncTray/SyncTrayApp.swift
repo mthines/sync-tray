@@ -522,5 +522,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUserNoti
 
 extension Notification.Name {
     static let selectProfile = Notification.Name("selectProfile")
+    /// Show the app-wide Settings page (e.g. from an error banner that needs a setting there).
+    static let selectAppSettings = Notification.Name("selectAppSettings")
     static let openSettingsWindow = Notification.Name("openSettingsWindow")
 }

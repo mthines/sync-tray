@@ -894,6 +894,55 @@ different-size edit still does, since the size check fails). On the **fallback**
 primary-derived cache roots may not resolve, in which case the skip simply doesn't apply and
 the warmer reads as before — safe degradation.
 
+### Encrypted rclone.conf
+
+`rclone config encryption` configs work unattended. The password lives in the macOS Keychain
+(`RcloneConfigPassword`: service `com.synctray.rclone-config`, `.dev` suffix on Debug builds,
+account `rclone.conf`) and never in a profile file, plist, log, telemetry or argv.
+
+- **How rclone gets it.** The app's rclone children are built by `RcloneProcess.make` (or take `RcloneConfigPassword.rcloneEnvironment()`), which sets
+  `RCLONE_PASSWORD_COMMAND="<SyncTray exe>" rclone-password get`. rclone runs it WITHOUT a shell (it splits the string itself: spaces, CSV-style double quotes with `""` for a literal quote), so the path is double-quoted — single quotes would be read as part of the path, which an end-to-end run caught. AC-EC2 drives real rclone against a hostile path.
+  rclone only runs it when the config IS encrypted. The generated sync script exports the same
+  command (so launchd runs work) unless `RCLONE_CONFIG_PASS` or the user's own
+  `RCLONE_PASSWORD_COMMAND` is already set — theirs wins. The shared script is rewritten at every
+  launch, so an app move or upgrade follows; setting or clearing the password needs no reinstall.
+- **Why the app binary, not `/usr/bin/security`.** The item's default access list trusts only the
+  signed SyncTray, so `security find-generic-password` from another process gets a Keychain prompt.
+  **This does not make the password private from the user's own processes:** `rclone-password get`
+  prints it to whoever runs it, so any process running as the same user can read it by running the
+  SyncTray binary. That is a conscious acceptance, the same boundary as the rest of this app (a
+  same-user process can already read `rclone.conf`'s encrypted blob, drive launchd, and run rclone
+  as the user); the encryption protects the file at rest and when copied elsewhere, not against
+  code already running as the user. An unsigned dev build may show a Keychain prompt once.
+- **Dev and release builds have separate shared scripts.** The generated script embeds the
+  launching binary's path in `RCLONE_PASSWORD_COMMAND`, so a script shared by both would send the
+  release profiles' scheduled runs to a dev binary (and its `.dev` Keychain item) whenever a Debug
+  build launched. `SyncProfile.sharedScriptPath` is therefore
+  `~/.local/bin/synctray-dev/synctray-sync.sh` in Debug builds and `~/.local/bin/synctray-sync.sh`
+  in Release; the file NAME is the same (process identification matches on it). Agents a dev build
+  installs point at the dev script; the release agents are never touched by it.
+- **Never block the main thread on it.** `readRemoteConfig`/`listRemotes` run rclone (and so the
+  password command) on an encrypted config. View-body code uses the non-blocking
+  `cachedRemoteConfig`; the wizard, `AddRemoteSheet` and `ProviderFieldsView` read off the main
+  thread; `computeFallbackRequiresCacheRebuild` (profile install) uses `cachedRemoteConfig` on the
+  main thread and treats a cold cache as "unreadable" (the safe REMOTE-swap default).
+- **No direct parsing of an encrypted file.** `RcloneConfigService.configIsEncrypted()` looks for the
+  `RCLONE_ENCRYPT_V0:` marker (rclone writes a comment line before it). When set, `readRemoteConfig`
+  and telemetry's `readConfigContents` read `rclone config dump` instead (`dumpConfig`, cached 5 s),
+  and the script's `check_no_cert` reads the dump too. Plain-text configs keep the file reads.
+- **Remote add/edit.** On an encrypted config `addRemote`/`updateRemote` use
+  `rclone config create … --non-interactive --no-obscure` instead of appending text (which would
+  corrupt the file). The values are rclone arguments, so they show in `ps` for that moment. Plain-text
+  configs are unchanged.
+- **Errors.** `SyncLogPatterns.isRcloneConfigPasswordError` turns rclone's decrypt failures into the
+  banner action "Set rclone Password" (opens App Settings via `.selectAppSettings`), and
+  `categorizeError` files them under `config_decrypt_failed`. `synctray doctor` has an `rclone config`
+  check. Settings has an "Encrypted rclone config" row, shown only when the file is encrypted or a
+  password is stored; Save verifies the password against rclone first.
+- **Known limit.** The app still hard-codes `~/.config/rclone/rclone.conf`; an `RCLONE_CONFIG`
+  override isn't honoured.
+Covered by `ConfigSelfTest` AC-EC1–AC-EC6 (AC-EC4 drives real rclone against an encrypted fixture).
+
 ### Models/
 
 | File | Purpose |
@@ -1367,6 +1416,7 @@ Covered by `ConfigSelfTest` AC-CLI4 and AC-SEC3.
 | `synctray remote folders <remote>[:path] [--json]` | List a remote's folders exactly as the profile editor's folder chooser and the setup wizard show them — same `rclone lsf --dirs-only` arguments (`RcloneConfigService.folderListingArguments`, including the remote's `no_check_certificate`) and the same parser (`parseDirectoryListing`), so names with spaces come out verbatim. Needs no profile. `--json` prints a JSON array, which makes leading/trailing spaces visible. Covered by `ConfigSelfTest` AC-CLI12 (and AC-RF1 for the parser). |
 | `synctray settings [show] [--json]` / `settings get <key>` | Every app-wide setting (or, with `get`, one) (`AppSettingsFileStore.allKeyNames`) with the value the app actually uses (UserDefaults, `SMAppService` for launch at login) — `key=value` lines, or a sorted-key object with `--json`. |
 | `synctray telemetry [status\|on\|off] [--json]` | Show or change whether usage data is shared — the same setting as the app's telemetry toggle (see "Privacy and consent" below). `status --json` prints `{"asked":…,"enabled":…}`. `on`/`off` count as answering the first-run question. |
+| `synctray rclone-password status\|set\|clear` (and `get`) | The Keychain password for an encrypted `rclone.conf` (see "Encrypted rclone.conf" below). `set` reads it from the terminal (no echo) or stdin — **never an argument** — and stores it only if `rclone config dump` accepts it. `status` prints `stored=… config_encrypted=…`. `get` prints just the password; it is what rclone runs, so it skips the telemetry consent question and records no event. |
 
 **Configure** (mutating — headless-capable, no running app required):
 
@@ -2145,7 +2195,7 @@ collecting never sends, a retry after a failed send never re-sends).
 | `~/.config/synctray/profiles/{shortId}-exclude.txt` | Exclude filter (user-editable; SyncTray owns two managed blocks — the "Don't Sync" exclude block at the TOP and, when `syncIncludeFolders` is non-empty, the "Sync Only These Folders" include block at the BOTTOM) |
 | `~/.config/synctray/profiles/{shortId}.resync-pending` | Two-Way (bisync) profiles only, created only when `syncIncludeFolders` changes (or once by migration v5, for a profile whose folder holds a Photos library, by migration v6 or v7, for one whose bisync listings hold a volume system folder, or by migration v8, for one holding a Photo Booth library) — a UUID token the sync script reads to schedule a safe `--resync --resync-mode newer` instead of a plain bisync, removed only after every required bisync session (see `.resync-pending.consumed`) has consumed it with an unchanged token |
 | `~/.config/synctray/profiles/{shortId}.resync-pending.consumed` | Two-Way (bisync) profiles only — per-token record of which bisync session(s) have already run their one-time resync for the current `.resync-pending` token; deleted together with the marker once every required session (primary, and the fallback's own session on a full remote swap) has consumed it |
-| `~/.local/bin/synctray-sync.sh` | Shared sync script (all profiles) |
+| `~/.local/bin/synctray-sync.sh` | Shared sync script (all profiles). Debug builds use `~/.local/bin/synctray-dev/synctray-sync.sh` instead |
 | `~/Library/LaunchAgents/com.synctray.sync.{shortId}.plist` | launchd schedule |
 | `~/.local/log/synctray-sync-{shortId}.log` | Sync logs. `~/.local/log` and `~/.config/synctray/profiles/` are created owner-only (0700) — the logs name every synced file, the profile JSON names remotes, local paths and extra rclone flags — and a directory an earlier version left 0755 is tightened at launch (`SyncSetupService.tightenPrivateDirectoriesIfLoose`). Covered by `ConfigSelfTest` AC-SEC5. |
 | `/tmp/synctray-sync-{shortId}.lock` | Lock file (prevents concurrent syncs) |

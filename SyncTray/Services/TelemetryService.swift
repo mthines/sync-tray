@@ -1402,6 +1402,9 @@ final class TelemetryService {
                 // folder names themselves never leave the machine.
                 "config.sync_include_folder_count": .int(profile.isMountMode ? 0 : profile.syncIncludeFolders.count),
                 "config.allow_non_empty_mount": .bool(profile.allowNonEmptyMount),
+                // Whether rclone.conf is encrypted (`rclone config encryption`) — a bool only.
+                "config.rclone_config_encrypted": .bool(RcloneConfigService.shared.configIsEncrypted()),
+                "config.rclone_config_password_stored": .bool(RcloneConfigPassword.isStored),
                 "config.download_connections": .int(profile.isMountMode ? profile.downloadConnections : 0),
                 "config.has_bandwidth_limit": .bool(!profile.bandwidthLimit.isEmpty),
                 "config.mount_resilient": .string(profile.isMountMode ? String(profile.mountResilient) : "n/a"),
@@ -3498,6 +3501,11 @@ final class TelemetryService {
         // transient checks below.
         if SyncLogPatterns.isTooManyDeletesError(msg) {
             return "too_many_deletes"
+        }
+        // Ahead of the critical check: rclone logs these at CRITICAL, but the cause is the
+        // missing/wrong encrypted-config password, which is actionable, not "critical".
+        if SyncLogPatterns.isRcloneConfigPasswordError(msg) {
+            return "config_decrypt_failed"
         }
         // A run that was stopped, not one that failed: a signal cancelled rclone's transfers
         // ("context canceled") or bisync's graceful shutdown failed ("Bisync interrupted…",

@@ -51,6 +51,7 @@
 		E1A0B1C2D3E4F56789AB0005 /* TelemetryOptInBanner.swift in Sources */ = {isa = PBXBuildFile; fileRef = E1A0B1C2D3E4F56789AB0006 /* TelemetryOptInBanner.swift */; };
 		E1A0B1C2D3E4F56789AB0007 /* TelemetryDetailsSheet.swift in Sources */ = {isa = PBXBuildFile; fileRef = E1A0B1C2D3E4F56789AB0008 /* TelemetryDetailsSheet.swift */; };
 		E912A1B4B43D4029246920EE /* RcloneLocator.swift in Sources */ = {isa = PBXBuildFile; fileRef = D767944E8289869D576524AC /* RcloneLocator.swift */; };
+		A1B2C3D4E5F60718293A4B5C /* RcloneConfigPassword.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1B2C3D4E5F60718293A4B5D /* RcloneConfigPassword.swift */; };
 		E98B9E367273424F260154CC /* ConfigReconciler.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5AD2D42E871A6CC074379689 /* ConfigReconciler.swift */; };
 		EF980FBC32B46CA1A4645855 /* CacheMigrationService.swift in Sources */ = {isa = PBXBuildFile; fileRef = CE2089D1111CD3C727D2BF40 /* CacheMigrationService.swift */; };
 		F2B3C4D5E6F7089012AB0001 /* MigrationRunner.swift in Sources */ = {isa = PBXBuildFile; fileRef = F2B3C4D5E6F7089012AB0002 /* MigrationRunner.swift */; };
@@ -140,6 +141,7 @@
 		C0DC6141FBB853681643F593 /* RcloneConfigService.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = RcloneConfigService.swift; sourceTree = "<group>"; };
 		C537381AA63EEF38035C8CA0 /* ConfigSchemaInstaller.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = ConfigSchemaInstaller.swift; sourceTree = "<group>"; };
 		CE2089D1111CD3C727D2BF40 /* CacheMigrationService.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = CacheMigrationService.swift; sourceTree = "<group>"; };
+		A1B2C3D4E5F60718293A4B5D /* RcloneConfigPassword.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = RcloneConfigPassword.swift; sourceTree = "<group>"; };
 		D767944E8289869D576524AC /* RcloneLocator.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = RcloneLocator.swift; sourceTree = "<group>"; };
 		DFEE308C253708BD60348055 /* CacheMigrationProgress.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = CacheMigrationProgress.swift; sourceTree = "<group>"; };
 		E1A0B1C2D3E4F56789AB0002 /* VFSCacheService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VFSCacheService.swift; sourceTree = "<group>"; };
@@ -266,6 +268,7 @@
 				F2B3C4D5E6F7089012AB0002 /* MigrationRunner.swift */,
 				OT00000000000000000000A1 /* TelemetryService.swift */,
 				D767944E8289869D576524AC /* RcloneLocator.swift */,
+				A1B2C3D4E5F60718293A4B5D /* RcloneConfigPassword.swift */,
 				48C81844C44AA7C559B6730B /* AppSettingsFileStore.swift */,
 				75E6545555EB74D6B9B97A02 /* ConfigFileWatcher.swift */,
 				C537381AA63EEF38035C8CA0 /* ConfigSchemaInstaller.swift */,
@@ -516,6 +519,7 @@
 				F2B3C4D5E6F7089012AB0001 /* MigrationRunner.swift in Sources */,
 				OT00000000000000000000B1 /* TelemetryService.swift in Sources */,
 				E912A1B4B43D4029246920EE /* RcloneLocator.swift in Sources */,
+				A1B2C3D4E5F60718293A4B5C /* RcloneConfigPassword.swift in Sources */,
 				FC42AD91FD4C3FCBE784DE4F /* AppSettingsFileStore.swift in Sources */,
 				A8048FF52AC46AD7139A2000 /* ConfigFileWatcher.swift in Sources */,
 				F9268603C9EA887930F58C52 /* ConfigSchemaInstaller.swift in Sources */,

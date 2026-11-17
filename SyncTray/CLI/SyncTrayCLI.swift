@@ -34,6 +34,55 @@ enum TelemetryAction: Equatable {
     case set(enabled: Bool)
 }
 
+/// `rclone-password <get|set|clear|status>` — the Keychain-held password for an
+/// encrypted rclone.conf. `get` is what rclone's `RCLONE_PASSWORD_COMMAND` runs.
+enum RclonePasswordAction: Equatable {
+    case get
+    case set
+    case clear
+    case status
+}
+
+/// What the CLI needs to reach the rclone config password. Injected so the self-test
+/// never touches the real Keychain.
+struct RclonePasswordAccess {
+    var isStored: () -> Bool
+    var read: () -> String?
+    var store: (String) -> Bool
+    var clear: () -> Bool
+    /// Ask for the password without echoing it (stdin line when not a terminal).
+    var readSecret: (_ prompt: String) -> String?
+    /// Whether rclone.conf is an encrypted config.
+    var configIsEncrypted: () -> Bool
+    /// Whether `password` decrypts the config (`rclone config dump` exits 0 with it).
+    var verify: (_ password: String) -> Bool
+
+    /// No Keychain, no encrypted config — the default for fakes.
+    static let inert = RclonePasswordAccess(
+        isStored: { false }, read: { nil }, store: { _ in true }, clear: { true },
+        readSecret: { _ in nil }, configIsEncrypted: { false }, verify: { _ in true })
+
+    static let production = RclonePasswordAccess(
+        isStored: { RcloneConfigPassword.isStored },
+        read: { RcloneConfigPassword.read() },
+        store: { RcloneConfigPassword.set($0) },
+        clear: { RcloneConfigPassword.clear() },
+        readSecret: { prompt in
+            if isatty(STDIN_FILENO) != 0 {
+                guard let raw = getpass(prompt) else { return nil }
+                return String(cString: raw)
+            }
+            return Swift.readLine()
+        },
+        configIsEncrypted: { RcloneConfigService.shared.configIsEncrypted() },
+        verify: { password in
+            var env = ProcessInfo.processInfo.environment
+            env["RCLONE_CONFIG_PASS"] = password
+            env.removeValue(forKey: "RCLONE_PASSWORD_COMMAND")
+            return RcloneConfigService.shared.runRclone(["config", "dump"], timeout: 15, environment: env).exitCode == 0
+        })
+}
+
 /// One app-wide setting's value, typed by its key: a `SafeKey` is on/off, a
 /// `StringKey` a validated string (`AppSettingsFileStore`).
 enum AppSettingValue: Equatable {
@@ -72,6 +121,7 @@ enum CLICommand: Equatable {
     case listRemotes
     case remoteFolders(target: String, json: Bool)
     case telemetry(TelemetryAction)
+    case rclonePassword(RclonePasswordAction)
     case settings(SettingsAction)
     case profiles
     case status(target: String?, json: Bool, wait: StatusWait?)
@@ -216,6 +266,8 @@ struct CLIEnvironment {
     /// Whether rclone.conf sets `no_check_certificate = true` for this remote,
     /// so `remote folders` lists with the same flags the app's folder chooser uses.
     var remoteSkipsCertCheck: (_ remoteName: String) -> Bool
+    /// The encrypted-rclone.conf password (Keychain). Defaults to an inert fake.
+    var rclonePassword: RclonePasswordAccess = .inert
     /// The shared telemetry opt-in (`SyncTraySettings`, the same store the app reads).
     var telemetryConsent: () -> TelemetryConsentState
     /// Record the user's telemetry answer in every place the app reads it — the
@@ -290,6 +342,10 @@ enum SyncTrayCLI {
                                    List the folders the app's folder chooser shows for a remote
       telemetry [status|on|off] [--json]
                                    Show or change usage-data sharing (shared with the app)
+      rclone-password status|set|clear
+                                   Manage the Keychain password for an encrypted rclone.conf
+                                   (set reads it from the terminal or stdin, never from arguments).
+                                   `get` prints it; it is what rclone's password command runs.
       settings [show] [--json]     Show the values the app uses (the keys of settings.json)
       settings get <key>           Print one app-wide setting
 
@@ -366,6 +422,11 @@ enum SyncTrayCLI {
             return nil                                          // other flags → GUI/self-test path
         }
         // `-`-prefixed `-h`/`--help`, or any bare token, IS a subcommand.
+        // `rclone-password get` is what rclone runs on EVERY invocation to read the config
+        // password: no consent prompt, no telemetry event, no flush — just the answer.
+        if argv == ["rclone-password", "get"] {
+            return execute(argv, env: .production())
+        }
         TelemetryService.processKind = "cli"
         return runMeasured(argv, env: .production())
     }
@@ -437,6 +498,10 @@ enum SyncTrayCLI {
             let sub = argv.dropFirst().first(where: { !$0.hasPrefix("-") }) ?? "status"
             return ["status", "on", "off"].contains(sub) ? "telemetry-\(sub)" : "(other)"
         }
+        if first == "rclone-password" {
+            let sub = argv.dropFirst().first(where: { !$0.hasPrefix("-") }) ?? ""
+            return ["set", "clear", "status"].contains(sub) ? "rclone-password-\(sub)" : "(other)"
+        }
         if first == "remote" {
             let sub = argv.dropFirst().first(where: { !$0.hasPrefix("-") }) ?? ""
             return sub == "folders" ? "remote-folders" : "(other)"
@@ -498,6 +563,15 @@ enum SyncTrayCLI {
             }
             return .failure(CLIUsageError(message: "usage: synctray telemetry [status|on|off] [--json]"))
 
+        case "rclone-password":
+            // No extra arguments are accepted: the password must never travel in argv.
+            let actions: [String: RclonePasswordAction] = [
+                "get": .get, "set": .set, "clear": .clear, "status": .status,
+            ]
+            if rest.count == 1, let action = actions[rest[0]] {
+                return .success(.rclonePassword(action))
+            }
+            return .failure(CLIUsageError(message: "usage: synctray rclone-password <get|set|clear|status>"))
         case "settings":
             return parseSettings(rest)
 
@@ -813,6 +887,8 @@ enum SyncTrayCLI {
             return runRemoteFolders(target, json: json, env: env)
         case .telemetry(let action):
             return runTelemetry(action, env: env)
+        case .rclonePassword(let action):
+            return runRclonePassword(action, env: env)
         case .settings(let action):
             return runSettings(action, env: env)
         case .profiles:
@@ -888,6 +964,8 @@ enum SyncTrayCLI {
             checks.append(DoctorCheck(name: "rclone", status: .fail, detail: "not found"))
         }
 
+        checks.append(rcloneConfigCheck(env: env))
+
         checks.append(
             env.schemaFilesPresent()
                 ? DoctorCheck(name: "config schemas", status: .ok, detail: "installed")
@@ -903,6 +981,26 @@ enum SyncTrayCLI {
         }
 
         return checks
+    }
+
+    /// `rclone config`: plain text is fine; an encrypted config needs a stored password that
+    /// actually decrypts it, or scheduled runs and mounts fail with no terminal to ask.
+    static func rcloneConfigCheck(env: CLIEnvironment) -> DoctorCheck {
+        let store = env.rclonePassword
+        guard store.configIsEncrypted() else {
+            return DoctorCheck(name: "rclone config", status: .ok, detail: "not encrypted")
+        }
+        guard store.isStored() else {
+            return DoctorCheck(
+                name: "rclone config", status: .fail,
+                detail: "encrypted, but no password is stored — run `synctray rclone-password set`")
+        }
+        let (exit, _, _) = env.runRclone(["config", "dump"], 15)
+        return exit == 0
+            ? DoctorCheck(name: "rclone config", status: .ok, detail: "encrypted, password unlocks it")
+            : DoctorCheck(
+                name: "rclone config", status: .fail,
+                detail: "encrypted, but the stored password does not decrypt it — run `synctray rclone-password set`")
     }
 
     private static func doctorChecks(for profile: SyncProfile, env: CLIEnvironment) -> [DoctorCheck] {
@@ -940,6 +1038,56 @@ enum SyncTrayCLI {
         checks.append(DoctorCheck(name: label, status: probeStatus, detail: probe.detail))
 
         return checks
+    }
+
+    // MARK: - rclone-password
+
+    /// The Keychain password for an encrypted rclone.conf. The password only ever travels
+    /// through the Keychain, stdout of `get` (which rclone reads) and the prompt of `set` —
+    /// never argv, a file, a log or telemetry.
+    static func runRclonePassword(_ action: RclonePasswordAction, env: CLIEnvironment) -> Int32 {
+        let store = env.rclonePassword
+        switch action {
+        case .get:
+            guard let password = store.read(), !password.isEmpty else {
+                env.stderr("No rclone config password is stored in SyncTray. Set it in Settings or run `synctray rclone-password set`.\n")
+                return 1
+            }
+            env.stdout(password + "\n")
+            return 0
+
+        case .set:
+            guard store.configIsEncrypted() else {
+                env.stderr("error: rclone.conf is not encrypted, so there is no password to store.\n")
+                return 1
+            }
+            guard let password = store.readSecret("rclone config password: "), !password.isEmpty else {
+                env.stderr("error: no password entered\n")
+                return 1
+            }
+            guard store.verify(password) else {
+                env.stderr("error: that password does not decrypt rclone.conf; nothing was stored.\n")
+                return 1
+            }
+            guard store.store(password) else {
+                env.stderr("error: could not save the password to the Keychain\n")
+                return 1
+            }
+            env.stdout("Stored. Scheduled syncs and mounts can now unlock rclone.conf.\n")
+            return 0
+
+        case .clear:
+            guard store.clear() else {
+                env.stderr("error: could not remove the password from the Keychain\n")
+                return 1
+            }
+            env.stdout("Removed the rclone config password from the Keychain.\n")
+            return 0
+
+        case .status:
+            env.stdout("stored=\(store.isStored()) config_encrypted=\(store.configIsEncrypted())\n")
+            return 0
+        }
     }
 
     /// Judge a profile's `/tmp` run lock by its holder's liveness (plan D4) rather than mere
@@ -2224,6 +2372,7 @@ extension CLIEnvironment {
             remoteSkipsCertCheck: { name in
                 RcloneConfigService.shared.readRemoteConfig(name: name)?.values["no_check_certificate"] == "true"
             },
+            rclonePassword: .production,
             telemetryConsent: {
                 TelemetryConsentState(
                     enabled: SyncTraySettings.telemetryEnabled,
@@ -2505,6 +2654,7 @@ extension CLIEnvironment {
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: rclonePath)
         proc.arguments = args
+        proc.environment = RcloneConfigPassword.rcloneEnvironment()
         let stdoutPipe = Pipe()
         let stderrPipe = Pipe()
         proc.standardOutput = stdoutPipe

@@ -56,6 +56,8 @@ struct AppSettingsView: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
                 }
 
+                EncryptedRcloneConfigSection()
+
                 GroupBox("Advanced") {
                     VStack(alignment: .leading, spacing: 12) {
                         debugLoggingToggle
@@ -477,4 +479,111 @@ struct AppSettingsView: View {
     AppSettingsView()
         .environmentObject(SyncManager())
         .frame(width: 500, height: 650)
+}
+
+
+/// Password for an encrypted `rclone.conf`, kept in the macOS Keychain so scheduled syncs and
+/// mounts (which have no terminal to ask) can open it. Shown only when the config is
+/// encrypted or a password is already stored. Saving checks the password against rclone
+/// first, so a typo can't silently break every scheduled run.
+private struct EncryptedRcloneConfigSection: View {
+    @State private var encrypted = false
+    @State private var stored = false
+    @State private var password = ""
+    @State private var busy = false
+    @State private var message: String?
+    @State private var messageIsError = false
+
+    var body: some View {
+        // A container that always exists: `.task` on an empty `Group` never fires, so the
+        // section would stay hidden and never discover that the config is encrypted.
+        VStack(spacing: 0) {
+            if encrypted || stored {
+                GroupBox("Encrypted rclone config") {
+                    VStack(alignment: .leading, spacing: 10) {
+                        Text(statusText)
+                            .font(.callout)
+                        Text("The password is kept in your Keychain and handed to rclone when it runs. It is never written to a profile, log or setting.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                        HStack(spacing: 8) {
+                            SecureField("rclone config password", text: $password)
+                                .textFieldStyle(.roundedBorder)
+                                .frame(maxWidth: 260)
+                                .onSubmit(save)
+                            Button(stored ? "Update" : "Save", action: save)
+                                .disabled(password.isEmpty || busy)
+                            if stored {
+                                Button("Remove", role: .destructive, action: remove)
+                                    .disabled(busy)
+                            }
+                            if busy { ProgressView().controlSize(.small) }
+                        }
+                        if let message {
+                            Text(message)
+                                .font(.caption)
+                                .foregroundStyle(messageIsError ? Color.red : Color.secondary)
+                        }
+                    }
+                    .padding(4)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+            }
+        }
+        .task { refresh() }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+            refresh()
+        }
+    }
+
+    private var statusText: String {
+        switch (encrypted, stored) {
+        case (true, true): return "rclone.conf is encrypted. Password stored in Keychain."
+        case (true, false): return "rclone.conf is encrypted, but no password is stored. Scheduled syncs and mounts can't open it until you add one."
+        default: return "A password is stored, but rclone.conf is not encrypted."
+        }
+    }
+
+    private func refresh() {
+        encrypted = RcloneConfigService.shared.configIsEncrypted()
+        stored = RcloneConfigPassword.isStored
+    }
+
+    private func save() {
+        let candidate = password
+        guard !candidate.isEmpty, !busy else { return }
+        busy = true
+        message = nil
+        Task.detached(priority: .userInitiated) {
+            let access = RclonePasswordAccess.production
+            let ok = access.verify(candidate)
+            let saved = ok && access.store(candidate)
+            await MainActor.run {
+                busy = false
+                if saved {
+                    password = ""
+                    messageIsError = false
+                    message = "Saved. Scheduled syncs and mounts can now open rclone.conf."
+                } else {
+                    messageIsError = true
+                    message = ok
+                        ? "Couldn't save the password to the Keychain."
+                        : "That password doesn't decrypt rclone.conf — nothing was saved."
+                }
+                refresh()
+            }
+        }
+    }
+
+    private func remove() {
+        if RcloneConfigPassword.clear() {
+            message = "Removed from the Keychain."
+            messageIsError = false
+        } else {
+            message = "Couldn't remove the password from the Keychain."
+            messageIsError = true
+        }
+        refresh()
+    }
 }
