@@ -3624,9 +3624,24 @@ final class SyncManager: ObservableObject {
                     SyncLogPatterns.macOSBlockedAccessSummary(for: errorDescription, localSyncPath: $0.localSyncPath)
                 }
                 // Full Disk Access only helps a privacy denial, so only that one mentions access.
-                let blockedAction = SyncLogPatterns.blockedAccess(in: errorDescription)?.kind == .filePermissions
-                    ? "Open SyncTray to exclude it."
-                    : "Open SyncTray to exclude it or allow access."
+                // The sync folder itself can't be excluded, only allowed (or, for permissions, fixed).
+                let blockedIsSyncFolder: Bool = {
+                    guard let localPath = profile?.localSyncPath,
+                          let blockedPath = SyncLogPatterns.macOSBlockedPath(in: errorDescription, localSyncPath: localPath) else {
+                        return false
+                    }
+                    return SyncExcludeFilter.isSyncFolderItself(blockedPath, localSyncPath: localPath)
+                }()
+                let blockedAction: String
+                if blockedIsSyncFolder {
+                    blockedAction = SyncLogPatterns.blockedAccess(in: errorDescription)?.kind == .filePermissions
+                        ? "Open SyncTray for details."
+                        : "Open SyncTray to allow access."
+                } else {
+                    blockedAction = SyncLogPatterns.blockedAccess(in: errorDescription)?.kind == .filePermissions
+                        ? "Open SyncTray to exclude it."
+                        : "Open SyncTray to exclude it or allow access."
+                }
                 let notificationText = blockedSummary
                     .map { "\($0) \(blockedAction)" }
                     ?? "Sync failed: \(errorDescription)"
@@ -3725,13 +3740,12 @@ final class SyncManager: ObservableObject {
             // Prefer critical/actionable errors over file-level errors
             // Critical errors tell us what to do (e.g., "out of sync", "resync")
             // File-level errors (e.g., "Path1 file not found") are less actionable
-            let isCriticalError = SyncLogPatterns.isCriticalError(message)
-            let existingIsCritical = profileErrors[profileId].map {
-                SyncLogPatterns.isCriticalError($0)
-            } ?? false
-
-            // Store error if: no existing error, OR new error is critical and existing isn't
-            if profileErrors[profileId] == nil || (isCriticalError && !existingIsCritical) {
+            // Store error if: no existing error, OR new error is critical and existing isn't —
+            // except over a local access denial (macOS privacy / permissions) in the sync
+            // folder, the root cause that bisync's own "retryable without --resync" notice
+            // would otherwise displace (issue #143; `shouldReplaceStoredError`).
+            if SyncLogPatterns.shouldReplaceStoredError(
+                existing: profileErrors[profileId], with: message, localSyncPath: profile?.localSyncPath) {
                 profileErrors[profileId] = message
             }
 

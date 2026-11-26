@@ -172,6 +172,10 @@ enum ConfigSelfTest {
             testMigrationV5PhotosLibraryExclude,
             testMacOSBlockedAccessPatterns,
             testMacOSBlockedAccessWiringPinned,
+            testBlockedErrorNotDisplaced,
+            testScriptLocalAccessProbe,
+            testSyncFolderItselfBanner,
+            testPrivacyProtectedConfigKey,
             testPhotoBoothLibraryDefaultExclude,
             testMigrationV8PhotoBoothLibraryExclude,
             testFilterSaveFollowUpMatrix,
@@ -8997,6 +9001,25 @@ enum ConfigSelfTest {
                 return report(name, slug, false, "(categorizeError(\(input.debugDescription)) = \(got), expected \(expected))")
             }
         }
+
+        // Issue #143 (report ST-277DCW): the sync folder ITSELF is refused (a scheduled run
+        // can't read ~/Documents). rclone's real line is recognized as a local macOS block,
+        // can't be excluded (it is the whole folder), is not an out-of-sync error (so auto-fix
+        // never fires on it) and is bucketed permission_denied with in_sync_folder.
+        let documents = "/Users/jdiaz/Documents"
+        let documentsLine = "failed to open directory \"\": open \(documents): operation not permitted"
+        let documentsAttributes = TelemetryService.accessDenialAttributes(for: documentsLine, localSyncPath: documents)
+        guard SyncLogPatterns.macOSBlockedPath(in: documentsLine, localSyncPath: documents) == documents,
+              SyncLogPatterns.macOSBlockedAccessSummary(for: documentsLine, localSyncPath: documents)
+                == "macOS blocked access to “Documents”.",
+              SyncExcludeFilter.excludePattern(forBlockedPath: documents, localSyncPath: documents, isDirectory: true) == nil,
+              SyncExcludeFilter.isSyncFolderItself(documents, localSyncPath: documents),
+              !SyncLogPatterns.isOutOfSyncError(documentsLine),
+              TelemetryService.categorizeError(documentsLine) == "permission_denied",
+              documentsAttributes["error.blocked_path.in_sync_folder"] == .bool(true),
+              documentsAttributes["error.access_denial"] == .string("operation_not_permitted") else {
+            return report(name, slug, false, "(a denial on the sync folder itself was not handled as a macOS block)")
+        }
         return report(name, slug, true)
     }
 
@@ -9032,6 +9055,179 @@ enum ConfigSelfTest {
         }
         guard migrationSource.contains("MigrationV7VolumeSystemFolderResyncFromListings(),\n        MigrationV8PhotoBoothLibraryExclude(),") else {
             return report(name, slug, false, "(migration v8 is not registered after v7)")
+        }
+        return report(name, slug, true)
+    }
+
+    // MARK: - AC-BA1 — a stored macOS block is not displaced by bisync's "resync" notice
+
+    /// Issue #143: after rclone's "operation not permitted", bisync logs "Error is retryable
+    /// without --resync due to --resilient mode." That message matches `isCriticalError` (it
+    /// says "resync"), so it used to replace the stored denial and the banner offered Fix Sync
+    /// Issues. `shouldReplaceStoredError` keeps the denial, still replaces an ordinary error, and
+    /// the `.errorMessage` handler must go through it.
+    private static func testBlockedErrorNotDisplaced() -> Bool {
+        let name = "AC-BA1", slug = "blocked-error-not-displaced"
+        let root = "/Users/jdiaz/Documents"
+        let denial = "failed to open directory \"\": open \(root): operation not permitted"
+        let retryable = "Error is retryable without --resync due to --resilient mode."
+        let outOfSync = "Bisync critical error: out of sync - must run --resync"
+        let fileLevel = "Failed to copy: file not found"
+        guard SyncLogPatterns.isCriticalError(retryable), !SyncLogPatterns.isCriticalError(fileLevel) else {
+            return report(name, slug, false, "(premise changed: the retryable notice is no longer critical)")
+        }
+        guard SyncLogPatterns.shouldReplaceStoredError(existing: nil, with: denial, localSyncPath: root),
+              !SyncLogPatterns.shouldReplaceStoredError(existing: denial, with: retryable, localSyncPath: root),
+              !SyncLogPatterns.shouldReplaceStoredError(existing: denial, with: outOfSync, localSyncPath: root),
+              !SyncLogPatterns.shouldReplaceStoredError(existing: denial, with: fileLevel, localSyncPath: root) else {
+            return report(name, slug, false, "(a stored macOS block was displaced)")
+        }
+        let permissions = "failed to open directory \"x\": open \(root)/Locked: permission denied"
+        let remoteDenial = "Failed to copy: sftp: open /home/me/x.txt: operation not permitted"
+        guard !SyncLogPatterns.shouldReplaceStoredError(existing: permissions, with: retryable, localSyncPath: root),
+              SyncLogPatterns.shouldReplaceStoredError(existing: fileLevel, with: retryable, localSyncPath: root),
+              !SyncLogPatterns.shouldReplaceStoredError(existing: retryable, with: fileLevel, localSyncPath: root),
+              SyncLogPatterns.shouldReplaceStoredError(existing: remoteDenial, with: retryable, localSyncPath: root) else {
+            return report(name, slug, false, "(replacement rules for ordinary errors changed)")
+        }
+        guard let managerSource = readSourceFile("Services/SyncManager.swift"),
+              managerSource.contains("SyncLogPatterns.shouldReplaceStoredError("),
+              !managerSource.contains("profileErrors[profileId] == nil || (isCriticalError && !existingIsCritical)") else {
+            return report(name, slug, false, "(the .errorMessage handler no longer uses shouldReplaceStoredError)")
+        }
+        return report(name, slug, true)
+    }
+
+    // MARK: - AC-BA2 — the sync script reads a protected folder before rclone starts
+
+    /// The generated script reads a privacy-protected local folder up front (`/bin/ls`, a real
+    /// directory read) and, when it is refused, logs the error line rclone would log and exits
+    /// non-zero without starting rclone — for both sync modes, never for a mount, and never when
+    /// the app didn't mark the folder protected. An unreadable temp folder stands in for the
+    /// TCC-denied one (EACCES instead of EPERM: the same branch, "permission denied").
+    private static func testScriptLocalAccessProbe() -> Bool {
+        let name = "AC-BA2", slug = "script-access-probe"
+        let fm = FileManager.default
+        let base = "\(selfTestRoot)/ba2-\(UUID().uuidString)"
+        let remoteDir = "\(base)/remote", localDir = "\(base)/local", cacheDir = "\(base)/cache"
+        for dir in [remoteDir, localDir, cacheDir] {
+            try? fm.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        }
+        let filter = "\(base)/filter.txt"
+        try? "- .DS_Store\n".write(toFile: filter, atomically: true, encoding: .utf8)
+        try? fm.setAttributes([.posixPermissions: 0o000], ofItemAtPath: localDir)
+        defer {
+            try? fm.setAttributes([.posixPermissions: 0o700], ofItemAtPath: localDir)
+            try? fm.removeItem(atPath: base)
+        }
+        let rcloneConf = aliasRcloneConfig(name: "selftest-fixture-remote", path: remoteDir)
+        func syncProfile(_ mode: SyncMode) -> SyncProfile {
+            var profile = sampleProfile(name: "BA2 \(mode.rawValue)")
+            profile.syncMode = mode
+            profile.remotePath = ""
+            profile.localSyncPath = localDir
+            return profile
+        }
+        let marker = "\"source\": \"synctray-sync.sh\""
+
+        // 1. Protected + unreadable: both sync modes fail up front, with the line the app parses.
+        for (mode, failedLine) in [(SyncMode.sync, "Sync failed with exit code 1"), (SyncMode.bisync, "Bisync failed with exit code 1")] {
+            let result = dryRunMountScript(
+                profile: syncProfile(mode), rcloneConfig: rcloneConf, dryRun: false,
+                configOverrides: ["localPathPrivacyProtected": true, "filterPath": filter])
+            guard result.exitCode == 1,
+                  result.log.contains(marker),
+                  result.log.contains(failedLine),
+                  !result.log.contains("Starting bisync"),
+                  let jsonLine = result.log.split(separator: "\n").first(where: { $0.contains(marker) }),
+                  let event = LogParser().parse(line: String(jsonLine)),
+                  case .errorMessage(let message) = event.type,
+                  SyncLogPatterns.macOSBlockedPath(in: message, localSyncPath: localDir) == localDir else {
+                return report(name, slug, false, "(\(mode.rawValue): exit \(result.exitCode), log: \(result.log.prefix(400)))")
+            }
+        }
+
+        // 2. Not marked protected (or marked false): the script never probes.
+        let notProtected = dryRunMountScript(
+            profile: syncProfile(.sync), rcloneConfig: rcloneConf, dryRun: false,
+            configOverrides: ["localPathPrivacyProtected": false, "filterPath": filter])
+        let keyAbsent = dryRunMountScript(
+            profile: syncProfile(.sync), rcloneConfig: rcloneConf, dryRun: false,
+            configOverrides: ["filterPath": filter, "localPathPrivacyProtected": NSNull()])
+        guard !notProtected.log.contains(marker), !keyAbsent.log.contains(marker) else {
+            return report(name, slug, false, "(the script probed a folder the app did not mark protected)")
+        }
+
+        // 3. A mount never probes: its local path is the mount point.
+        var mount = mountFixtureProfile(localPath: localDir, cachePath: cacheDir)
+        mount.rcloneRemote = "synology:"
+        let mountRun = dryRunMountScript(
+            profile: mount, rcloneConfig: aliasRcloneConfig(name: "synology", path: remoteDir),
+            configOverrides: ["localPathPrivacyProtected": true])
+        guard !mountRun.log.contains(marker), mountRun.mode != nil else {
+            return report(name, slug, false, "(a mount profile was probed, or never reached its mount mode)")
+        }
+
+        // 4. The probe is a real directory read, not a permission-bit test.
+        let script = SyncSetupService.shared.generateSyncScript()
+        guard script.contains("/bin/ls -- \"$PROBE_PATH\""),
+              script.contains("parse_json \"localPathPrivacyProtected\""),
+              !script.contains("[[ -r \"$LOCAL_PATH\" ]]"),
+              !script.contains("[[ -r \"$PROBE_PATH\" ]]") else {
+            return report(name, slug, false, "(the probe is not a real directory read)")
+        }
+        return report(name, slug, true)
+    }
+
+    // MARK: - AC-BA3 — the banner explains a denial on the sync folder itself
+
+    /// When the refused path IS the sync folder, Exclude doesn't exist, and a scheduled sync is
+    /// refused by macOS even though the app (and an app-launched sync) can read the folder — so
+    /// the banner must say Full Disk Access is needed for the process that runs scheduled syncs.
+    private static func testSyncFolderItselfBanner() -> Bool {
+        let name = "AC-BA3", slug = "sync-folder-itself-banner"
+        let root = "/Users/jdiaz/Documents"
+        guard SyncExcludeFilter.isSyncFolderItself(root, localSyncPath: root),
+              SyncExcludeFilter.isSyncFolderItself(root + "/", localSyncPath: root),
+              SyncExcludeFilter.isSyncFolderItself("~/Documents", localSyncPath: root) == (NSHomeDirectory() == "/Users/jdiaz"),
+              !SyncExcludeFilter.isSyncFolderItself(root + "/Sub", localSyncPath: root),
+              !SyncExcludeFilter.isSyncFolderItself("/Users/jdiaz/Other", localSyncPath: root) else {
+            return report(name, slug, false, "(isSyncFolderItself matched the wrong paths)")
+        }
+        guard let view = readSourceFile("Views/Settings/ProfileDetailView.swift"),
+              let explanation = extractFunctionBody(startingAt: "private func blockedAccessExplanation(", in: view),
+              explanation.contains("case .macOSPrivacy where isSyncFolder:"),
+              explanation.contains("Full Disk Access"),
+              explanation.contains("/bin/bash"),
+              explanation.contains("program that runs scheduled syncs"),
+              view.contains("isSyncFolder: SyncExcludeFilter.isSyncFolderItself(blockedPath, localSyncPath: profile.localSyncPath)") else {
+            return report(name, slug, false, "(the banner does not explain Full Disk Access for the script runner)")
+        }
+        return report(name, slug, true)
+    }
+
+    // MARK: - AC-BA4 — the derived config marks privacy-protected folders for the script
+
+    private static func testPrivacyProtectedConfigKey() -> Bool {
+        let name = "AC-BA4", slug = "config-privacy-flag"
+        func flag(_ path: String, mount: Bool = false) -> Bool? {
+            var profile = sampleProfile()
+            profile.syncMode = mount ? .mount : .bisync
+            profile.localSyncPath = path
+            let json = SyncSetupService.shared.generateProfileConfig(for: profile)
+            guard let data = json.data(using: .utf8),
+                  let dict = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { return nil }
+            return dict["localPathPrivacyProtected"] as? Bool
+        }
+        let home = NSHomeDirectory()
+        guard flag(home + "/Documents") == true,
+              flag("~/Documents/Work") == true,
+              flag(home + "/Desktop") == true,
+              flag("/Volumes/Drive/Folder") == true,
+              flag(home + "/Pictures") == false,
+              flag("/tmp/synctray-selftest-local") == false,
+              flag(home + "/Documents", mount: true) == false else {
+            return report(name, slug, false, "(the privacy-protected key is wrong for a sampled folder)")
         }
         return report(name, slug, true)
     }

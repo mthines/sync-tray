@@ -4146,7 +4146,9 @@ struct ProfileDetailView: View {
                 Text(summary)
                     .font(.caption.weight(.medium))
             }
-            Text(blockedAccessExplanation(itemName: name, kind: kind, canExclude: excludePattern != nil))
+            Text(blockedAccessExplanation(
+                itemName: name, kind: kind, canExclude: excludePattern != nil,
+                isSyncFolder: SyncExcludeFilter.isSyncFolderItself(blockedPath, localSyncPath: profile.localSyncPath)))
                 .font(.caption)
                 .foregroundColor(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -4177,9 +4179,19 @@ struct ProfileDetailView: View {
         }
     }
 
-    private func blockedAccessExplanation(itemName: String, kind: SyncLogPatterns.BlockedAccessKind, canExclude: Bool) -> String {
+    private func blockedAccessExplanation(
+        itemName: String, kind: SyncLogPatterns.BlockedAccessKind, canExclude: Bool, isSyncFolder: Bool = false
+    ) -> String {
         var text: String
         switch kind {
+        case .macOSPrivacy where isSyncFolder:
+            // The synced folder itself is protected (Documents, Desktop, an external drive…).
+            // Scheduled syncs are started by launchd, not by SyncTray, so macOS checks the
+            // program that runs the sync script — an app-launched sync (Sync Now, Fix Sync
+            // Issues) can succeed while every scheduled one is refused (issue #143).
+            text = "macOS lets SyncTray read this folder but not the program that runs scheduled syncs. "
+                + "Add /bin/bash (and SyncTray) under System Settings › Privacy & Security › Full Disk Access, "
+                + "then sync again. Fix Sync Issues can't help here."
         case .macOSPrivacy:
             text = canExclude
                 ? "Exclude it from this profile to finish syncing, or allow access under System Settings › "
