@@ -1712,6 +1712,42 @@ extension SyncSetupService {
             if [[ $SCHEDULE_RESULT -eq 10 ]]; then exit 0; fi
             if [[ $SCHEDULE_RESULT -ne 0 ]]; then exit 1; fi
 
+            # Local-folder access probe (issue #143). Desktop, Documents, Downloads, iCloud Drive,
+            # ~/Library and external volumes are guarded by macOS privacy controls (TCC), and a
+            # scheduled run is started by launchd, so macOS checks THIS script's process, not
+            # SyncTray: an app-launched sync can read the folder while every scheduled one is
+            # refused. rclone then fails mid-run ("operation not permitted") and bisync follows
+            # with a "retryable without --resync" notice that hides the cause. So for a protected
+            # folder (`localPathPrivacyProtected`, written by the app; sync modes only) read the
+            # folder once, with a real directory read ([[ -r ]] can pass under TCC), and fail up
+            # front with the same error line rclone logs, which the app turns into the
+            # "macOS blocked access" banner. Any other failure (a missing folder) is rclone's to report.
+            LOCAL_PATH_PROTECTED=$(parse_json "localPathPrivacyProtected" "False")
+            if [[ "$SYNC_MODE" != "mount" && "$LOCAL_PATH_PROTECTED" =~ ^(True|true|1)$ ]]; then
+                case "$LOCAL_PATH" in
+                    "~"|"~/"*) PROBE_PATH="$HOME${LOCAL_PATH#"~"}" ;;
+                    *) PROBE_PATH="$LOCAL_PATH" ;;
+                esac
+                PROBE_ERR=$(LC_ALL=C /bin/ls -- "$PROBE_PATH" 2>&1 >/dev/null)
+                PROBE_STATUS=$?
+                PROBE_REASON=""
+                if [[ $PROBE_STATUS -ne 0 ]]; then
+                    case "$PROBE_ERR" in
+                        *"Operation not permitted"*) PROBE_REASON="operation not permitted" ;;
+                        *"Permission denied"*) PROBE_REASON="permission denied" ;;
+                    esac
+                fi
+                if [[ -n "$PROBE_REASON" ]]; then
+                    python3 -c 'import datetime, json, sys; print(json.dumps({"time": datetime.datetime.now().astimezone().isoformat(), "level": "error", "msg": "%s: open %s: %s" % (sys.argv[1], sys.argv[2], sys.argv[3]), "source": "synctray-sync.sh"}))' 'failed to open directory ""' "$PROBE_PATH" "$PROBE_REASON" >> "$LOG_FILE"
+                    if [[ "$SYNC_MODE" == "bisync" ]]; then
+                        echo "$(date '+%Y-%m-%d %H:%M:%S') - Bisync failed with exit code 1" >> "$LOG_FILE"
+                    else
+                        echo "$(date '+%Y-%m-%d %H:%M:%S') - Sync failed with exit code 1" >> "$LOG_FILE"
+                    fi
+                    exit 1
+                fi
+            fi
+
             ADDITIONAL_FLAGS=$(parse_json "additionalFlags" "")
             FILTER_FILE=$(parse_json "filterPath" "")
             SYNC_DIRECTION=$(parse_json "syncDirection" "localToRemote")
@@ -2963,6 +2999,10 @@ extension SyncSetupService {
             "downloadConnections": profile.downloadConnections,
             "bandwidthLimit": profile.bandwidthLimit,
             "mountResilient": profile.mountResilient,
+            // The script reads the local folder up front when macOS privacy controls guard it
+            // (sync modes only — a mount's local path is the mount point).
+            "localPathPrivacyProtected": !profile.isMountMode && SyncPathKind.isPrivacyProtected(
+                SyncPathKind.classify(localPath: profile.localSyncPath, homeDirectory: NSHomeDirectory())),
         ].merging(mountCacheOnlyConfigKeys(for: profile)) { _, new in new }
 
         if let data = try? JSONSerialization.data(
@@ -3412,6 +3452,13 @@ enum SyncExcludeFilter {
     /// server's EPERM.
     static func isWithinSyncFolder(_ path: String, localSyncPath: String) -> Bool {
         relativePath(of: path, within: localSyncPath) != nil
+    }
+
+    /// Whether `path` IS the sync folder `localSyncPath` (not something inside it). A denial on
+    /// the sync folder itself can't be fixed by excluding it, so the banner explains the access
+    /// to grant instead.
+    static func isSyncFolderItself(_ path: String, localSyncPath: String) -> Bool {
+        relativePath(of: path, within: localSyncPath) == ""
     }
 
     /// `path` relative to `root` (`""` for the root itself), or nil when it isn't inside it.

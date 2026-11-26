@@ -770,6 +770,29 @@ enum SyncLogPatterns {
         }
     }
 
+    /// Whether a newly seen error message should replace the error stored for the profile.
+    ///
+    /// A local access denial in the sync folder is the root cause of the run's failure: the
+    /// messages rclone logs after it ("Bisync aborted. Error is retryable without --resync due
+    /// to --resilient mode.", "…must run --resync") only say what bisync did about it. They
+    /// match `isCriticalError` (the word "resync"), so without this guard they displaced the
+    /// denial, and the banner offered Fix Sync Issues — which can't lift a macOS privacy block —
+    /// instead of the access actions (issue #143). Nothing stored always accepts the message;
+    /// otherwise a critical message replaces a non-critical one, as before, except over a
+    /// stored local access denial.
+    static func shouldReplaceStoredError(existing: String?, with new: String, localSyncPath: String?) -> Bool {
+        guard let existing else { return true }
+        if let localSyncPath, macOSBlockedAccess(in: existing, localSyncPath: localSyncPath) != nil {
+            return false
+        }
+        // A denial in the sync folder is the cause of the run's failure, so it replaces any
+        // older, different error (a probe failure writes it before rclone logs anything).
+        if let localSyncPath, macOSBlockedAccess(in: new, localSyncPath: localSyncPath) != nil {
+            return true
+        }
+        return isCriticalError(new) && !isCriticalError(existing)
+    }
+
     /// True when rclone failed to open a DIRECTORY (the local backend's listing error), as
     /// opposed to a single file — so an exclude for it ends in `/` (folder and contents).
     static func isDirectoryOpenFailure(_ message: String) -> Bool {
