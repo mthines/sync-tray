@@ -1,0 +1,14 @@
+version: 1
+# Changes to these paths are never merged by /atelier: it holds for a person.
+# Release, signing and distribution decide what ships to users; atelier's own config decides what it may merge.
+manual_merge_paths:
+  - ".github/workflows/"
+  - "scripts/release.sh"
+  - "scripts/release-ci.sh"
+  - "scripts/install.sh"
+  - "scripts/setup-tap.sh"
+  - "Config/"
+  - "**/*.entitlements"
+  - "Casks/"
+  - "docs/release-signing.md"
+  - ".agents/aw/"
