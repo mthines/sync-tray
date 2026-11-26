@@ -4189,7 +4189,7 @@ struct ProfileDetailView: View {
             // Scheduled syncs are started by launchd, not by SyncTray, so macOS checks the
             // program that runs the sync script — an app-launched sync (Sync Now, Fix Sync
             // Issues) can succeed while every scheduled one is refused (issue #143).
-            text = "macOS lets SyncTray read this folder but not the program that runs scheduled syncs. "
+            text = "macOS is blocking access to this folder. The program that runs scheduled syncs needs access as well as SyncTray. "
                 + "Add /bin/bash (and SyncTray) under System Settings › Privacy & Security › Full Disk Access, "
                 + "then sync again. Fix Sync Issues can't help here."
         case .macOSPrivacy:

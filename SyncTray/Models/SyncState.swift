@@ -785,6 +785,11 @@ enum SyncLogPatterns {
         if let localSyncPath, macOSBlockedAccess(in: existing, localSyncPath: localSyncPath) != nil {
             return false
         }
+        // A denial in the sync folder is the cause of the run's failure, so it replaces any
+        // older, different error (a probe failure writes it before rclone logs anything).
+        if let localSyncPath, macOSBlockedAccess(in: new, localSyncPath: localSyncPath) != nil {
+            return true
+        }
         return isCriticalError(new) && !isCriticalError(existing)
     }
 

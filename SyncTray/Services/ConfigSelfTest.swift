@@ -9090,6 +9090,11 @@ enum ConfigSelfTest {
               SyncLogPatterns.shouldReplaceStoredError(existing: remoteDenial, with: retryable, localSyncPath: root) else {
             return report(name, slug, false, "(replacement rules for ordinary errors changed)")
         }
+        // A denial in the sync folder replaces an older, different (non-denial) error.
+        guard SyncLogPatterns.shouldReplaceStoredError(existing: remoteDenial, with: denial, localSyncPath: root),
+              SyncLogPatterns.shouldReplaceStoredError(existing: fileLevel, with: denial, localSyncPath: root) else {
+            return report(name, slug, false, "(a sync-folder denial must replace an older non-denial error)")
+        }
         guard let managerSource = readSourceFile("Services/SyncManager.swift"),
               managerSource.contains("SyncLogPatterns.shouldReplaceStoredError("),
               !managerSource.contains("profileErrors[profileId] == nil || (isCriticalError && !existingIsCritical)") else {

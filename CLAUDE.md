@@ -1131,6 +1131,8 @@ server's EPERM is not):
   `permission_denied` and the closing "not deleting … as there were IO errors" notice to
   `io_errors_blocked_deletes`. The banner action itself records `recovery.result = "staged"`
   (not `"started"`) since it starts no run.
+Covered by `ConfigSelfTest` AC-PL1–AC-PL6.
+
 **The sync folder itself can be the blocked path — and a scheduled run is checked, not the app.**
 launchd starts the sync script, so macOS applies its privacy controls to *that* process: an
 app-launched sync (Sync Now, Fix Sync Issues, auto-fix) can read `~/Documents` while every
@@ -1154,8 +1156,6 @@ scheduled one gets `open /Users/me/Documents: operation not permitted` (issue #1
   `synctray-sync.sh`), the "failed with exit code 1" line, and exits 1 without starting rclone. Any other
   failure is rclone's to report.
 Covered by `ConfigSelfTest` AC-PL3 (the real Documents line), AC-BA1–AC-BA4.
-
-Covered by `ConfigSelfTest` AC-PL1–AC-PL6.
 
 **"Permission denied" (EACCES) gets the same handling, and volume system folders are excluded
 by default.** rclone reports a local folder whose POSIX permissions it can't read as
